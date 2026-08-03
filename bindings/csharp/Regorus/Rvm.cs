@@ -2,6 +2,8 @@
 // Licensed under the MIT License.
 
 using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
 using Regorus.Internal;
 
 #nullable enable
@@ -21,6 +23,22 @@ namespace Regorus
         /// Suspendable execution mode.
         /// </summary>
         Suspendable = 1,
+    }
+
+    /// <summary>
+    /// Evaluation mode for the explanation/causality system.
+    /// </summary>
+    public enum EvaluationMode : byte
+    {
+        /// <summary>
+        /// Standard causality reporting (default).
+        /// </summary>
+        Causality = 0,
+
+        /// <summary>
+        /// Partial evaluation - produces residual queries over declared unknowns.
+        /// </summary>
+        PartialEval = 1,
     }
 
     /// <summary>
@@ -145,6 +163,26 @@ namespace Regorus
         }
 
         /// <summary>
+        /// Set the maximum number of VM instructions a single <see cref="Execute"/> call
+        /// is allowed to run before the engine bails with
+        /// <c>"Execution stopped: exceeded maximum instruction limit"</c>.
+        /// </summary>
+        /// <remarks>
+        /// Managed wrapper over the existing <c>regorus_rvm_set_max_instructions</c>
+        /// entry point. Hosts evaluating large policy sets over many resources can
+        /// exceed the default limit, which surfaces as a fail-fast rather than a
+        /// result, so the cap needs to be raisable from the binding.
+        /// </remarks>
+        public void SetMaxInstructions(ulong maxInstructions)
+        {
+            UseHandle(vmPtr =>
+            {
+                CheckAndDropResult(API.regorus_rvm_set_max_instructions((RegorusRvm*)vmPtr, (UIntPtr)maxInstructions));
+                return 0;
+            });
+        }
+
+        /// <summary>
         /// Execute the program and return the JSON result.
         /// </summary>
         public string? Execute()
@@ -216,13 +254,21 @@ namespace Regorus
         /// <summary>
         /// Set explanation settings for causality tracking.
         /// </summary>
-        public void SetExplanationSettings(bool enabled, ExplanationValueMode valueMode = ExplanationValueMode.Redacted, ExplanationConditionMode conditionMode = ExplanationConditionMode.PrimaryOnly, ExplanationScope scope = ExplanationScope.AllEmissions, ExplanationDetail detail = ExplanationDetail.Standard, uint? emissionIndex = null, string? emissionValueJson = null, bool assumeUnknownInput = false)
+        /// <param name="evalMode">Evaluation mode - <see cref="EvaluationMode.Causality"/> for standard causality reporting,
+        /// or <see cref="EvaluationMode.PartialEval"/> for partial evaluation against declared unknowns.</param>
+        /// <param name="unknowns">Paths declared as unknown inputs (e.g. "input", "input.deployment"). When null or empty, defaults to ["input"].</param>
+        public void SetExplanationSettings(bool enabled, ExplanationValueMode valueMode = ExplanationValueMode.Redacted, ExplanationConditionMode conditionMode = ExplanationConditionMode.PrimaryOnly, ExplanationScope scope = ExplanationScope.AllEmissions, ExplanationDetail detail = ExplanationDetail.Standard, uint? emissionIndex = null, string? emissionValueJson = null, bool assumeUnknownInput = false, EvaluationMode evalMode = EvaluationMode.Causality, IReadOnlyList<string>? unknowns = null)
         {
+            using var pinnedUnknowns = ModuleMarshalling.PinEntryPoints(unknowns ?? Array.Empty<string>());
+
             if (emissionValueJson is null)
             {
                 UseHandle(vmPtr =>
                 {
-                    CheckAndDropResult(API.regorus_rvm_set_explanation_settings((RegorusRvm*)vmPtr, enabled, (byte)valueMode, (byte)conditionMode, (byte)scope, (byte)detail, emissionIndex.HasValue, emissionIndex.GetValueOrDefault(), false, null, assumeUnknownInput));
+                    fixed (IntPtr* unknownsPtr = pinnedUnknowns.Buffer)
+                    {
+                        CheckAndDropResult(API.regorus_rvm_set_explanation_settings((RegorusRvm*)vmPtr, enabled, (byte)valueMode, (byte)conditionMode, (byte)scope, (byte)detail, emissionIndex.HasValue, emissionIndex.GetValueOrDefault(), false, null, assumeUnknownInput, (byte)evalMode, (byte**)unknownsPtr, (UIntPtr)pinnedUnknowns.Length));
+                    }
                     return 0;
                 });
 
@@ -233,7 +279,10 @@ namespace Regorus
             {
                 UseHandle(vmPtr =>
                 {
-                    CheckAndDropResult(API.regorus_rvm_set_explanation_settings((RegorusRvm*)vmPtr, enabled, (byte)valueMode, (byte)conditionMode, (byte)scope, (byte)detail, emissionIndex.HasValue, emissionIndex.GetValueOrDefault(), true, (byte*)emissionValuePtr, assumeUnknownInput));
+                    fixed (IntPtr* unknownsPtr = pinnedUnknowns.Buffer)
+                    {
+                        CheckAndDropResult(API.regorus_rvm_set_explanation_settings((RegorusRvm*)vmPtr, enabled, (byte)valueMode, (byte)conditionMode, (byte)scope, (byte)detail, emissionIndex.HasValue, emissionIndex.GetValueOrDefault(), true, (byte*)emissionValuePtr, assumeUnknownInput, (byte)evalMode, (byte**)unknownsPtr, (UIntPtr)pinnedUnknowns.Length));
+                    }
                     return 0;
                 });
             });
@@ -247,6 +296,45 @@ namespace Regorus
             return UseHandle(vmPtr =>
             {
                 return CheckAndDropResult(API.regorus_rvm_take_causality_report((RegorusRvm*)vmPtr));
+            });
+        }
+
+        /// <summary>
+        /// Take the causality report from the most recent evaluation as MessagePack bytes
+        /// (named-field encoding via rmp-serde's <c>to_vec_named</c>). Returns null only on
+        /// VM-state failure. The native FFI must be built with the <c>causality_msgpack</c>
+        /// cargo feature; calling this against a default-build native DLL will fail with
+        /// EntryPointNotFoundException.
+        /// </summary>
+        public byte[]? TakeCausalityReportMsgpack()
+        {
+            return UseHandle(vmPtr =>
+            {
+                return ExtractBuffer(API.regorus_rvm_take_causality_report_msgpack((RegorusRvm*)vmPtr));
+            });
+        }
+
+        /// <summary>
+        /// Take the partial-evaluation result from the most recent evaluation as JSON.
+        /// Returns DNF residual queries with conditions on declared unknowns.
+        /// </summary>
+        /// <param name="valueJson">Optional JSON literal/raw string representing the query result value to seed residual rendering.</param>
+        public string? TakePartialEvalResult(string? valueJson = null)
+        {
+            if (valueJson is null)
+            {
+                return UseHandle(vmPtr =>
+                {
+                    return CheckAndDropResult(API.regorus_rvm_take_partial_eval_result((RegorusRvm*)vmPtr, null));
+                });
+            }
+
+            return Utf8Marshaller.WithUtf8(valueJson, valuePtr =>
+            {
+                return UseHandle(vmPtr =>
+                {
+                    return CheckAndDropResult(API.regorus_rvm_take_partial_eval_result((RegorusRvm*)vmPtr, (byte*)valuePtr));
+                });
             });
         }
 
@@ -277,6 +365,47 @@ namespace Regorus
         private static string? CheckAndDropResult(RegorusResult result)
         {
             return ResultHelpers.GetStringResult(result);
+        }
+
+        /// <summary>
+        /// Extract bytes from a RegorusResult that returns a <c>RegorusBuffer*</c>
+        /// in <c>pointer_value</c> (the pattern used by <c>regorus_program_serialize_binary</c>
+        /// and <c>regorus_rvm_take_causality_report_msgpack</c>). Copies into a managed
+        /// <c>byte[]</c> and frees both the buffer and the result.
+        /// </summary>
+        private static byte[]? ExtractBuffer(RegorusResult result)
+        {
+            RegorusBuffer* buffer = null;
+            try
+            {
+                if (result.status != RegorusStatus.Ok)
+                {
+                    var message = Utf8Marshaller.FromUtf8(result.error_message);
+                    throw result.status.CreateException(message);
+                }
+
+                if (result.data_type != RegorusDataType.Pointer || result.pointer_value == null)
+                {
+                    throw new Exception("Expected buffer pointer but got different data type");
+                }
+
+                buffer = (RegorusBuffer*)result.pointer_value;
+                var length = checked((int)buffer->len);
+                var data = new byte[length];
+                if (length > 0)
+                {
+                    Marshal.Copy((IntPtr)buffer->data, data, 0, length);
+                }
+                return data;
+            }
+            finally
+            {
+                if (buffer != null)
+                {
+                    API.regorus_buffer_drop(buffer);
+                }
+                API.regorus_result_drop(result);
+            }
         }
     }
 }

@@ -155,6 +155,11 @@ pub struct ConditionOutcome {
     pub expected_path: Option<String>,
     /// Index of the loop summary in `loop_stats`, if this condition has one.
     pub loop_stat_idx: Option<ValueIdx>,
+    /// Rule index that was active when this outcome was recorded. Mirrors
+    /// `Assumption::rule_index`; used by causality materialization to attach
+    /// helper-body conditions back to the outer truthiness condition that
+    /// invoked the helper.
+    pub rule_index: u16,
 }
 
 /// Statistics for a completed loop.
@@ -247,6 +252,14 @@ pub struct Assumption {
     /// an unknown input key (e.g. `data.perms[input.role]`), this captures
     /// the concrete data object so `materialize_pe` can invert the lookup.
     pub data_lookup_context: Option<DataLookupContext>,
+    /// Set to `true` retroactively at definition-end (in `rules.rs`) when the
+    /// enclosing definition failed to emit / assign a value. Materialize-time
+    /// filter: `materialize_pe` skips orphaned assumptions so a concretely-
+    /// false downstream condition prunes any assumptions recorded earlier in
+    /// the body (including assumptions recorded inside helper calls). Not
+    /// consulted in causality mode — causality still attaches assumptions to
+    /// their recording definition for explainability.
+    pub orphaned: bool,
 }
 
 /// Context for inverting a data lookup during partial evaluation.
@@ -364,6 +377,7 @@ impl EvaluationTrace {
         actual_path: Option<String>,
         expected: Option<Value>,
         expected_path: Option<String>,
+        rule_index: u16,
     ) {
         let actual_idx = actual.and_then(|v| self.capture_value(v));
         let expected_idx = expected.and_then(|v| self.capture_value(v));
@@ -376,6 +390,7 @@ impl EvaluationTrace {
             expected_value_idx: expected_idx,
             expected_path,
             loop_stat_idx: None,
+            rule_index,
         });
     }
 
@@ -525,6 +540,7 @@ impl EvaluationTrace {
             negation_scope_id,
             owned_negation_scope_id: None,
             data_lookup_context: None,
+            orphaned: false,
         });
     }
 

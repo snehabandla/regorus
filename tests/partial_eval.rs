@@ -2177,3 +2177,226 @@ allow if { input.resource.public == true }
         "second def uses known input.resource — result definitive"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Causality-8: PE prune-through-helper for concretely-false
+// downstream conditions. Regression pins for the retroactive-orphan-flag fix
+// in `rules.rs` + `materialize_pe` filter in `causality_report.rs`.
+//
+// Bug: when a `PartialSet`/`PartialObject` rule has a definition that
+// (a) records an assumption (e.g. via a helper gate on unknown input) and
+// (b) then concretely fails downstream (e.g. the resource loop finds no
+//     matches, or a downstream `==` is concretely-false),
+// the earlier definition-scoped orphan-flag scan did not fire, so the
+// assumption survived as a spurious residual disjunct.
+// Fix: at definition end, if the definition emitted nothing, mark all
+// assumptions recorded during that definition as `orphaned = true`;
+// `materialize_pe` then skips them.
+// ---------------------------------------------------------------------------
+
+/// pe_61: helper gate + concretely-false downstream (compliant resource).
+/// The `in_resource_group` helper records an assumption on
+/// `input.deployment.resourceGroupName`, but the resource loop then
+/// concretely fails (`allowBlobPublicAccess == false`). The assumption must
+/// be orphaned and pruned — no residual disjunct.
+#[test]
+fn pe_61_helper_gate_prunes_on_concrete_false_downstream() {
+    let policy = r#"
+package bicep
+import future.keywords
+
+in_resource_group(fragment) if contains(input.deployment.resourceGroupName, fragment)
+
+deny contains msg if {
+    in_resource_group("prod")
+    some _, resource in input.resources
+    resource.type == "Microsoft.Storage/storageAccounts"
+    resource.properties.allowBlobPublicAccess == true
+    msg := "allowBlobPublicAccess must be false in prod-rg"
+}
+"#;
+    let input = r#"{
+        "resources": [
+            {
+                "type": "Microsoft.Storage/storageAccounts",
+                "name": "compliantStorage",
+                "properties": { "allowBlobPublicAccess": false }
+            }
+        ]
+    }"#;
+    let result = run_pe_with_unknowns(
+        policy,
+        Some(input),
+        None,
+        "data.bicep.deny",
+        Some(vec!["input.deployment".into()]),
+    );
+    eprintln!("pe_61: {}", serde_json::to_string_pretty(&result).unwrap());
+
+    let queries = result["residual_queries"].as_array().unwrap();
+    assert_eq!(
+        queries.len(),
+        0,
+        "helper-gate assumption must be orphaned when downstream is concretely-false — got {} residual(s)",
+        queries.len()
+    );
+    let concrete = result["result"].as_array().unwrap();
+    assert_eq!(
+        concrete.len(),
+        0,
+        "compliant resource must not produce a concrete deny — got {:?}",
+        concrete
+    );
+}
+
+/// pe_62: inline gate + concretely-false downstream (compliant resource).
+/// Same as pe_61 but the helper is inlined directly into the rule body.
+/// The inline `contains(...)` still records an assumption; the same orphan
+/// path must fire — no residual disjunct.
+#[test]
+fn pe_62_inline_gate_prunes_on_concrete_false_downstream() {
+    let policy = r#"
+package bicep
+import future.keywords
+
+deny contains msg if {
+    contains(input.deployment.resourceGroupName, "prod")
+    some _, resource in input.resources
+    resource.type == "Microsoft.Storage/storageAccounts"
+    resource.properties.allowBlobPublicAccess == true
+    msg := "allowBlobPublicAccess must be false in prod-rg"
+}
+"#;
+    let input = r#"{
+        "resources": [
+            {
+                "type": "Microsoft.Storage/storageAccounts",
+                "name": "compliantStorage",
+                "properties": { "allowBlobPublicAccess": false }
+            }
+        ]
+    }"#;
+    let result = run_pe_with_unknowns(
+        policy,
+        Some(input),
+        None,
+        "data.bicep.deny",
+        Some(vec!["input.deployment".into()]),
+    );
+    eprintln!("pe_62: {}", serde_json::to_string_pretty(&result).unwrap());
+
+    let queries = result["residual_queries"].as_array().unwrap();
+    assert_eq!(
+        queries.len(),
+        0,
+        "inline-gate assumption must be orphaned when downstream is concretely-false — got {} residual(s)",
+        queries.len()
+    );
+    let concrete = result["result"].as_array().unwrap();
+    assert_eq!(
+        concrete.len(),
+        0,
+        "compliant resource must not produce a concrete deny — got {:?}",
+        concrete
+    );
+}
+
+/// pe_63: helper gate + genuinely symbolic downstream (over-prune guard).
+/// When downstream is unknown/symbolic (not concretely-false), the definition
+/// does not "concretely fail" — it never definitively runs to completion, so
+/// the assumption must be preserved. This guards against over-pruning.
+#[test]
+fn pe_63_helper_gate_keeps_when_downstream_symbolic() {
+    let policy = r#"
+package bicep
+import future.keywords
+
+in_resource_group(fragment) if contains(input.deployment.resourceGroupName, fragment)
+
+deny contains msg if {
+    in_resource_group("prod")
+    some _, resource in input.resources
+    resource.type == "Microsoft.Storage/storageAccounts"
+    resource.properties.allowBlobPublicAccess == true
+    msg := "allowBlobPublicAccess must be false in prod-rg"
+}
+"#;
+    // No input at all — `input.deployment` AND `input.resources` are unknown.
+    // The resource loop is symbolic; the emission is fully unknown-conditioned.
+    let result = run_pe(policy, None, None, "data.bicep.deny");
+    eprintln!("pe_63: {}", serde_json::to_string_pretty(&result).unwrap());
+
+    let queries = result["residual_queries"].as_array().unwrap();
+    assert!(
+        !queries.is_empty(),
+        "fully-symbolic downstream must NOT orphan the helper-gate assumption — over-pruning bug"
+    );
+}
+
+/// pe_64: helper gate + concretely-true downstream (noncompliant resource).
+/// The helper records an assumption; the resource concretely matches all
+/// downstream conditions (`allowBlobPublicAccess == true`). The emission
+/// fires conditionally on the assumption — residual survives and `result`
+/// contains the msg (since `assume_unknown_input = true`).
+#[test]
+fn pe_64_helper_gate_emits_on_noncompliant_resource() {
+    let policy = r#"
+package bicep
+import future.keywords
+
+in_resource_group(fragment) if contains(input.deployment.resourceGroupName, fragment)
+
+deny contains msg if {
+    in_resource_group("prod")
+    some _, resource in input.resources
+    resource.type == "Microsoft.Storage/storageAccounts"
+    resource.properties.allowBlobPublicAccess == true
+    msg := "allowBlobPublicAccess must be false in prod-rg"
+}
+"#;
+    let input = r#"{
+        "resources": [
+            {
+                "type": "Microsoft.Storage/storageAccounts",
+                "name": "openStorage",
+                "properties": { "allowBlobPublicAccess": true }
+            }
+        ]
+    }"#;
+    let result = run_pe_with_unknowns(
+        policy,
+        Some(input),
+        None,
+        "data.bicep.deny",
+        Some(vec!["input.deployment".into()]),
+    );
+    eprintln!("pe_64: {}", serde_json::to_string_pretty(&result).unwrap());
+
+    let queries = result["residual_queries"].as_array().unwrap();
+    assert!(
+        !queries.is_empty(),
+        "noncompliant resource + helper-gate assumption must produce a residual"
+    );
+    let concrete = result["result"].as_array().unwrap();
+    assert!(
+        concrete
+            .iter()
+            .any(|v| v.as_str() == Some("allowBlobPublicAccess must be false in prod-rg")),
+        "assume_unknown_input=true must include the deny msg in `result` — got {:?}",
+        concrete
+    );
+    // Sanity: the residual must reference the helper's input path so a
+    // consumer can render "if resource group contains \"prod\"".
+    let has_rg_ref = queries.iter().any(|q| {
+        q.as_array().is_some_and(|terms| {
+            terms
+                .iter()
+                .any(|t| t["input_path"].as_str() == Some("input.deployment.resourceGroupName"))
+        })
+    });
+    assert!(
+        has_rg_ref,
+        "residual must reference input.deployment.resourceGroupName — got {:?}",
+        queries
+    );
+}

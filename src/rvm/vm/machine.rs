@@ -613,6 +613,27 @@ impl RegoVM {
         serde_json::to_string_pretty(&report).map_err(|e| alloc::format!("{e}"))
     }
 
+    /// Take the causality report for the most recent evaluation, serialized
+    /// as MessagePack bytes (named-field encoding via `rmp_serde::to_vec_named`).
+    ///
+    /// Produces the same report as [`Self::take_causality_report`] over a binary
+    /// wire, for hosts where JSON encode/parse dominates the cost of retrieving
+    /// it. Clears the internal trace, identical to `take_causality_report`.
+    #[cfg(all(feature = "explanations", feature = "causality_msgpack"))]
+    pub fn take_causality_report_msgpack(
+        &mut self,
+        query_result: Value,
+    ) -> core::result::Result<alloc::vec::Vec<u8>, alloc::string::String> {
+        let report = crate::causality_report::materialize(
+            &self.program,
+            &self.trace,
+            &self.explanation_settings,
+            query_result,
+        );
+        self.trace.clear();
+        rmp_serde::to_vec_named(&report).map_err(|e| alloc::format!("{e}"))
+    }
+
     /// Take the partial evaluation result for the most recent evaluation.
     ///
     /// Returns a JSON string with DNF residual queries. Clears the internal trace.

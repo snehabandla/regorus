@@ -22,6 +22,11 @@ pub(super) enum InstructionOutcome {
     Suspend { reason: SuspendReason },
 }
 
+/// `(subject_value, subject_path, value_value, value_path)` recovered from the
+/// instruction that produced a guard's boolean result.
+#[cfg(feature = "explanations")]
+type GuardOperandCapture = (Option<Value>, Option<String>, Option<Value>, Option<String>);
+
 impl RegoVM {
     #[cfg(feature = "explanations")]
     pub(super) fn runtime_path_for_register(&self, register: u8) -> Option<alloc::string::String> {
@@ -169,6 +174,28 @@ impl RegoVM {
             None => return false,
         };
 
+        // For whitelisted string-predicate builtins, capture structured
+        // operator + value alongside the input path so a consumer can render
+        // the residual from fields rather than by parsing `condition_text`.
+        // Tier-aware arg mapping keeps `left = subject, right = value`
+        // regardless of source arg order — see `builtin_operand_indices` in
+        // static_provenance.
+        let (operator, assumed_value) = self
+            .program
+            .builtin_info_table
+            .get(usize::from(params.builtin_index))
+            .and_then(|info| {
+                let (_, value_idx) = crate::static_provenance::builtin_operand_indices(&info.name)?;
+                let args = params.arg_registers();
+                let value_reg = *args.get(value_idx)?;
+                let value = self
+                    .get_register(value_reg)
+                    .ok()
+                    .and_then(|v| (!matches!(v, Value::Undefined)).then(|| v.clone()));
+                Some((Some(info.name.clone()), value))
+            })
+            .unwrap_or((None, None));
+
         let (rule_index, definition_index) = self.current_rule_scope();
         let iteration_index = self.current_loop_iteration_index();
         self.trace.record_assumption(
@@ -176,14 +203,153 @@ impl RegoVM {
             input_path,
             condition_text,
             u32::try_from(self.pc).unwrap_or(u32::MAX),
-            None,
-            None,
+            operator,
+            assumed_value,
             rule_index,
             definition_index,
             iteration_index,
             self.current_conjunction_id(),
         );
         true
+    }
+
+    /// For a `Guard(register)` preceded (directly or via a `Not`) by a
+    /// whitelisted string-predicate builtin, return `(subject_value,
+    /// subject_path, value_value, value_path)` so the causality condition's
+    /// `left`/`right` operand slots carry the operand values instead of the
+    /// boolean guard result. Returns `None` for non-whitelisted builtins or
+    /// unrelated preceding instructions — caller falls back to today's
+    /// behavior (guard register value + provenance in the `left` slot).
+    ///
+    /// Companion to `peek_preceding_builtin` / `peek_through_negation` Case B
+    /// on the static side; both use the shared `builtin_operand_indices`
+    /// mapping so `left = subject, right = value` regardless of source arg
+    /// order.
+    #[cfg(feature = "explanations")]
+    fn capture_builtin_guard_operands(&self, register: u8) -> Option<GuardOperandCapture> {
+        // Small lookback window — the compiler emits builtin -> (Not?) ->
+        // guard adjacently, so 8 instructions matches the static-side scanner.
+        const LOOKBACK: usize = 8;
+        let start = self.pc.saturating_sub(LOOKBACK).max(1);
+
+        // If `register` was written by a `Not { operand }`, retarget the scan
+        // to look for the BuiltinCall writing to that inner operand. This
+        // handles the `not startswith(...)` / `not contains(...)` pattern and
+        // mirrors `peek_through_negation` Case B on the static side.
+        let target_reg = if self.pc > 0 {
+            match self
+                .program
+                .instructions
+                .get(self.pc.saturating_sub(1))
+                .copied()
+            {
+                Some(Instruction::Not { dest, operand }) if dest == register => operand,
+                _ => register,
+            }
+        } else {
+            register
+        };
+
+        let mut cur = self.pc;
+        while cur > start {
+            cur = cur.saturating_sub(1);
+            let instr = *self.program.instructions.get(cur)?;
+            if let Instruction::BuiltinCall { params_index } = instr {
+                let params = self
+                    .program
+                    .instruction_data
+                    .get_builtin_call_params(params_index)?;
+                if params.dest != target_reg {
+                    continue;
+                }
+                let info = self
+                    .program
+                    .builtin_info_table
+                    .get(usize::from(params.builtin_index))?;
+                let (subject_idx, value_idx) =
+                    crate::static_provenance::builtin_operand_indices(&info.name)?;
+                let args = params.arg_registers();
+                let subject_reg = *args.get(subject_idx)?;
+                let value_reg = *args.get(value_idx)?;
+                let subject_val = self.get_register(subject_reg).ok().cloned();
+                let value_val = self.get_register(value_reg).ok().cloned();
+                let subject_path = self
+                    .provenance
+                    .get(subject_reg)
+                    .map(|p| p.as_ref().to_string());
+                let value_path = self
+                    .provenance
+                    .get(value_reg)
+                    .map(|p| p.as_ref().to_string());
+                return Some((subject_val, subject_path, value_val, value_path));
+            }
+        }
+        None
+    }
+
+    /// Runtime analog of `peek_through_negation` Case A. When a Guard
+    /// fires on a `Not(inner)` register whose inner was written by a
+    /// comparison opcode (`Eq`/`Ne`/`Lt`/`Le`/`Gt`/`Ge`/`Contains`), surface
+    /// the comparison's operand values so the emitted condition carries
+    /// populated `left`/`right` shapes just like a positive comparison would.
+    /// Mirrors `capture_builtin_guard_operands`.
+    #[cfg(feature = "explanations")]
+    fn capture_comparison_guard_operands(&self, register: u8) -> Option<GuardOperandCapture> {
+        // Only meaningful when Guard is fed by a `Not` — otherwise the
+        // positive-comparison path (record_runtime_comparison_assumption)
+        // already captured operands via record_condition's own arguments.
+        if self.pc == 0 {
+            return None;
+        }
+        let not_operand = match self
+            .program
+            .instructions
+            .get(self.pc.saturating_sub(1))
+            .copied()
+        {
+            Some(Instruction::Not { dest, operand }) if dest == register => operand,
+            _ => return None,
+        };
+
+        // Small lookback window — matches static-side peek_through_negation.
+        const LOOKBACK: usize = 8;
+        let start = self.pc.saturating_sub(LOOKBACK).max(1);
+
+        let mut cur = self.pc.saturating_sub(1); // skip the Not itself
+        while cur > start {
+            cur = cur.saturating_sub(1);
+            let instr = *self.program.instructions.get(cur)?;
+            let (left_reg, right_reg) = match instr {
+                Instruction::Eq { dest, left, right }
+                | Instruction::Ne { dest, left, right }
+                | Instruction::Lt { dest, left, right }
+                | Instruction::Le { dest, left, right }
+                | Instruction::Gt { dest, left, right }
+                | Instruction::Ge { dest, left, right }
+                    if dest == not_operand =>
+                {
+                    (left, right)
+                }
+                Instruction::Contains {
+                    dest,
+                    collection,
+                    value,
+                } if dest == not_operand => (collection, value),
+                _ => continue,
+            };
+            let left_val = self.get_register(left_reg).ok().cloned();
+            let right_val = self.get_register(right_reg).ok().cloned();
+            let left_path = self
+                .provenance
+                .get(left_reg)
+                .map(|p| p.as_ref().to_string());
+            let right_path = self
+                .provenance
+                .get(right_reg)
+                .map(|p| p.as_ref().to_string());
+            return Some((left_val, left_path, right_val, right_path));
+        }
+        None
     }
 
     #[cfg(feature = "explanations")]
@@ -389,6 +555,7 @@ impl RegoVM {
                 {
                     let pc = u32::try_from(self.pc).unwrap_or(u32::MAX);
                     let passed = !matches!(value, Value::Undefined);
+                    let (rule_index, _) = self.current_rule_scope();
                     self.trace.record_condition(
                         pc,
                         passed,
@@ -399,6 +566,7 @@ impl RegoVM {
                             .map(|path| path.as_ref().to_string()),
                         None,
                         None,
+                        rule_index,
                     );
                 }
                 Ok(InstructionOutcome::Continue)
@@ -826,6 +994,7 @@ impl RegoVM {
                 #[cfg(feature = "explanations")]
                 if self.explanation_settings.enabled {
                     let pc = u32::try_from(self.pc).unwrap_or(u32::MAX);
+                    let (rule_index, _) = self.current_rule_scope();
                     self.trace.record_condition(
                         pc,
                         passed,
@@ -838,6 +1007,7 @@ impl RegoVM {
                         self.provenance
                             .get(right)
                             .map(|path| path.as_ref().to_string()),
+                        rule_index,
                     );
                 }
                 self.handle_condition(passed)?;
@@ -872,16 +1042,45 @@ impl RegoVM {
                 #[cfg(feature = "explanations")]
                 if self.explanation_settings.enabled {
                     let pc = u32::try_from(self.pc).unwrap_or(u32::MAX);
+                    // For a Guard on a whitelisted string-predicate builtin,
+                    // surface the operand values instead of the boolean guard
+                    // result. Mirrors the comparison path (AssertEq) so
+                    // consumers see uniform `left`/`right` operand shape.
+                    let builtin_operands = self.capture_builtin_guard_operands(register);
+                    // Same treatment for negated comparisons
+                    // (`not X == Y`, `not X < Y`, `not X in Y`, ...): walk
+                    // back through the `Not` to the comparison instruction
+                    // and capture its operand values.
+                    let comparison_operands = if builtin_operands.is_none() {
+                        self.capture_comparison_guard_operands(register)
+                    } else {
+                        None
+                    };
+                    let (actual, actual_path, expected, expected_path) =
+                        if let Some(ops) = builtin_operands {
+                            ops
+                        } else if let Some(ops) = comparison_operands {
+                            ops
+                        } else {
+                            (
+                                Some(value),
+                                self.provenance
+                                    .get(register)
+                                    .map(|path| path.as_ref().to_string()),
+                                None,
+                                None,
+                            )
+                        };
+                    let (rule_index, _) = self.current_rule_scope();
                     self.trace.record_condition(
                         pc,
                         passed,
                         assumed,
-                        Some(value),
-                        self.provenance
-                            .get(register)
-                            .map(|path| path.as_ref().to_string()),
-                        None,
-                        None,
+                        actual,
+                        actual_path,
+                        expected,
+                        expected_path,
+                        rule_index,
                     );
                 }
                 self.handle_condition(passed)?;
@@ -982,7 +1181,50 @@ impl RegoVM {
                 let mut obj_value = self.take_register(obj)?;
 
                 if let Ok(obj_mut) = obj_value.as_object_mut() {
+                    // Recording a PartialObject emission (mirrors SetAdd below) lets
+                    // materialize_pe distinguish rule definitions that actually
+                    // emitted from those that recorded assumptions but never
+                    // reached the emission point. Resolved before the insert so the
+                    // emitted value is only cloned when it will actually be recorded.
+                    #[cfg(feature = "explanations")]
+                    let emission = self
+                        .explanation_settings
+                        .enabled
+                        .then(|| self.call_rule_stack.last())
+                        .flatten()
+                        .filter(|ctx| {
+                            ctx.rule_type == crate::rvm::program::RuleType::PartialObject
+                                && obj == ctx.result_reg
+                        })
+                        .map(|ctx| {
+                            (
+                                ctx.rule_index,
+                                u16::try_from(ctx.current_definition_index).unwrap_or(u16::MAX),
+                                u32::try_from(ctx.current_body_condition_start).unwrap_or(u32::MAX),
+                                value_value.clone(),
+                            )
+                        });
+
                     obj_mut.insert(key_value, value_value);
+
+                    #[cfg(feature = "explanations")]
+                    if let Some((
+                        rule_index,
+                        definition_index,
+                        condition_start_index,
+                        emitted_value,
+                    )) = emission
+                    {
+                        let condition_end_index =
+                            u32::try_from(self.trace.condition_outcomes.len()).unwrap_or(u32::MAX);
+                        self.trace.record_emission(
+                            rule_index,
+                            definition_index,
+                            condition_start_index,
+                            condition_end_index,
+                            emitted_value,
+                        );
+                    }
                     self.set_register(obj, obj_value)?;
                 } else {
                     let offending = obj_value.clone();

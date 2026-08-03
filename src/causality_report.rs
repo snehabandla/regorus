@@ -18,6 +18,7 @@ use crate::evaluation_trace::{
     ExplanationScope, ExplanationSettings, RuleOutcome, ValueMode,
 };
 use crate::rvm::program::Program;
+use crate::rvm::Instruction;
 use crate::static_provenance::{Provenance, ProvenanceRoot};
 use crate::value::Value;
 
@@ -185,6 +186,33 @@ pub struct ConditionExplanation {
     /// For binding conditions (`:=`): the variable name being bound.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding_name: Option<String>,
+    /// For Builtin kind: the builtin function name (`"startswith"`, `"endswith"`,
+    /// `"contains"`). Populated only when `kind == "builtin"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub builtin_name: Option<String>,
+    /// Orthogonal modifier: `true` when the condition's truth is inverted (e.g.
+    /// `not X == Y` emits `kind: "comparison", negated: true`, and
+    /// `not startswith(X, "foo")` emits `kind: "builtin", negated: true`). Omitted
+    /// from serialized output when `false`, so positive conditions keep the same
+    /// shape they had before this field existed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub negated: bool,
+    /// For truthiness conditions whose backing register was written by a
+    /// `CallRule` (i.e. the customer wrote `not _helper(x)` or bare
+    /// `_helper(x)` as a guard), this carries the helper's evaluated inner
+    /// conditions structurally so consumers can render "Violation caused by:
+    /// …" inline. Populated at materialize time by walking chronological
+    /// `condition_outcomes` between the `CallRule` and outer `Guard`,
+    /// filtered by `rule_index == helper_idx`. Omitted from serialized
+    /// output when empty. Bounded by the `MAX_HELPER_DEPTH` recursion guard for
+    /// nested helpers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub helper_conditions: Vec<ConditionExplanation>,
+}
+
+/// Serde skip helper: omit the field when the boolean is `false`.
+const fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Witness summary for a loop-backed condition.
@@ -277,6 +305,13 @@ pub struct ResidualCondition {
     /// 1-based source column for the condition.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_col: Option<u32>,
+    /// 1-based source line of the FIRST instruction of the rule body
+    /// (definition) that produced this condition.  Mirrors the value reported
+    /// by `DefinitionExplanation.location.row` in the causality report, so
+    /// consumers can exact-match a PE residual conjunct to the rule body it
+    /// came from — including the multi-body same-name rule case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_rule_start_row: Option<u32>,
 }
 
 /// Result of partial evaluation.
@@ -328,6 +363,13 @@ pub fn materialize_pe(
 
     // First pass: collect inner-negation assumptions into negation_inner.
     for a in &trace.assumptions {
+        // An assumption is orphaned when its enclosing definition (or any
+        // enclosing definition on the call stack) failed to emit / assign
+        // a value, meaning the assumption cannot have caused any observable
+        // effect.
+        if a.orphaned {
+            continue;
+        }
         if let Some(neg_scope) = a.negation_scope_id {
             let cond = assumption_to_residual(a, program);
             negation_inner.entry(neg_scope).or_default().push(cond);
@@ -336,6 +378,10 @@ pub fn materialize_pe(
 
     // Second pass: build disjuncts from top-level (non-negation-inner) assumptions.
     for a in &trace.assumptions {
+        // Skip orphaned assumptions (see comment on first pass above).
+        if a.orphaned {
+            continue;
+        }
         // Skip assumptions that belong inside a negation body — they will be
         // attached to the NegationHolds parent below.
         if a.negation_scope_id.is_some() {
@@ -388,11 +434,16 @@ pub fn materialize_pe(
     // input path, no operator, and no inner conditions.  Such a placeholder
     // provides no information to consumers and prevents the disjunct from
     // collapsing to an empty (always-true) clause.
+    //
+    // The filter recurses into `negated_conditions[]` so empty placeholders
+    // nested inside another `negation_holds` are also dropped;
+    // `attach_nested_negation_inner` above assigns the inner arrays but
+    // doesn't filter them.
     let residual_queries: Vec<Vec<ResidualCondition>> = disjunct_map
         .into_values()
         .filter_map(|mut conds| {
             conds.dedup_by(|a, b| a.condition == b.condition && a.operator == b.operator);
-            conds.retain(|c| !is_empty_placeholder(c));
+            filter_empty_placeholders_recursive(&mut conds);
             if conds.is_empty() {
                 None
             } else {
@@ -432,7 +483,8 @@ fn assumption_to_residual_conditions(
     a: &crate::evaluation_trace::Assumption,
     program: &Program,
 ) -> Vec<ResidualCondition> {
-    let (source_rule, source_file, source_row, source_col) = source_attribution(a, program);
+    let (source_rule, source_file, source_row, source_col, source_rule_start_row) =
+        source_attribution(a, program);
 
     // Check for data-key inversion.
     if let (Some(ref ctx), Some(ref cmp_value), Some(ref op)) =
@@ -473,6 +525,7 @@ fn assumption_to_residual_conditions(
                             source_file: source_file.clone(),
                             source_row,
                             source_col,
+                            source_rule_start_row,
                         }
                     })
                     .collect();
@@ -495,14 +548,26 @@ fn assumption_to_residual(
         AssumptionKind::CollectionExists => "collection_exists",
         AssumptionKind::NegationHolds => "negation_holds",
     };
-    let (source_rule, source_file, source_row, source_col) = source_attribution(a, program);
+    let (source_rule, source_file, source_row, source_col, source_rule_start_row) =
+        source_attribution(a, program);
     ResidualCondition {
         condition: strip_trailing_comment(&a.condition_text),
         operator: a.operator.clone(),
+        // Strip the trailing `[_]` iteration marker from `input_path` on
+        // `exists` and `condition_holds` kinds. The `[_]` originates in
+        // `rvm/vm/loops.rs`'s phantom-iteration setup (`element_path = base + "[_]"`
+        // tainting the iterator's value-register provenance) and propagates
+        // through Guard/comparison assumption recording. It's an engine-internal
+        // iterator variable placeholder with no meaning to a policy author.
+        // `collection_exists` is already clean (recorded pre-taint from the base
+        // path); `negation_holds` carries an empty `input_path`.
         input_path: if a.input_path.is_empty() {
             None
         } else {
-            Some(a.input_path.clone())
+            Some(match kind_str {
+                "exists" | "condition_holds" => strip_iteration_suffix(&a.input_path),
+                _ => a.input_path.clone(),
+            })
         },
         value: a.assumed_value.clone(),
         kind: kind_str.to_string(),
@@ -511,18 +576,33 @@ fn assumption_to_residual(
         source_file,
         source_row,
         source_col,
+        source_rule_start_row,
     }
 }
 
-/// Look up (rule_name, source_file, row, col) for an assumption.
+/// Strip a trailing `[_]` iterator placeholder from an input path.
+/// Returns the base collection path when the suffix is present; otherwise
+/// clones the input unchanged.
+fn strip_iteration_suffix(path: &str) -> String {
+    path.strip_suffix("[_]").unwrap_or(path).to_string()
+}
+
+/// `(rule_name, source_file, row, col, rule_start_row)` for an assumption.
+type SourceAttribution = (
+    Option<String>,
+    Option<String>,
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+);
+
+/// Look up (rule_name, source_file, row, col, rule_start_row) for an assumption.
 fn source_attribution(
     a: &crate::evaluation_trace::Assumption,
     program: &Program,
-) -> (Option<String>, Option<String>, Option<u32>, Option<u32>) {
-    let rule_name = program
-        .rule_infos
-        .get(usize::from(a.rule_index))
-        .map(|info| info.name.clone());
+) -> SourceAttribution {
+    let rule_info = program.rule_infos.get(usize::from(a.rule_index));
+    let rule_name = rule_info.map(|info| info.name.clone());
     let pc_usize: usize = a.pc.try_into().unwrap_or(0);
     let (file, row, col) = program
         .instruction_spans
@@ -541,7 +621,22 @@ fn source_attribution(
             )
         })
         .unwrap_or((None, None, None));
-    (rule_name, file, row, col)
+    // Mirror `materialize_definitions`: the rule-body row is the line of the
+    // FIRST instruction of `RuleInfo.definitions[definition_index]`. Causality
+    // already reports this as `DefinitionExplanation.location.row`, so a
+    // consumer can join PE residual conjuncts to causality definitions by
+    // exact equality on (rule_name, rule_start_row) — critical for the
+    // multi-body same-name rule case.
+    let rule_start_row = rule_info
+        .and_then(|info| info.definitions.get(usize::from(a.definition_index)))
+        .and_then(|def_pcs| def_pcs.first().copied())
+        .and_then(|first_pc| {
+            let idx = usize::try_from(first_pc).unwrap_or(0);
+            program.instruction_spans.get(idx).cloned()
+        })
+        .flatten()
+        .map(|span| u32::try_from(span.line).unwrap_or(u32::MAX));
+    (rule_name, file, row, col, rule_start_row)
 }
 
 /// Strip a trailing Rego comment (`# ...`) from a rendered condition string,
@@ -588,6 +683,20 @@ fn is_empty_placeholder(cond: &ResidualCondition) -> bool {
         && cond.input_path.is_none()
         && cond.operator.is_none()
         && cond.negated_conditions.is_empty()
+}
+
+/// Recursively drop empty `negation_holds` placeholders — both at
+/// the current level and inside any `negated_conditions[]` array of a
+/// nested `negation_holds` frame. Order matters: recurse into children
+/// FIRST so an inner `negation_holds` that becomes empty after its own
+/// children are filtered also gets dropped at this level.
+fn filter_empty_placeholders_recursive(conditions: &mut Vec<ResidualCondition>) {
+    for cond in conditions.iter_mut() {
+        if cond.kind == "negation_holds" && !cond.negated_conditions.is_empty() {
+            filter_empty_placeholders_recursive(&mut cond.negated_conditions);
+        }
+    }
+    conditions.retain(|c| !is_empty_placeholder(c));
 }
 
 /// Recursively attach inner negation conditions to any `negation_holds`
@@ -817,6 +926,7 @@ fn materialize_rule_emissions(
             conditions: materialize_condition_window(
                 emission.condition_start_index,
                 emission.condition_end_index,
+                emission.rule_index,
                 program,
                 trace,
                 settings,
@@ -849,9 +959,372 @@ fn materialize_conditions(
     )
 }
 
+// ---------------------------------------------------------------------------
+// Helper-boundary stitching
+// ---------------------------------------------------------------------------
+
+/// Maximum recursion depth when materializing nested helper bodies. Prevents
+/// stack blow-up on pathological policies (mutually-recursive helpers).
+const MAX_HELPER_DEPTH: usize = 8;
+
+/// If the Guard at `outer_pc` fires on a register written by a rule call
+/// (either `CallRule` for a bare rule reference, or `FunctionCall` for a
+/// helper-function call — the compiler picks `FunctionCall` for helpers with
+/// arguments like `_frontdoor_has_waf(resource)`), return the callee rule
+/// index. Handles both the positive `_helper(x)` and negated `not _helper(x)`
+/// forms (the latter has a `Not` between the call and the Guard). Returns
+/// `None` otherwise.
+fn detect_helper_call_at_guard(outer_pc: usize, program: &Program) -> Option<u16> {
+    let guard = program.instructions.get(outer_pc)?;
+    let guard_reg = match *guard {
+        Instruction::Guard { register, .. } => register,
+        _ => return None,
+    };
+    if outer_pc == 0 {
+        return None;
+    }
+    let prev = program.instructions.get(outer_pc.saturating_sub(1))?;
+
+    // Case 1: `_helper(x)` -- CallRule or FunctionCall writes directly to
+    // the guard register.
+    if let Some(rule_idx) = call_writes_to(prev, guard_reg, program) {
+        return Some(rule_idx);
+    }
+
+    // Case 2: `not _helper(x)` -- Not writes to the guard register from an
+    // inner register that was in turn written by CallRule/FunctionCall.
+    // Small lookback window mirrors `capture_builtin_guard_operands` in
+    // `dispatch.rs`.
+    if let Instruction::Not { dest, operand } = *prev {
+        if dest == guard_reg && outer_pc >= 2 {
+            const LOOKBACK: usize = 8;
+            let start = outer_pc.saturating_sub(LOOKBACK).max(1);
+            let mut cur = outer_pc.saturating_sub(1);
+            while cur > start {
+                cur = cur.saturating_sub(1);
+                let candidate = program.instructions.get(cur)?;
+                if let Some(rule_idx) = call_writes_to(candidate, operand, program) {
+                    return Some(rule_idx);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Returns the callee rule index if `instr` is a rule-call instruction
+/// (`CallRule` or `FunctionCall`) writing to `target_reg`.
+fn call_writes_to(instr: &Instruction, target_reg: u8, program: &Program) -> Option<u16> {
+    match *instr {
+        Instruction::CallRule { dest, rule_index } if dest == target_reg => Some(rule_index),
+        Instruction::FunctionCall { params_index } => {
+            let params = program
+                .instruction_data
+                .function_call_params
+                .get(usize::from(params_index))?;
+            (params.dest == target_reg).then_some(params.func_rule_index)
+        }
+        _ => None,
+    }
+}
+
+/// Walk `trace.condition_outcomes` backward from `outer_outcome_idx`,
+/// collecting outcomes whose `rule_index == helper_rule_index`. Stops when it
+/// hits an outcome from `outer_rule_index` (marking the boundary where helper
+/// execution began). Returns them in original chronological order.
+fn collect_helper_condition_outcomes(
+    outer_outcome_idx: usize,
+    outer_rule_index: u16,
+    helper_rule_index: u16,
+    trace: &EvaluationTrace,
+) -> Vec<(usize, &ConditionOutcome)> {
+    if outer_outcome_idx == 0 {
+        return Vec::new();
+    }
+    let mut collected: Vec<(usize, &ConditionOutcome)> = Vec::new();
+    let mut idx = outer_outcome_idx;
+    while idx > 0 {
+        idx = idx.saturating_sub(1);
+        let Some(outcome) = trace.condition_outcomes.get(idx) else {
+            break;
+        };
+        if outcome.rule_index == outer_rule_index {
+            break;
+        }
+        if outcome.rule_index == helper_rule_index {
+            collected.push((idx, outcome));
+        }
+    }
+    collected.reverse();
+    collected
+}
+
+/// For a truthiness outer condition on a `Guard` whose backing register was
+/// written by a rule call, materialize the helper's evaluated inner
+/// conditions as structural children. Returns an empty Vec
+/// when no helper call is detected or the recursion depth cap is reached.
+fn materialize_helper_conditions(
+    outer_pc: usize,
+    outer_outcome_idx: usize,
+    outer_rule_index: u16,
+    program: &Program,
+    trace: &EvaluationTrace,
+    settings: &ExplanationSettings,
+    depth: usize,
+) -> Vec<ConditionExplanation> {
+    if depth >= MAX_HELPER_DEPTH {
+        return Vec::new();
+    }
+    let Some(helper_rule_index) = detect_helper_call_at_guard(outer_pc, program) else {
+        return Vec::new();
+    };
+    let inner_outcomes = collect_helper_condition_outcomes(
+        outer_outcome_idx,
+        outer_rule_index,
+        helper_rule_index,
+        trace,
+    );
+    if inner_outcomes.is_empty() {
+        return Vec::new();
+    }
+    let mut inner = materialize_condition_explanations_at_depth(
+        inner_outcomes,
+        program,
+        trace,
+        settings,
+        depth.saturating_add(1),
+    );
+
+    // Rewrite each inner condition's `text` to just the helper body
+    // expression (drop rule head `<name>(params) if `) and substitute helper
+    // parameter names with the caller's argument literals extracted from the
+    // FunctionCall opcode preceding `outer_pc`. Turns
+    // `in_resource_group(fragment) if contains(input.deployment.resourceGroupName, fragment)`
+    // into `contains(input.deployment.resourceGroupName, "prod")` so a
+    // consumer can render the body without leaking helper parameter names or
+    // the rule head into user-facing output.
+    let substitutions = extract_helper_arg_substitutions(outer_pc, helper_rule_index, program);
+    for cond in inner.iter_mut() {
+        cond.text = rewrite_helper_body_text(&cond.text, &substitutions);
+    }
+
+    // Drop no-op inner entries. Helper invocation emits per-arg
+    // register-binding Move outcomes which surface as `kind: "unknown"` with
+    // empty `text` — they represent internal wiring (arg → param register
+    // move), not authorable predicates.
+    inner.retain(|c| !(c.kind == "unknown" && c.text.is_empty()));
+
+    inner
+}
+
+/// Walk backward from `outer_pc` to locate the `FunctionCall`
+/// instruction that invoked the helper. Mirrors `detect_helper_call_at_guard`:
+/// the FunctionCall is either directly preceding the Guard (for `_helper(x)`),
+/// or a few instructions before a `Not` (for `not _helper(x)`).
+fn find_preceding_function_call_pc(outer_pc: usize, program: &Program) -> Option<usize> {
+    if outer_pc == 0 {
+        return None;
+    }
+    let prev_pc = outer_pc.saturating_sub(1);
+    let prev = program.instructions.get(prev_pc)?;
+    match *prev {
+        Instruction::FunctionCall { .. } => Some(prev_pc),
+        Instruction::Not { .. } => {
+            const LOOKBACK: usize = 8;
+            let start = prev_pc.saturating_sub(LOOKBACK);
+            let mut cur = prev_pc;
+            while cur > start {
+                cur = cur.saturating_sub(1);
+                if let Some(Instruction::FunctionCall { .. }) = program.instructions.get(cur) {
+                    return Some(cur);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Build `(param_name, arg_source_literal)` pairs so
+/// [`rewrite_helper_body_text`] can substitute the helper's parameter names
+/// with the caller's literal argument values. Only literal arguments
+/// (`Load { dest, literal_idx }` writing to the arg register) are recovered;
+/// dynamic-value args leave the parameter name unsubstituted (the body text
+/// stays as-is for that identifier).
+fn extract_helper_arg_substitutions(
+    outer_pc: usize,
+    helper_rule_index: u16,
+    program: &Program,
+) -> Vec<(String, String)> {
+    let Some(fn_call_pc) = find_preceding_function_call_pc(outer_pc, program) else {
+        return Vec::new();
+    };
+    let Some(&Instruction::FunctionCall { params_index }) = program.instructions.get(fn_call_pc)
+    else {
+        return Vec::new();
+    };
+    let Some(params) = program
+        .instruction_data
+        .function_call_params
+        .get(usize::from(params_index))
+    else {
+        return Vec::new();
+    };
+    let Some(rule_info) = program.rule_infos.get(usize::from(helper_rule_index)) else {
+        return Vec::new();
+    };
+    let Some(function_info) = &rule_info.function_info else {
+        return Vec::new();
+    };
+    let arg_registers = params.arg_registers();
+    let mut substitutions: Vec<(String, String)> = Vec::new();
+    for (i, param_name) in function_info.param_names.iter().enumerate() {
+        let Some(&arg_reg) = arg_registers.get(i) else {
+            break;
+        };
+        if let Some(literal_str) = find_literal_load(fn_call_pc, arg_reg, program) {
+            substitutions.push((param_name.clone(), literal_str));
+        }
+    }
+    substitutions
+}
+
+/// Walk backward from `pc` (exclusive) within a bounded window,
+/// looking for a `Load { dest, literal_idx }` that wrote to `target_reg`.
+/// Returns the loaded value formatted as its Rego source literal (via
+/// [`format_value`]) when found. Returns `None` when the arg was not
+/// populated by a simple literal load (e.g. dynamic value, chained index,
+/// arithmetic result) — in which case the caller leaves the parameter
+/// name unsubstituted in the body text.
+fn find_literal_load(pc: usize, target_reg: u8, program: &Program) -> Option<String> {
+    const LOOKBACK: usize = 32;
+    let start = pc.saturating_sub(LOOKBACK);
+    let mut cur = pc;
+    while cur > start {
+        cur = cur.saturating_sub(1);
+        let instr = program.instructions.get(cur)?;
+        if let Instruction::Load { dest, literal_idx } = *instr {
+            if dest == target_reg {
+                let literal = program.literals.get(usize::from(literal_idx))?;
+                return Some(format_value(literal));
+            }
+        }
+    }
+    None
+}
+
+/// Rewrite a helper inner condition's raw source text so it renders
+/// as just the body expression with parameter names substituted. Two passes:
+///
+/// 1. Slice past the first ` if ` boundary (the Rego rule-head/body separator)
+///    to drop the helper rule declaration prefix. Absent ` if ` means the
+///    text was already body-only (e.g. 0-arg helper's Guard on an inline
+///    expression) and no slicing occurs.
+/// 2. For each `(param, literal)` pair, do a word-boundary substitution of
+///    `param` → `literal` throughout the body. Only identifier-token matches
+///    are replaced; substrings inside longer identifiers or other tokens are
+///    left alone.
+fn rewrite_helper_body_text(text: &str, substitutions: &[(String, String)]) -> String {
+    const SEPARATOR: &str = " if ";
+    let body = text
+        .find(SEPARATOR)
+        .and_then(|pos| pos.checked_add(SEPARATOR.len()))
+        .and_then(|body_start| text.get(body_start..))
+        .unwrap_or(text);
+    let mut current = body.to_string();
+    for (param, replacement) in substitutions {
+        current = substitute_identifier(&current, param, replacement);
+    }
+    current
+}
+
+/// Word-boundary-aware substitution used to swap helper parameter
+/// names for caller-supplied argument literals in helper body text. Boundary
+/// characters are ASCII identifier characters (`[A-Za-z0-9_]`); other bytes,
+/// including all non-ASCII, count as a boundary. Rego parameter names are
+/// ASCII identifiers by grammar, so a byte-level check is sound here.
+fn substitute_identifier(text: &str, pattern: &str, replacement: &str) -> String {
+    if pattern.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while cursor < text.len() {
+        match text[cursor..].find(pattern) {
+            Some(rel) => {
+                let start = cursor.saturating_add(rel);
+                let end = start.saturating_add(pattern.len());
+                out.push_str(&text[cursor..start]);
+                let left_ok = start == 0
+                    || !text[..start]
+                        .chars()
+                        .next_back()
+                        .is_some_and(is_identifier_char);
+                let right_ok = end == text.len()
+                    || !text[end..].chars().next().is_some_and(is_identifier_char);
+                if left_ok && right_ok {
+                    out.push_str(replacement);
+                } else {
+                    // Preserve the false match verbatim; don't rescan into it.
+                    out.push_str(&text[start..end]);
+                }
+                cursor = end;
+            }
+            None => {
+                out.push_str(&text[cursor..]);
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// ASCII identifier character predicate. Rego identifiers are
+/// `[A-Za-z_][A-Za-z0-9_]*` per grammar, so non-ASCII characters are always
+/// boundaries.
+const fn is_identifier_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// Derive the outer truthiness condition's `left.provenance` from the
+/// last failed helper inner condition. When the outer already has a
+/// provenance we don't overwrite; when it has an operand but no provenance,
+/// we augment it; when it has no operand at all, we leave it alone (a fully
+/// missing `left` on the outer is the engine's signal that the operand isn't
+/// meaningfully attributable to a single value).
+fn derive_left_provenance_from_helper(
+    left: Option<OperandExplanation>,
+    helper_conditions: &[ConditionExplanation],
+) -> Option<OperandExplanation> {
+    let existing = left?;
+    if existing.provenance.is_some() {
+        return Some(existing);
+    }
+    // Find the last inner condition whose outcome is "failure" and whose
+    // `left` carries a provenance. Iterating in reverse mirrors the fact that
+    // a helper body short-circuits on its first failing condition -- the one
+    // that actually determined the helper's Undefined/false return.
+    let derived_provenance = helper_conditions.iter().rev().find_map(|inner| {
+        if inner.outcome != "failure" {
+            return None;
+        }
+        inner.left.as_ref().and_then(|op| op.provenance.clone())
+    });
+    match derived_provenance {
+        Some(prov) => Some(OperandExplanation {
+            value: existing.value,
+            provenance: Some(prov),
+            redacted: existing.redacted,
+        }),
+        None => Some(existing),
+    }
+}
+
 fn materialize_condition_window(
     condition_start_index: u32,
     condition_end_index: u32,
+    outer_rule_index: u16,
     program: &Program,
     trace: &EvaluationTrace,
     settings: &ExplanationSettings,
@@ -863,8 +1336,17 @@ fn materialize_condition_window(
         settings,
     );
 
+    // Filter out outcomes that belong to a helper rule scope: they are
+    // surfaced structurally under `helper_conditions[]` on the outer
+    // truthiness record that invoked the helper, so keeping them as siblings
+    // here would duplicate them.
+    let outer_only: Vec<(usize, &ConditionOutcome)> = relevant_outcomes
+        .into_iter()
+        .filter(|(_, o)| o.rule_index == outer_rule_index)
+        .collect();
+
     finalize_condition_explanations(
-        materialize_condition_explanations(relevant_outcomes, program, trace, settings),
+        materialize_condition_explanations(outer_only, program, trace, settings),
         settings,
         true,
     )
@@ -1011,9 +1493,22 @@ fn materialize_condition_explanations(
     trace: &EvaluationTrace,
     settings: &ExplanationSettings,
 ) -> Vec<ConditionExplanation> {
+    materialize_condition_explanations_at_depth(relevant_outcomes, program, trace, settings, 0)
+}
+
+/// Recursion-aware variant. Callers that materialize helper inner
+/// bodies bump `depth` so we stop at `MAX_HELPER_DEPTH` to avoid unbounded
+/// recursion on pathological policies (mutually-recursive helpers).
+fn materialize_condition_explanations_at_depth(
+    relevant_outcomes: Vec<(usize, &ConditionOutcome)>,
+    program: &Program,
+    trace: &EvaluationTrace,
+    settings: &ExplanationSettings,
+    depth: usize,
+) -> Vec<ConditionExplanation> {
     let mut conditions: Vec<ConditionExplanation> = Vec::new();
 
-    for (_, outcome) in &relevant_outcomes {
+    for (outcome_idx, outcome) in &relevant_outcomes {
         let pc_usize: usize = outcome.pc.try_into().unwrap_or(0);
 
         let static_info = program
@@ -1044,7 +1539,26 @@ fn materialize_condition_explanations(
         let (left, right) = materialize_operands(outcome, static_info, trace, settings);
         let witness = materialize_loop_witness(outcome, trace);
         let binding_name = static_info.and_then(|i| i.binding_name.clone());
+        let builtin_name = static_info.and_then(|i| i.builtin_name.clone());
+        let negated = static_info.map(|i| i.negated).unwrap_or(false);
         let text = decorate_condition_text(base_text, static_info, left.as_ref());
+
+        // For a truthiness condition whose backing Guard fires on a register
+        // written by a rule call (`_helper(x)` or `not _helper(x)`), stitch
+        // the helper's evaluated inner conditions as structural children.
+        let helper_conditions = materialize_helper_conditions(
+            pc_usize,
+            *outcome_idx,
+            outcome.rule_index,
+            program,
+            trace,
+            settings,
+            depth,
+        );
+
+        // Derive outer `left.provenance` from the last failed helper inner
+        // condition when the outer condition doesn't already carry one.
+        let left = derive_left_provenance_from_helper(left, &helper_conditions);
 
         conditions.push(ConditionExplanation {
             text,
@@ -1056,6 +1570,9 @@ fn materialize_condition_explanations(
             right,
             witness,
             binding_name,
+            builtin_name,
+            negated,
+            helper_conditions,
         });
     }
 
@@ -1349,8 +1866,8 @@ fn format_condition_kind(kind: &crate::static_provenance::ConditionKind) -> Stri
         ConditionKind::Truthiness => "truthiness",
         ConditionKind::Existence => "existence",
         ConditionKind::EqualityAssertion => "equality_assertion",
-        ConditionKind::Negation => "negation",
         ConditionKind::Binding => "binding",
+        ConditionKind::Builtin => "builtin",
     }
     .to_string()
 }
@@ -1359,6 +1876,7 @@ fn format_condition_kind(kind: &crate::static_provenance::ConditionKind) -> Stri
 #[allow(clippy::indexing_slicing, clippy::unwrap_used)]
 mod tests {
     use alloc::vec;
+    use alloc::vec::Vec;
 
     use super::{
         dedupe_emission_conditions, materialize, materialize_condition_explanations,
@@ -1420,6 +1938,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1430,13 +1950,15 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
         ];
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, None, None, None, None);
-        trace.record_condition(1, false, false, None, None, None, None);
-        trace.record_condition(2, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
+        trace.record_condition(1, false, false, None, None, None, None, 0);
+        trace.record_condition(2, true, false, None, None, None, None, 0);
 
         let conditions = materialize_conditions(
             1,
@@ -1480,12 +2002,14 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
         ];
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, None, None, None, None);
-        trace.record_condition(1, false, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
+        trace.record_condition(1, false, false, None, None, None, None, 0);
 
         let conditions = materialize_conditions(
             1,
@@ -1522,6 +2046,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1532,6 +2058,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1542,6 +2070,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
         ];
         let rule_info = RuleInfo::new(
@@ -1554,13 +2084,13 @@ mod tests {
         program.rule_infos.push(rule_info.clone());
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, None, None, None, None);
-        trace.record_condition(2, true, false, None, None, None, None);
-        trace.record_condition(3, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
+        trace.record_condition(2, true, false, None, None, None, None, 0);
+        trace.record_condition(3, true, false, None, None, None, None, 0);
         trace.record_emission(0, 0, 0, 3, Value::from("violation a"));
-        trace.record_condition(1, true, false, None, None, None, None);
-        trace.record_condition(2, true, false, None, None, None, None);
-        trace.record_condition(3, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
+        trace.record_condition(2, true, false, None, None, None, None, 0);
+        trace.record_condition(3, true, false, None, None, None, None, 0);
         trace.record_emission(0, 0, 3, 6, Value::from("violation b"));
         trace.record_emission(0, 0, 3, 6, Value::from("violation b"));
 
@@ -1617,6 +2147,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1627,6 +2159,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1637,6 +2171,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
         ];
         let rule_info = RuleInfo::new(
@@ -1649,13 +2185,13 @@ mod tests {
         program.rule_infos.push(rule_info.clone());
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, None, None, None, None);
-        trace.record_condition(2, true, false, None, None, None, None);
-        trace.record_condition(3, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
+        trace.record_condition(2, true, false, None, None, None, None, 0);
+        trace.record_condition(3, true, false, None, None, None, None, 0);
         trace.record_emission(0, 0, 0, 3, Value::from("violation a"));
-        trace.record_condition(1, true, false, None, None, None, None);
-        trace.record_condition(2, true, false, None, None, None, None);
-        trace.record_condition(3, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
+        trace.record_condition(2, true, false, None, None, None, None, 0);
+        trace.record_condition(3, true, false, None, None, None, None, 0);
         trace.record_emission(0, 0, 3, 6, Value::from("violation b"));
 
         let emissions = materialize_rule_emissions(
@@ -1700,6 +2236,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1710,6 +2248,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1720,6 +2260,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
         ];
         let rule_info = RuleInfo::new(
@@ -1732,13 +2274,13 @@ mod tests {
         program.rule_infos.push(rule_info.clone());
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, None, None, None, None);
-        trace.record_condition(2, true, false, None, None, None, None);
-        trace.record_condition(3, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
+        trace.record_condition(2, true, false, None, None, None, None, 0);
+        trace.record_condition(3, true, false, None, None, None, None, 0);
         trace.record_emission(0, 0, 0, 3, Value::from("violation a"));
-        trace.record_condition(1, true, false, None, None, None, None);
-        trace.record_condition(2, true, false, None, None, None, None);
-        trace.record_condition(3, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
+        trace.record_condition(2, true, false, None, None, None, None, 0);
+        trace.record_condition(3, true, false, None, None, None, None, 0);
         trace.record_emission(0, 0, 3, 6, Value::from("violation b"));
 
         let emissions = materialize_rule_emissions(
@@ -1781,6 +2323,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1791,6 +2335,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
         ];
         let rule_info = RuleInfo::new(
@@ -1803,8 +2349,8 @@ mod tests {
         program.rule_infos.push(rule_info.clone());
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, None, None, None, None);
-        trace.record_condition(2, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
+        trace.record_condition(2, true, false, None, None, None, None, 0);
         trace.record_emission(0, 0, 0, 2, Value::from("violation a"));
 
         let standard = materialize_rule_emissions(
@@ -1852,6 +2398,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1862,6 +2410,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1872,11 +2422,13 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
         ];
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
         trace.record_condition(
             2,
             true,
@@ -1885,6 +2437,7 @@ mod tests {
             None,
             None,
             None,
+            0,
         );
         trace.attach_loop_stat_to_last_condition(
             2,
@@ -1893,7 +2446,7 @@ mod tests {
             Some(Value::from(1_u64)),
             Some(Value::from("match-a")),
         );
-        trace.record_condition(3, true, false, None, None, None, None);
+        trace.record_condition(3, true, false, None, None, None, None, 0);
 
         let conditions = materialize_conditions(
             1,
@@ -1937,11 +2490,13 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
         ];
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, Some(Value::Bool(true)), None, None, None);
+        trace.record_condition(1, true, false, Some(Value::Bool(true)), None, None, None, 0);
         trace.attach_loop_stat_to_last_condition(
             1,
             3,
@@ -1989,6 +2544,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
             None,
         ];
@@ -2007,7 +2564,7 @@ mod tests {
         program.rule_infos.push(rule_info);
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
         trace.record_rule_outcome(0, 0, true, Some(Value::from("violation a")));
         trace.record_emission(0, 0, 0, 1, Value::from("violation a"));
         trace.record_assumption(
@@ -2055,11 +2612,13 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
         ];
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, Some(Value::Bool(true)), None, None, None);
+        trace.record_condition(1, true, false, Some(Value::Bool(true)), None, None, None, 0);
         trace.attach_loop_stat_to_last_condition(
             1,
             3,
@@ -2106,6 +2665,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -2116,12 +2677,23 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
         ];
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, Some(Value::Bool(true)), None, None, None);
-        trace.record_condition(2, false, false, Some(Value::Bool(false)), None, None, None);
+        trace.record_condition(1, true, false, Some(Value::Bool(true)), None, None, None, 0);
+        trace.record_condition(
+            2,
+            false,
+            false,
+            Some(Value::Bool(false)),
+            None,
+            None,
+            None,
+            0,
+        );
         trace.record_loop(
             2,
             Some(1),
@@ -2198,6 +2770,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
         ];
 
@@ -2210,6 +2784,7 @@ mod tests {
             None,
             None,
             None,
+            0,
         );
 
         let conditions = materialize_condition_explanations(
@@ -2242,6 +2817,9 @@ mod tests {
                 right: None,
                 witness: None,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
+                helper_conditions: Vec::new(),
             },
             ConditionExplanation {
                 text: "some item in coll [matched: b]".into(),
@@ -2257,6 +2835,9 @@ mod tests {
                 right: None,
                 witness: None,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
+                helper_conditions: Vec::new(),
             },
         ];
 

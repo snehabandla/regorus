@@ -185,10 +185,13 @@ pub enum ConditionKind {
     Existence,
     /// An equality assertion (`AssertEq`).
     EqualityAssertion,
-    /// A negation guard (`not expr`).
-    Negation,
     /// A variable binding (`:=` assignment).
     Binding,
+    /// A structured predicate builtin (`startswith`, `endswith`, `contains(str, substr)`).
+    /// Distinct from `Comparison` because comparisons dispatch through dedicated RVM
+    /// opcodes with a closed `Operator` enum; builtins go through `BuiltinCall` and carry
+    /// an arbitrary function name.
+    Builtin,
 }
 
 /// Comparison/logical operator.
@@ -247,6 +250,15 @@ pub struct StaticConditionInfo {
     pub has_input_operand: bool,
     /// For binding conditions: the variable name being bound (e.g. `"container"`).
     pub binding_name: Option<String>,
+    /// For Builtin kind: the builtin function name (e.g. `"startswith"`, `"endswith"`,
+    /// `"contains"`). `None` for every other kind. Populated by `peek_preceding_builtin`
+    /// when the guard register was written by a `BuiltinCall` for a whitelisted predicate.
+    pub builtin_name: Option<String>,
+    /// Orthogonal modifier: `true` when the condition's truth is inverted (bytecode
+    /// `Not(inner)` before the branch). Applies alongside any `kind`: for example a
+    /// `not X == Y` guard emits `kind: Comparison, negated: true`, and a
+    /// `not startswith(X, "foo")` emits `kind: Builtin, negated: true`.
+    pub negated: bool,
 }
 
 impl StaticConditionInfo {
@@ -409,6 +421,8 @@ fn analyze_instruction(
                         operator: None,
                         has_input_operand: has_input,
                         binding_name: Some(binding_name),
+                        builtin_name: None,
+                        negated: false,
                     });
                 }
             }
@@ -665,6 +679,39 @@ fn peek_preceding_comparison(
     find_comparison_writing_to(pc, target_dest, reg_prov, program)
 }
 
+/// For string-predicate builtins with structured operands, return
+/// `(subject_arg_idx, value_arg_idx)` — which register slot in `params.args`
+/// carries the "subject" (the operand being tested, whose provenance a
+/// consumer wants to attribute the failure to) and which carries the "value"
+/// (the constraint literal or comparison target).
+///
+/// Consumers of the causality report get a uniform shape regardless of the
+/// builtin's source-code arg order: `left` is always subject with provenance,
+/// `right` is always value. Callers on both the static side
+/// ([`peek_preceding_builtin`]) and the runtime PE side
+/// (`record_builtin_assumption`) share this mapping so their emitted records
+/// agree.
+///
+/// Returns `None` for builtins outside the whitelist below. The whitelist is
+/// deliberately narrow: it covers the predicates whose arguments map cleanly
+/// onto a subject/value pair, which is what makes the uniform `left`/`right`
+/// shape meaningful.
+#[cfg(feature = "explanations")]
+pub(crate) fn builtin_operand_indices(name: &str) -> Option<(usize, usize)> {
+    match name {
+        // Tier 1: arg[0] = subject, arg[1] = value/pattern.
+        "startswith"
+        | "endswith"
+        | "contains"
+        | "strings.any_prefix_match"
+        | "strings.any_suffix_match" => Some((0, 1)),
+        // Tier 2: arg[0] = value/pattern, arg[1] = subject.
+        // Rego convention puts the pattern first for regex.* and CIDR checks.
+        "regex.match" | "net.cidr_contains" => Some((1, 0)),
+        _ => None,
+    }
+}
+
 /// Scan backward from `pc` (exclusive) looking for a comparison-like
 /// instruction whose `dest` register matches `target_dest`.  Stops at the
 /// nearest such instruction.  Used both for direct comparisons preceding a
@@ -734,6 +781,68 @@ fn find_comparison_writing_to(
     None
 }
 
+/// Peek at the instruction before `pc` to identify a whitelisted string-builtin
+/// call and its structured operands.  Mirrors [`peek_preceding_comparison`]
+/// but for `Instruction::BuiltinCall` — see [`builtin_operand_indices`] for
+/// the whitelist.  Returns `(builtin_name, operands)` where operands are
+/// normalized so `left` is always the subject and `right` is always the
+/// value/pattern, regardless of the builtin's source-level arg order.
+#[cfg(feature = "explanations")]
+fn peek_preceding_builtin(
+    pc: usize,
+    reg_prov: &[Option<Provenance>],
+    program: &Program,
+) -> Option<(String, ConditionOperands)> {
+    let target_dest = get_guard_register_at(pc, program)?;
+    find_builtin_writing_to(pc, target_dest, reg_prov, program)
+}
+
+/// Scan backward from `pc` (exclusive) looking for a `BuiltinCall` whose
+/// `params.dest` matches `target_dest` AND whose builtin name is on the
+/// whitelist. Same short-window lookback as [`find_comparison_writing_to`];
+/// bails early on unrelated writes only if the scan window is exceeded.
+#[cfg(feature = "explanations")]
+fn find_builtin_writing_to(
+    pc: usize,
+    target_dest: u8,
+    reg_prov: &[Option<Provenance>],
+    program: &Program,
+) -> Option<(String, ConditionOperands)> {
+    const LOOKBACK: usize = 8;
+    let start = pc.saturating_sub(LOOKBACK).max(1);
+    let mut cur = pc;
+    while cur > start {
+        cur = cur.saturating_sub(1);
+        let instr = program.instructions.get(cur)?;
+        if let Instruction::BuiltinCall { params_index } = *instr {
+            let params = program
+                .instruction_data
+                .builtin_call_params
+                .get(usize::from(params_index))?;
+            if params.dest != target_dest {
+                continue;
+            }
+            let builtin_info = program
+                .builtin_info_table
+                .get(usize::from(params.builtin_index))?;
+            let (subject_idx, value_idx) = builtin_operand_indices(&builtin_info.name)?;
+            let args = params.arg_registers();
+            let subject_reg = *args.get(subject_idx)?;
+            let value_reg = *args.get(value_idx)?;
+            return Some((
+                builtin_info.name.clone(),
+                ConditionOperands {
+                    left_reg: subject_reg,
+                    right_reg: value_reg,
+                    left_provenance: get_provenance(reg_prov, subject_reg).cloned(),
+                    right_provenance: get_provenance(reg_prov, value_reg).cloned(),
+                },
+            ));
+        }
+    }
+    None
+}
+
 /// If the instruction immediately preceding `pc` is `Not { dest, operand }`
 /// where `dest` is the register being guarded at `pc`, look further back to
 /// the comparison/contains/builtin call that produced `operand`.
@@ -765,13 +874,17 @@ fn peek_through_negation(
             operator: Some(op),
             operands: Some(operands),
             inner_provenance: get_provenance(reg_prov, not_operand).cloned(),
+            builtin_name: None,
         });
     }
 
-    // Case B: `not <builtin>(...)` — inner is a BuiltinCall.  We can't surface
-    // a structured operator, but we can still attach the input-rooted
-    // provenance of the first input-rooted argument so callers can attribute
-    // the failure to the right input path.
+    // Case B: `not <builtin>(...)` — inner is a BuiltinCall.  For whitelisted
+    // string-predicate builtins (see `builtin_operand_indices`), synthesize
+    // structured `left`/`right` operands + propagate the builtin name so the
+    // outer `kind: Negation` record carries the same shape as an un-negated
+    // builtin.  For non-whitelisted builtins, fall back to today's behavior:
+    // attach only the first input-rooted argument's provenance so callers can
+    // still attribute the failure to the right input path.
     let lookback_start = pc.saturating_sub(8).max(1);
     let mut cur = pc.saturating_sub(1);
     while cur > lookback_start {
@@ -784,6 +897,40 @@ fn peek_through_negation(
                 .get(usize::from(params_index))
             {
                 if params.dest == not_operand {
+                    let builtin_info = program
+                        .builtin_info_table
+                        .get(usize::from(params.builtin_index));
+
+                    // Try whitelisted structured shape first.
+                    if let Some(info) = builtin_info {
+                        if let Some((subject_idx, value_idx)) = builtin_operand_indices(&info.name)
+                        {
+                            let args = params.arg_registers();
+                            if let (Some(&subject_reg), Some(&value_reg)) =
+                                (args.get(subject_idx), args.get(value_idx))
+                            {
+                                let operands = ConditionOperands {
+                                    left_reg: subject_reg,
+                                    right_reg: value_reg,
+                                    left_provenance: get_provenance(reg_prov, subject_reg).cloned(),
+                                    right_provenance: get_provenance(reg_prov, value_reg).cloned(),
+                                };
+                                let inner_prov = get_provenance(reg_prov, subject_reg)
+                                    .or_else(|| get_provenance(reg_prov, not_operand))
+                                    .cloned();
+                                return Some(NegationLookThrough {
+                                    operator: None,
+                                    operands: Some(operands),
+                                    inner_provenance: inner_prov,
+                                    builtin_name: Some(info.name.clone()),
+                                });
+                            }
+                        }
+                    }
+
+                    // Fallback: non-whitelisted builtin. Preserve today's
+                    // behavior — surface only the first input-rooted arg's
+                    // provenance so consumers can still attribute the input.
                     let inner_prov = params
                         .arg_registers()
                         .iter()
@@ -797,6 +944,7 @@ fn peek_through_negation(
                         operator: None,
                         operands: None,
                         inner_provenance: inner_prov,
+                        builtin_name: None,
                     });
                 }
             }
@@ -811,6 +959,11 @@ struct NegationLookThrough {
     operator: Option<Operator>,
     operands: Option<ConditionOperands>,
     inner_provenance: Option<Provenance>,
+    /// For `not <whitelisted-builtin>(...)`: the inner builtin's name so
+    /// callers can propagate `builtin_name` onto the outer Negation-kind
+    /// `StaticConditionInfo`. `None` for `not <comparison>` and for
+    /// non-whitelisted builtins.
+    builtin_name: Option<String>,
 }
 
 /// Get the register being checked by the Guard instruction at `pc`.
@@ -868,6 +1021,49 @@ fn build_guard_condition_info(
                     operator: Some(op),
                     has_input_operand: has_input,
                     binding_name: None,
+                    builtin_name: None,
+                    negated: false,
+                }
+            } else if let Some((name, operands)) = peek_preceding_builtin(pc, reg_prov, program) {
+                // `startswith(x, "y")` / `endswith` / `contains` / `regex.match` /
+                // `net.cidr_contains` / `strings.any_{prefix,suffix}_match` —
+                // Guard fires on the boolean result of a whitelisted string
+                // predicate builtin (see `builtin_operand_indices`). Emit
+                // structured operands + builtin_name so the causality report
+                // renders identically to a comparison and a consumer can key
+                // on (kind: "builtin", builtin_name).
+                let has_input = operands
+                    .left_provenance
+                    .as_ref()
+                    .is_some_and(Provenance::is_input_rooted)
+                    || operands
+                        .right_provenance
+                        .as_ref()
+                        .is_some_and(Provenance::is_input_rooted);
+                let effective_provenance = if has_input {
+                    operands
+                        .left_provenance
+                        .as_ref()
+                        .filter(|p| p.is_input_rooted())
+                        .or(operands
+                            .right_provenance
+                            .as_ref()
+                            .filter(|p| p.is_input_rooted()))
+                        .cloned()
+                } else {
+                    checked_provenance
+                };
+                StaticConditionInfo {
+                    checked_register: register,
+                    checked_provenance: effective_provenance,
+                    operands: Some(operands),
+                    text,
+                    kind: ConditionKind::Builtin,
+                    operator: None,
+                    has_input_operand: has_input,
+                    binding_name: None,
+                    builtin_name: Some(name),
+                    negated: false,
                 }
             } else if let Some(neg) = peek_through_negation(pc, reg_prov, program) {
                 // `not <expr>` — Guard fires on `Not(inner)`.  Surface the
@@ -924,15 +1120,30 @@ fn build_guard_condition_info(
                     })
                 });
 
+                // Negation is an orthogonal modifier, so derive the outer
+                // `kind` from what `peek_through_negation` recovered:
+                //   - whitelisted builtin  → kind: Builtin  (Case B success)
+                //   - bare comparison      → kind: Comparison (Case A)
+                //   - opaque (non-whitelisted builtin or no inner) → kind: Truthiness
+                // In all three cases, `negated: true` flags the inversion.
+                let inferred_kind = if neg.builtin_name.is_some() {
+                    ConditionKind::Builtin
+                } else if neg.operator.is_some() {
+                    ConditionKind::Comparison
+                } else {
+                    ConditionKind::Truthiness
+                };
                 StaticConditionInfo {
                     checked_register: register,
                     checked_provenance: effective_provenance,
                     operands,
                     text,
-                    kind: ConditionKind::Negation,
+                    kind: inferred_kind,
                     operator: neg.operator,
                     has_input_operand: has_input,
                     binding_name: None,
+                    builtin_name: neg.builtin_name,
+                    negated: true,
                 }
             } else {
                 // Generic truthiness guard.
@@ -948,6 +1159,8 @@ fn build_guard_condition_info(
                     operator: None,
                     has_input_operand: has_input,
                     binding_name: None,
+                    builtin_name: None,
+                    negated: false,
                 }
             }
         }
@@ -964,9 +1177,13 @@ fn build_guard_condition_info(
                 operator: None,
                 has_input_operand: has_input,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }
         }
         GuardMode::Not => {
+            // Opaque negation (no structured inner recovered): emit as
+            // Truthiness with `negated: true`, matching the else-branch above.
             let has_input = checked_provenance
                 .as_ref()
                 .is_some_and(Provenance::is_input_rooted);
@@ -975,10 +1192,12 @@ fn build_guard_condition_info(
                 checked_provenance,
                 operands: None,
                 text,
-                kind: ConditionKind::Negation,
+                kind: ConditionKind::Truthiness,
                 operator: None,
                 has_input_operand: has_input,
                 binding_name: None,
+                builtin_name: None,
+                negated: true,
             }
         }
     }
@@ -1010,6 +1229,8 @@ fn build_assert_eq_condition_info(
         operator: Some(Operator::Eq),
         has_input_operand: has_input,
         binding_name: None,
+        builtin_name: None,
+        negated: false,
     }
 }
 

@@ -131,6 +131,12 @@ impl RegoVM {
             #[cfg(feature = "explanations")]
             let def_assumptions_start = self.trace.assumptions.len();
 
+            // Snapshot the emission-outcome cursor so we can tell whether
+            // THIS definition emitted anything by the time it finishes. Used
+            // by the orphan-assumption logic at def-end.
+            #[cfg(feature = "explanations")]
+            let def_start_emissions = self.trace.emission_outcomes.len();
+
             #[cfg(feature = "explanations")]
             let mut def_succeeded = false;
 
@@ -264,6 +270,39 @@ impl RegoVM {
                         def_succeeded,
                         None,
                     );
+
+                    // Retroactively orphan assumptions recorded during THIS
+                    // definition's body when the definition failed to emit:
+                    //   - PartialSet / PartialObject only: if no emissions
+                    //     were added since `def_start_emissions`, the body
+                    //     never reached its emit point (usually because a
+                    //     concrete downstream condition short-circuited),
+                    //     so any assumptions recorded earlier in the body
+                    //     (including inside helper calls) are spurious.
+                    // Complete rules are intentionally NOT orphaned here:
+                    // a Complete rule whose body records an assumption but
+                    // doesn't concretely succeed represents a legitimate
+                    // assumption-conditioned residual (see `pe_22`).
+                    // The mark is monotonic (only sets true, never resets),
+                    // so an outer failing PS/PO definition correctly orphans
+                    // any assumptions that inner successful helper calls
+                    // left behind. `materialize_pe` skips orphaned
+                    // assumptions.
+                    if matches!(
+                        rule_info.rule_type,
+                        RuleType::PartialSet | RuleType::PartialObject
+                    ) {
+                        let def_emitted = self.trace.emission_outcomes.len() > def_start_emissions;
+                        if !def_emitted {
+                            if let Some(recorded) =
+                                self.trace.assumptions.get_mut(def_assumptions_start..)
+                            {
+                                for a in recorded {
+                                    a.orphaned = true;
+                                }
+                            }
+                        }
+                    }
                 }
                 self.pop_conjunction_scope();
             }

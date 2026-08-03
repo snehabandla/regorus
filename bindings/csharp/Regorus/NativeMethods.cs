@@ -220,13 +220,27 @@ namespace Regorus.Internal
         /// Set explanation settings for causality tracking on the RVM.
         /// </summary>
         [DllImport(LibraryName, EntryPoint = "regorus_rvm_set_explanation_settings", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
-        internal static extern RegorusResult regorus_rvm_set_explanation_settings(RegorusRvm* vm, [MarshalAs(UnmanagedType.U1)] bool enabled, byte value_mode, byte condition_mode, byte scope_mode, byte detail_mode, [MarshalAs(UnmanagedType.U1)] bool has_emission_index, uint emission_index, [MarshalAs(UnmanagedType.U1)] bool has_emission_value, byte* emission_value_json, [MarshalAs(UnmanagedType.U1)] bool assume_unknown_input);
+        internal static extern RegorusResult regorus_rvm_set_explanation_settings(RegorusRvm* vm, [MarshalAs(UnmanagedType.U1)] bool enabled, byte value_mode, byte condition_mode, byte scope_mode, byte detail_mode, [MarshalAs(UnmanagedType.U1)] bool has_emission_index, uint emission_index, [MarshalAs(UnmanagedType.U1)] bool has_emission_value, byte* emission_value_json, [MarshalAs(UnmanagedType.U1)] bool assume_unknown_input, byte eval_mode, byte** unknowns, UIntPtr unknowns_len);
+
+        /// <summary>
+        /// Take the partial-evaluation result from the most recent RVM evaluation as JSON.
+        /// </summary>
+        [DllImport(LibraryName, EntryPoint = "regorus_rvm_take_partial_eval_result", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern RegorusResult regorus_rvm_take_partial_eval_result(RegorusRvm* vm, byte* value_json);
 
         /// <summary>
         /// Take the causality report from the most recent RVM evaluation as JSON.
         /// </summary>
         [DllImport(LibraryName, EntryPoint = "regorus_rvm_take_causality_report", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         internal static extern RegorusResult regorus_rvm_take_causality_report(RegorusRvm* vm);
+
+        /// <summary>
+        /// Take the causality report from the most recent RVM evaluation as MessagePack bytes.
+        /// Available only when the FFI is built with the <c>causality_msgpack</c> feature.
+        /// Returns a RegorusBuffer* in pointer_value; caller must free via regorus_buffer_drop.
+        /// </summary>
+        [DllImport(LibraryName, EntryPoint = "regorus_rvm_take_causality_report_msgpack", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern RegorusResult regorus_rvm_take_causality_report_msgpack(RegorusRvm* vm);
 
         /// <summary>
         /// Set the maximum instruction limit.

@@ -596,8 +596,13 @@ pub extern "C" fn regorus_rvm_get_execution_state(vm: *mut RegorusRvm) -> Regoru
 /// * `has_emission_value`: Whether `emission_value_json` should be used.
 /// * `emission_value_json`: JSON literal or raw string to match against emitted values.
 /// * `assume_unknown_input`: Whether to assume unknown input fields exist.
+/// * `eval_mode`: 0 = Causality (default), 1 = PartialEval.
+/// * `unknowns`: Pointer to array of UTF-8 paths declared as unknown (e.g. "input", "input.deployment").
+///   May be null when `unknowns_len` is 0; in that case defaults to `["input"]`.
+/// * `unknowns_len`: Number of entries in the `unknowns` array.
 #[no_mangle]
 #[cfg(feature = "explanations")]
+#[allow(clippy::too_many_arguments)]
 pub extern "C" fn regorus_rvm_set_explanation_settings(
     vm: *mut RegorusRvm,
     enabled: bool,
@@ -610,6 +615,9 @@ pub extern "C" fn regorus_rvm_set_explanation_settings(
     has_emission_value: bool,
     emission_value_json: *const c_char,
     assume_unknown_input: bool,
+    eval_mode: u8,
+    unknowns: *const *const c_char,
+    unknowns_len: usize,
 ) -> RegorusResult {
     with_unwind_guard(|| {
         to_regorus_result(|| -> Result<()> {
@@ -670,6 +678,20 @@ pub extern "C" fn regorus_rvm_set_explanation_settings(
             } else {
                 None
             };
+            let em = match eval_mode {
+                0 => regorus::evaluation_trace::EvaluationMode::Causality,
+                1 => regorus::evaluation_trace::EvaluationMode::PartialEval,
+                _ => {
+                    return Err(anyhow!(
+                        "invalid eval_mode; expected 0 (Causality) or 1 (PartialEval)"
+                    ))
+                }
+            };
+            let unknown_paths: Vec<String> = if unknowns.is_null() || unknowns_len == 0 {
+                alloc::vec![String::from("input")]
+            } else {
+                convert_c_entry_points(unknowns, unknowns_len)?
+            };
             guard.set_explanation_settings(regorus::evaluation_trace::ExplanationSettings {
                 enabled,
                 value_mode: vm_mode,
@@ -679,8 +701,8 @@ pub extern "C" fn regorus_rvm_set_explanation_settings(
                 emission_index,
                 emission_value,
                 assume_unknown_input,
-                eval_mode: regorus::evaluation_trace::EvaluationMode::default(),
-                unknowns: alloc::vec![String::from("input")],
+                eval_mode: em,
+                unknowns: unknown_paths,
             });
             Ok(())
         }())
@@ -697,6 +719,64 @@ pub extern "C" fn regorus_rvm_take_causality_report(vm: *mut RegorusRvm) -> Rego
             let mut guard = vm.try_write()?;
             let report = guard.take_causality_report(regorus::Value::Undefined);
             report.map_err(|e| anyhow!("{e}"))
+        }();
+        match output {
+            Ok(out) => RegorusResult::ok_string(out),
+            Err(e) => to_regorus_result(Err(e)),
+        }
+    })
+}
+
+/// Take the causality report from the most recent RVM evaluation as
+/// MessagePack bytes (named-field encoding). Returns a `RegorusBuffer*`
+/// in the pointer slot; caller must free via `regorus_buffer_drop`.
+///
+/// Enabled only when the FFI crate is built with `--features causality_msgpack`.
+#[no_mangle]
+#[cfg(all(feature = "explanations", feature = "causality_msgpack"))]
+pub extern "C" fn regorus_rvm_take_causality_report_msgpack(vm: *mut RegorusRvm) -> RegorusResult {
+    with_unwind_guard(|| {
+        let output = || -> Result<*mut RegorusBuffer> {
+            let vm = to_ref(vm)?;
+            let mut guard = vm.try_write()?;
+            let bytes = guard
+                .take_causality_report_msgpack(regorus::Value::Undefined)
+                .map_err(|e| anyhow!("{e}"))?;
+            Ok(RegorusBuffer::from_vec(bytes))
+        }();
+        match output {
+            Ok(buffer) => RegorusResult::ok_pointer(buffer as *mut c_void),
+            Err(err) => RegorusResult::err_with_message(RegorusStatus::Error, format!("{err}")),
+        }
+    })
+}
+
+/// Take the partial-evaluation result from the most recent RVM evaluation as JSON.
+///
+/// Returns DNF residual queries with conditions on unknown inputs.
+///
+/// * `vm`: Pointer to the RVM.
+/// * `value_json`: Optional JSON literal/raw string representing the query result value to seed
+///   the residual rendering. Pass null to use `Value::Undefined`.
+#[no_mangle]
+#[cfg(feature = "explanations")]
+pub extern "C" fn regorus_rvm_take_partial_eval_result(
+    vm: *mut RegorusRvm,
+    value_json: *const c_char,
+) -> RegorusResult {
+    with_unwind_guard(|| {
+        let output = || -> Result<String> {
+            let vm = to_ref(vm)?;
+            let mut guard = vm.try_write()?;
+            let value = if value_json.is_null() {
+                regorus::Value::Undefined
+            } else {
+                let raw = from_c_str(value_json)?;
+                regorus::Value::from_json_str(&raw).unwrap_or_else(|_| regorus::Value::from(raw))
+            };
+            guard
+                .take_partial_eval_result(value)
+                .map_err(|e| anyhow!("{e}"))
         }();
         match output {
             Ok(out) => RegorusResult::ok_string(out),
