@@ -29,6 +29,20 @@ use super::execution_model::{
     BreakpointSet, ExecutionMode, ExecutionStack, ExecutionState, SuspendReason,
 };
 
+/// An open Azure Policy `allOf` / `anyOf` block during partial evaluation.
+#[cfg(all(feature = "explanations", feature = "azure_policy"))]
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PolicyBlockFrame {
+    /// Index into `EvaluationTrace::assumptions` where this block began.
+    pub(super) assumptions_start: usize,
+    /// Index where the child currently being evaluated began. `anyOf` uses it
+    /// to tell an assumed-true child from a concretely-true one.
+    pub(super) child_assumptions_start: usize,
+    /// `anyOf` blocks scope each child into its own conjunction so alternatives
+    /// materialize as separate DNF disjuncts; `allOf` children share one.
+    pub(super) is_any_of: bool,
+}
+
 #[cfg(feature = "explanations")]
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
@@ -299,6 +313,13 @@ pub struct RegoVM {
     #[cfg(feature = "explanations")]
     pub(super) conjunction_id_stack: Vec<u32>,
 
+    /// Open Azure Policy `allOf` / `anyOf` blocks, innermost last. Each frame
+    /// remembers where the block's assumptions begin so a block that resolves
+    /// false can orphan them. AP has no rule definitions, so this replaces the
+    /// definition-end hook Rego uses for the same purpose.
+    #[cfg(all(feature = "explanations", feature = "azure_policy"))]
+    pub(super) policy_block_stack: Vec<PolicyBlockFrame>,
+
     /// Pending data lookup context from the last ChainedIndex that indexed a
     /// concrete data object with an unknown input key.  Consumed by the next
     /// assumption recording (in `record_runtime_comparison_assumption`).
@@ -369,6 +390,8 @@ impl RegoVM {
             assumption_dependent_depth: 0,
             #[cfg(feature = "explanations")]
             conjunction_id_stack: Vec::new(),
+            #[cfg(all(feature = "explanations", feature = "azure_policy"))]
+            policy_block_stack: Vec::new(),
             #[cfg(feature = "explanations")]
             pending_data_lookup: None,
         }

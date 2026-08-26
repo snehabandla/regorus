@@ -83,7 +83,19 @@ impl Compiler {
             FieldKind::Alias(path) => {
                 self.record_alias(path);
                 let short = self.resolve_alias_path(path, span)?;
-                self.compile_field_path_expression(&short, span)?
+                let pc_before = self.program.instructions.len();
+                let reg = self.compile_field_path_expression(&short, span)?;
+                // Tag the last instruction emitted for this alias, not the first: for a
+                // plain property this is the one ChainedIndex that produces the value;
+                // for the wildcard-collect path (a different, already-scoped-out gap)
+                // it would be a loop-closing instruction instead, which is fine since
+                // that path's aggregate has no provenance to fold this into anyway.
+                if let Some(last_pc) = self.program.instructions.len().checked_sub(1) {
+                    if last_pc >= pc_before {
+                        self.record_source_alias_for_pc(last_pc, path);
+                    }
+                }
+                reg
             }
             FieldKind::Expr(expr) => self.compile_dynamic_field_expr(expr, span)?,
         };

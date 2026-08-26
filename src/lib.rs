@@ -161,7 +161,7 @@ pub mod target;
 #[cfg(any(test, all(feature = "yaml", feature = "std")))]
 pub mod test_utils;
 pub mod utils;
-mod value;
+pub mod value;
 
 #[cfg(feature = "azure_policy")]
 pub use {
@@ -211,10 +211,10 @@ pub use alloc::sync::Arc as Rc;
 pub use alloc::rc::Rc;
 
 #[cfg(feature = "std")]
-use std::collections::{hash_map::Entry as MapEntry, HashMap as Map, HashSet as Set};
+use std::collections::{hash_map::Entry as MapEntry, HashMap as Map, HashSet as MapSet};
 
 #[cfg(not(feature = "std"))]
-use alloc::collections::{btree_map::Entry as MapEntry, BTreeMap as Map, BTreeSet as Set};
+use alloc::collections::{btree_map::Entry as MapEntry, BTreeMap as Map, BTreeSet as MapSet};
 
 use alloc::{
     borrow::ToOwned as _,

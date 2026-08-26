@@ -27,10 +27,14 @@ use num_traits::{One, Signed, ToPrimitive, Zero};
 use serde::ser::Serializer;
 use serde::Serialize;
 
+#[cfg(feature = "verus")]
+use vstd::prelude::*;
+
 use crate::*;
 
 pub type BigInt = NumBigInt;
 
+#[cfg_attr(feature = "verus", verus_verify)]
 const F64_SAFE_INTEGER: f64 = 9_007_199_254_740_992.0; // 2^53
 
 #[derive(Clone)]
@@ -140,13 +144,9 @@ impl Number {
         }
     }
 
-    fn ints_to_bigint(a: &Number, b: &Number) -> (BigInt, BigInt) {
-        (a.to_bigint_owned().unwrap(), b.to_bigint_owned().unwrap())
-    }
-
     fn normalize_float(value: f64) -> Number {
-        if let Some(int) = Self::float_to_small_bigint(value) {
-            return Self::from_bigint_owned(int);
+        if let Some(i) = Self::float_to_small_bigint(value) {
+            return Self::from_bigint_owned(i);
         }
         Number::Float(value)
     }
@@ -587,7 +587,11 @@ impl Number {
                 }
             }
             (Number::Int(a), Number::Int(b)) => {
-                if *a % *b == 0 {
+                if *a == i64::MIN && *b == -1 {
+                    // Rust panics on i64::MIN % -1i64, so handle it specially
+                    let quotient = BigInt::from(*a) / BigInt::from(*b);
+                    Ok(Number::from_bigint_owned(quotient))
+                } else if *a % *b == 0 {
                     if let Some(q) = a.checked_div(*b) {
                         Ok(Number::Int(q))
                     } else {
@@ -656,15 +660,17 @@ impl Number {
     }
 
     pub fn modulo(self, rhs: &Self) -> Result<Number> {
-        if rhs.is_zero() {
+        // Conversion fails for a non-integral float, and also for an integral
+        // one whose magnitude exceeds 2^53, which cannot be represented exactly.
+        let (a, b) = match (self.to_bigint_owned(), rhs.to_bigint_owned()) {
+            (Some(a), Some(b)) => (a, b),
+            _ => bail!("modulo on floating-point number"),
+        };
+
+        if b.is_zero() {
             bail!("modulo by zero");
         }
 
-        if !self.is_integer() || !rhs.is_integer() {
-            bail!("modulo on floating-point number");
-        }
-
-        let (a, b) = Number::ints_to_bigint(&self, rhs);
         let rem = a % &b;
         Ok(Number::from_bigint_owned(rem))
     }
@@ -685,6 +691,7 @@ impl Number {
         }
     }
 
+    #[allow(clippy::if_then_some_else_none)]
     fn ensure_integers(a: &Number, b: &Number) -> Option<(BigInt, BigInt)> {
         if a.is_integer() && b.is_integer() {
             Some((a.to_bigint_owned()?, b.to_bigint_owned()?))
@@ -776,7 +783,8 @@ impl Number {
         if e >= 0 {
             Ok(two_pow_positive(e as u32))
         } else {
-            let denom = two_pow_positive((-e) as u32);
+            // Must cast to i64 before negating in case it's i32::MIN
+            let denom = two_pow_positive((-(e as i64)) as u32);
             Number::from(1u64).divide(&denom)
         }
     }
@@ -785,7 +793,8 @@ impl Number {
         if e >= 0 {
             Ok(ten_pow_positive(e as u32))
         } else {
-            let denom = ten_pow_positive((-e) as u32);
+            // Must cast to i64 before negating in case it's i32::MIN
+            let denom = ten_pow_positive((-(e as i64)) as u32);
             Number::from(1u64).divide(&denom)
         }
     }
@@ -983,4 +992,68 @@ fn scientific_parts_to_bigint(mantissa: &str, exponent: i32) -> Option<BigInt> {
     }
 
     Some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used)] // tests expect() to assert arithmetic results
+
+    use super::*;
+    use alloc::string::ToString;
+
+    /// Regression test: `i64::MIN / -1` overflows `i64` and panics in Rust's
+    /// native integer division/remainder. `divide` must promote the result
+    /// instead of panicking.
+    #[test]
+    fn i64_min_by_negative_one() {
+        let quotient = Number::Int(i64::MIN)
+            .divide(&Number::Int(-1))
+            .expect("division should succeed");
+
+        // 2^63 does not fit in i64, but does fit in u64.
+        assert_eq!(quotient.as_u64(), Some(9_223_372_036_854_775_808));
+        assert_eq!(quotient.as_i64(), None);
+        assert_eq!(quotient.as_i128(), Some(9_223_372_036_854_775_808));
+        assert_eq!(
+            *quotient.to_big().expect("to_big should succeed"),
+            -BigInt::from(i64::MIN)
+        );
+
+        // The same overflow case reached via the mixed `Int`/`BigInt` path.
+        let big_quotient = Number::Int(i64::MIN)
+            .divide(&Number::BigInt(Rc::new(BigInt::from(-1))))
+            .expect("division should succeed");
+        assert_eq!(big_quotient.as_u64(), Some(9_223_372_036_854_775_808));
+
+        // `i64::MIN % -1` also panics natively; the result must be zero.
+        let remainder = Number::Int(i64::MIN)
+            .modulo(&Number::Int(-1))
+            .expect("modulo should succeed");
+        assert_eq!(remainder.as_i64(), Some(0));
+    }
+
+    #[test]
+    fn modulo_handles_floats_that_are_really_integers() {
+        // An integral float is a valid operand.
+        assert!(matches!(
+            Number::Float(4.0).modulo(&Number::Int(3)),
+            Ok(Number::UInt(1))
+        ));
+        // `1e300` has no fractional part, but it is too large to convert to an
+        // integer exactly. This must report an error, not panic.
+        assert_eq!(
+            Number::Float(1e300)
+                .modulo(&Number::Int(3))
+                .err()
+                .map(|e| e.to_string()),
+            Some("modulo on floating-point number".to_string())
+        );
+        assert_eq!(
+            Number::Int(3)
+                .modulo(&Number::Float(1e300))
+                .err()
+                .map(|e| e.to_string()),
+            Some("modulo on floating-point number".to_string())
+        );
+    }
 }

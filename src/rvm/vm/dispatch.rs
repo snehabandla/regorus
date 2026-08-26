@@ -4,7 +4,6 @@
 use crate::rvm::instructions::{GuardMode, Instruction, LiteralOrRegister};
 use crate::rvm::program::Program;
 use crate::value::Value;
-use alloc::collections::BTreeSet;
 #[cfg(feature = "explanations")]
 use alloc::string::{String, ToString as _};
 use alloc::vec::Vec;
@@ -48,6 +47,231 @@ impl RegoVM {
                 )
             })
             .unwrap_or((0, 0))
+    }
+
+    /// Record an Azure Policy comparison outcome.
+    ///
+    /// `right` is `None` for unary operators, so the report never reports an
+    /// expected value the policy never wrote.
+    #[cfg(all(feature = "explanations", feature = "azure_policy"))]
+    fn record_policy_condition(&mut self, passed: bool, left: u8, right: Option<u8>) {
+        if !self.explanation_settings.enabled {
+            return;
+        }
+        let pc = u32::try_from(self.pc).unwrap_or(u32::MAX);
+        let (rule_index, _) = self.current_rule_scope();
+        let actual = self.get_register(left).ok().cloned();
+        let actual_path = self
+            .provenance
+            .get(left)
+            .map(|path| path.as_ref().to_string());
+        let (expected, expected_path) = match right {
+            Some(r) => (
+                self.get_register(r).ok().cloned(),
+                self.provenance.get(r).map(|path| path.as_ref().to_string()),
+            ),
+            None => (None, None),
+        };
+        self.trace.record_condition(
+            pc,
+            passed,
+            false,
+            actual,
+            actual_path,
+            expected,
+            expected_path,
+            rule_index,
+        );
+    }
+
+    /// Record a PE assumption for an Azure Policy condition whose subject was
+    /// declared unknown, and continue the branch as assumed-true.
+    ///
+    /// Returns `true` when the condition was assumed, so the caller skips the
+    /// concrete operator evaluation entirely. Azure Policy assigns deliberate
+    /// meaning to a missing field (`equals null` matches, `notEquals false`
+    /// matches, and so on); those semantics must survive untouched, so this
+    /// fires only when the operand's runtime path was *declared* unknown, never
+    /// merely because it is undefined.
+    #[cfg(all(feature = "explanations", feature = "azure_policy"))]
+    fn maybe_assume_policy_condition(
+        &mut self,
+        dest: u8,
+        left: u8,
+        right: u8,
+        op: crate::rvm::instructions::PolicyOp,
+    ) -> Result<bool> {
+        use crate::rvm::instructions::PolicyOp;
+
+        // Gated on `assume_unknown_input` rather than on PE mode, matching the
+        // Rego guard path: a causality pass run alongside partial evaluation must
+        // follow the same assumed branch, or it explains the wrong outcome.
+        if !self.explanation_settings.enabled || !self.explanation_settings.assume_unknown_input {
+            return Ok(false);
+        }
+
+        if !matches!(self.get_register(left), Ok(v) if *v == Value::Undefined) {
+            return Ok(false);
+        }
+
+        let Some(input_path) = self.runtime_path_for_register(left) else {
+            return Ok(false);
+        };
+
+        if matches!(op, PolicyOp::ValueConditionGuard) {
+            // Compiler-inserted definedness guard around a `value:` condition.
+            // The authored condition it wraps has already recorded the
+            // assumption, so propagate that result instead of adding a second,
+            // operator-less residual for the same path.
+            let inner = self.get_register(right)?.clone();
+            self.set_register(dest, inner)?;
+            return Ok(true);
+        }
+
+        // Unary ops leave `right` unused; reporting it would invent an expected
+        // value the policy never wrote.
+        let assumed_value = if matches!(op, PolicyOp::Not | PolicyOp::Exists) {
+            None
+        } else {
+            self.get_register(right)
+                .ok()
+                .and_then(|value| (!matches!(value, Value::Undefined)).then(|| value.clone()))
+        };
+
+        let static_info = self
+            .program
+            .condition_infos
+            .get(self.pc)
+            .and_then(Option::as_ref);
+        let operator = static_info
+            .and_then(|info| info.operator)
+            .map(|symbol| alloc::format!("{symbol}"));
+        let builtin_name = static_info.and_then(|info| info.builtin_name.clone());
+
+        let (rule_index, definition_index) = self.current_rule_scope();
+        let iteration_index = self.current_loop_iteration_index();
+        self.trace.record_assumption(
+            crate::evaluation_trace::AssumptionKind::ConditionHolds,
+            input_path,
+            // Deliberately empty: an AP condition's source text is a raw JSON
+            // line, which consumers render verbatim. They must use the
+            // structured fields instead.
+            String::new(),
+            u32::try_from(self.pc).unwrap_or(u32::MAX),
+            operator,
+            assumed_value,
+            rule_index,
+            definition_index,
+            iteration_index,
+            self.current_conjunction_id(),
+        );
+        if let Some(last) = self.trace.assumptions.last_mut() {
+            last.builtin_name = builtin_name;
+        }
+
+        self.set_register(dest, Value::Bool(true))?;
+        Ok(true)
+    }
+
+    /// Open an Azure Policy logical block, remembering where its assumptions start.
+    #[cfg(all(feature = "explanations", feature = "azure_policy"))]
+    fn push_policy_block(&mut self, is_any_of: bool) {
+        if self.explanation_settings.eval_mode
+            != crate::evaluation_trace::EvaluationMode::PartialEval
+        {
+            return;
+        }
+        let start = self.trace.assumptions.len();
+        self.policy_block_stack
+            .push(crate::rvm::vm::machine::PolicyBlockFrame {
+                assumptions_start: start,
+                child_assumptions_start: start,
+                is_any_of,
+            });
+        if is_any_of {
+            self.push_conjunction_scope();
+        }
+    }
+
+    /// Close an Azure Policy logical block. When the block resolved false, every
+    /// assumption recorded inside it (including nested blocks) is spurious: the
+    /// block cannot have caused an effect, so the assumptions are orphaned and
+    /// `materialize_pe` drops them.
+    #[cfg(all(feature = "explanations", feature = "azure_policy"))]
+    fn pop_policy_block(&mut self, block_holds: bool) {
+        if self.explanation_settings.eval_mode
+            != crate::evaluation_trace::EvaluationMode::PartialEval
+        {
+            return;
+        }
+        let Some(frame) = self.policy_block_stack.pop() else {
+            return;
+        };
+        if frame.is_any_of {
+            self.pop_conjunction_scope();
+        }
+        if block_holds {
+            return;
+        }
+        self.orphan_assumptions_from(frame.assumptions_start);
+    }
+
+    /// Advance an `anyOf` block to its next alternative: close the current
+    /// child's conjunction scope and open a fresh one, so each alternative
+    /// materializes as its own DNF disjunct rather than being AND-ed together.
+    #[cfg(all(feature = "explanations", feature = "azure_policy"))]
+    fn next_policy_block_child(&mut self) {
+        if self.explanation_settings.eval_mode
+            != crate::evaluation_trace::EvaluationMode::PartialEval
+        {
+            return;
+        }
+        let len = self.trace.assumptions.len();
+        let Some(frame) = self.policy_block_stack.last_mut() else {
+            return;
+        };
+        frame.child_assumptions_start = len;
+        if frame.is_any_of {
+            self.pop_conjunction_scope();
+            self.push_conjunction_scope();
+        }
+    }
+
+    #[cfg(all(feature = "explanations", feature = "azure_policy"))]
+    fn orphan_assumptions_from(&mut self, start: usize) {
+        if let Some(recorded) = self.trace.assumptions.get_mut(start..) {
+            for assumption in recorded {
+                assumption.orphaned = true;
+            }
+        }
+    }
+
+    /// Whether the `anyOf` child that just finished depended on an assumption.
+    #[cfg(all(feature = "explanations", feature = "azure_policy"))]
+    fn current_policy_child_assumed(&self) -> bool {
+        self.explanation_settings.eval_mode == crate::evaluation_trace::EvaluationMode::PartialEval
+            && self
+                .policy_block_stack
+                .last()
+                .is_some_and(|frame| self.trace.assumptions.len() > frame.child_assumptions_start)
+    }
+
+    /// Orphan only the assumptions recorded by the child that just finished.
+    #[cfg(all(feature = "explanations", feature = "azure_policy"))]
+    fn orphan_current_policy_child(&mut self) {
+        if self.explanation_settings.eval_mode
+            != crate::evaluation_trace::EvaluationMode::PartialEval
+        {
+            return;
+        }
+        let Some(start) = self
+            .policy_block_stack
+            .last()
+            .map(|frame| frame.child_assumptions_start)
+        else {
+            return;
+        };
+        self.orphan_assumptions_from(start);
     }
 
     #[cfg(feature = "explanations")]
@@ -534,6 +758,10 @@ impl RegoVM {
             }
             LoadContext { dest } => {
                 self.set_register(dest, self.context.clone())?;
+                // Rooted at "context", not "input.context": the context is a
+                // separate VM slot and is never read from the input envelope.
+                #[cfg(feature = "explanations")]
+                self.provenance.set_root(dest, "context");
                 Ok(InstructionOutcome::Continue)
             }
             LoadMetadata { dest } => {
@@ -1501,7 +1729,7 @@ impl RegoVM {
                 }
             }
             SetNew { dest } => {
-                let empty_set = Value::Set(crate::Rc::new(BTreeSet::new()));
+                let empty_set = Value::new_set();
                 self.set_register(dest, empty_set)?;
                 Ok(InstructionOutcome::Continue)
             }
@@ -1565,7 +1793,7 @@ impl RegoVM {
                     if any_undefined {
                         self.set_register(params.dest, Value::Undefined)?;
                     } else {
-                        let mut set = BTreeSet::new();
+                        let mut set = alloc::collections::BTreeSet::new();
                         for &reg in params.element_registers() {
                             set.insert(self.get_register(reg)?.clone());
                         }
@@ -1738,10 +1966,14 @@ impl RegoVM {
         let l = self.get_register(left)?;
         if is_undefined(l) {
             self.set_register(dest, Value::Bool(false))?;
+            #[cfg(feature = "explanations")]
+            self.record_policy_condition(false, left, Some(right));
         } else {
             let r = self.get_register(right)?;
             let result = compare_values(l, r).is_some_and(cmp);
             self.set_register(dest, Value::Bool(result))?;
+            #[cfg(feature = "explanations")]
+            self.record_policy_condition(result, left, Some(right));
         }
         Ok(InstructionOutcome::Continue)
     }
@@ -1767,6 +1999,14 @@ impl RegoVM {
                 right,
                 op,
             } => {
+                // Placed before the operator match so a declared-unknown operand
+                // never reaches the concrete missing-value semantics below.
+                #[cfg(feature = "explanations")]
+                if self.maybe_assume_policy_condition(dest, left, right, op)? {
+                    return Ok(InstructionOutcome::Continue);
+                }
+                #[cfg(feature = "explanations")]
+                let unary = matches!(op, PolicyOp::Not);
                 let l = self.get_register(left)?;
                 let result = match op {
                     PolicyOp::Equals => {
@@ -1904,17 +2144,24 @@ impl RegoVM {
                     }
                 };
                 self.set_register(dest, Value::Bool(result))?;
+                #[cfg(feature = "explanations")]
+                {
+                    let right_operand = if unary { None } else { Some(right) };
+                    self.record_policy_condition(result, left, right_operand);
+                }
                 Ok(InstructionOutcome::Continue)
             }
 
             // AllOf / AnyOf structured instructions
             LogicalBlockStart {
-                mode: _,
+                mode,
                 result,
                 end_pc: _,
             } => {
                 // Initialize result to false (pessimistic).
                 self.set_register(result, Value::Bool(false))?;
+                #[cfg(feature = "explanations")]
+                self.push_policy_block(matches!(mode, LogicalBlockMode::AnyOf));
                 Ok(InstructionOutcome::Continue)
             }
             AllOfNext {
@@ -1923,9 +2170,15 @@ impl RegoVM {
                 end_pc,
             } => {
                 let val = self.get_register(check)?;
-                if !matches!(val, Value::Bool(true)) {
+                if matches!(val, Value::Bool(true)) {
+                    #[cfg(feature = "explanations")]
+                    self.next_policy_block_child();
+                } else {
                     // Child failed — short-circuit. Ensure the block result is false.
                     self.set_register(result, Value::Bool(false))?;
+                    // The jump skips `LogicalBlockEnd`, so the block is closed here.
+                    #[cfg(feature = "explanations")]
+                    self.pop_policy_block(false);
                     self.pc = usize::from(end_pc);
                 }
                 Ok(InstructionOutcome::Continue)
@@ -1936,10 +2189,36 @@ impl RegoVM {
                 end_pc,
             } => {
                 let val = self.get_register(check)?;
-                if matches!(val, Value::Bool(true)) {
-                    // Child succeeded — short-circuit.
+                let child_holds = matches!(val, Value::Bool(true));
+
+                // In PE mode an *assumed*-true alternative must not short-circuit:
+                // a later alternative may hold concretely, which would make the
+                // result definitive and this assumption irrelevant. Only a
+                // concretely-true child ends the block.
+                #[cfg(feature = "explanations")]
+                let child_assumed = self.current_policy_child_assumed();
+                #[cfg(not(feature = "explanations"))]
+                let child_assumed = false;
+
+                if child_holds {
                     self.set_register(result, Value::Bool(true))?;
-                    self.pc = usize::from(end_pc);
+                    if !child_assumed {
+                        // Concrete match: earlier assumed alternatives cannot
+                        // have caused the effect.
+                        #[cfg(feature = "explanations")]
+                        self.pop_policy_block(false);
+                        self.pc = usize::from(end_pc);
+                        return Ok(InstructionOutcome::Continue);
+                    }
+                    #[cfg(feature = "explanations")]
+                    self.next_policy_block_child();
+                } else {
+                    // A failed alternative's own assumptions are spurious.
+                    #[cfg(feature = "explanations")]
+                    {
+                        self.orphan_current_policy_child();
+                        self.next_policy_block_child();
+                    }
                 }
                 Ok(InstructionOutcome::Continue)
             }
@@ -1948,9 +2227,18 @@ impl RegoVM {
                     LogicalBlockMode::AllOf => {
                         // All children passed — set result to true.
                         self.set_register(result, Value::Bool(true))?;
+                        #[cfg(feature = "explanations")]
+                        self.pop_policy_block(true);
                     }
                     LogicalBlockMode::AnyOf => {
-                        // No child matched — result stays false (set by LogicalBlockStart).
+                        // Reached only when no child short-circuited. The result
+                        // register is true iff some alternative held under an
+                        // assumption; otherwise it stays false from the start.
+                        #[cfg(feature = "explanations")]
+                        {
+                            let holds = matches!(self.get_register(result)?, Value::Bool(true));
+                            self.pop_policy_block(holds);
+                        }
                     }
                 }
                 Ok(InstructionOutcome::Continue)
@@ -2121,12 +2409,7 @@ impl RegoVM {
 
         if remaining_keys.is_empty() {
             if multi_value {
-                let leaf = match object.entry(first_key.clone()) {
-                    alloc::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-                    alloc::collections::btree_map::Entry::Vacant(entry) => {
-                        entry.insert(Value::new_set())
-                    }
-                };
+                let leaf = object.get_or_insert_with(first_key.clone(), Value::new_set);
 
                 let leaf_snapshot = leaf.clone();
                 let set = leaf.as_set_mut().map_err(|_| VmError::RegisterNotSet {
@@ -2142,12 +2425,7 @@ impl RegoVM {
             return Ok(());
         }
 
-        let child = match object.entry(first_key.clone()) {
-            alloc::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-            alloc::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(Value::new_object())
-            }
-        };
+        let child = object.get_or_insert_with(first_key.clone(), Value::new_object);
 
         if !matches!(child, Value::Object(_)) {
             return Err(VmError::RegisterNotObject {

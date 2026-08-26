@@ -622,6 +622,11 @@ enum RegorusCommand {
         /// API version for alias path selection.
         #[arg(long)]
         api_version: Option<String>,
+
+        /// Capture and print the causality report for the policy evaluation.
+        #[cfg(feature = "explanations")]
+        #[arg(long = "why")]
+        why: bool,
     },
 
     /// List aliases from an alias registry file.
@@ -723,12 +728,16 @@ fn main() -> Result<()> {
             aliases,
             parameters,
             api_version,
+            #[cfg(feature = "explanations")]
+            why,
         } => azure_policy::azure_policy_eval(
             policy_definition,
             resource,
             aliases,
             parameters,
             api_version,
+            #[cfg(feature = "explanations")]
+            why,
         ),
         #[cfg(feature = "azure_policy")]
         RegorusCommand::AzurePolicyAliases {

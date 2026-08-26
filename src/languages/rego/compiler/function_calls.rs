@@ -17,8 +17,20 @@ use crate::lexer::Span;
 use crate::rvm::instructions::{BuiltinCallParams, FunctionCallParams};
 use crate::rvm::Instruction;
 use crate::utils::get_path_string;
-use alloc::{format, string::ToString, vec::Vec};
+use crate::value::Value;
+use alloc::{
+    format,
+    string::{String, ToString},
+    vec::Vec,
+};
 
+/// Resolved destination of a Rego function-call expression. Produced by
+/// [`Compiler::determine_call_target`] and consumed by
+/// [`Compiler::compile_function_call`] to choose which instruction to emit.
+/// Carrying the discrimination in the type (rather than re-matching on a
+/// magic name at the emit site) keeps the host-await handling honest under
+/// future refactors — the compiler will refuse to build if a new variant is
+/// added without updating every match site.
 enum CallTarget {
     User {
         rule_index: u16,
@@ -28,9 +40,14 @@ enum CallTarget {
         builtin_index: u16,
         expected_args: Option<usize>,
     },
-    HostAwait {
-        expected_args: Option<usize>,
-    },
+    /// Explicit `__builtin_host_await(arg, id)` call form (2 user args).
+    /// The identifier is supplied by the policy author at runtime via the
+    /// second argument register.
+    ExplicitHostAwait,
+    /// A registered host-awaitable builtin invoked by its registered name
+    /// (1 user arg). The identifier is the registered name itself and is
+    /// baked into the bytecode as a string literal at compile time.
+    RegisteredHostAwait { identifier: String },
 }
 
 impl<'a> Compiler<'a> {
@@ -46,6 +63,9 @@ impl<'a> Compiler<'a> {
         let original_fcn_path = fcn_path.clone();
         let full_fcn_path = if self.policy.inner.rules.contains_key(&fcn_path) {
             fcn_path
+        } else if let Some(resolved) = self.resolve_fcn_path_through_imports(&original_fcn_path) {
+            // Resolve a leading import alias before module-prefixing and builtins.
+            resolved
         } else {
             get_path_string(fcn, Some(&self.current_package))
                 .map_err(|_| CompilerError::InvalidFunctionExpressionWithPackage.at(&span))?
@@ -59,7 +79,11 @@ impl<'a> Compiler<'a> {
         let expected_args = match &call_target {
             CallTarget::User { expected_args, .. } => *expected_args,
             CallTarget::Builtin { expected_args, .. } => *expected_args,
-            CallTarget::HostAwait { expected_args } => *expected_args,
+            // Both host-await variants have a known fixed arity; carrying it
+            // in the variant lets the rest of the compiler depend on the type
+            // rather than re-matching on the magic name `__builtin_host_await`.
+            CallTarget::ExplicitHostAwait => Some(2),
+            CallTarget::RegisteredHostAwait { .. } => Some(1),
         };
 
         if let Some(expected) = expected_args {
@@ -126,7 +150,8 @@ impl<'a> Compiler<'a> {
                 });
                 self.emit_instruction(Instruction::BuiltinCall { params_index }, &span);
             }
-            CallTarget::HostAwait { .. } => {
+            CallTarget::ExplicitHostAwait => {
+                // Explicit __builtin_host_await(arg, id) — 2 arguments
                 if arg_regs.len() != 2 {
                     return Err(CompilerError::General {
                         message: format!(
@@ -136,12 +161,42 @@ impl<'a> Compiler<'a> {
                     }
                     .at(&span));
                 }
-
                 self.emit_instruction(
                     Instruction::HostAwait {
                         dest,
                         arg: arg_regs[0],
                         id: arg_regs[1],
+                    },
+                    &span,
+                );
+            }
+            CallTarget::RegisteredHostAwait { identifier } => {
+                // Registered host-awaitable builtin — the identifier is the
+                // registered name and is baked into the bytecode as a literal.
+                if arg_regs.len() != 1 {
+                    return Err(CompilerError::General {
+                        message: format!(
+                            "host-awaitable builtin '{}' expects exactly 1 argument, got {}",
+                            identifier,
+                            arg_regs.len()
+                        ),
+                    }
+                    .at(&span));
+                }
+                let id_reg = self.alloc_register();
+                let literal_idx = self.add_literal(Value::String(identifier.into()));
+                self.emit_instruction(
+                    Instruction::Load {
+                        dest: id_reg,
+                        literal_idx,
+                    },
+                    &span,
+                );
+                self.emit_instruction(
+                    Instruction::HostAwait {
+                        dest,
+                        arg: arg_regs[0],
+                        id: id_reg,
                     },
                     &span,
                 );
@@ -168,6 +223,37 @@ impl<'a> Compiler<'a> {
         Ok(dest)
     }
 
+    /// Rewrite an import-aliased call path to its target, e.g. `b.f(1)` to
+    /// `data.a.b.f` after `import data.a.b`. Resolves only when the target is
+    /// a known function (the `rules` map cannot be used here: it also indexes
+    /// value rules and every rule-path prefix, which must not become callable
+    /// through an alias), so an alias whose target defines the called
+    /// function shadows a like-named builtin namespace, while other spellings
+    /// keep their prior meaning (e.g. a builtin call). OPA instead rewrites
+    /// aliases unconditionally and rejects calls to a missing target at
+    /// compile time.
+    fn resolve_fcn_path_through_imports(&self, path: &str) -> Option<String> {
+        if self.policy.inner.imports.is_empty() || path.starts_with("data.") {
+            return None;
+        }
+        let (alias, rest) = match path.split_once('.') {
+            Some((alias, rest)) => (alias, Some(rest)),
+            None => (path, None),
+        };
+        let import_key = format!("{}.{}", self.current_package, alias);
+        let import_expr = self.policy.inner.imports.get(&import_key)?;
+        let target = get_path_string(import_expr, None).ok()?;
+        let candidate = match rest {
+            Some(rest) => format!("{target}.{rest}"),
+            None => target,
+        };
+        self.policy
+            .inner
+            .functions
+            .contains_key(&candidate)
+            .then_some(candidate)
+    }
+
     fn lookup_builtin_arity(&self, name: &str) -> Option<usize> {
         if name == "print" {
             Some(2)
@@ -187,8 +273,26 @@ impl<'a> Compiler<'a> {
         span: &Span,
     ) -> Result<CallTarget> {
         if original_fcn_path == "__builtin_host_await" {
-            return Ok(CallTarget::HostAwait {
-                expected_args: Some(2),
+            return Ok(CallTarget::ExplicitHostAwait);
+        }
+
+        // Check registered host-awaitable builtins. Registered builtins are
+        // restricted to arg_count == 1 at registration time (see
+        // `Compiler::register_host_await_builtin`), so the variant doesn't
+        // need to carry an arity — it's fixed at 1.
+        //
+        // We deliberately match against `original_fcn_path` only, not
+        // `full_fcn_path`. Registration intercepts the *unqualified* call
+        // form (e.g. `lookup(x)` inside the policy's own package). A
+        // package-qualified call like `data.other.lookup(x)` is left to
+        // resolve through the normal user-defined / builtin path, so a
+        // registered name does not leak into unrelated packages that
+        // happen to expose a rule with the same identifier. This is
+        // documented on `register_host_await_builtin`; the
+        // `registered_host_await.yaml` suite pins the behavior.
+        if self.host_await_builtins.contains_key(original_fcn_path) {
+            return Ok(CallTarget::RegisteredHostAwait {
+                identifier: original_fcn_path.to_string(),
             });
         }
 

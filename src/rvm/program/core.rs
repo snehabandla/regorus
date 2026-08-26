@@ -109,6 +109,15 @@ pub struct Program {
     #[cfg(feature = "explanations")]
     #[serde(skip, default)]
     pub binding_infos: Vec<Option<String>>,
+
+    /// Fully-qualified Azure Policy alias name per instruction (parallel to
+    /// `instructions`), for the single instruction that produces a value
+    /// compiled from an alias. Consulted once, at that instruction, by the
+    /// static provenance analysis, then carried forward as part of the
+    /// resulting `Provenance` rather than looked up again.
+    #[cfg(feature = "explanations")]
+    #[serde(skip, default)]
+    pub instruction_source_aliases: Vec<Option<crate::Rc<str>>>,
 }
 
 impl Program {
@@ -165,6 +174,8 @@ impl Program {
             register_provenances: Vec::new(),
             #[cfg(feature = "explanations")]
             binding_infos: Vec::new(),
+            #[cfg(feature = "explanations")]
+            instruction_source_aliases: Vec::new(),
         }
     }
 

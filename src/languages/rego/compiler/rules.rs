@@ -58,8 +58,12 @@ impl<'a> Compiler<'a> {
                 Expr::RefDot {
                     refr: inner, field, ..
                 } => {
-                    // RefDot field is (Span, Value) — wrap as a literal Expr
-                    let field_expr = ExprRef::new(Expr::Var {
+                    // RefDot field is (Span, Value) and is a literal key, not a variable
+                    // reference. Emitting Expr::Var here makes the reference compiler try to
+                    // resolve the field name as a variable root, which fails for any field that
+                    // is not also a rule name — including Rego keywords such as
+                    // `policy.default.level`, which the parser accepts after `.`.
+                    let field_expr = ExprRef::new(Expr::String {
                         span: field.0.clone(),
                         value: field.1.clone(),
                         eidx: 0,
@@ -281,7 +285,19 @@ impl<'a> Compiler<'a> {
         policy: &CompiledPolicy,
         entry_points: &[&str],
     ) -> Result<Arc<Program>> {
+        Self::compile_from_policy_with_host_await(policy, entry_points, &[])
+    }
+
+    /// Compile from a CompiledPolicy to RVM Program with registered host-awaitable builtins.
+    pub fn compile_from_policy_with_host_await(
+        policy: &CompiledPolicy,
+        entry_points: &[&str],
+        host_await_builtins: &[(&str, usize)],
+    ) -> Result<Arc<Program>> {
         let mut compiler = Compiler::with_policy(policy);
+        for &(name, arg_count) in host_await_builtins {
+            compiler.register_host_await_builtin(name, arg_count)?;
+        }
         compiler.current_rule_path = "".to_string();
         let rules = policy.get_rules();
 

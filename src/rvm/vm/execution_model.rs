@@ -83,6 +83,10 @@ pub(super) struct RuleFrameData {
     /// PE mode: assumption count when the current definition started.
     #[cfg(feature = "explanations")]
     pub(super) assumptions_at_def_start: usize,
+    /// Assumption count when the rule call began, used to tell an
+    /// unknown-induced undefined from a concrete one at the default site.
+    #[cfg(feature = "explanations")]
+    pub(super) assumptions_at_rule_start: usize,
     /// PE mode: at least one definition succeeded with zero assumptions.
     #[cfg(feature = "explanations")]
     pub(super) pe_any_def_resolved: bool,

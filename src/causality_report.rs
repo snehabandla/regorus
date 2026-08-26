@@ -236,6 +236,14 @@ pub struct OperandExplanation {
     pub provenance: Option<String>,
     /// Whether the value was redacted.
     pub redacted: bool,
+    /// Fully-qualified Azure Policy alias name this value was compiled from,
+    /// e.g. `"Microsoft.Storage/storageAccounts/supportsHttpsTrafficOnly"`.
+    /// Lets a consumer map straight to the alias's ARM `defaultPath` instead
+    /// of inverting the (lower-cased, `properties`-flattened) `provenance`
+    /// path above. Absent for non-Azure-Policy conditions and for values not
+    /// compiled from an alias.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_alias: Option<String>,
 }
 
 /// Source location.
@@ -278,6 +286,12 @@ pub struct ResidualCondition {
     /// The comparison operator, e.g. `"=="`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operator: Option<String>,
+    /// The operator as the policy author wrote it, when it differs from the
+    /// normalized symbol in `operator` (Azure Policy's `notEquals` vs `!=`).
+    /// Mirrors `ConditionExplanation::builtin_name` so a consumer can render
+    /// residuals in the authoring language without parsing source text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub builtin_name: Option<String>,
     /// The input path that is unknown, e.g. `"input.document.status"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_path: Option<String>,
@@ -517,6 +531,9 @@ fn assumption_to_residual_conditions(
                                 format_value(key),
                             ),
                             operator: Some(inverted_op.to_string()),
+                            // Data-key inversion rewrites the operator, so the
+                            // authored form no longer describes this condition.
+                            builtin_name: None,
                             input_path: Some(ctx.key_input_path.clone()),
                             value: Some(key.clone()),
                             kind: "condition_holds".to_string(),
@@ -553,6 +570,7 @@ fn assumption_to_residual(
     ResidualCondition {
         condition: strip_trailing_comment(&a.condition_text),
         operator: a.operator.clone(),
+        builtin_name: a.builtin_name.clone(),
         // Strip the trailing `[_]` iteration marker from `input_path` on
         // `exists` and `condition_holds` kinds. The `[_]` originates in
         // `rvm/vm/loops.rs`'s phantom-iteration setup (`element_path = base + "[_]"`
@@ -587,6 +605,23 @@ fn strip_iteration_suffix(path: &str) -> String {
     path.strip_suffix("[_]").unwrap_or(path).to_string()
 }
 
+/// Name a program that has no rule structure, from the compiler's definition
+/// metadata. Shared by causality's synthetic rule and PE's residual source
+/// attribution so a consumer can join the two on the same string.
+fn ruleless_program_name(program: &Program) -> alloc::string::String {
+    ["display_name", "policy_name", "policy_id"]
+        .iter()
+        .find_map(|key| {
+            program
+                .metadata
+                .annotations
+                .get(*key)
+                .and_then(|v| v.as_string().ok())
+                .map(|s| s.as_ref().to_string())
+        })
+        .unwrap_or_else(|| alloc::string::String::from("policy"))
+}
+
 /// `(rule_name, source_file, row, col, rule_start_row)` for an assumption.
 type SourceAttribution = (
     Option<String>,
@@ -602,7 +637,14 @@ fn source_attribution(
     program: &Program,
 ) -> SourceAttribution {
     let rule_info = program.rule_infos.get(usize::from(a.rule_index));
-    let rule_name = rule_info.map(|info| info.name.clone());
+    // A rule-less program (Azure Policy) has no `RuleInfo`, so name it the same
+    // way causality names its synthetic rule — that string is the join key a
+    // consumer uses to match a residual to its causality violation.
+    let rule_name = match rule_info {
+        Some(info) => Some(info.name.clone()),
+        None if program.rule_infos.is_empty() => Some(ruleless_program_name(program)),
+        None => None,
+    };
     let pc_usize: usize = a.pc.try_into().unwrap_or(0);
     let (file, row, col) = program
         .instruction_spans
@@ -734,7 +776,19 @@ pub fn materialize(
     settings: &ExplanationSettings,
     query_result: Value,
 ) -> CausalityReport {
-    let rules = materialize_rules(program, trace, settings);
+    let mut rules = materialize_rules(program, trace, settings);
+    // Azure Policy compiles to a flat `main` entry point with no `CallRule`, so
+    // no rule outcome is ever recorded and the conditions would be discarded.
+    // Gated on `rule_infos` being empty so a Rego program, which always has
+    // rules, can never take this path.
+    if rules.is_empty() && program.rule_infos.is_empty() && !trace.condition_outcomes.is_empty() {
+        rules.push(materialize_ruleless_program(
+            program,
+            trace,
+            settings,
+            &query_result,
+        ));
+    }
     let assumptions = if settings.detail == ExplanationDetail::Compact {
         Vec::new()
     } else {
@@ -745,6 +799,36 @@ pub fn materialize(
         query_result,
         rules,
         assumptions,
+    }
+}
+
+/// Build a single synthetic rule for a program that has no rule structure,
+/// naming it from the compiler's definition metadata where available.
+fn materialize_ruleless_program(
+    program: &Program,
+    trace: &EvaluationTrace,
+    settings: &ExplanationSettings,
+    query_result: &Value,
+) -> RuleExplanation {
+    let conditions = materialize_conditions(0, u32::MAX, program, trace, settings);
+    let outcome = if conditions.iter().any(|c| c.outcome == "failure") {
+        "failure"
+    } else {
+        "success"
+    };
+    let name = ruleless_program_name(program);
+
+    RuleExplanation {
+        name,
+        rule_type: alloc::string::String::from("policy"),
+        result: query_result.clone(),
+        emissions: Vec::new(),
+        definitions: alloc::vec![DefinitionExplanation {
+            index: 0,
+            outcome: alloc::string::String::from(outcome),
+            location: None,
+            conditions,
+        }],
     }
 }
 
@@ -1316,6 +1400,7 @@ fn derive_left_provenance_from_helper(
             value: existing.value,
             provenance: Some(prov),
             redacted: existing.redacted,
+            source_alias: existing.source_alias,
         }),
         None => Some(existing),
     }
@@ -1777,6 +1862,9 @@ fn materialize_operands(
             },
             provenance: left_output_path.clone(),
             redacted: should_redact,
+            source_alias: left_prov
+                .and_then(|p| p.source_alias.as_deref())
+                .map(str::to_string),
         }
     });
 
@@ -1795,6 +1883,9 @@ fn materialize_operands(
             },
             provenance: right_output_path.clone(),
             redacted: should_redact,
+            source_alias: right_prov
+                .and_then(|p| p.source_alias.as_deref())
+                .map(str::to_string),
         }
     });
 
@@ -2813,6 +2904,7 @@ mod tests {
                     value: Value::from("a"),
                     provenance: None,
                     redacted: false,
+                    source_alias: None,
                 }),
                 right: None,
                 witness: None,
@@ -2831,6 +2923,7 @@ mod tests {
                     value: Value::from("b"),
                     provenance: None,
                     redacted: false,
+                    source_alias: None,
                 }),
                 right: None,
                 witness: None,

@@ -489,6 +489,19 @@ impl RegoVM {
             .call_rule_stack
             .pop()
             .ok_or(VmError::CallRuleStackUnderflow { pc: self.pc })?;
+        // Stack discipline: the context we just popped must belong to the
+        // rule we are finalizing. A mismatch indicates a missing push or an
+        // extra pop somewhere in this rule's execution and would otherwise
+        // silently restore the wrong return_pc / rule_type. Surface as a
+        // typed VmError so the contract holds the same in debug and release
+        // builds (avoiding FFI poisoning via a debug-only panic).
+        if rule_index != call_context.rule_index {
+            return Err(VmError::CallRuleStackMismatch {
+                expected: rule_index,
+                actual: call_context.rule_index,
+                pc: self.pc,
+            });
+        }
         self.pc = call_context.return_pc;
 
         let result_from_rule = if !rule_failed_due_to_inconsistency {
@@ -521,19 +534,25 @@ impl RegoVM {
                     self.set_register(dest, Value::new_object())?;
                 }
                 RuleType::Complete => {
-                    if let Some(rule_metadata) = self
-                        .program
-                        .rule_infos
-                        .get(usize::from(call_context.rule_index))
-                    {
-                        if let Some(default_literal_index) = rule_metadata.default_literal_index {
-                            if let Some(default_value) = self
-                                .program
-                                .literals
-                                .get(usize::from(default_literal_index))
-                                .cloned()
+                    if !self.pe_suppresses_default(
+                        #[cfg(feature = "explanations")]
+                        result_is_assumption_dependent,
+                    ) {
+                        if let Some(rule_metadata) = self
+                            .program
+                            .rule_infos
+                            .get(usize::from(call_context.rule_index))
+                        {
+                            if let Some(default_literal_index) = rule_metadata.default_literal_index
                             {
-                                self.set_register(dest, default_value)?;
+                                if let Some(default_value) = self
+                                    .program
+                                    .literals
+                                    .get(usize::from(default_literal_index))
+                                    .cloned()
+                                {
+                                    self.set_register(dest, default_value)?;
+                                }
                             }
                         }
                     }
@@ -709,6 +728,8 @@ impl RegoVM {
             saved_comprehension_stack,
             #[cfg(feature = "explanations")]
             assumptions_at_def_start: 0,
+            #[cfg(feature = "explanations")]
+            assumptions_at_rule_start: self.trace.assumptions.len(),
             #[cfg(feature = "explanations")]
             pe_any_def_resolved: false,
             #[cfg(feature = "explanations")]
@@ -1007,6 +1028,9 @@ impl RegoVM {
         let pe_any_def_resolved = frame_data.pe_any_def_resolved;
         #[cfg(feature = "explanations")]
         let pe_any_def_has_assumptions = frame_data.pe_any_def_has_assumptions;
+        #[cfg(feature = "explanations")]
+        let pe_result_is_assumption_dependent =
+            self.trace.assumptions.len() > frame_data.assumptions_at_rule_start;
 
         let RuleFrameData {
             return_pc,
@@ -1109,22 +1133,27 @@ impl RegoVM {
                     *slot = Value::new_object();
                 }
                 RuleType::Complete => {
-                    if let Some(default_literal_index) = rule_info.default_literal_index {
-                        if let Some(default_value) = self
-                            .program
-                            .literals
-                            .get(usize::from(default_literal_index))
-                            .cloned()
-                        {
-                            let register_count = parent_registers.len();
-                            let slot = parent_registers.get_mut(dest_idx).ok_or(
-                                VmError::RegisterIndexOutOfBounds {
-                                    index: dest_reg,
-                                    pc: self.pc,
-                                    register_count,
-                                },
-                            )?;
-                            *slot = default_value;
+                    if !self.pe_suppresses_default(
+                        #[cfg(feature = "explanations")]
+                        pe_result_is_assumption_dependent,
+                    ) {
+                        if let Some(default_literal_index) = rule_info.default_literal_index {
+                            if let Some(default_value) = self
+                                .program
+                                .literals
+                                .get(usize::from(default_literal_index))
+                                .cloned()
+                            {
+                                let register_count = parent_registers.len();
+                                let slot = parent_registers.get_mut(dest_idx).ok_or(
+                                    VmError::RegisterIndexOutOfBounds {
+                                        index: dest_reg,
+                                        pc: self.pc,
+                                        register_count,
+                                    },
+                                )?;
+                                *slot = default_value;
+                            }
                         }
                     }
                 }
@@ -1157,6 +1186,9 @@ impl RegoVM {
 
         self.registers = parent_registers;
 
+        // Underflow here means malformed/poisoned program state; surface as a
+        // typed error rather than a debug-only panic so the public load_program
+        // contract holds the same in debug and release.
         if self.call_rule_stack.pop().is_none() {
             return Err(VmError::CallRuleStackUnderflow { pc: self.pc });
         }
@@ -1202,6 +1234,26 @@ impl RegoVM {
     ) -> Result<Option<usize>> {
         let rule_info = self.get_rule_info(frame_data.rule_index)?;
         self.rule_frame_after_failure(frame_data, &rule_info)
+    }
+
+    /// In partial evaluation, a `default` rule must not overwrite an undefined
+    /// that an unknown produced: doing so reports a confident concrete answer
+    /// for a question the engine cannot yet decide. The residual carries the
+    /// real condition, so leaving the value undefined keeps `result` honest.
+    fn pe_suppresses_default(
+        &self,
+        #[cfg(feature = "explanations")] result_is_assumption_dependent: bool,
+    ) -> bool {
+        #[cfg(feature = "explanations")]
+        {
+            self.explanation_settings.eval_mode
+                == crate::evaluation_trace::EvaluationMode::PartialEval
+                && result_is_assumption_dependent
+        }
+        #[cfg(not(feature = "explanations"))]
+        {
+            false
+        }
     }
 
     fn get_rule_info(&self, rule_index: u16) -> Result<RuleInfo> {

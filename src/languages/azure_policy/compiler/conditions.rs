@@ -146,17 +146,18 @@ impl Compiler {
         self.record_resource_type_from_condition(condition);
 
         // Implicit allOf: field with [*] outside count -> every element must match.
-        if let Some(field_path) = self.has_unbound_wildcard_field(&condition.lhs)? {
-            return self.compile_condition_wildcard_allof(&field_path, condition);
+        if let Some((alias, field_path)) = self.has_unbound_wildcard_field(&condition.lhs)? {
+            return self.compile_condition_wildcard_allof(&alias, &field_path, condition);
         }
 
         // Inner unbound [*] within count where clause.
-        if let Some((binding, inner_path)) =
+        if let Some((alias, binding, inner_path)) =
             self.has_inner_unbound_wildcard_field(&condition.lhs)?
         {
             let span = &condition.span;
             let rhs_reg = self.compile_value_or_expr(&condition.rhs, span)?;
             return self.compile_allof_loop_inner(
+                &alias,
                 Some(binding.current_reg),
                 &inner_path,
                 rhs_reg,

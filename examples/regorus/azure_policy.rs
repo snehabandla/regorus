@@ -39,6 +39,7 @@ pub fn azure_policy_eval(
     aliases: String,
     parameters_json: Option<String>,
     api_version: Option<String>,
+    #[cfg(feature = "explanations")] why: bool,
 ) -> Result<()> {
     // 1. Load alias registry.
     let aliases_json = std::fs::read_to_string(&aliases)
@@ -115,9 +116,29 @@ pub fn azure_policy_eval(
     vm.set_input(input);
     vm.set_context(context);
 
+    #[cfg(feature = "explanations")]
+    if why {
+        vm.set_explanation_settings(regorus::evaluation_trace::ExplanationSettings {
+            enabled: true,
+            value_mode: regorus::evaluation_trace::ValueMode::Full,
+            condition_mode: regorus::evaluation_trace::ConditionMode::AllContributing,
+            detail: regorus::evaluation_trace::ExplanationDetail::Full,
+            ..Default::default()
+        });
+    }
+
     let result = vm.execute_entry_point_by_name("main")?;
     println!("\nPolicy evaluation result:");
     println!("{}", serde_json::to_string_pretty(&result)?);
+
+    #[cfg(feature = "explanations")]
+    if why {
+        let report = vm
+            .take_causality_report(result.clone())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        println!("\n--- Causality Report ---");
+        println!("{report}");
+    }
 
     Ok(())
 }

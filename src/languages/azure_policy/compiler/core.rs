@@ -114,6 +114,9 @@ impl Compiler {
 
         self.populate_compiled_annotations();
 
+        #[cfg(feature = "explanations")]
+        crate::static_provenance::analyze(&mut self.program);
+
         Ok(Rc::new(self.program))
     }
 
@@ -162,6 +165,28 @@ impl Compiler {
         let span_info = self.span_info(span);
         self.program.add_instruction(instruction, Some(span_info));
     }
+
+    /// Record the fully-qualified Azure Policy alias name that produced the value
+    /// at instruction `pc`, for the static provenance analysis to fold into that
+    /// instruction's `Provenance` (see `Provenance::with_source_alias`).
+    ///
+    /// Resize-then-set, mirroring how Rego's compiler populates `binding_infos`
+    /// (`languages/rego/compiler/destructuring.rs`) — the table only needs to be
+    /// as long as the highest PC actually tagged, not kept in lockstep with every
+    /// instruction the way `instruction_spans` is.
+    #[cfg(feature = "explanations")]
+    pub(super) fn record_source_alias_for_pc(&mut self, pc: usize, alias: &str) {
+        let table = &mut self.program.instruction_source_aliases;
+        if table.len() <= pc {
+            table.resize(pc.saturating_add(1), None);
+        }
+        if let Some(slot) = table.get_mut(pc) {
+            *slot = Some(Rc::from(alias));
+        }
+    }
+
+    #[cfg(not(feature = "explanations"))]
+    pub(super) fn record_source_alias_for_pc(&mut self, _pc: usize, _alias: &str) {}
 
     // -- literal / builtin / chained-index helpers -------------------------
 

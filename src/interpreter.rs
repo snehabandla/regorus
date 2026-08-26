@@ -28,7 +28,6 @@ use crate::{Expression, Extension, Location, QueryResult, QueryResults};
 use crate::query::traversal::traverse;
 
 use crate::Rc;
-use alloc::collections::btree_map::Entry as BTreeMapEntry;
 use alloc::collections::{BTreeMap, BTreeSet};
 use anyhow::{anyhow, bail, Result};
 use core::ops::Bound::*;
@@ -59,6 +58,17 @@ type State = (
 enum FunctionModifier {
     Function(String),
     Value(Value),
+}
+
+/// How [`Interpreter::update_data`] merges a rule's value into the data document.
+#[derive(Debug, Clone, Copy)]
+enum RuleValueMerge {
+    /// Shallow-merge keeping disjoint keys, so rules sharing a path prefix scaffold into one
+    /// object (`a.foo` + `a.bar` → one `a`) instead of conflicting.
+    Combine,
+    /// Complete-rule semantics: existing value must be absent or exactly equal, else conflict.
+    /// Used for zero-arg function outputs (`f() := …`), which OPA treats like complete rules.
+    Strict,
 }
 
 type RuleValues = BTreeMap<Vec<Value>, (Value, Ref<Expr>)>;
@@ -1263,7 +1273,34 @@ impl Interpreter {
             // Apply with modifiers.
             for wm in &stmt.with_mods {
                 let path = Parser::get_path_ref_components(&wm.refr)?;
-                let path: Vec<&str> = path.iter().map(|s| s.text()).collect();
+                let mut path: Vec<String> = path.iter().map(|s| s.text().to_string()).collect();
+
+                // Matching OPA, a leading import alias is rewritten before
+                // any lookups: functions register as overrides below,
+                // anything else becomes a data override. Only the alias
+                // component is replaced so bracketed keys containing dots
+                // survive the rewrite.
+                let rewritten: Option<Vec<String>> = match path.split_first() {
+                    Some((head, rest)) if head.as_str() != "data" => {
+                        self.lookup_import(head).and_then(|import_expr| {
+                            // Use the import target's parsed components, not
+                            // its dot-joined string, so bracketed keys
+                            // containing dots survive in the import path too.
+                            let comps = Parser::get_path_ref_components(import_expr).ok()?;
+                            Some(
+                                comps
+                                    .iter()
+                                    .map(|s| s.text().to_string())
+                                    .chain(rest.iter().cloned())
+                                    .collect(),
+                            )
+                        })
+                    }
+                    _ => None,
+                };
+                if let Some(new_path) = rewritten {
+                    path = new_path;
+                }
                 let mut target = path.join(".");
 
                 let mut target_is_function = self.lookup_function_by_name(&target).is_some()
@@ -1302,11 +1339,17 @@ impl Interpreter {
                             if self.lookup_function_by_name(&function_path).is_none() {
                                 // Lookup without current module path prefixed.
                                 function_path = get_path_string(&wm.r#as, None)?;
-                                if self.lookup_function_by_name(&function_path).is_none()
-                                    && !Self::is_builtin(wm.r#as.span(), &function_path)
-                                {
-                                    // bail!(wm.r#as.span().error("could not evaluate expression"));
-                                    skip_exec = true;
+                                if self.lookup_function_by_name(&function_path).is_none() {
+                                    // Resolve an aliased replacement before builtins.
+                                    let resolved = self
+                                        .resolve_fcn_path_through_imports(&function_path)
+                                        .filter(|r| self.compiled_policy.functions.contains_key(r));
+                                    if let Some(resolved) = resolved {
+                                        function_path = resolved;
+                                    } else if !Self::is_builtin(wm.r#as.span(), &function_path) {
+                                        // bail!(wm.r#as.span().error("could not evaluate expression"));
+                                        skip_exec = true;
+                                    }
                                 }
                             }
                             self.with_functions
@@ -1327,10 +1370,10 @@ impl Interpreter {
                                 *obj = Value::new_object();
                             }
 
-                            obj = obj
-                                .as_object_mut()?
-                                .entry(Value::String(p.to_string().into()))
-                                .or_insert(Value::new_object());
+                            obj = obj.as_object_mut()?.get_or_insert_with(
+                                Value::String(p.to_string().into()),
+                                Value::new_object,
+                            );
                         }
                         *obj = value;
                         // Mark modified rules as processed.
@@ -1697,8 +1740,7 @@ impl Interpreter {
                     let set = obj
                         .as_object_mut()
                         .map_err(|_| anyhow!(span.error("previous value is not an object")))?
-                        .entry(p)
-                        .or_insert(Value::new_set())
+                        .get_or_insert_with(p, Value::new_set)
                         .as_set_mut()
                         .map_err(|_| anyhow!(span.error("previous value is not a set")))?;
                     set.append(value.as_set_mut()?);
@@ -1706,20 +1748,13 @@ impl Interpreter {
                     let obj = obj
                         .as_object_mut()
                         .map_err(|_| anyhow!(span.error("previous value is not an object")))?;
-                    match obj.entry(p) {
-                        BTreeMapEntry::Vacant(v) => {
-                            if value != Value::Undefined {
-                                v.insert(value);
-                            } else {
-                                // TODO: clean this assumption between Undefined vs Object.
-                                v.insert(Value::new_object());
-                            }
-                        }
-                        BTreeMapEntry::Occupied(o) => {
-                            if o.get() != &value && value != Value::Undefined {
-                                bail!(span
-                                    .error("complete rules should not produce multiple outputs"))
-                            }
+                    if value == Value::Undefined {
+                        // TODO: clean this assumption between Undefined vs Object.
+                        obj.get_or_insert_with(p, Value::new_object);
+                    } else {
+                        let existing = obj.get_or_insert_with(p, || value.clone());
+                        if *existing != value {
+                            bail!(span.error("complete rules should not produce multiple outputs"))
                         }
                     }
                 }
@@ -1728,8 +1763,7 @@ impl Interpreter {
                 obj = obj
                     .as_object_mut()
                     .map_err(|_| anyhow!(span.error("previous value is not an object")))?
-                    .entry(p)
-                    .or_insert(Value::new_object());
+                    .get_or_insert_with(p, Value::new_object);
             }
         }
         Ok(())
@@ -1837,8 +1871,7 @@ impl Interpreter {
                     let set = ctx_mut
                         .rule_value
                         .as_object_mut()?
-                        .entry(Value::from_array(comps))
-                        .or_insert(Value::new_set());
+                        .get_or_insert_with(Value::from_array(comps), Value::new_set);
                     if output != Value::Undefined {
                         set.as_set_mut()?.insert(output);
                         return Ok(true);
@@ -1847,20 +1880,13 @@ impl Interpreter {
                 }
 
                 // Non-set rule.
-                match ctx_mut
-                    .rule_value
-                    .as_object_mut()?
-                    .entry(Value::from_array(comps))
-                {
-                    BTreeMapEntry::Vacant(v) => {
-                        v.insert(output);
-                    }
-                    BTreeMapEntry::Occupied(o) if o.get() != &output => bail!(rule_ref
+                let key = Value::from_array(comps);
+                let obj_mut = ctx_mut.rule_value.as_object_mut()?;
+                let existing = obj_mut.get_or_insert_with(key, || output.clone());
+                if *existing != output {
+                    bail!(rule_ref
                         .span()
-                        .error("rules must not produce multiple outputs")),
-                    _ => {
-                        // Rule produced same value.
-                    }
+                        .error("rules must not produce multiple outputs"));
                 }
 
                 return Ok(true);
@@ -2393,6 +2419,72 @@ impl Interpreter {
         }
     }
 
+    /// Look up the import of the current module with the given alias, e.g.
+    /// the `data.a.b` import expression for `b` after `import data.a.b`.
+    fn lookup_import(&self, alias: &str) -> Option<&Ref<Expr>> {
+        if self.compiled_policy.imports.is_empty() {
+            return None;
+        }
+        let import_key = format!("{}.{}", self.current_module_path, alias);
+        self.compiled_policy.imports.get(&import_key)
+    }
+
+    /// Look up the dot-joined target path of an import of the current module
+    /// with the given alias, e.g. `data.a.b` for `b` after `import data.a.b`.
+    fn lookup_import_alias(&self, alias: &str) -> Option<String> {
+        get_path_string(self.lookup_import(alias)?, None).ok()
+    }
+
+    /// Rewrite a path whose leading component is an import alias of the
+    /// current module to the import's target, e.g. `b.f` to `data.a.b.f`
+    /// after `import data.a.b`.
+    fn rewrite_path_through_imports(&self, path: &str) -> Option<String> {
+        if path.starts_with("data.") {
+            return None;
+        }
+
+        let (alias, rest) = match path.split_once('.') {
+            Some((alias, rest)) => (alias, Some(rest)),
+            None => (path, None),
+        };
+        let target = self.lookup_import_alias(alias)?;
+        Some(match rest {
+            Some(rest) => format!("{target}.{rest}"),
+            None => target,
+        })
+    }
+
+    /// Rewrite an import-aliased call path to its target, e.g. `b.f(1)` to
+    /// `data.a.b.f` after `import data.a.b`. Resolves only when the target is
+    /// a known function or default function, so an alias whose target defines
+    /// the called function shadows a like-named builtin namespace, while other
+    /// spellings keep their prior meaning (e.g. a builtin call). OPA instead
+    /// rewrites aliases unconditionally and rejects calls to a missing target
+    /// at compile time.
+    fn resolve_fcn_path_through_imports(&self, path: &str) -> Option<String> {
+        let candidate = self.rewrite_path_through_imports(path)?;
+        (self.compiled_policy.functions.contains_key(&candidate)
+            || self.is_default_function(&candidate))
+        .then_some(candidate)
+    }
+
+    /// True if `path` is the exact path of a `default` function rule.
+    /// `default_rules` also indexes every prefix of a rule path, so it cannot
+    /// be consulted alone: `rule_paths` holds only exact rule paths, and the
+    /// non-empty argument list distinguishes functions from value rules.
+    fn is_default_function(&self, path: &str) -> bool {
+        self.compiled_policy.rule_paths.contains(path)
+            && self
+                .compiled_policy
+                .default_rules
+                .get(path)
+                .is_some_and(|rules| {
+                    rules.iter().any(|(rule, _)| {
+                        matches!(rule.as_ref(), Rule::Default { args, .. } if !args.is_empty())
+                    })
+                })
+    }
+
     fn eval_builtin_call(
         &mut self,
         span: &Span,
@@ -2486,7 +2578,7 @@ impl Interpreter {
             }
             Value::Object(map) => {
                 s.push('{');
-                for (idx, (k, entry_value)) in map.iter().enumerate() {
+                for (idx, (k, entry_value)) in map.iter_sorted().enumerate() {
                     if idx > 0 {
                         s.push_str(", ");
                     }
@@ -2563,6 +2655,13 @@ impl Interpreter {
         for p in params {
             param_values.push(self.eval_expr(p)?);
         }
+
+        // Resolve a leading import alias before the `with` override and builtin
+        // lookups, so an override keyed by the full path reaches aliased calls
+        // and the alias shadows a like-named builtin namespace (matching OPA).
+        let fcn_path = self
+            .resolve_fcn_path_through_imports(&fcn_path)
+            .unwrap_or(fcn_path);
 
         let orig_fcn_path = fcn_path.clone();
 
@@ -2740,7 +2839,12 @@ impl Interpreter {
             let value = match self.eval_rule_bodies(ctx, span, bodies) {
                 Ok(v) => v,
                 Err(e) => {
-                    // If the rule produces an error, save the error.
+                    // If the rule produces an error, save the error. Restore
+                    // the caller's module even so: leaving the callee's module
+                    // in place would make the rest of the caller's body
+                    // resolve paths through the wrong module's imports when
+                    // the error is swallowed below in non-strict mode.
+                    self.set_current_module(prev_module)?;
                     errors.push(e);
                     self.scopes = scopes;
                     continue;
@@ -3441,6 +3545,23 @@ impl Interpreter {
         }
     }
 
+    /// Materialize a complete-rule value: the existing value must be absent or *exactly equal*
+    /// to `new`, else it is a conflict.
+    ///
+    /// Unlike the shallow [`Self::merge_rule_value`], differing outputs conflict instead of
+    /// combining — `f() := {"a": 1}` and `f() := {"b": 2}` conflict — matching OPA's semantics
+    /// for zero-arg functions.
+    fn merge_rule_value_strict(span: &Span, value: &mut Value, new: Value) -> Result<()> {
+        if *value == Value::Undefined {
+            *value = new;
+            Ok(())
+        } else if *value == new {
+            Ok(())
+        } else {
+            Err(span.error("rules should not produce multiple outputs."))
+        }
+    }
+
     pub fn get_path_string(refr: &Expr, document: Option<&str>) -> Result<String> {
         let mut comps = vec![];
         let mut expr_opt = Some(refr);
@@ -3696,6 +3817,7 @@ impl Interpreter {
         _refr: &Expr,
         path: &[&str],
         value: Value,
+        merge: RuleValueMerge,
     ) -> Result<()> {
         if value == Value::Undefined {
             return Ok(());
@@ -3703,7 +3825,10 @@ impl Interpreter {
         // Ensure that path is created.
         let vref = Self::make_or_get_value_mut(&mut self.data, path)?;
         if Self::get_value_chained(self.init_data.clone(), path) == Value::Undefined {
-            Self::merge_rule_value(span, vref, value)
+            match merge {
+                RuleValueMerge::Strict => Self::merge_rule_value_strict(span, vref, value),
+                RuleValueMerge::Combine => Self::merge_rule_value(span, vref, value),
+            }
         } else {
             // Retain specified value.
             Ok(())
@@ -3811,7 +3936,13 @@ impl Interpreter {
                         // `a` is created as an empty object.
                         if let Some((_, prefix)) = path.split_last() {
                             if !prefix.is_empty() {
-                                self.update_data(span, refr, prefix, Value::new_object())?;
+                                self.update_data(
+                                    span,
+                                    refr,
+                                    prefix,
+                                    Value::new_object(),
+                                    RuleValueMerge::Combine,
+                                )?;
                             }
                         }
 
@@ -3823,7 +3954,13 @@ impl Interpreter {
                             };
 
                             let value = self.eval_rule_bodies(ctx, span, rule_body)?;
-                            self.update_data(refr.span(), refr, &path[..], value)?;
+                            self.update_data(
+                                refr.span(),
+                                refr,
+                                &path[..],
+                                value,
+                                RuleValueMerge::Strict,
+                            )?;
                         }
                     }
                 }
@@ -4070,6 +4207,7 @@ impl Interpreter {
                         rule_refr,
                         &prefix_path,
                         Value::new_object(),
+                        RuleValueMerge::Combine,
                     )?;
                 }
             }

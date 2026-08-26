@@ -68,6 +68,10 @@ pub enum Segment {
 pub struct Provenance {
     pub root: ProvenanceRoot,
     pub segments: Vec<Segment>,
+    /// Fully-qualified Azure Policy alias name this value was compiled from, if any.
+    /// Lets a consumer map back to the alias's `defaultPath` without inverting the
+    /// (lower-cased, `properties`-flattened) normalized path in `segments`.
+    pub source_alias: Option<Rc<str>>,
 }
 
 impl Provenance {
@@ -75,6 +79,7 @@ impl Provenance {
         Self {
             root: ProvenanceRoot::Input,
             segments: Vec::new(),
+            source_alias: None,
         }
     }
 
@@ -82,6 +87,7 @@ impl Provenance {
         Self {
             root: ProvenanceRoot::Data,
             segments: Vec::new(),
+            source_alias: None,
         }
     }
 
@@ -89,6 +95,7 @@ impl Provenance {
         Self {
             root: ProvenanceRoot::RuleResult { rule_index },
             segments: Vec::new(),
+            source_alias: None,
         }
     }
 
@@ -96,6 +103,7 @@ impl Provenance {
         Self {
             root: ProvenanceRoot::VirtualDocument,
             segments: Vec::new(),
+            source_alias: None,
         }
     }
 
@@ -114,6 +122,7 @@ impl Provenance {
         Self {
             root: self.root.clone(),
             segments,
+            source_alias: self.source_alias.clone(),
         }
     }
 
@@ -124,6 +133,7 @@ impl Provenance {
         Self {
             root: self.root.clone(),
             segments,
+            source_alias: self.source_alias.clone(),
         }
     }
 
@@ -134,6 +144,7 @@ impl Provenance {
         Self {
             root: self.root.clone(),
             segments,
+            source_alias: self.source_alias.clone(),
         }
     }
 
@@ -144,6 +155,19 @@ impl Provenance {
         Self {
             root: self.root.clone(),
             segments,
+            source_alias: self.source_alias.clone(),
+        }
+    }
+
+    /// Create a new provenance carrying the fully-qualified alias name this value
+    /// was compiled from. Attached once, at the instruction that produces the
+    /// value (see `instruction_source_aliases`), then carried forward unchanged
+    /// by every other `with_*` method and by `Move` propagation.
+    pub fn with_source_alias(&self, alias: &str) -> Self {
+        Self {
+            root: self.root.clone(),
+            segments: self.segments.clone(),
+            source_alias: Some(Rc::from(alias)),
         }
     }
 }
@@ -333,8 +357,93 @@ pub fn analyze(program: &mut Program) {
         }
     }
 
+    // Azure Policy compiles to a flat `main` entry point with no rule structure,
+    // so the loop above never runs. Walk the whole program once instead.
+    if program.rule_infos.is_empty() {
+        let mut reg_provenance: Vec<Option<Provenance>> = Vec::new();
+        reg_provenance.resize_with(usize::from(u8::MAX) + 1, || None);
+        for pc in 0..num_instructions {
+            let Some(instr) = program.instructions.get(pc).copied() else {
+                break;
+            };
+            analyze_instruction(
+                &instr,
+                pc,
+                &mut reg_provenance,
+                &mut condition_infos,
+                program,
+            );
+        }
+        all_register_provenances.push(reg_provenance);
+    }
+
     program.condition_infos = condition_infos;
     program.register_provenances = all_register_provenances;
+}
+
+/// Describe an Azure Policy operator in the terms the causality report speaks.
+///
+/// `operator` is only set where a Rego equivalent exists; the AP name is always
+/// carried in `builtin_name` so the author's own operator survives regardless.
+///
+/// Not feature-gated: `PolicyCondition` is part of the shared instruction set,
+/// so its match arm compiles even when `azure_policy` is off.
+fn classify_policy_op(
+    op: crate::rvm::instructions::PolicyOp,
+) -> (ConditionKind, Option<Operator>, Option<String>) {
+    use crate::rvm::instructions::PolicyOp as P;
+    let name = |s: &str| Some(String::from(s));
+    match op {
+        P::Equals => (
+            ConditionKind::Comparison,
+            Some(Operator::Eq),
+            name("equals"),
+        ),
+        P::NotEquals => (
+            ConditionKind::Comparison,
+            Some(Operator::Ne),
+            name("notEquals"),
+        ),
+        P::Greater => (
+            ConditionKind::Comparison,
+            Some(Operator::Gt),
+            name("greater"),
+        ),
+        P::GreaterOrEquals => (
+            ConditionKind::Comparison,
+            Some(Operator::Ge),
+            name("greaterOrEquals"),
+        ),
+        P::Less => (ConditionKind::Comparison, Some(Operator::Lt), name("less")),
+        P::LessOrEquals => (
+            ConditionKind::Comparison,
+            Some(Operator::Le),
+            name("lessOrEquals"),
+        ),
+        P::In => (
+            ConditionKind::Membership,
+            Some(Operator::Contains),
+            name("in"),
+        ),
+        P::NotIn => (
+            ConditionKind::Membership,
+            Some(Operator::Contains),
+            name("notIn"),
+        ),
+        P::Contains => (ConditionKind::Builtin, None, name("contains")),
+        P::NotContains => (ConditionKind::Builtin, None, name("notContains")),
+        P::ContainsKey => (ConditionKind::Builtin, None, name("containsKey")),
+        P::NotContainsKey => (ConditionKind::Builtin, None, name("notContainsKey")),
+        P::Like => (ConditionKind::Builtin, None, name("like")),
+        P::NotLike => (ConditionKind::Builtin, None, name("notLike")),
+        P::Match => (ConditionKind::Builtin, None, name("match")),
+        P::NotMatch => (ConditionKind::Builtin, None, name("notMatch")),
+        P::MatchInsensitively => (ConditionKind::Builtin, None, name("matchInsensitively")),
+        P::NotMatchInsensitively => (ConditionKind::Builtin, None, name("notMatchInsensitively")),
+        P::Exists => (ConditionKind::Existence, None, name("exists")),
+        P::Not => (ConditionKind::Truthiness, None, None),
+        P::ValueConditionGuard => (ConditionKind::Truthiness, None, None),
+    }
 }
 
 /// Analyze a single instruction's effect on register provenances and extract
@@ -395,6 +504,19 @@ fn analyze_instruction(
                     &params.path_components,
                     &program.literals,
                 );
+                // Fold in the FQ Azure Policy alias name, if the compiler tagged this
+                // instruction as the one producing an aliased value (see
+                // `Program::instruction_source_aliases`). Consulted exactly once, here,
+                // at the instruction that builds the value's `Provenance` — after this,
+                // `source_alias` rides along for free via `Move`/`with_field`/etc.
+                let prov = match program
+                    .instruction_source_aliases
+                    .get(pc)
+                    .and_then(Option::as_deref)
+                {
+                    Some(alias) => prov.map(|p| p.with_source_alias(alias)),
+                    None => prov,
+                };
                 set_provenance(reg_prov, params.dest, prov);
             }
         }
@@ -436,7 +558,20 @@ fn analyze_instruction(
                 .get(usize::from(params_index))
             {
                 let base = get_provenance(reg_prov, params.collection);
-                let val_prov = base.map(|b| b.with_wildcard());
+                // No-suffix wildcard alias case (e.g. comparing array elements directly):
+                // there is no ChainedIndex to tag, so the alias is folded in here instead,
+                // at the instruction that gives the loop element its `Provenance`.
+                let alias = program
+                    .instruction_source_aliases
+                    .get(pc)
+                    .and_then(Option::as_deref);
+                let val_prov = base.map(|b| {
+                    let v = b.with_wildcard();
+                    match alias {
+                        Some(a) => v.with_source_alias(a),
+                        None => v,
+                    }
+                });
                 let key_prov = base.map(|b| b.with_wildcard_key());
                 set_provenance(reg_prov, params.value_reg, val_prov);
                 set_provenance(reg_prov, params.key_reg, key_prov);
@@ -600,7 +735,48 @@ fn analyze_instruction(
         | NegationBegin {} => {}
 
         // Azure Policy condition op writes its result into `dest`.
-        PolicyCondition { dest, .. } => {
+        PolicyCondition {
+            dest,
+            left,
+            right,
+            op,
+        } => {
+            use crate::rvm::instructions::PolicyOp;
+            let (kind, operator, builtin_name) = classify_policy_op(op);
+            // Unary ops leave `right` unused; reporting it would invent an
+            // expected value the policy never wrote.
+            let unary = matches!(op, PolicyOp::Not | PolicyOp::Exists);
+            let left_prov = get_provenance(reg_prov, left).cloned();
+            let right_prov = if unary {
+                None
+            } else {
+                get_provenance(reg_prov, right).cloned()
+            };
+            let has_input = left_prov.as_ref().is_some_and(Provenance::is_input_rooted)
+                || right_prov.as_ref().is_some_and(Provenance::is_input_rooted);
+            if let Some(slot) = condition_infos.get_mut(pc) {
+                *slot = Some(StaticConditionInfo {
+                    checked_register: dest,
+                    checked_provenance: left_prov.clone(),
+                    operands: if unary {
+                        None
+                    } else {
+                        Some(ConditionOperands {
+                            left_reg: left,
+                            right_reg: right,
+                            left_provenance: left_prov,
+                            right_provenance: right_prov,
+                        })
+                    },
+                    text: get_condition_text(pc, program),
+                    kind,
+                    operator,
+                    has_input_operand: has_input,
+                    binding_name: None,
+                    builtin_name,
+                    negated: op.is_negated(),
+                });
+            }
             clear_provenance(reg_prov, dest);
         }
     }
@@ -1253,5 +1429,40 @@ mod tests {
         let text = get_condition_text(0, &program);
 
         assert_eq!(text, "some link in input.links");
+    }
+
+    // Step 6 (Azure Policy attribution): `source_alias` must survive being
+    // carried forward exactly the way the rest of `Provenance` already does
+    // across a `Move` (a variable binding). The `Move` arm in `analyze()`
+    // clones the whole `Provenance` verbatim (`get_provenance(...).cloned()`),
+    // so this is a type-level guarantee -- proven here directly on
+    // `Provenance`, since reproducing a full Azure Policy count-binding
+    // fixture (the compiler construct that actually emits such a `Move`) is
+    // a separate, not-yet-read investigation (see the parent plan's Step 6,
+    // sub-step 5). A full end-to-end test through that construct remains a
+    // follow-up; this proves the mechanism the follow-up would rely on.
+    #[test]
+    fn source_alias_survives_field_appends_and_a_clone_carrying_move() {
+        use super::Provenance;
+
+        let base =
+            Provenance::input().with_source_alias("Microsoft.Storage/storageAccounts/accessTier");
+
+        // Simulates further path-building after the alias was attached --
+        // e.g. a nested property read off an aliased object.
+        let extended = base.with_field("nested");
+        assert_eq!(
+            extended.source_alias.as_deref(),
+            Some("Microsoft.Storage/storageAccounts/accessTier"),
+            "with_field must not drop source_alias"
+        );
+
+        // Simulates exactly what the `Move` arm in `analyze()` does:
+        // `get_provenance(reg_prov, src).cloned()` then `set_provenance(dest, ...)`.
+        let moved: Provenance = extended.clone();
+        assert_eq!(
+            moved.source_alias, extended.source_alias,
+            "a Move's plain .cloned() must carry source_alias forward unchanged"
+        );
     }
 }

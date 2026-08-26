@@ -555,8 +555,81 @@ allow if {
     );
 }
 
-/// Case 11: `every` over unknown collection — should produce a warning about vacuous truth
-/// and record a CollectionExists assumption.
+/// Control for `pe_11`: identical policy with **no `default` rule**.
+/// Isolates whether a concrete `false` comes from PE deciding false, or from a
+/// `default` rule masking an unknown-induced undefined.
+#[test]
+fn pe_11b_every_unknown_collection_no_default() {
+    let policy = r#"
+package test
+import data.blocked_tags
+allow if {
+    every tag in input.document.tags {
+        not tag in blocked_tags
+    }
+}
+"#;
+    let data = r#"{"blocked_tags": ["malware", "exploit"]}"#;
+    let result = run_pe(policy, None, Some(data), "data.test.allow");
+
+    assert_eq!(
+        result["result"],
+        serde_json::Value::Null,
+        "PROBE: actual result was: {result}"
+    );
+}
+
+/// Suppression must be direction-independent: we withhold the default rather
+/// than pick whichever constant looks safer. `default allow = true` is the
+/// mirror of `pe_11` and must also stay undefined.
+#[test]
+fn pe_11c_every_unknown_collection_default_true() {
+    let policy = r#"
+package test
+import data.blocked_tags
+default allow = true
+allow if {
+    every tag in input.document.tags {
+        not tag in blocked_tags
+    }
+}
+"#;
+    let data = r#"{"blocked_tags": ["malware", "exploit"]}"#;
+    let result = run_pe(policy, None, Some(data), "data.test.allow");
+
+    assert_eq!(
+        result["result"],
+        serde_json::Value::Null,
+        "default true must be withheld exactly as default false is, got: {result}"
+    );
+}
+
+/// 🔴 Negative control for the `pe_11` fix. A `default` whose rule body fails
+/// for a purely **concrete** reason — no unknowns anywhere — must still fire.
+/// Without this, suppressing defaults wholesale would satisfy every other
+/// test in this file.
+#[test]
+fn pe_11d_concrete_failure_still_uses_default() {
+    let policy = r#"
+package test
+import data.threshold
+default allow = false
+allow if {
+    threshold < 10
+}
+"#;
+    let data = r#"{"threshold": 50}"#;
+    let result = run_pe(policy, None, Some(data), "data.test.allow");
+
+    assert_eq!(
+        result["result"], false,
+        "a concretely-failing body must still fall back to its default, got: {result}"
+    );
+}
+
+/// Case 11: `every` over unknown collection — the rule is undefined, and a
+/// `default` must not mask that into a concrete answer. Records a
+/// CollectionExists assumption and warns.
 #[test]
 fn pe_11_every_unknown_collection() {
     let policy = r#"
@@ -572,14 +645,16 @@ allow if {
     let data = r#"{"blocked_tags": ["malware", "exploit"]}"#;
     let result = run_pe(policy, None, Some(data), "data.test.allow");
 
-    // `every` over an unknown collection is vacuously true.
-    // Phase 2A should record a CollectionExists assumption and a warning.
+    // `every` over an unknown collection leaves the rule undefined. The
+    // `default allow = false` must NOT fire: the engine cannot decide this
+    // until the collection is known, and the residual carries that condition.
     assert_eq!(
-        result["result"], true,
-        "every over unknown should still be vacuously true, got: {result}"
+        result["result"],
+        serde_json::Value::Null,
+        "every over unknown must stay undefined rather than fall back to the default, got: {result}"
     );
 
-    // Should have a warning about vacuous truth
+    // Should warn that `every` depends on an unknown collection.
     let warnings = result["warnings"].as_array();
     assert!(
         warnings.is_some_and(|w| !w.is_empty()),

@@ -226,6 +226,11 @@ pub struct Assumption {
     /// The comparison operator, e.g. `"=="`, `"!="`, `"<"`.
     /// `None` for existence checks.
     pub operator: Option<String>,
+    /// The operator as the policy author wrote it, when the source language
+    /// names it differently from the normalized symbol in `operator` (Azure
+    /// Policy's `notEquals` vs `!=`). `None` for Rego, whose authored form is
+    /// the symbol.
+    pub builtin_name: Option<String>,
     /// The non-input value that was compared against, e.g. `"admin"`.
     /// `None` for existence checks or when the value is not available.
     pub assumed_value: Option<Value>,
@@ -532,6 +537,7 @@ impl EvaluationTrace {
             condition_text,
             pc,
             operator,
+            builtin_name: None,
             assumed_value,
             rule_index,
             definition_index,

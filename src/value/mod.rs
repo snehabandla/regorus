@@ -11,6 +11,24 @@
     clippy::as_conversions
 )] // value helpers index paths directly for performance
 
+mod object;
+mod set;
+
+#[cfg(test)]
+mod tests;
+
+#[allow(unused_imports)] // surface for downstream PRs
+pub use object::{IntoIter, Iter, IterMut, Object};
+#[allow(unused_imports)] // surface for downstream PRs
+pub use set::Set;
+
+#[cfg(feature = "rvm")]
+#[allow(unused_imports)] // surface for downstream PRs
+pub use object::ObjectCursor;
+#[cfg(feature = "rvm")]
+#[allow(unused_imports)] // surface for downstream PRs
+pub use set::SetCursor;
+
 use crate::number::Number;
 
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -23,7 +41,7 @@ use core::str::FromStr;
 
 use anyhow::{anyhow, bail, Result};
 use serde::de::{self, Deserializer, Error as DeError, MapAccess, SeqAccess, Visitor};
-use serde::ser::{SerializeMap, Serializer};
+use serde::ser::Serializer;
 use serde::{Deserialize, Serialize};
 
 use crate::*;
@@ -63,7 +81,7 @@ pub enum Value {
 
     /// An object.
     /// Unlike JSON, keys can be any value, not just string.
-    Object(Rc<BTreeMap<Value, Value>>),
+    Object(Rc<Object>),
 
     /// Undefined value.
     /// Used to indicate the absence of a value.
@@ -86,26 +104,15 @@ impl Serialize for Value {
     where
         S: Serializer,
     {
-        use serde::ser::Error;
         match self {
             Value::Null => serializer.serialize_unit(),
             Value::Bool(b) => serializer.serialize_bool(*b),
             Value::String(s) => serializer.serialize_str(s.as_ref()),
             Value::Number(n) => n.serialize(serializer),
             Value::Array(a) => a.serialize(serializer),
-            Value::Object(fields) => {
-                let mut map = serializer.serialize_map(Some(fields.len()))?;
-                for (k, v) in fields.iter() {
-                    match k {
-                        Value::String(_) => map.serialize_entry(k, v)?,
-                        _ => {
-                            let key_str = serde_json::to_string(k).map_err(Error::custom)?;
-                            map.serialize_entry(&key_str, v)?
-                        }
-                    }
-                }
-                map.end()
-            }
+            // Delegate to the Object/Set serializers — single canonical path,
+            // handles non-string-key stringification internally.
+            Value::Object(fields) => fields.serialize(serializer),
 
             // display set as an array
             Value::Set(s) => s.serialize(serializer),
@@ -345,7 +352,7 @@ impl Value {
     /// assert_eq!(array[4], Value::from(12345u64));
     /// let obj = array[5].as_object().expect("not an object");
     /// assert_eq!(obj.len(), 1);
-    /// assert_eq!(obj[&Value::from("name")], Value::from("regorus"));
+    /// assert_eq!(obj.get(&Value::from("name")).expect("missing name"), &Value::from("regorus"));
     /// # Ok(())
     /// # }
     /// ```
@@ -800,7 +807,7 @@ impl From<BTreeMap<Value, Value>> for Value {
     /// # Ok(())
     /// # }
     fn from(s: BTreeMap<Value, Value>) -> Self {
-        Value::Object(Rc::new(s))
+        Value::Object(Rc::new(Object::from(s)))
     }
 }
 
@@ -1279,16 +1286,16 @@ impl Value {
         }
     }
 
-    /// Cast value to [`& BTreeMap<Value, Value>`] if [`Value::Object`].
+    /// Cast value to [`&Object`] if [`Value::Object`].
     /// ```
     /// # use regorus::*;
-    /// # use std::collections::BTreeMap;
+    /// # use regorus::value::Object;
     /// # fn main() -> anyhow::Result<()> {
     /// let v = Value::from(
     ///    [(Value::from("Hello"), Value::from("World"))]
     ///        .iter()
     ///        .cloned()
-    ///        .collect::<BTreeMap<Value, Value>>(),
+    ///        .collect::<Object>(),
     /// );
     /// assert_eq!(
     ///    v.as_object()?.iter().next(),
@@ -1296,34 +1303,41 @@ impl Value {
     /// );
     /// # Ok(())
     /// # }
-    pub fn as_object(&self) -> Result<&BTreeMap<Value, Value>> {
+    pub fn as_object(&self) -> Result<&Object> {
         match self {
             Value::Object(m) => Ok(m),
             _ => Err(anyhow!("not an object")),
         }
     }
 
-    /// Cast value to [`&mut BTreeMap<Value, Value>`] if [`Value::Object`].
+    /// Cast value to [`&mut Object`] if [`Value::Object`].
     /// ```
     /// # use regorus::*;
-    /// # use std::collections::BTreeMap;
+    /// # use regorus::value::Object;
     /// # fn main() -> anyhow::Result<()> {
     /// let mut v = Value::from(
     ///    [(Value::from("Hello"), Value::from("World"))]
     ///        .iter()
     ///        .cloned()
-    ///        .collect::<BTreeMap<Value, Value>>(),
+    ///        .collect::<Object>(),
     /// );
     /// v.as_object_mut()?.insert(Value::from("Good"), Value::from("Bye"));
     /// # Ok(())
     /// # }
-    pub fn as_object_mut(&mut self) -> Result<&mut BTreeMap<Value, Value>> {
+    pub fn as_object_mut(&mut self) -> Result<&mut Object> {
         match self {
             Value::Object(m) => Ok(Rc::make_mut(m)),
             _ => Err(anyhow!("not an object")),
         }
     }
 }
+
+/// Depth cap for `deep_merge`/`check_mergeable`, set at serde_json's default recursion limit.
+///
+/// Prevents a stack overflow from adversarially nested data — an uncatchable abort that poisons
+/// every engine in an FFI process. At serde_json's limit it only backstops `Value`s built without
+/// a parse-time cap: the Python/Ruby native bindings, or programmatic construction.
+const MAX_MERGE_DEPTH: usize = 128;
 
 impl Value {
     pub(crate) fn make_or_get_value_mut<'a>(&'a mut self, paths: &[&str]) -> Result<&'a mut Value> {
@@ -1358,6 +1372,11 @@ impl Value {
         }
     }
 
+    /// Shallow-merge `new` into `self` with strict rule-output semantics.
+    ///
+    /// Objects merge one level deep: a key on both sides must hold the *same* value or it is a
+    /// conflict; sets union; equal values are a no-op. Non-recursive by design — data documents
+    /// use [`Value::deep_merge`] instead.
     pub(crate) fn merge(&mut self, mut new: Value) -> Result<()> {
         if self == &new {
             return Ok(());
@@ -1365,24 +1384,26 @@ impl Value {
         match (self, &mut new) {
             (v @ Value::Undefined, _) => *v = new,
             (Value::Set(ref mut set), Value::Set(new)) => {
-                Rc::make_mut(set).append(Rc::make_mut(new));
-                // Enforce allocator limit after merging set entries.
+                // Union without deep-cloning the RHS set (see `deep_merge`).
+                let dst = Rc::make_mut(set);
+                match Rc::try_unwrap(core::mem::take(new)) {
+                    Ok(owned) => dst.extend(owned),
+                    Err(shared) => dst.extend(shared.iter().cloned()),
+                }
                 enforce_limit_anyhow()?;
             }
             (Value::Object(map), Value::Object(new)) => {
                 for (k, v) in new.iter() {
                     match map.get(k) {
-                        Some(pv) if *pv != *v => {
-                            bail!(
-                                "value for key `{}` generated multiple times: `{}` and `{}`",
-                                serde_json::to_string_pretty(&k).map_err(anyhow::Error::msg)?,
-                                serde_json::to_string_pretty(&pv).map_err(anyhow::Error::msg)?,
-                                serde_json::to_string_pretty(&v).map_err(anyhow::Error::msg)?,
-                            )
-                        }
+                        // Same key, different value: the rule produced two outputs for one path.
+                        Some(pv) if *pv != *v => bail!(
+                            "value for key `{}` generated multiple times: `{}` and `{}`",
+                            serde_json::to_string_pretty(&k).map_err(anyhow::Error::msg)?,
+                            serde_json::to_string_pretty(&pv).map_err(anyhow::Error::msg)?,
+                            serde_json::to_string_pretty(&v).map_err(anyhow::Error::msg)?,
+                        ),
                         _ => {
                             Rc::make_mut(map).insert(k.clone(), v.clone());
-                            // Enforce allocator limit after merging object entries.
                             enforce_limit_anyhow()?;
                         }
                     };
@@ -1391,6 +1412,151 @@ impl Value {
             _ => bail!("error: could not merge value"),
         };
         Ok(())
+    }
+
+    /// Recursively deep-merge `new` into `self` — the data-document merge behind [`Engine::add_data`].
+    ///
+    /// Objects recurse per-key, sets union, equal values are a no-op, any other differing pair
+    /// conflicts. Set-union is a regorus extension (OPA data is JSON, which has no sets). Distinct
+    /// from the strict, non-recursive [`Value::merge`] used for rule outputs — use deep-merge ONLY
+    /// for data documents.
+    ///
+    /// [`Engine::add_data`]: crate::Engine::add_data
+    pub(crate) fn deep_merge(&mut self, new: Value) -> Result<()> {
+        self.deep_merge_at(new, 0)
+    }
+
+    /// Depth-tracked worker for [`deep_merge`](Value::deep_merge). See [`MAX_MERGE_DEPTH`].
+    fn deep_merge_at(&mut self, mut new: Value, depth: usize) -> Result<()> {
+        if depth >= MAX_MERGE_DEPTH {
+            bail!("data merge exceeds maximum nesting depth of {MAX_MERGE_DEPTH}");
+        }
+        if self == &new {
+            return Ok(());
+        }
+        match (self, &mut new) {
+            (v @ Value::Undefined, _) => *v = new,
+            (Value::Set(ref mut set), Value::Set(new)) => {
+                // Union without deep-cloning the RHS set: move elements if uniquely owned,
+                // else clone only the element handles (`Rc` bumps), never the whole `BTreeSet`.
+                let dst = Rc::make_mut(set);
+                match Rc::try_unwrap(core::mem::take(new)) {
+                    Ok(owned) => dst.extend(owned),
+                    Err(shared) => dst.extend(shared.iter().cloned()),
+                }
+                enforce_limit_anyhow()?;
+            }
+            (Value::Object(map), Value::Object(new)) => {
+                // What each incoming key requires of the target map. Decided from a read-only
+                // probe so a no-op or a conflict never triggers `Rc::make_mut` (and never clones
+                // a shared map); `make_mut` is taken lazily, only when a key actually mutates.
+                enum Step {
+                    Skip,
+                    Insert,
+                    Recurse,
+                    Conflict,
+                }
+                for (k, v) in new.iter() {
+                    let step = match map.get(k) {
+                        None => Step::Insert,
+                        Some(existing) if existing == v => Step::Skip,
+                        Some(existing)
+                            if matches!(
+                                (existing, v),
+                                (Value::Object(_), Value::Object(_))
+                                    | (Value::Set(_), Value::Set(_))
+                            ) =>
+                        {
+                            Step::Recurse
+                        }
+                        Some(_) => Step::Conflict,
+                    };
+                    match step {
+                        Step::Skip => {}
+                        Step::Insert => {
+                            Rc::make_mut(map).insert(k.clone(), v.clone());
+                            enforce_limit_anyhow()?;
+                        }
+                        // Both sides are containers: recurse so nested objects merge rather than
+                        // the subtree being replaced (OPA data-merge semantics).
+                        Step::Recurse => {
+                            let existing = Rc::make_mut(map).get_mut(k).ok_or_else(|| {
+                                anyhow!("internal error: key vanished during merge")
+                            })?;
+                            existing.deep_merge_at(v.clone(), depth.saturating_add(1))?;
+                        }
+                        Step::Conflict => {
+                            let existing = map.get(k).ok_or_else(|| {
+                                anyhow!("internal error: key vanished during merge")
+                            })?;
+                            bail!(
+                                "value for key `{}` generated multiple times: `{}` and `{}`",
+                                serde_json::to_string_pretty(&k).map_err(anyhow::Error::msg)?,
+                                serde_json::to_string_pretty(&existing)
+                                    .map_err(anyhow::Error::msg)?,
+                                serde_json::to_string_pretty(&v).map_err(anyhow::Error::msg)?,
+                            )
+                        }
+                    }
+                }
+            }
+            _ => bail!("error: could not merge value"),
+        };
+        Ok(())
+    }
+
+    /// Read-only check that [`deep_merge`](Value::deep_merge)-ing `other` into `self` would not
+    /// conflict, without mutating or allocating.
+    ///
+    /// Lets [`Engine::add_data`] validate before merging in place. Since a conflict is the only
+    /// way the default-build merge can fail and it depends only on the inputs, a passing scan
+    /// guarantees the in-place `deep_merge` won't fail — avoiding the alternative of cloning the
+    /// whole document into a candidate just to validate. Only overlapping keys are walked, so
+    /// disjoint additions are near-free.
+    ///
+    /// [`Engine::add_data`]: crate::Engine::add_data
+    #[cfg(not(feature = "allocator-memory-limits"))]
+    pub(crate) fn check_mergeable(&self, other: &Value) -> Result<()> {
+        self.check_mergeable_at(other, 0)
+    }
+
+    /// Depth-tracked worker for [`check_mergeable`](Value::check_mergeable). See [`MAX_MERGE_DEPTH`].
+    #[cfg(not(feature = "allocator-memory-limits"))]
+    fn check_mergeable_at(&self, other: &Value, depth: usize) -> Result<()> {
+        if depth >= MAX_MERGE_DEPTH {
+            bail!("data merge exceeds maximum nesting depth of {MAX_MERGE_DEPTH}");
+        }
+        if self == other {
+            return Ok(());
+        }
+        match (self, other) {
+            (Value::Undefined, _) => Ok(()),
+            // Set union never conflicts.
+            (Value::Set(_), Value::Set(_)) => Ok(()),
+            (Value::Object(dst), Value::Object(src)) => {
+                for (k, sv) in src.iter() {
+                    // Only overlapping keys can conflict.
+                    if let Some(dv) = dst.get(k) {
+                        let both_mergeable = matches!(
+                            (dv, sv),
+                            (Value::Object(_), Value::Object(_)) | (Value::Set(_), Value::Set(_))
+                        );
+                        if both_mergeable {
+                            dv.check_mergeable_at(sv, depth.saturating_add(1))?;
+                        } else if dv != sv {
+                            bail!(
+                                "value for key `{}` generated multiple times: `{}` and `{}`",
+                                serde_json::to_string_pretty(&k).map_err(anyhow::Error::msg)?,
+                                serde_json::to_string_pretty(&dv).map_err(anyhow::Error::msg)?,
+                                serde_json::to_string_pretty(&sv).map_err(anyhow::Error::msg)?,
+                            )
+                        }
+                    }
+                }
+                Ok(())
+            }
+            _ => bail!("error: could not merge value"),
+        }
     }
 }
 
