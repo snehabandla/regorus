@@ -11,8 +11,8 @@ use serde::ser::{SerializeSeq as _, SerializeTuple as _};
 use serde::{Deserialize, Serialize};
 
 use crate::number::Number;
-use crate::value::Object;
 use crate::value::Value;
+use crate::value::{Object, Set};
 
 const VARIANT_NULL: u32 = 0;
 const VARIANT_BOOL: u32 = 1;
@@ -118,7 +118,7 @@ impl<'a> Serialize for BinaryValueSlice<'a> {
     }
 }
 
-struct BinarySetRef<'a>(&'a BTreeSet<Value>);
+struct BinarySetRef<'a>(&'a Set);
 
 impl<'a> Serialize for BinarySetRef<'a> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -126,7 +126,7 @@ impl<'a> Serialize for BinarySetRef<'a> {
         S: serde::Serializer,
     {
         let mut seq = serializer.serialize_seq(Some(self.0.len()))?;
-        for value in self.0.iter() {
+        for value in self.0.iter_sorted() {
             seq.serialize_element(&BinaryValueRef(value))?;
         }
         seq.end()
@@ -265,8 +265,15 @@ impl<'de> Visitor<'de> for BinaryValueVisitor {
                 let mut map = Object::new();
                 for (key, value) in entries {
                     map.insert(key.into_value(), value.into_value());
+                    crate::utils::limits::check_memory_limit_if_needed()
+                        .map_err(|err| de::Error::custom(format!("{err}")))?;
                 }
-                Ok(BinaryValue(Value::Object(crate::Rc::new(map))))
+                let object = map.into_value();
+                // Mirror the JSON object path: re-check after `into_value` compacts
+                // storage so binary program loading honors allocator memory limits.
+                crate::utils::limits::check_memory_limit_if_needed()
+                    .map_err(|err| de::Error::custom(format!("{err}")))?;
+                Ok(BinaryValue(object))
             }
             (BinaryVariant::Undefined, variant) => {
                 variant.unit_variant()?;

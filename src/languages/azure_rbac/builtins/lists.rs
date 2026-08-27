@@ -1,9 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-use alloc::collections::BTreeSet;
-
-use crate::value::Value;
+use crate::value::{Set, Value};
 
 use super::evaluator::RbacBuiltinError;
 
@@ -11,7 +9,7 @@ use super::evaluator::RbacBuiltinError;
 pub(super) fn list_contains(left: &Value, right: &Value) -> Result<bool, RbacBuiltinError> {
     match *left {
         // Lists and sets share containment semantics.
-        Value::Array(ref list) => Ok(list_contains_values(list, right)),
+        Value::Array(ref list) => Ok(list_contains_values(list.as_slice(), right)),
         Value::Set(ref set) => Ok(set_contains_values(set, right)),
         _ => Ok(false),
     }
@@ -28,7 +26,7 @@ fn list_contains_values(list: &[Value], needle: &Value) -> bool {
 }
 
 // For sets, treat a list/set needle as "all elements are contained".
-fn set_contains_values(set: &BTreeSet<Value>, needle: &Value) -> bool {
+fn set_contains_values(set: &Set, needle: &Value) -> bool {
     match *needle {
         // For collection needles, require all elements to be present.
         Value::Array(ref right_list) => right_list.iter().all(|item| set.contains(item)),

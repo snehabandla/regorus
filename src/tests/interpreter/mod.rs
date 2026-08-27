@@ -578,7 +578,7 @@ fn yaml_test_impl(file: &str) -> Result<()> {
     let _limits_lock = acquire_limits_test_lock();
 
     let yaml_str = std::fs::read_to_string(file)?;
-    let test: YamlTest = serde_yaml::from_str(&yaml_str)?;
+    let test: YamlTest = yaml_serde::from_str(&yaml_str)?;
 
     #[cfg(feature = "azure_policy")]
     load_target_definitions::load().expect("Failed to load target definitions");
@@ -744,6 +744,11 @@ fn yaml_test_impl(file: &str) -> Result<()> {
 fn yaml_test(file: &str) -> Result<()> {
     #[cfg(not(feature = "rego-extensions"))]
     if file.contains("rego-extensions") {
+        return Ok(());
+    }
+
+    #[cfg(not(feature = "jsonpatch"))]
+    if file.contains("json.patch.yaml") {
         return Ok(());
     }
 

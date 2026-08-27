@@ -4,7 +4,6 @@
 use crate::rvm::instructions::{ComprehensionBeginParams, ComprehensionMode};
 use crate::value::Object;
 use crate::value::Value;
-use crate::Rc;
 use alloc::format;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -34,7 +33,7 @@ impl RegoVM {
         let initial_result = match params.mode {
             ComprehensionMode::Set => Value::new_set(),
             ComprehensionMode::Array => Value::new_array(),
-            ComprehensionMode::Object => Value::Object(Rc::new(Object::new())),
+            ComprehensionMode::Object => Object::new().into_value(),
         };
         self.set_register(params.result_reg, initial_result.clone())?;
 
@@ -62,11 +61,8 @@ impl RegoVM {
                     if set.is_empty() {
                         None
                     } else {
-                        Some(IterationState::Set {
-                            items: set,
-                            current_item: None,
-                            first_iteration: true,
-                        })
+                        let cursor = set.cursor();
+                        Some(IterationState::Set { items: set, cursor })
                     }
                 }
                 Value::Undefined => None,
@@ -127,7 +123,7 @@ impl RegoVM {
         let initial_result = match params.mode {
             ComprehensionMode::Set => Value::new_set(),
             ComprehensionMode::Array => Value::new_array(),
-            ComprehensionMode::Object => Value::Object(Rc::new(Object::new())),
+            ComprehensionMode::Object => Object::new().into_value(),
         };
         self.set_register(params.result_reg, initial_result.clone())?;
 
@@ -154,11 +150,8 @@ impl RegoVM {
                     if set.is_empty() {
                         None
                     } else {
-                        Some(IterationState::Set {
-                            items: set,
-                            current_item: None,
-                            first_iteration: true,
-                        })
+                        let cursor = set.cursor();
+                        Some(IterationState::Set { items: set, cursor })
                     }
                 }
                 Value::Undefined => None,
@@ -268,21 +261,6 @@ impl RegoVM {
         #[cfg(feature = "explanations")]
         let value_is_undefined = value_to_add == Value::Undefined;
 
-        // Snapshot the iteration value register BEFORE taking the result
-        // register: if the comprehension compiler ever allocates
-        // `result_reg == context.value_reg`, the writeback at the bottom
-        // of this function would clobber the value register, and a
-        // post-writeback read here would feed the wrong value into
-        // `IterationState::Set::current_item`. Only Set needs the snapshot
-        // (Object uses a self-advancing cursor; Array advances by index).
-        let set_resume_snapshot = if matches!(
-            comprehension_context.iteration_state,
-            Some(IterationState::Set { .. })
-        ) {
-            Some(self.get_register(comprehension_context.value_reg)?.clone())
-        } else {
-            None
-        };
         // Take ownership of the result register so Rc refcount stays at 1,
         // allowing Rc::make_mut to mutate in-place instead of deep-cloning.
         let mut current_result = self.take_register(result_reg)?;
@@ -339,16 +317,6 @@ impl RegoVM {
         }
 
         if let Some(iter_state) = comprehension_context.iteration_state.as_mut() {
-            // Set's `Bound::Excluded(current_item)` resume scheme needs the
-            // pre-mutation snapshot taken at the top of this function.
-            // Object uses a self-advancing cursor and needs no snapshot.
-            if let IterationState::Set {
-                ref mut current_item,
-                ..
-            } = *iter_state
-            {
-                *current_item = set_resume_snapshot;
-            }
             iter_state.advance();
             let has_next = self.setup_next_iteration(
                 iter_state,
@@ -387,15 +355,7 @@ impl RegoVM {
                 pc: self.pc,
             })?;
 
-        let (
-            value_to_add,
-            key_value,
-            mode,
-            result_reg_idx,
-            key_reg_idx,
-            value_reg_idx,
-            iter_is_set,
-        ) = {
+        let (value_to_add, key_value, mode, result_reg_idx, key_reg_idx, value_reg_idx) = {
             let frame =
                 self.execution_stack
                     .get(comprehension_index)
@@ -416,9 +376,6 @@ impl RegoVM {
 
                 let result_reg_idx = context.result_reg;
                 let mode = context.mode.clone();
-                let iter_is_set =
-                    matches!(context.iteration_state, Some(IterationState::Set { .. }));
-
                 (
                     value_to_add,
                     key_value,
@@ -426,7 +383,6 @@ impl RegoVM {
                     result_reg_idx,
                     context.key_reg,
                     context.value_reg,
-                    iter_is_set,
                 )
             } else {
                 return Err(VmError::InvalidIteration {
@@ -434,18 +390,6 @@ impl RegoVM {
                     pc: self.pc,
                 });
             }
-        };
-
-        // Snapshot the iteration value register BEFORE the result writeback:
-        // if the compiler ever allocates `result_reg == value_reg_idx`, a
-        // post-writeback read would feed the result accumulator into
-        // `IterationState::Set::current_item`, breaking the next iteration.
-        // Only Set needs this (Object cursor self-advances; Array advances
-        // by index).
-        let set_resume_snapshot = if iter_is_set {
-            Some(self.get_register(value_reg_idx)?.clone())
-        } else {
-            None
         };
 
         // Take ownership of the result register so Rc refcount stays at 1,
@@ -521,13 +465,6 @@ impl RegoVM {
             } = &mut frame.kind
             {
                 if let Some(iter_state) = context.iteration_state.as_mut() {
-                    if let IterationState::Set {
-                        ref mut current_item,
-                        ..
-                    } = *iter_state
-                    {
-                        *current_item = set_resume_snapshot;
-                    }
                     iter_state.advance();
                 }
 
@@ -623,16 +560,6 @@ impl RegoVM {
         context: &mut ComprehensionContext,
     ) -> Result<()> {
         if let Some(iter_state) = context.iteration_state.as_mut() {
-            // Snapshot the current value into Set's `current_item` so the
-            // next iteration can resume from `Bound::Excluded(current)`.
-            // Object uses a self-advancing cursor and needs no snapshot here.
-            if let IterationState::Set {
-                ref mut current_item,
-                ..
-            } = *iter_state
-            {
-                *current_item = Some(self.get_register(context.value_reg)?.clone());
-            }
             iter_state.advance();
             let has_next =
                 self.setup_next_iteration(iter_state, context.key_reg, context.value_reg)?;
@@ -653,6 +580,8 @@ impl RegoVM {
         // `ComprehensionEnd` is reached from a loaded program; an empty stack
         // here means malformed user-supplied bytecode, which must still surface
         // as a typed error rather than a panic — including in debug builds.
+        // The accumulated result already resides in its result register, but
+        // explanations still need the context before the stack is unwound.
         #[allow(unused)]
         let context = self
             .comprehension_stack
@@ -691,7 +620,6 @@ impl RegoVM {
                 );
             }
         }
-
         Ok(())
     }
 
@@ -751,6 +679,9 @@ impl RegoVM {
                             );
                         }
                     }
+
+                    // The accumulated result already resides in `result_reg`; no
+                    // post-processing is required before resuming.
                     let raw_target = context.resume_pc;
                     let resume_pc = if raw_target <= self.pc {
                         self.pc.saturating_add(1)

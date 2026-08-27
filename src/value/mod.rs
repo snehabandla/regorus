@@ -11,13 +11,18 @@
     clippy::as_conversions
 )] // value helpers index paths directly for performance
 
+mod array;
 mod object;
 mod set;
+
+#[cfg(feature = "std")]
+mod interning;
 
 #[cfg(test)]
 mod tests;
 
 #[allow(unused_imports)] // surface for downstream PRs
+pub use array::{Array, ArrayCursor, ArrayIntoIter, ArrayIter, ArrayIterMut};
 pub use object::{IntoIter, Iter, IterMut, Object};
 #[allow(unused_imports)] // surface for downstream PRs
 pub use set::Set;
@@ -25,7 +30,6 @@ pub use set::Set;
 #[cfg(feature = "rvm")]
 #[allow(unused_imports)] // surface for downstream PRs
 pub use object::ObjectCursor;
-#[cfg(feature = "rvm")]
 #[allow(unused_imports)] // surface for downstream PRs
 pub use set::SetCursor;
 
@@ -72,12 +76,12 @@ pub enum Value {
     String(Rc<str>),
 
     /// JSON array.
-    Array(Rc<Vec<Value>>),
+    Array(Rc<Array>),
 
     /// A set of values.
     /// No JSON equivalent.
     /// Sets are serialized as arrays in JSON.
-    Set(Rc<BTreeSet<Value>>),
+    Set(Rc<Set>),
 
     /// An object.
     /// Unlike JSON, keys can be any value, not just string.
@@ -236,19 +240,40 @@ impl<'de> Visitor<'de> for ValueVisitor {
                 }
             }
             let mut map = BTreeMap::new();
-            map.insert(key, value);
+            map.insert(intern_object_key(key), value);
             // Enforce allocator limit while expanding a deserialized object.
             enforce_limit_for::<V::Error>()?;
             while let Some((key, value)) = visitor.next_entry()? {
-                map.insert(key, value);
+                map.insert(intern_object_key(key), value);
                 // Enforce allocator limit while expanding a deserialized object.
                 enforce_limit_for::<V::Error>()?;
             }
-            Ok(Value::from(map))
+            let value = Value::from(map);
+            // The freeze into compact object storage allocates after the final map insert.
+            // Re-check fallible deserialization paths so allocator-limit builds observe it.
+            enforce_limit_for::<V::Error>()?;
+            Ok(value)
         } else {
             Ok(Value::new_object())
         }
     }
+}
+
+/// Key-only interning hook for the JSON deserialization hot path (see
+/// [`crate::value::interning`]). No-op when no interning session is installed
+/// or when built without the `std` feature.
+#[cfg(feature = "std")]
+fn intern_object_key(key: Value) -> Value {
+    match key {
+        Value::String(rc) => Value::String(interning::intern_key(rc)),
+        other => other,
+    }
+}
+
+/// No-op key hook for builds without the `std` feature (no interning table).
+#[cfg(not(feature = "std"))]
+const fn intern_object_key(key: Value) -> Value {
+    key
 }
 
 #[doc(hidden)]
@@ -357,6 +382,10 @@ impl Value {
     /// # }
     /// ```
     pub fn from_json_str(json: &str) -> Result<Value> {
+        // Intern object keys for the duration of the parse: a homogeneous array
+        // of N objects sharing K keys allocates K key strings instead of N * K.
+        #[cfg(feature = "std")]
+        let _guard = interning::InternGuard::install();
         match serde_json::from_str::<Value>(json) {
             Ok(value) => Ok(value),
             Err(err) => {
@@ -470,7 +499,7 @@ impl Value {
     #[cfg(feature = "yaml")]
     #[cfg_attr(docsrs, doc(cfg(feature = "std")))]
     pub fn from_yaml_str(yaml: &str) -> Result<Value> {
-        let value = serde_yaml::from_str(yaml)
+        let value = yaml_serde::from_str(yaml)
             .map_err(|err| anyhow::anyhow!("Failed to parse YAML: {}", err))?;
         Ok(value)
     }
@@ -680,8 +709,8 @@ impl From<serde_json::Value> for Value {
 
 #[cfg(feature = "yaml")]
 #[cfg_attr(docsrs, doc(cfg(feature = "yaml")))]
-impl From<serde_yaml::Value> for Value {
-    /// Create a [`Value`] from [`serde_yaml::Value`].
+impl From<yaml_serde::Value> for Value {
+    /// Create a [`Value`] from [`yaml_serde::Value`].
     ///
     /// Returns [`Value::Undefined`] in case of error.
     /// ```
@@ -691,15 +720,15 @@ impl From<serde_yaml::Value> for Value {
     ///   x: 10
     ///   y: 20
     /// ";
-    /// let yaml_v : serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+    /// let yaml_v : yaml_serde::Value = yaml_serde::from_str(&yaml).unwrap();
     /// let v = Value::from(yaml_v);
     ///
     /// assert_eq!(v["x"].as_u64()?, 10);
     /// assert_eq!(v["y"].as_u64()?, 20);
     /// # Ok(())
     /// # }
-    fn from(v: serde_yaml::Value) -> Self {
-        match serde_yaml::from_value(v) {
+    fn from(v: yaml_serde::Value) -> Self {
+        match yaml_serde::from_value(v) {
             Ok(v) => v,
             _ => Value::Undefined,
         }
@@ -764,7 +793,7 @@ impl From<Vec<Value>> for Value {
     /// # Ok(())
     /// # }
     fn from(a: Vec<Value>) -> Self {
-        Value::Array(Rc::new(a))
+        Value::Array(Rc::new(Array::from(a)))
     }
 }
 
@@ -786,7 +815,7 @@ impl From<BTreeSet<Value>> for Value {
     /// # Ok(())
     /// # }
     fn from(s: BTreeSet<Value>) -> Self {
-        Value::Set(Rc::new(s))
+        Value::Set(Rc::new(Set::from(s)))
     }
 }
 
@@ -807,7 +836,7 @@ impl From<BTreeMap<Value, Value>> for Value {
     /// # Ok(())
     /// # }
     fn from(s: BTreeMap<Value, Value>) -> Self {
-        Value::Object(Rc::new(Object::from(s)))
+        Object::from(s).into_value()
     }
 }
 
@@ -1214,7 +1243,7 @@ impl Value {
         }
     }
 
-    /// Cast value to [`& Vec<Value>`] if [`Value::Array`].
+    /// Cast value to [`&Array`] if [`Value::Array`].
     /// ```
     /// # use regorus::*;
     /// # fn main() -> anyhow::Result<()> {
@@ -1222,14 +1251,14 @@ impl Value {
     /// assert_eq!(v.as_array()?[0], Value::from("Hello"));
     /// # Ok(())
     /// # }
-    pub fn as_array(&self) -> Result<&Vec<Value>> {
+    pub fn as_array(&self) -> Result<&Array> {
         match self {
             Value::Array(a) => Ok(a),
             _ => Err(anyhow!("not an array")),
         }
     }
 
-    /// Cast value to [`&mut Vec<Value>`] if [`Value::Array`].
+    /// Cast value to [`&mut Array`] if [`Value::Array`].
     /// ```
     /// # use regorus::*;
     /// # fn main() -> anyhow::Result<()> {
@@ -1237,14 +1266,14 @@ impl Value {
     /// v.as_array_mut()?.push(Value::from("World"));
     /// # Ok(())
     /// # }
-    pub fn as_array_mut(&mut self) -> Result<&mut Vec<Value>> {
+    pub fn as_array_mut(&mut self) -> Result<&mut Array> {
         match self {
             Value::Array(a) => Ok(Rc::make_mut(a)),
             _ => Err(anyhow!("not an array")),
         }
     }
 
-    /// Cast value to [`& BTreeSet<Value>`] if [`Value::Set`].
+    /// Cast value to [`&Set`] if [`Value::Set`].
     /// ```
     /// # use regorus::*;
     /// # use std::collections::BTreeSet;
@@ -1258,14 +1287,14 @@ impl Value {
     /// assert_eq!(v.as_set()?.first(), Some(&Value::from("Hello")));
     /// # Ok(())
     /// # }
-    pub fn as_set(&self) -> Result<&BTreeSet<Value>> {
+    pub fn as_set(&self) -> Result<&Set> {
         match self {
             Value::Set(s) => Ok(s),
             _ => Err(anyhow!("not a set")),
         }
     }
 
-    /// Cast value to [`&mut BTreeSet<Value>`] if [`Value::Set`].
+    /// Cast value to [`&mut Set`] if [`Value::Set`].
     /// ```
     /// # use regorus::*;
     /// # use std::collections::BTreeSet;
@@ -1279,7 +1308,7 @@ impl Value {
     /// v.as_set_mut()?.insert(Value::from("World"));
     /// # Ok(())
     /// # }
-    pub fn as_set_mut(&mut self) -> Result<&mut BTreeSet<Value>> {
+    pub fn as_set_mut(&mut self) -> Result<&mut Set> {
         match self {
             Value::Set(s) => Ok(Rc::make_mut(s)),
             _ => Err(anyhow!("not a set")),
@@ -1621,7 +1650,7 @@ impl ops::Index<&Value> for Value {
                 _ => &Value::Undefined,
             },
             (Value::Array(a), Value::Number(n)) => match n.as_u64() {
-                Some(index) if (index as usize) < a.len() => &a[index as usize],
+                Some(index) => a.get(index as usize).unwrap_or(&Value::Undefined),
                 _ => &Value::Undefined,
             },
             _ => &Value::Undefined,

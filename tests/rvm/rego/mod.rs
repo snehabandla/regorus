@@ -34,6 +34,7 @@ struct TestCase {
     pub want_error_code: Option<String>,
     #[serde(default = "default_strict")]
     pub strict: bool,
+    pub rego_v0: Option<bool>,
     pub allow_interpreter_success: Option<bool>,
     pub allow_interpreter_incorrect_behavior: Option<bool>,
     pub skip_interpreter: Option<bool>,
@@ -377,7 +378,7 @@ fn compile_and_run_rvm_with_all_entry_points(
 
 fn yaml_test_impl(file: &str) -> Result<()> {
     let yaml_str = fs::read_to_string(file)?;
-    let test: YamlTest = serde_yaml::from_str(&yaml_str)?;
+    let test: YamlTest = yaml_serde::from_str(&yaml_str)?;
 
     println!("running {file}");
     if let Ok(filter) = std::env::var("TEST_CASE_FILTER") {
@@ -406,6 +407,7 @@ fn yaml_test_impl(file: &str) -> Result<()> {
         executed_count += 1;
 
         let mut engine = Engine::new();
+        engine.set_rego_v0(case.rego_v0 == Some(true));
         for (idx, module) in case.modules.iter().enumerate() {
             engine.add_policy(format!("rego_{idx}"), module.clone())?;
         }

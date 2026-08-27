@@ -429,6 +429,10 @@ mod tests {
                 result_reg,
                 num_registers: 50, // Increased to accommodate test cases with higher register indices
                 destructuring_blocks,
+                else_bodies: definitions
+                    .iter()
+                    .map(|b| alloc::vec![false; b.len()])
+                    .collect(),
                 early_exit_on_first_success: false,
             };
 
@@ -905,7 +909,7 @@ mod tests {
     fn run_vm_test_suite(file: &str) -> Result<()> {
         std::println!("Running VM test suite: {}", file);
         let yaml_content = fs::read_to_string(file)?;
-        let test_suite: VmTestSuite = serde_yaml::from_str(&yaml_content)?;
+        let test_suite: VmTestSuite = yaml_serde::from_str(&yaml_content)?;
 
         for test_case in test_suite.cases {
             std::println!("Running VM test case: {}", test_case.note);

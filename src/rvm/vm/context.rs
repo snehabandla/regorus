@@ -2,11 +2,10 @@
 // Licensed under the MIT License.
 
 use crate::rvm::instructions::{ComprehensionMode, LoopMode};
+#[cfg(feature = "explanations")]
 use crate::value::Value;
-use crate::value::{Object, ObjectCursor};
+use crate::value::{Array, Object, ObjectCursor, Set, SetCursor};
 use crate::Rc;
-use alloc::collections::BTreeSet;
-use alloc::vec::Vec;
 
 /// Loop execution context for managing iteration state
 #[derive(Debug, Clone)]
@@ -45,14 +44,11 @@ pub struct LoopContext {
 /// pre-mutation state. The `ObjectCursor` is opaque and resumes in
 /// O(log n) for the BTree backend.
 ///
-/// `Set` continues to use the pre-existing snapshot-by-cloned-key
-/// approach (`current_item` + `first_iteration`); migration of `Set`
-/// to a cursor-based iterator ships with the `Set` storage abstraction
-/// in a follow-up PR.
+/// `Set` mirrors Object using an opaque cursor over a shared `Rc<Set>`.
 #[derive(Debug, Clone)]
 pub enum IterationState {
     Array {
-        items: Rc<Vec<Value>>,
+        items: Rc<Array>,
         index: usize,
     },
     Object {
@@ -60,9 +56,8 @@ pub enum IterationState {
         cursor: ObjectCursor,
     },
     Set {
-        items: Rc<BTreeSet<Value>>,
-        current_item: Option<Value>,
-        first_iteration: bool,
+        items: Rc<Set>,
+        cursor: SetCursor,
     },
     /// Virtual single-element iteration for non-collection values.
     /// Used by Azure Policy's `[*]` on scalar/null fields: presents a single
@@ -91,12 +86,7 @@ impl IterationState {
             // when it pulls the next item via `Object::next`, so `advance`
             // is a no-op for the cursor-backed Object variant.
             Self::Object { .. } => {}
-            Self::Set {
-                ref mut first_iteration,
-                ..
-            } => {
-                *first_iteration = false;
-            }
+            Self::Set { .. } => {}
             Self::Single {
                 ref mut consumed, ..
             } => {
@@ -166,7 +156,8 @@ pub(super) struct ComprehensionContext {
 )]
 mod tests {
     use super::*;
-    use crate::value::Object;
+    use crate::value::{Object, Value};
+    use alloc::vec::Vec;
 
     /// IterationState::Object holds an `Rc<Object>` plus an opaque cursor.
     /// Mutating an aliased Rc via `Rc::make_mut` allocates a new collection

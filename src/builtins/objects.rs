@@ -32,6 +32,11 @@ pub fn register(m: &mut builtins::BuiltinsMap<&'static str, builtins::BuiltinFcn
         m.insert("json.match_schema", (json_match_schema, 2));
         m.insert("json.verify_schema", (json_verify_schema, 1));
     }
+
+    #[cfg(feature = "jsonpatch")]
+    {
+        m.insert("json.patch", (json_patch, 2));
+    }
 }
 
 fn json_filter_impl(v: &Value, filter: &Value) -> Result<Value> {
@@ -349,7 +354,10 @@ fn is_subset(sup: &Value, sub: &Value) -> bool {
             })
         }
         (Value::Set(sup), Value::Set(sub)) => sub.is_subset(sup),
-        (Value::Array(sup), Value::Array(sub)) => sup.windows(sub.len()).any(|w| w == &sub[..]),
+        (Value::Array(sup), Value::Array(sub)) => sup
+            .as_slice()
+            .windows(sub.len())
+            .any(|w| w == sub.as_slice()),
         (Value::Array(sup), Value::Set(_)) => {
             let sup = Value::from_set(sup.iter().cloned().collect());
             is_subset(&sup, sub)
@@ -391,7 +399,8 @@ fn object_union(span: &Span, params: &[Ref<Expr>], args: &[Value], _strict: bool
     let _ = ensure_object(name, &params[0], args[0].clone())?;
     let _ = ensure_object(name, &params[1], args[1].clone())?;
 
-    union(&args[0], &args[1])
+    let result = union(&args[0], &args[1])?;
+    Ok(result)
 }
 
 fn object_union_n(
@@ -469,7 +478,6 @@ fn json_match_schema(
     let name = "json.match_schema";
     ensure_args_count(span, name, params, args, 2)?;
 
-    // The following is expected to succeed.
     let document: serde_json::Value = serde_json::from_str(&args[0].to_json_str()?)
         .map_err(|err| span.error(&format!("Failed to parse JSON: {err}")))?;
 
@@ -486,4 +494,32 @@ fn json_match_schema(
         }
         .to_vec(),
     ))
+}
+
+// Note: matching OPA's own `builtinJSONPatch`, any failure while applying the
+// patch (bad path, missing attribute, failed `test`, ...) yields Undefined
+// rather than a hard error -- this builtin never errors on a malformed patch,
+// regardless of the `strict-builtin-errors` setting.
+#[cfg(feature = "jsonpatch")]
+fn json_patch(span: &Span, params: &[Ref<Expr>], args: &[Value], _strict: bool) -> Result<Value> {
+    let name = "json.patch";
+    ensure_args_count(span, name, params, args, 2)?;
+    ensure_array(name, &params[1], args[1].clone())?;
+
+    let ops = args[1].as_array()?;
+
+    let patched = super::json_patch::apply(&args[0], ops.as_slice());
+    match patched {
+        Ok(patched) => Ok(patched),
+        // Resource-limit errors must propagate rather than look like an
+        // invalid patch, so callers cannot bypass configured limits.
+        Err(err)
+            if err
+                .downcast_ref::<crate::utils::limits::LimitError>()
+                .is_some() =>
+        {
+            Err(err)
+        }
+        Err(_) => Ok(Value::Undefined),
+    }
 }

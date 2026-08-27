@@ -5,12 +5,10 @@
 use crate::ast::{Expr, Ref};
 use crate::lexer::Span;
 use crate::number::Number;
-use crate::value::Object;
+use crate::value::{Array, Object, Set};
 use crate::Rc;
 use crate::Value;
 use crate::*;
-
-use alloc::collections::BTreeSet;
 
 use anyhow::{bail, Result};
 
@@ -149,7 +147,7 @@ pub fn ensure_string_collection<'a>(fcn: &str, arg: &Expr, v: &'a Value) -> Resu
     Ok(collection)
 }
 
-pub fn ensure_array(fcn: &str, arg: &Expr, v: Value) -> Result<Rc<Vec<Value>>> {
+pub fn ensure_array(fcn: &str, arg: &Expr, v: Value) -> Result<Rc<Array>> {
     Ok(match v {
         Value::Array(a) => a,
         _ => {
@@ -159,7 +157,7 @@ pub fn ensure_array(fcn: &str, arg: &Expr, v: Value) -> Result<Rc<Vec<Value>>> {
     })
 }
 
-pub fn ensure_set(fcn: &str, arg: &Expr, v: Value) -> Result<Rc<BTreeSet<Value>>> {
+pub fn ensure_set(fcn: &str, arg: &Expr, v: Value) -> Result<Rc<Set>> {
     Ok(match v {
         Value::Set(s) => s,
         _ => {
