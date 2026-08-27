@@ -66,6 +66,15 @@ struct TestCase {
     #[serde(default)]
     pub want_compile_error: Option<bool>,
 
+    /// Substring the compile error message must contain.
+    ///
+    /// `want_compile_error: true` alone only asserts that *some* error
+    /// occurred, which lets a case pass for an unrelated reason (a parse
+    /// failure, an unrecognized function). Set this when the case exists to
+    /// pin a specific diagnostic.
+    #[serde(default)]
+    pub want_compile_error_contains: Option<String>,
+
     /// If true, evaluation is expected to produce `Value::Undefined`
     /// (the condition does not match and the policy has no effect).
     #[serde(default)]
@@ -318,7 +327,8 @@ fn yaml_test_impl(file: &str) -> Result<()> {
             }
         };
 
-        let expects_compile_error = case.want_compile_error == Some(true);
+        let expects_compile_error =
+            case.want_compile_error == Some(true) || case.want_compile_error_contains.is_some();
 
         let program = match compile_result {
             Ok(prog) => {
@@ -332,6 +342,17 @@ fn yaml_test_impl(file: &str) -> Result<()> {
             }
             Err(e) => {
                 if expects_compile_error {
+                    if let Some(expected) = &case.want_compile_error_contains {
+                        let actual = e.to_string();
+                        if !actual.contains(expected.as_str()) {
+                            bail!(
+                                "case '{}': compile error did not contain {:?}; got: {}",
+                                case.note,
+                                expected,
+                                actual
+                            );
+                        }
+                    }
                     println!("passed (expected compile error: {})", e);
                     continue;
                 }

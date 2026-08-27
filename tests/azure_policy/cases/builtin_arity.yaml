@@ -1,0 +1,118 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Builtin call arity boundary suite.
+#
+# The compiler emits at most eight argument registers per builtin call
+# (`emit_builtin_call` in src/languages/azure_policy/compiler/core.rs). The cap
+# counts *emitted registers*, not the arity the policy author wrote, so most
+# variadic-looking ARM functions never reach it: `concat`, for example, packs
+# its arguments into an array and calls the builtin with two registers.
+#
+# `and` and `or` are the functions that forward compiled arguments one-to-one,
+# so they are what actually exercises the boundary. These cases pin that a
+# nine-argument call is rejected with an actionable message rather than
+# silently producing an evaluation that could resemble compliance.
+
+cases:
+  - note: and_eight_args_compiles_and_evaluates
+    policy_rule: |
+      {
+        "if": {
+          "value": "[and(equals('a','a'), equals('b','b'), equals('c','c'), equals('d','d'), equals('e','e'), equals('f','f'), equals('g','g'), equals('h','h'))]",
+          "equals": true
+        },
+        "then": { "effect": "audit" }
+      }
+    resource:
+      type: "any"
+    want_effect: "audit"
+
+  # Negative control for the case above: eight arguments must still be able to
+  # produce a *false* result. Without this, the positive control could pass on
+  # a builtin that ignored its arguments entirely.
+  - note: and_eight_args_false_argument_does_not_match
+    policy_rule: |
+      {
+        "if": {
+          "value": "[and(equals('a','a'), equals('b','b'), equals('c','c'), equals('d','d'), equals('e','e'), equals('f','f'), equals('g','g'), equals('h','MISMATCH'))]",
+          "equals": true
+        },
+        "then": { "effect": "audit" }
+      }
+    resource:
+      type: "any"
+    want_undefined: true
+
+  - note: and_nine_args_is_rejected_with_actionable_error
+    policy_rule: |
+      {
+        "if": {
+          "value": "[and(equals('a','a'), equals('b','b'), equals('c','c'), equals('d','d'), equals('e','e'), equals('f','f'), equals('g','g'), equals('h','h'), equals('i','i'))]",
+          "equals": true
+        },
+        "then": { "effect": "audit" }
+      }
+    resource:
+      type: "any"
+    want_compile_error_contains: "and() does not support more than 8 arguments (got 9)"
+
+  - note: or_nine_args_is_rejected_with_actionable_error
+    policy_rule: |
+      {
+        "if": {
+          "value": "[or(equals('a','z'), equals('b','z'), equals('c','z'), equals('d','z'), equals('e','z'), equals('f','z'), equals('g','z'), equals('h','z'), equals('i','i'))]",
+          "equals": true
+        },
+        "then": { "effect": "audit" }
+      }
+    resource:
+      type: "any"
+    want_compile_error_contains: "or() does not support more than 8 arguments (got 9)"
+
+  # `and` and `or` lower to internal builtins (azure.policy.logic_all /
+  # logic_any) whose names an author would not recognize, and most other ARM
+  # functions lower to `azure.policy.fn.*`. The error must name what the author
+  # actually wrote.
+  - note: nine_arg_error_names_arm_function_not_internal_builtin
+    policy_rule: |
+      {
+        "if": {
+          "value": "[and(equals('a','a'), equals('b','b'), equals('c','c'), equals('d','d'), equals('e','e'), equals('f','f'), equals('g','g'), equals('h','h'), equals('i','i'))]",
+          "equals": true
+        },
+        "then": { "effect": "audit" }
+      }
+    resource:
+      type: "any"
+    want_compile_error_contains: "and()"
+
+  # Attribution must be innermost: the nested call is the one that overflowed.
+  - note: nested_overflow_is_attributed_to_the_inner_function
+    policy_rule: |
+      {
+        "if": {
+          "value": "[and(equals('a','a'), format('{0}{1}{2}{3}{4}{5}{6}{7}', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'))]",
+          "equals": true
+        },
+        "then": { "effect": "audit" }
+      }
+    resource:
+      type: "any"
+    want_compile_error_contains: "format() does not support more than 8 arguments (got 9)"
+
+  # Restore control for the case above. A nested call that compiles
+  # successfully must not leak its name onto a later overflow in the caller;
+  # without the save/restore this reports `format` instead of `and`.
+  - note: overflow_after_completed_nested_call_names_the_caller
+    policy_rule: |
+      {
+        "if": {
+          "value": "[and(format('{0}', 'a'), equals('b','b'), equals('c','c'), equals('d','d'), equals('e','e'), equals('f','f'), equals('g','g'), equals('h','h'), equals('i','i'))]",
+          "equals": true
+        },
+        "then": { "effect": "audit" }
+      }
+    resource:
+      type: "any"
+    want_compile_error_contains: "and() does not support more than 8 arguments (got 9)"

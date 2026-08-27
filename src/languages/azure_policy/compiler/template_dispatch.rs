@@ -26,6 +26,22 @@ impl Compiler {
         span: &crate::lexer::Span,
         args: &[Expr],
     ) -> Result<Option<u8>> {
+        // Restored on every exit path so nested calls report the innermost
+        // function and the caller's name survives a completed nested call.
+        let enclosing = self
+            .current_arm_function
+            .replace(alloc::string::String::from(function_name));
+        let result = self.compile_arm_template_function_inner(function_name, span, args);
+        self.current_arm_function = enclosing;
+        result
+    }
+
+    fn compile_arm_template_function_inner(
+        &mut self,
+        function_name: &str,
+        span: &crate::lexer::Span,
+        args: &[Expr],
+    ) -> Result<Option<u8>> {
         let dest = match function_name {
             // -- Core ARM template functions --
             "concat" => {
