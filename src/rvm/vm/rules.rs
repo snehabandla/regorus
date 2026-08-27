@@ -480,6 +480,10 @@ impl RegoVM {
             current_definition_index: 0,
             current_body_index: 0,
             current_body_condition_start: 0,
+            #[cfg(feature = "explanations")]
+            caller_conjunction_id: self.current_conjunction_id(),
+            #[cfg(not(feature = "explanations"))]
+            caller_conjunction_id: 0,
         });
 
         #[cfg(feature = "explanations")]
@@ -722,6 +726,10 @@ impl RegoVM {
             current_definition_index: 0,
             current_body_index: 0,
             current_body_condition_start: 0,
+            #[cfg(feature = "explanations")]
+            caller_conjunction_id: self.current_conjunction_id(),
+            #[cfg(not(feature = "explanations"))]
+            caller_conjunction_id: 0,
         });
 
         let mut frame_data = RuleFrameData {

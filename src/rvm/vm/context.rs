@@ -113,6 +113,13 @@ pub struct CallRuleContext {
     pub current_definition_index: usize,
     pub current_body_index: usize,
     pub current_body_condition_start: usize,
+    /// Conjunction scope active in the *caller* at the moment this rule was
+    /// invoked. Captured here rather than inferred by aligning the conjunction
+    /// stack with the call stack, because scopes are pushed per definition and
+    /// a frame can sit on the call stack between definitions with no scope of
+    /// its own. Partial evaluation uses it to fold a callee's residual back
+    /// into the conjunction that called it.
+    pub caller_conjunction_id: u32,
 }
 
 /// Context for tracking active comprehensions

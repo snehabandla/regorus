@@ -292,6 +292,11 @@ pub struct CallFrame {
     pub definition_index: u16,
     /// PC of the call site inside this frame.
     pub call_pc: u32,
+    /// Conjunction scope active in this frame when it made the call. Partial
+    /// evaluation folds the callee's residual back into this conjunction, so
+    /// a helper call groups with its caller instead of forming a sibling
+    /// disjunct. Not serialized; it is internal linkage, not author-facing.
+    pub conjunction_id: u32,
 }
 
 /// Context for inverting a data lookup during partial evaluation.

@@ -376,6 +376,177 @@ pub struct PartialEvalResult {
     pub warnings: Vec<String>,
 }
 
+/// Grouping metadata for one residual disjunct, taken from the assumptions
+/// that formed it. Every assumption recorded in the same conjunction scope
+/// shares these, so the first one seen describes the whole group.
+#[derive(Clone)]
+struct GroupMeta {
+    conjunction_id: u32,
+    /// Conjunctions of the calling frames, innermost first. A whole chain is
+    /// kept rather than just the immediate caller because an intermediate rule
+    /// that contributed no conditions of its own produces no group, so the
+    /// nearest *existing* ancestor is what this group folds into.
+    caller_conjunctions: Vec<u32>,
+    rule_index: u16,
+}
+
+/// Describe the conjunction scope an assumption was recorded in.
+fn group_meta_of(a: &crate::evaluation_trace::Assumption) -> GroupMeta {
+    GroupMeta {
+        conjunction_id: a.conjunction_id,
+        caller_conjunctions: a
+            .call_chain
+            .iter()
+            .rev()
+            .map(|frame| frame.conjunction_id)
+            .collect(),
+        rule_index: a.rule_index,
+    }
+}
+
+/// Upper bound on disjuncts in a distributed residual. Distribution is
+/// multiplicative, so without a bound a policy with several multi-definition
+/// helpers could expand far enough to be a denial-of-service surface.
+const MAX_RESIDUAL_DISJUNCTS: usize = 1024;
+
+/// Depth guard for pathological call nesting. Rego rejects recursive rules, so
+/// this bounds unexpected shapes rather than legitimate ones.
+const MAX_DISTRIBUTION_DEPTH: usize = 32;
+
+/// Fold each called rule's residual back into the conjunction that called it.
+///
+/// A called rule is a *conjunct* of its caller, while a rule with several
+/// definitions is itself a *disjunction*. Folding is therefore a distribution:
+/// `a AND (X OR Y)` becomes `(a AND X) OR (a AND Y)`. Without it, a condition
+/// wrapped in a helper becomes a sibling disjunct and the residual claims the
+/// policy applies under conditions it does not.
+///
+/// Returns `None` when the result would exceed [`MAX_RESIDUAL_DISJUNCTS`], so
+/// the caller can fall back to the undistributed grouping. That fallback is
+/// broader than the truth rather than narrower, which keeps a finding visible
+/// instead of hiding one.
+fn distribute_call_conjunctions(
+    groups: &[(GroupMeta, Vec<ResidualCondition>)],
+) -> Option<Vec<Vec<ResidualCondition>>> {
+    let produced_a_group: alloc::collections::BTreeSet<u32> =
+        groups.iter().map(|(meta, _)| meta.conjunction_id).collect();
+
+    // Children keyed by the nearest ancestor conjunction that produced a group.
+    let mut children: alloc::collections::BTreeMap<u32, Vec<usize>> =
+        alloc::collections::BTreeMap::new();
+    // Groups whose callers contributed no conditions at all still constrain
+    // each other, so they are folded together under their outermost frame
+    // rather than left as independent alternatives.
+    let mut orphan_buckets: alloc::collections::BTreeMap<u32, Vec<usize>> =
+        alloc::collections::BTreeMap::new();
+    let mut roots: Vec<usize> = Vec::new();
+
+    for (idx, (meta, _)) in groups.iter().enumerate() {
+        let Some(outermost) = meta.caller_conjunctions.last().copied() else {
+            roots.push(idx);
+            continue;
+        };
+        match meta
+            .caller_conjunctions
+            .iter()
+            .find(|conjunction| produced_a_group.contains(conjunction))
+        {
+            Some(parent) => children.entry(*parent).or_default().push(idx),
+            None => orphan_buckets.entry(outermost).or_default().push(idx),
+        }
+    }
+
+    let mut out: Vec<Vec<ResidualCondition>> = Vec::new();
+    for idx in roots {
+        out.extend(resolve_group(groups, &children, idx, 0)?);
+        if out.len() > MAX_RESIDUAL_DISJUNCTS {
+            return None;
+        }
+    }
+    for (_, bucket) in orphan_buckets {
+        out.extend(fold_children(groups, &children, Vec::new(), &bucket, 0)?);
+        if out.len() > MAX_RESIDUAL_DISJUNCTS {
+            return None;
+        }
+    }
+
+    // A conjunction with no conditions is trivially true and would make the
+    // whole residual vacuous.
+    out.retain(|conjunction| !conjunction.is_empty());
+    Some(out)
+}
+
+/// Expand one group into its alternatives, folding in every rule it called.
+fn resolve_group(
+    groups: &[(GroupMeta, Vec<ResidualCondition>)],
+    children: &alloc::collections::BTreeMap<u32, Vec<usize>>,
+    idx: usize,
+    depth: usize,
+) -> Option<Vec<Vec<ResidualCondition>>> {
+    let (meta, conds) = groups.get(idx)?;
+    let called = children
+        .get(&meta.conjunction_id)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    fold_children(groups, children, conds.clone(), called, depth)
+}
+
+/// Multiply `base` by every called rule reachable from it.
+///
+/// Definitions of the same callee are alternatives and are OR-ed; distinct
+/// callees are conjuncts, so each one multiplies the accumulator in turn.
+fn fold_children(
+    groups: &[(GroupMeta, Vec<ResidualCondition>)],
+    children: &alloc::collections::BTreeMap<u32, Vec<usize>>,
+    base: Vec<ResidualCondition>,
+    child_indexes: &[usize],
+    depth: usize,
+) -> Option<Vec<Vec<ResidualCondition>>> {
+    if depth >= MAX_DISTRIBUTION_DEPTH {
+        return None;
+    }
+
+    let mut by_callee: alloc::collections::BTreeMap<u16, Vec<usize>> =
+        alloc::collections::BTreeMap::new();
+    for &child in child_indexes {
+        if let Some((child_meta, _)) = groups.get(child) {
+            by_callee
+                .entry(child_meta.rule_index)
+                .or_default()
+                .push(child);
+        }
+    }
+
+    let mut acc: Vec<Vec<ResidualCondition>> = alloc::vec![base];
+    for (_, callee_groups) in by_callee {
+        let mut alternatives: Vec<Vec<ResidualCondition>> = Vec::new();
+        for child in callee_groups {
+            alternatives.extend(resolve_group(
+                groups,
+                children,
+                child,
+                depth.saturating_add(1),
+            )?);
+        }
+        if alternatives.is_empty() {
+            continue;
+        }
+        let mut next: Vec<Vec<ResidualCondition>> = Vec::new();
+        for existing in &acc {
+            for alternative in &alternatives {
+                if next.len() >= MAX_RESIDUAL_DISJUNCTS {
+                    return None;
+                }
+                let mut merged = existing.clone();
+                merged.extend(alternative.iter().cloned());
+                next.push(merged);
+            }
+        }
+        acc = next;
+    }
+    Some(acc)
+}
+
 /// Produce a [`PartialEvalResult`] from a program and its evaluation trace.
 pub fn materialize_pe(
     program: &Program,
@@ -409,7 +580,8 @@ pub fn materialize_pe(
 
     // Group assumptions by (conjunction_id, iteration_index) to form disjuncts.
     // Each unique combination produces one conjunction (AND) in the DNF output.
-    let mut disjunct_map: BTreeMap<(u32, Option<u32>), Vec<ResidualCondition>> = BTreeMap::new();
+    let mut disjunct_map: BTreeMap<(u32, Option<u32>), (GroupMeta, Vec<ResidualCondition>)> =
+        BTreeMap::new();
 
     // First pass: collect inner-negation assumptions into negation_inner.
     for a in &trace.assumptions {
@@ -449,7 +621,11 @@ pub fn materialize_pe(
                     cond.negated_conditions = inner;
                 }
             }
-            disjunct_map.entry(key).or_default().push(cond);
+            disjunct_map
+                .entry(key)
+                .or_insert_with(|| (group_meta_of(a), Vec::new()))
+                .1
+                .push(cond);
             continue;
         }
 
@@ -469,11 +645,19 @@ pub fn materialize_pe(
                             .wrapping_add(1000_u32.wrapping_add(offset)),
                     ),
                 );
-                disjunct_map.entry(split_key).or_default().push(cond);
+                disjunct_map
+                    .entry(split_key)
+                    .or_insert_with(|| (group_meta_of(a), Vec::new()))
+                    .1
+                    .push(cond);
             }
         } else {
             for cond in inverted {
-                disjunct_map.entry(key).or_default().push(cond);
+                disjunct_map
+                    .entry(key)
+                    .or_insert_with(|| (group_meta_of(a), Vec::new()))
+                    .1
+                    .push(cond);
             }
         }
     }
@@ -489,18 +673,29 @@ pub fn materialize_pe(
     // nested inside another `negation_holds` are also dropped;
     // `attach_nested_negation_inner` above assigns the inner arrays but
     // doesn't filter them.
-    let residual_queries: Vec<Vec<ResidualCondition>> = disjunct_map
+    let groups: Vec<(GroupMeta, Vec<ResidualCondition>)> = disjunct_map
         .into_values()
-        .filter_map(|mut conds| {
+        .filter_map(|(meta, mut conds)| {
             conds.dedup_by(|a, b| a.condition == b.condition && a.operator == b.operator);
             filter_empty_placeholders_recursive(&mut conds);
             if conds.is_empty() {
                 None
             } else {
-                Some(conds)
+                Some((meta, conds))
             }
         })
         .collect();
+
+    let mut warnings = trace.warnings.clone();
+    let residual_queries = distribute_call_conjunctions(&groups).unwrap_or_else(|| {
+        warnings.push(
+            "residual could not be distributed within the disjunct limit; conditions from \
+             called rules are reported as separate alternatives, which is broader than the \
+             policy requires"
+                .to_string(),
+        );
+        groups.iter().map(|(_, conds)| conds.clone()).collect()
+    });
 
     let result = match query_result {
         Value::Undefined => Value::Null,
@@ -510,7 +705,7 @@ pub fn materialize_pe(
     PartialEvalResult {
         result,
         residual_queries,
-        warnings: trace.warnings.clone(),
+        warnings,
     }
 }
 

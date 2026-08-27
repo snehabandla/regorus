@@ -69,6 +69,9 @@ impl RegoVM {
                     definition_index: u16::try_from(frame.current_definition_index)
                         .unwrap_or(u16::MAX),
                     call_pc: u32::try_from(invoked.return_pc).unwrap_or(u32::MAX),
+                    // Captured on the invoked frame at call time, so it is the
+                    // conjunction this caller was in when it made the call.
+                    conjunction_id: invoked.caller_conjunction_id,
                 })
             })
             .collect()

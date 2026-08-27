@@ -1545,22 +1545,39 @@ allow if {
 
     assert_eq!(result["result"], true);
     let queries = result["residual_queries"].as_array().unwrap();
+
+    // `allow` requires is_authorized_user AND input.resource.public, and
+    // is_authorized_user requires input.user.active AND is_valid_request. The
+    // chain is conjunctive throughout, so the residual is a single conjunction.
+    //
+    // This previously asserted three separate disjuncts, one per rule call,
+    // which read as `A OR B OR C` under the documented DNF semantics and so
+    // claimed the policy applied when any one condition held. That shape was
+    // the defect, not the contract.
     assert_eq!(
         queries.len(),
-        3,
-        "chained helpers produce separate conjunctions per rule call"
+        1,
+        "a conjunctive chain must produce one conjunction, not one disjunct per \
+         rule call; got: {}",
+        serde_json::to_string_pretty(&result["residual_queries"]).unwrap()
     );
-    // Each conjunction should have 1 condition
-    for (i, q) in queries.iter().enumerate() {
-        let conditions = q.as_array().unwrap();
-        assert_eq!(
-            conditions.len(),
-            1,
-            "conjunction {} should have 1 condition, got: {}",
-            i,
-            serde_json::to_string_pretty(q).unwrap()
-        );
-    }
+
+    let mut paths: Vec<&str> = queries[0]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["input_path"].as_str())
+        .collect();
+    paths.sort_unstable();
+    assert_eq!(
+        paths,
+        vec![
+            "input.request.method",
+            "input.resource.public",
+            "input.user.active",
+        ],
+        "every condition in the chain must appear in the single conjunction"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2761,5 +2778,189 @@ deny contains msg if {
         text.contains("fragment"),
         "a non-literal argument must leave the parameter name in place rather than \
          inventing a value; got: {text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Conjunction grouping across rule calls.
+//
+// A residual recorded inside a called helper landed in its own disjunct,
+// because a new conjunction scope is opened per rule definition whether that
+// definition is an alternative of its rule or an invoked sub-rule. Identical
+// logic therefore residualized as a conjunction inline and as a disjunction
+// through a helper, which overstates when a policy applies.
+//
+// A called rule is a *conjunct* of its caller. A rule with several
+// definitions is itself a disjunction, so folding it into the caller is a
+// distribution: `a AND (X OR Y)` becomes `(a AND X) OR (a AND Y)`.
+// ---------------------------------------------------------------------------
+
+/// Normalized residual shape: each disjunct as its sorted set of input paths,
+/// with the disjuncts themselves sorted. Comparing shapes rather than raw JSON
+/// keeps these tests about grouping, not about condition rendering or ordering.
+fn disjunct_path_shape(result: &serde_json::Value) -> Vec<Vec<String>> {
+    let mut shape: Vec<Vec<String>> = result["residual_queries"]
+        .as_array()
+        .expect("residual_queries must be an array")
+        .iter()
+        .map(|disjunct| {
+            let mut paths: Vec<String> = disjunct
+                .as_array()
+                .expect("each disjunct must be an array")
+                .iter()
+                .filter_map(|c| c["input_path"].as_str().map(str::to_string))
+                .collect();
+            paths.sort();
+            paths
+        })
+        .collect();
+    shape.sort();
+    shape
+}
+
+/// pe_69: the same logic written inline and written through a helper must
+/// produce the same residual. This is the defect in its simplest form: the
+/// helper boundary is the only difference between the two policies.
+#[test]
+fn pe_69_helper_conjunction_matches_inline_shape() {
+    let inline = r#"
+package test
+import future.keywords
+
+allow if {
+    input.a == 1
+    input.b == 2
+}
+"#;
+    let helper = r#"
+package test
+import future.keywords
+
+b_ok if input.b == 2
+
+allow if {
+    input.a == 1
+    b_ok
+}
+"#;
+
+    let inline_shape = disjunct_path_shape(&run_pe(inline, None, None, "data.test.allow"));
+    let helper_shape = disjunct_path_shape(&run_pe(helper, None, None, "data.test.allow"));
+
+    assert_eq!(
+        inline_shape,
+        vec![vec!["input.a".to_string(), "input.b".to_string()]],
+        "inline conjunction must be one disjunct of two conditions"
+    );
+    assert_eq!(
+        helper_shape, inline_shape,
+        "a helper call is a conjunct of its caller, so wrapping a condition in a \
+         helper must not turn the conjunction into a disjunction"
+    );
+}
+
+/// pe_70: a helper with two definitions is itself a disjunction, so folding
+/// it into the caller must distribute rather than flatten. This is the case a
+/// naive conjunction-scope share gets wrong in the dangerous direction, by
+/// collapsing to `a AND b AND c`.
+#[test]
+fn pe_70_multi_definition_helper_distributes() {
+    let policy = r#"
+package test
+import future.keywords
+
+b_ok if input.b == 2
+
+b_ok if input.c == 3
+
+allow if {
+    input.a == 1
+    b_ok
+}
+"#;
+    let shape = disjunct_path_shape(&run_pe(policy, None, None, "data.test.allow"));
+
+    assert_eq!(
+        shape,
+        vec![
+            vec!["input.a".to_string(), "input.b".to_string()],
+            vec!["input.a".to_string(), "input.c".to_string()],
+        ],
+        "`a AND (b OR c)` must distribute to `(a AND b) OR (a AND c)`; \
+         flattening to a single conjunction would understate when the policy applies"
+    );
+}
+
+/// pe_71: one helper invoked from two different rule bodies must be folded
+/// into each caller separately, rather than pooling its condition into a
+/// shared disjunct.
+#[test]
+fn pe_71_helper_called_from_two_rules_groups_per_caller() {
+    let policy = r#"
+package test
+import future.keywords
+
+b_ok if input.b == 2
+
+deny contains "from a" if {
+    input.a == 1
+    b_ok
+}
+
+deny contains "from z" if {
+    input.z == 9
+    b_ok
+}
+"#;
+    let shape = disjunct_path_shape(&run_pe(policy, None, None, "data.test.deny"));
+
+    assert_eq!(
+        shape,
+        vec![
+            vec!["input.a".to_string(), "input.b".to_string()],
+            vec!["input.b".to_string(), "input.z".to_string()],
+        ],
+        "each caller must carry its own copy of the helper's condition"
+    );
+}
+
+/// pe_72: distribution is multiplicative, so it has to be bounded. Eleven
+/// two-definition helpers expand to 2^11 = 2048 disjuncts, past the limit.
+/// The engine must fall back to the undistributed grouping and say so, rather
+/// than emitting a truncated residual — truncation reads precise while being
+/// narrower than the truth, which hides findings.
+#[test]
+fn pe_72_distribution_overflow_falls_back_and_warns() {
+    const HELPERS: usize = 11;
+
+    let mut policy = String::from("package test\nimport future.keywords\n\n");
+    for i in 0..HELPERS {
+        policy.push_str(&format!("h{i} if input.a{i} == 1\n"));
+        policy.push_str(&format!("h{i} if input.b{i} == 2\n\n"));
+    }
+    policy.push_str("allow if {\n");
+    for i in 0..HELPERS {
+        policy.push_str(&format!("    h{i}\n"));
+    }
+    policy.push_str("}\n");
+
+    let result = run_pe(&policy, None, None, "data.test.allow");
+    let queries = result["residual_queries"]
+        .as_array()
+        .expect("residual_queries must be an array");
+    let warnings = result["warnings"].as_array().cloned().unwrap_or_default();
+
+    assert!(
+        queries.len() < 2048,
+        "distribution must be bounded rather than expanding to the full product; \
+         got {} disjuncts",
+        queries.len()
+    );
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.as_str().unwrap_or_default().contains("distributed")),
+        "falling back to the undistributed shape must be reported rather than silent; \
+         warnings: {warnings:?}"
     );
 }
