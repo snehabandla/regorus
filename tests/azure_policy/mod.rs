@@ -84,6 +84,15 @@ struct TestCase {
     #[serde(default)]
     pub want_parse_error: Option<bool>,
 
+    /// Substring the evaluation-time error message must contain.
+    ///
+    /// Distinct from the compile-error fields: this asserts a failure raised
+    /// while the program runs, such as a host await whose response was never
+    /// supplied. Without it such a case can only crash the test, so a policy
+    /// that reaches the host cannot be told apart from one that does not.
+    #[serde(default)]
+    pub want_eval_error_contains: Option<String>,
+
     /// Optional API version for the resource (e.g., "2023-01-01").
     /// When set, injected as `input.resource.apiversion` (lowercased to match
     /// the compiler's lowercased lookup paths) so policies and alias-versioned
@@ -427,7 +436,34 @@ fn yaml_test_impl(file: &str) -> Result<()> {
             vm.set_host_await_responses(responses);
         }
 
-        let value = vm.execute_entry_point_by_name("main")?;
+        let value = match vm.execute_entry_point_by_name("main") {
+            Ok(value) => {
+                if case.want_eval_error_contains.is_some() {
+                    bail!(
+                        "case '{}': expected an evaluation error but execution succeeded with {}",
+                        case.note,
+                        value
+                    );
+                }
+                value
+            }
+            Err(e) => {
+                let Some(expected) = &case.want_eval_error_contains else {
+                    bail!("case '{}': unexpected evaluation error: {}", case.note, e);
+                };
+                let actual = e.to_string();
+                if !actual.contains(expected.as_str()) {
+                    bail!(
+                        "case '{}': evaluation error did not contain {:?}; got: {}",
+                        case.note,
+                        expected,
+                        actual
+                    );
+                }
+                println!("passed (expected evaluation error: {})", e);
+                continue;
+            }
+        };
 
         if case.want_undefined == Some(true) {
             assert_eq!(

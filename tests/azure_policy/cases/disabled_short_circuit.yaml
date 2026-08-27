@@ -1,0 +1,81 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Disabled short-circuit suite.
+#
+# `compile_cross_resource_effect` emits `emit_disabled_guard` *before*
+# `emit_host_await_lookup`, so a cross-resource policy whose effect resolves to
+# `Disabled` should return Undefined without ever asking the host for the
+# related resource. Skipping that lookup matters because the host call is the
+# expensive part and, at authoring time, an unnecessary one.
+#
+# The effect must be *parameterized*. A literal `"disabled"` is routed by
+# `EffectKind::Disabled` down a different path that never emits a host await at
+# all, so it would not exercise the guard.
+#
+# HOW THESE CASES DETECT A HOST AWAIT
+#
+# The harness has no await counter, so supplying canned responses and asserting
+# the result cannot tell "short-circuited" apart from "called the host, then
+# returned Undefined" - both yield Undefined. Instead both cases below supply
+# *no* `host_await` block, which makes `VmError::HostAwaitResponseMissing` the
+# detector: reaching the lookup is then an error rather than a silent success.
+#
+# The two cases are the same policy differing only in the parameter value, so
+# the control proves the absence of responses is genuinely observable and the
+# Disabled case therefore cannot pass vacuously.
+
+cases:
+  - note: disabled_cross_resource_effect_never_reaches_the_host
+    policy_rule: |
+      {
+        "if": {
+          "field": "type",
+          "equals": "Microsoft.Compute/virtualMachines"
+        },
+        "then": {
+          "effect": "[parameters('effect')]",
+          "details": {
+            "type": "Microsoft.Compute/virtualMachines/extensions",
+            "existenceCondition": {
+              "field": "properties.type",
+              "equals": "IaaSAntimalware"
+            }
+          }
+        }
+      }
+    parameters:
+      effect: "Disabled"
+    resource:
+      type: "Microsoft.Compute/virtualMachines"
+    # No `host_await` block on purpose. If the disabled guard stopped
+    # short-circuiting, the lookup would fail for a missing response instead of
+    # returning Undefined, and this case would fail loudly.
+    want_undefined: true
+
+  # Positive control for the case above: the identical policy with a
+  # non-Disabled effect must reach the host and fail on the absent response.
+  # Without this, the Disabled case would pass whether or not the guard works.
+  - note: non_disabled_cross_resource_effect_reaches_the_host
+    policy_rule: |
+      {
+        "if": {
+          "field": "type",
+          "equals": "Microsoft.Compute/virtualMachines"
+        },
+        "then": {
+          "effect": "[parameters('effect')]",
+          "details": {
+            "type": "Microsoft.Compute/virtualMachines/extensions",
+            "existenceCondition": {
+              "field": "properties.type",
+              "equals": "IaaSAntimalware"
+            }
+          }
+        }
+      }
+    parameters:
+      effect: "AuditIfNotExists"
+    resource:
+      type: "Microsoft.Compute/virtualMachines"
+    want_eval_error_contains: "azure.policy.existence_check"
