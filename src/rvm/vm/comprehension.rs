@@ -617,6 +617,7 @@ impl RegoVM {
                     definition_index,
                     iteration_index,
                     self.current_conjunction_id(),
+                    self.current_call_chain(),
                 );
             }
         }
@@ -676,6 +677,7 @@ impl RegoVM {
                                 definition_index,
                                 iteration_index,
                                 self.current_conjunction_id(),
+                                self.current_call_chain(),
                             );
                         }
                     }

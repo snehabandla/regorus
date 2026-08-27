@@ -754,6 +754,7 @@ impl RegoVM {
                             definition_index,
                             iteration_index,
                             self.current_conjunction_id(),
+                            self.current_call_chain(),
                         );
 
                         // For Any/ForEach modes, create a phantom iteration

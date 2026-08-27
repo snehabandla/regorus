@@ -49,6 +49,31 @@ impl RegoVM {
             .unwrap_or((0, 0))
     }
 
+    /// Calling rule frames for an assumption recorded right now, outermost
+    /// first, excluding the rule doing the recording (already captured as
+    /// `Assumption::rule_index`).
+    ///
+    /// Read straight off the live call stack rather than mirrored into the
+    /// trace, so it cannot drift out of sync with pushes and pops. A caller's
+    /// call site is recorded on the frame it pushed, so frame `i` takes its
+    /// call pc from frame `i + 1`.
+    #[cfg(feature = "explanations")]
+    pub(super) fn current_call_chain(&self) -> Vec<crate::evaluation_trace::CallFrame> {
+        self.call_rule_stack
+            .windows(2)
+            .filter_map(|pair| {
+                let frame = pair.first()?;
+                let invoked = pair.get(1)?;
+                Some(crate::evaluation_trace::CallFrame {
+                    rule_index: frame.rule_index,
+                    definition_index: u16::try_from(frame.current_definition_index)
+                        .unwrap_or(u16::MAX),
+                    call_pc: u32::try_from(invoked.return_pc).unwrap_or(u32::MAX),
+                })
+            })
+            .collect()
+    }
+
     /// Record an Azure Policy comparison outcome.
     ///
     /// `right` is `None` for unary operators, so the report never reports an
@@ -164,6 +189,7 @@ impl RegoVM {
             definition_index,
             iteration_index,
             self.current_conjunction_id(),
+            self.current_call_chain(),
         );
         if let Some(last) = self.trace.assumptions.last_mut() {
             last.builtin_name = builtin_name;
@@ -349,6 +375,7 @@ impl RegoVM {
             definition_index,
             iteration_index,
             self.current_conjunction_id(),
+            self.current_call_chain(),
         );
         // Attach pending data lookup context (from ChainedIndex) if available.
         if let Some(ctx) = self.pending_data_lookup.take() {
@@ -433,6 +460,7 @@ impl RegoVM {
             definition_index,
             iteration_index,
             self.current_conjunction_id(),
+            self.current_call_chain(),
         );
         true
     }
@@ -620,6 +648,7 @@ impl RegoVM {
                     definition_index,
                     iteration_index,
                     self.current_conjunction_id(),
+                    self.current_call_chain(),
                 );
                 true
             }
@@ -692,6 +721,7 @@ impl RegoVM {
                             definition_index,
                             iteration_index,
                             self.current_conjunction_id(),
+                            self.current_call_chain(),
                         );
                         return true;
                     }
@@ -1147,6 +1177,7 @@ impl RegoVM {
                                     definition_index,
                                     iteration_index,
                                     self.current_conjunction_id(),
+                                    self.current_call_chain(),
                                 );
                                 if negation_scope_id.is_some() {
                                     self.trace.negation_scope_stack.pop();
@@ -1177,6 +1208,7 @@ impl RegoVM {
                             definition_index,
                             iteration_index,
                             self.current_conjunction_id(),
+                            self.current_call_chain(),
                         );
                         // Tag the NegationHolds with the scope it owns so
                         // materialize_pe can find the matching inner assumptions.

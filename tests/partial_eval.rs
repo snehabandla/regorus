@@ -2475,3 +2475,291 @@ deny contains msg if {
         queries
     );
 }
+
+// ---------------------------------------------------------------------------
+// PE helper call chain: attribute a helper-gated residual to the rule that
+// owns it, and specialize the helper's condition with the caller's argument.
+//
+// Bug: a residual recorded inside a helper carries only the callee in
+// `source_rule`, and its `condition` is the helper *definition* text with the
+// formal parameter name. A consumer joining residuals to violations by rule
+// name therefore drops the clause entirely, and could not render the bound
+// condition even if it matched.
+//
+// Contract: `call_chain` lists the calling frames root-first (the callee is
+// never duplicated into it), so `call_chain[0]` is the owning rule and is a
+// stable join key at any depth. Omitted entirely for inline gates.
+// ---------------------------------------------------------------------------
+
+/// Find the single residual condition referencing `input_path` across all
+/// disjuncts. Panics with the full residual set when absent, so a shape
+/// change surfaces as a readable failure rather than an unwrap.
+fn find_residual_by_input_path<'a>(
+    result: &'a serde_json::Value,
+    input_path: &str,
+) -> &'a serde_json::Value {
+    let queries = result["residual_queries"]
+        .as_array()
+        .expect("residual_queries must be an array");
+    queries
+        .iter()
+        .filter_map(|q| q.as_array())
+        .flatten()
+        .find(|c| c["input_path"].as_str() == Some(input_path))
+        .unwrap_or_else(|| {
+            panic!("no residual condition for {input_path}; residuals: {queries:#?}")
+        })
+}
+
+/// pe_65: one-hop helper gate. The residual recorded inside
+/// `in_resource_group` must name the owning `deny` rule at `call_chain[0]`
+/// and render the condition with the caller's `"prod"` argument substituted
+/// for the `fragment` parameter.
+#[test]
+fn pe_65_helper_gate_emits_call_chain_root_and_specialized_condition() {
+    let policy = r#"
+package bicep
+import future.keywords
+
+in_resource_group(fragment) if contains(input.deployment.resourceGroupName, fragment)
+
+deny contains msg if {
+    in_resource_group("prod")
+    some _, resource in input.resources
+    resource.type == "Microsoft.Storage/storageAccounts"
+    resource.properties.allowBlobPublicAccess == true
+    msg := "allowBlobPublicAccess must be false in prod-rg"
+}
+"#;
+    let input = r#"{
+        "resources": [
+            {
+                "type": "Microsoft.Storage/storageAccounts",
+                "name": "badStorage",
+                "properties": { "allowBlobPublicAccess": true }
+            }
+        ]
+    }"#;
+    let result = run_pe_with_unknowns(
+        policy,
+        Some(input),
+        None,
+        "data.bicep.deny",
+        Some(vec!["input.deployment".into()]),
+    );
+    eprintln!("pe_65: {}", serde_json::to_string_pretty(&result).unwrap());
+
+    let cond = find_residual_by_input_path(&result, "input.deployment.resourceGroupName");
+
+    // The callee stays in source_rule — the chain is additive, not a rename.
+    assert_eq!(
+        cond["source_rule"].as_str(),
+        Some("data.bicep.in_resource_group"),
+        "source_rule must continue to name the callee; got: {cond:#?}"
+    );
+
+    let chain = cond["call_chain"].as_array().unwrap_or_else(|| {
+        panic!("call_chain must be present on a helper residual; got: {cond:#?}")
+    });
+    assert_eq!(
+        chain.len(),
+        1,
+        "one-hop helper must produce exactly one calling frame; got: {chain:#?}"
+    );
+    assert_eq!(
+        chain[0]["rule"].as_str(),
+        Some("data.bicep.deny"),
+        "call_chain[0] must be the owning rule; got: {chain:#?}"
+    );
+    assert!(
+        chain[0]["rule_start_row"].is_number(),
+        "call_chain[0] must carry the owning rule's body start row so a consumer \
+         can disambiguate rule bodies; got: {chain:#?}"
+    );
+
+    let text = cond["condition"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("\"prod\""),
+        "condition must be specialized with the caller's argument; got: {text}"
+    );
+    assert!(
+        !text.contains("fragment"),
+        "condition must not leak the helper's parameter name; got: {text}"
+    );
+}
+
+/// pe_66: two-hop chain `deny -> is_regulated -> is_prod_rg`. The innermost
+/// residual must carry both calling frames root-first, so `call_chain[0]` is
+/// the owning rule regardless of depth. This is the case that a
+/// nearest-caller-only design gets wrong.
+#[test]
+fn pe_66_two_hop_chain_is_root_first() {
+    let policy = r#"
+package bicep
+import future.keywords
+
+is_prod_rg if contains(input.deployment.resourceGroupName, "prod")
+
+is_regulated if {
+    is_prod_rg
+    input.deployment.location == "eastus"
+}
+
+deny contains msg if {
+    is_regulated
+    some _, resource in input.resources
+    resource.type == "Microsoft.Storage/storageAccounts"
+    resource.properties.allowBlobPublicAccess == true
+    msg := "allowBlobPublicAccess must be false in regulated rg"
+}
+"#;
+    let input = r#"{
+        "resources": [
+            {
+                "type": "Microsoft.Storage/storageAccounts",
+                "name": "badStorage",
+                "properties": { "allowBlobPublicAccess": true }
+            }
+        ]
+    }"#;
+    let result = run_pe_with_unknowns(
+        policy,
+        Some(input),
+        None,
+        "data.bicep.deny",
+        Some(vec!["input.deployment".into()]),
+    );
+    eprintln!("pe_66: {}", serde_json::to_string_pretty(&result).unwrap());
+
+    let cond = find_residual_by_input_path(&result, "input.deployment.resourceGroupName");
+    let chain = cond["call_chain"].as_array().unwrap_or_else(|| {
+        panic!("call_chain must be present on a helper residual; got: {cond:#?}")
+    });
+
+    assert_eq!(
+        chain.len(),
+        2,
+        "two-hop chain must carry both calling frames; got: {chain:#?}"
+    );
+    assert_eq!(
+        chain[0]["rule"].as_str(),
+        Some("data.bicep.deny"),
+        "call_chain must be root-first so index 0 is the owning rule at any depth; got: {chain:#?}"
+    );
+    assert_eq!(
+        chain[1]["rule"].as_str(),
+        Some("data.bicep.is_regulated"),
+        "call_chain[1] must be the intermediate helper; got: {chain:#?}"
+    );
+    assert_eq!(
+        cond["source_rule"].as_str(),
+        Some("data.bicep.is_prod_rg"),
+        "the callee must not be duplicated into the chain; got: {cond:#?}"
+    );
+}
+
+/// pe_67: inline gate parity control. An assumption recorded directly in the
+/// rule body has no calling frame, so `call_chain` must be absent rather than
+/// empty — this proves the additive field cannot change inline output.
+#[test]
+fn pe_67_inline_gate_has_no_call_chain() {
+    let policy = r#"
+package bicep
+import future.keywords
+
+deny contains msg if {
+    contains(input.deployment.resourceGroupName, "prod")
+    some _, resource in input.resources
+    resource.type == "Microsoft.Storage/storageAccounts"
+    resource.properties.allowBlobPublicAccess == true
+    msg := "allowBlobPublicAccess must be false in prod-rg"
+}
+"#;
+    let input = r#"{
+        "resources": [
+            {
+                "type": "Microsoft.Storage/storageAccounts",
+                "name": "badStorage",
+                "properties": { "allowBlobPublicAccess": true }
+            }
+        ]
+    }"#;
+    let result = run_pe_with_unknowns(
+        policy,
+        Some(input),
+        None,
+        "data.bicep.deny",
+        Some(vec!["input.deployment".into()]),
+    );
+    eprintln!("pe_67: {}", serde_json::to_string_pretty(&result).unwrap());
+
+    let cond = find_residual_by_input_path(&result, "input.deployment.resourceGroupName");
+    assert!(
+        cond.get("call_chain").is_none(),
+        "inline gate must not emit a call_chain key at all; got: {cond:#?}"
+    );
+    assert_eq!(
+        cond["source_rule"].as_str(),
+        Some("data.bicep.deny"),
+        "inline gate attribution must be unchanged; got: {cond:#?}"
+    );
+}
+
+/// pe_68: dynamic-argument honesty control. When the caller passes a
+/// non-literal argument there is nothing to substitute, so the parameter name
+/// must survive in the condition text rather than being replaced by an
+/// invented value. The chain must still be emitted.
+#[test]
+fn pe_68_dynamic_arg_is_not_substituted() {
+    let policy = r#"
+package bicep
+import future.keywords
+
+rg_contains(fragment) if {
+    contains(input.deployment.resourceGroupName, fragment)
+    fragment != ""
+}
+
+deny contains msg if {
+    some _, resource in input.resources
+    resource.type == "Microsoft.Storage/storageAccounts"
+    rg_contains(resource.name)
+    resource.properties.allowBlobPublicAccess == true
+    msg := "allowBlobPublicAccess must be false"
+}
+"#;
+    let input = r#"{
+        "resources": [
+            {
+                "type": "Microsoft.Storage/storageAccounts",
+                "name": "prod",
+                "properties": { "allowBlobPublicAccess": true }
+            }
+        ]
+    }"#;
+    let result = run_pe_with_unknowns(
+        policy,
+        Some(input),
+        None,
+        "data.bicep.deny",
+        Some(vec!["input.deployment".into()]),
+    );
+    eprintln!("pe_68: {}", serde_json::to_string_pretty(&result).unwrap());
+
+    let cond = find_residual_by_input_path(&result, "input.deployment.resourceGroupName");
+    let chain = cond["call_chain"].as_array().unwrap_or_else(|| {
+        panic!("call_chain must be present on a helper residual; got: {cond:#?}")
+    });
+    assert_eq!(
+        chain[0]["rule"].as_str(),
+        Some("data.bicep.deny"),
+        "dynamic arguments must not prevent chain attribution; got: {chain:#?}"
+    );
+
+    let text = cond["condition"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("fragment"),
+        "a non-literal argument must leave the parameter name in place rather than \
+         inventing a value; got: {text}"
+    );
+}

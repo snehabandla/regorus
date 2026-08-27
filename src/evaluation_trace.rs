@@ -265,6 +265,33 @@ pub struct Assumption {
     /// consulted in causality mode — causality still attaches assumptions to
     /// their recording definition for explainability.
     pub orphaned: bool,
+    /// Rule frames that were on the call stack when this assumption was
+    /// recorded, outermost first, excluding the rule that recorded it (which
+    /// is already `rule_index`). Empty when the assumption was recorded
+    /// directly in the body of the rule being evaluated.
+    ///
+    /// Each rule definition opens its own conjunction scope, so a residual
+    /// recorded inside a helper lands in its own disjunct and cannot be
+    /// attributed to the rule that owns it by grouping alone. This chain is
+    /// what lets a consumer join it back to the owning rule at any call depth.
+    pub call_chain: Vec<CallFrame>,
+}
+
+/// One calling rule frame captured at assumption-record time.
+///
+/// Carries indices rather than resolved names so the trace stays cheap; the
+/// report layer resolves them against the program exactly the way it resolves
+/// the recording rule's own attribution.
+#[derive(Debug, Clone)]
+pub struct CallFrame {
+    /// Index of the calling rule.
+    pub rule_index: u16,
+    /// Definition index active in that rule when it made the call. Needed to
+    /// resolve the body start row, which is what disambiguates two bodies of
+    /// a same-named rule.
+    pub definition_index: u16,
+    /// PC of the call site inside this frame.
+    pub call_pc: u32,
 }
 
 /// Context for inverting a data lookup during partial evaluation.
@@ -528,6 +555,7 @@ impl EvaluationTrace {
         definition_index: u16,
         iteration_index: Option<u32>,
         conjunction_id: u32,
+        call_chain: Vec<CallFrame>,
     ) {
         // Pick up the current negation scope (if any) from the stack.
         let negation_scope_id = self.negation_scope_stack.last().copied();
@@ -547,6 +575,7 @@ impl EvaluationTrace {
             owned_negation_scope_id: None,
             data_lookup_context: None,
             orphaned: false,
+            call_chain,
         });
     }
 

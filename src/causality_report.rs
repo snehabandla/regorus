@@ -326,6 +326,36 @@ pub struct ResidualCondition {
     /// came from — including the multi-body same-name rule case.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_rule_start_row: Option<u32>,
+    /// Calling rule frames, outermost first, present when this condition was
+    /// recorded inside a helper that another rule invoked. `call_chain[0]` is
+    /// the rule that owns the residual at any call depth, which is the key a
+    /// consumer joins a residual back to its violation on; `source_rule`
+    /// continues to name the callee that recorded it, and is never duplicated
+    /// into the chain. Absent for a condition recorded directly in a rule body.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub call_chain: Vec<CallFrameInfo>,
+}
+
+/// One calling rule frame for a residual recorded inside a helper.
+#[derive(Debug, Clone, Serialize)]
+pub struct CallFrameInfo {
+    /// Fully-qualified name of the calling rule, e.g. `"data.bicep.deny"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    /// Source file declaring the calling rule's body. Carried alongside the
+    /// name and row because a helper may live in a different file from its
+    /// caller, and a consumer that scopes a body match by file would
+    /// otherwise fail to attribute the residual.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_file: Option<String>,
+    /// 1-based line of the first instruction of the calling rule's active
+    /// body. Carried because a name alone cannot distinguish two bodies of a
+    /// same-named rule, and a consumer that matches bodies needs both.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rule_start_row: Option<u32>,
+    /// 1-based line of the call site inside this frame.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_row: Option<u32>,
 }
 
 /// Result of partial evaluation.
@@ -543,6 +573,7 @@ fn assumption_to_residual_conditions(
                             source_row,
                             source_col,
                             source_rule_start_row,
+                            call_chain: call_chain_attribution(a, program),
                         }
                     })
                     .collect();
@@ -568,7 +599,7 @@ fn assumption_to_residual(
     let (source_rule, source_file, source_row, source_col, source_rule_start_row) =
         source_attribution(a, program);
     ResidualCondition {
-        condition: strip_trailing_comment(&a.condition_text),
+        condition: residual_condition_text(a, program),
         operator: a.operator.clone(),
         builtin_name: a.builtin_name.clone(),
         // Strip the trailing `[_]` iteration marker from `input_path` on
@@ -595,6 +626,7 @@ fn assumption_to_residual(
         source_row,
         source_col,
         source_rule_start_row,
+        call_chain: call_chain_attribution(a, program),
     }
 }
 
@@ -669,16 +701,105 @@ fn source_attribution(
     // consumer can join PE residual conjuncts to causality definitions by
     // exact equality on (rule_name, rule_start_row) — critical for the
     // multi-body same-name rule case.
-    let rule_start_row = rule_info
-        .and_then(|info| info.definitions.get(usize::from(a.definition_index)))
+    let rule_start_row = rule_body_start_row(program, a.rule_index, a.definition_index);
+    (rule_name, file, row, col, rule_start_row)
+}
+
+/// 1-based line of the first instruction of a rule definition's body.
+///
+/// Shared by the recording rule's own attribution and by each calling frame
+/// in `call_chain`, so both sides of a consumer's body-level join are computed
+/// the same way rather than by two implementations that could drift.
+fn rule_body_start_row(program: &Program, rule_index: u16, definition_index: u16) -> Option<u32> {
+    rule_body_span(program, rule_index, definition_index)
+        .map(|span| u32::try_from(span.line).unwrap_or(u32::MAX))
+}
+
+/// Span of the first instruction of a rule definition's body.
+fn rule_body_span(
+    program: &Program,
+    rule_index: u16,
+    definition_index: u16,
+) -> Option<crate::rvm::program::SpanInfo> {
+    program
+        .rule_infos
+        .get(usize::from(rule_index))
+        .and_then(|info| info.definitions.get(usize::from(definition_index)))
         .and_then(|def_pcs| def_pcs.first().copied())
         .and_then(|first_pc| {
             let idx = usize::try_from(first_pc).unwrap_or(0);
             program.instruction_spans.get(idx).cloned()
         })
         .flatten()
-        .map(|span| u32::try_from(span.line).unwrap_or(u32::MAX));
-    (rule_name, file, row, col, rule_start_row)
+}
+
+/// Name of the source file a span belongs to.
+fn span_source_name(program: &Program, span: &crate::rvm::program::SpanInfo) -> Option<String> {
+    program
+        .sources
+        .get(span.source_index)
+        .map(|source| source.name.clone())
+}
+
+/// 1-based source line for an instruction.
+fn instruction_row(program: &Program, pc: u32) -> Option<u32> {
+    let idx = usize::try_from(pc).unwrap_or(0);
+    program
+        .instruction_spans
+        .get(idx)
+        .and_then(Option::as_ref)
+        .map(|span| u32::try_from(span.line).unwrap_or(u32::MAX))
+}
+
+/// Resolve the recorded calling frames into names, files and rows, outermost
+/// first.
+fn call_chain_attribution(
+    a: &crate::evaluation_trace::Assumption,
+    program: &Program,
+) -> Vec<CallFrameInfo> {
+    a.call_chain
+        .iter()
+        .map(|frame| {
+            let body_span = rule_body_span(program, frame.rule_index, frame.definition_index);
+            CallFrameInfo {
+                rule: program
+                    .rule_infos
+                    .get(usize::from(frame.rule_index))
+                    .map(|info| info.name.clone()),
+                rule_file: body_span
+                    .as_ref()
+                    .and_then(|span| span_source_name(program, span)),
+                rule_start_row: body_span
+                    .as_ref()
+                    .map(|span| u32::try_from(span.line).unwrap_or(u32::MAX)),
+                call_row: instruction_row(program, frame.call_pc),
+            }
+        })
+        .collect()
+}
+
+/// Render a residual's condition text for display.
+///
+/// For a condition recorded inside a helper, the raw text is the helper's
+/// *definition* — rule head plus formal parameter names — which describes the
+/// helper rather than the check the caller actually requested. Reuse the
+/// causality path's helper-body rewriting to drop the head and substitute the
+/// caller's literal arguments, so both explanation surfaces phrase a
+/// helper-gated condition the same way. A non-literal argument leaves the
+/// parameter name in place rather than inventing a value.
+fn residual_condition_text(a: &crate::evaluation_trace::Assumption, program: &Program) -> String {
+    let raw = strip_trailing_comment(&a.condition_text);
+    let Some(innermost) = a.call_chain.last() else {
+        return raw;
+    };
+    // `extract_helper_arg_substitutions` locates the call by looking at the
+    // instruction *before* the pc it is given, so hand it the slot after the
+    // call site.
+    let after_call_pc = usize::try_from(innermost.call_pc)
+        .unwrap_or(0)
+        .saturating_add(1);
+    let substitutions = extract_helper_arg_substitutions(after_call_pc, a.rule_index, program);
+    rewrite_helper_body_text(&raw, &substitutions)
 }
 
 /// Strip a trailing Rego comment (`# ...`) from a rendered condition string,
@@ -2669,6 +2790,7 @@ mod tests {
             0,
             None,
             0,
+            Vec::new(),
         );
 
         let report = materialize(
