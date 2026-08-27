@@ -208,6 +208,12 @@ pub struct ConditionExplanation {
     /// nested helpers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub helper_conditions: Vec<ConditionExplanation>,
+    /// `true` when this condition had a helper call behind it that was not
+    /// expanded because `MAX_HELPER_DEPTH` was reached. Distinguishes "there
+    /// is nothing behind this condition" from "there was more and we stopped",
+    /// which are otherwise identical in the output. Omitted when `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub helper_conditions_truncated: bool,
 }
 
 /// Serde skip helper: omit the field when the boolean is `false`.
@@ -1267,8 +1273,12 @@ fn collect_helper_condition_outcomes(
 
 /// For a truthiness outer condition on a `Guard` whose backing register was
 /// written by a rule call, materialize the helper's evaluated inner
-/// conditions as structural children. Returns an empty Vec
-/// when no helper call is detected or the recursion depth cap is reached.
+/// conditions as structural children.
+///
+/// Returns the conditions plus whether expansion was cut short by the depth
+/// cap. Detection deliberately runs *before* the cap check so the two empty
+/// cases stay distinguishable: no helper call at all reports `false`, while a
+/// real helper we declined to expand reports `true`.
 fn materialize_helper_conditions(
     outer_pc: usize,
     outer_outcome_idx: usize,
@@ -1277,13 +1287,13 @@ fn materialize_helper_conditions(
     trace: &EvaluationTrace,
     settings: &ExplanationSettings,
     depth: usize,
-) -> Vec<ConditionExplanation> {
-    if depth >= MAX_HELPER_DEPTH {
-        return Vec::new();
-    }
+) -> (Vec<ConditionExplanation>, bool) {
     let Some(helper_rule_index) = detect_helper_call_at_guard(outer_pc, program) else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
+    if depth >= MAX_HELPER_DEPTH {
+        return (Vec::new(), true);
+    }
     let inner_outcomes = collect_helper_condition_outcomes(
         outer_outcome_idx,
         outer_rule_index,
@@ -1291,7 +1301,7 @@ fn materialize_helper_conditions(
         trace,
     );
     if inner_outcomes.is_empty() {
-        return Vec::new();
+        return (Vec::new(), false);
     }
     let mut inner = materialize_condition_explanations_at_depth(
         inner_outcomes,
@@ -1320,7 +1330,7 @@ fn materialize_helper_conditions(
     // move), not authorable predicates.
     inner.retain(|c| !(c.kind == "unknown" && c.text.is_empty()));
 
-    inner
+    (inner, false)
 }
 
 /// Walk backward from `outer_pc` to locate the `FunctionCall`
@@ -1752,7 +1762,7 @@ fn materialize_condition_explanations_at_depth(
         // For a truthiness condition whose backing Guard fires on a register
         // written by a rule call (`_helper(x)` or `not _helper(x)`), stitch
         // the helper's evaluated inner conditions as structural children.
-        let helper_conditions = materialize_helper_conditions(
+        let (helper_conditions, helper_conditions_truncated) = materialize_helper_conditions(
             pc_usize,
             *outcome_idx,
             outcome.rule_index,
@@ -1779,6 +1789,7 @@ fn materialize_condition_explanations_at_depth(
             builtin_name,
             negated,
             helper_conditions,
+            helper_conditions_truncated,
         });
     }
 
@@ -3034,6 +3045,7 @@ mod tests {
                 builtin_name: None,
                 negated: false,
                 helper_conditions: Vec::new(),
+                helper_conditions_truncated: false,
             },
             ConditionExplanation {
                 text: "some item in coll [matched: b]".into(),
@@ -3053,6 +3065,7 @@ mod tests {
                 builtin_name: None,
                 negated: false,
                 helper_conditions: Vec::new(),
+                helper_conditions_truncated: false,
             },
         ];
 

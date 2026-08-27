@@ -1991,6 +1991,84 @@ deny contains msg if {
 }
 
 // ===========================================================================
+// Helper nesting depth cap is observable.
+//
+// `materialize_helper_conditions` stops recursing at MAX_HELPER_DEPTH. It
+// previously returned an empty vec for that case AND for "there is no helper
+// call here", so a consumer could not tell a condition with nothing behind it
+// from one whose nesting was dropped. That is silent under-reporting, and it
+// bites exactly on the deepest policies.
+// ===========================================================================
+
+/// Recursively search a report for a condition that reported truncated
+/// helper nesting.
+fn has_truncation_flag(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map
+                .get("helper_conditions_truncated")
+                .and_then(|v| v.as_bool())
+                == Some(true)
+            {
+                return true;
+            }
+            map.values().any(has_truncation_flag)
+        }
+        serde_json::Value::Array(items) => items.iter().any(has_truncation_flag),
+        _ => false,
+    }
+}
+
+/// Build `deny -> h1 -> h2 -> ... -> hN`, each helper with a multi-line body
+/// so the compiler does not inline it at the call site and collapse the chain.
+fn nested_helper_policy(levels: usize) -> String {
+    let mut policy = String::from("package bicep\nimport rego.v1\n\n");
+    for level in 1..levels {
+        policy.push_str(&format!(
+            "h{level} if {{\n    h{next}\n    input.deployment.location == \"eastus\"\n}}\n\n",
+            next = level + 1
+        ));
+    }
+    policy.push_str(&format!(
+        "h{levels} if {{\n    contains(input.deployment.resourceGroupName, \"prod\")\n    input.deployment.location == \"eastus\"\n}}\n\n"
+    ));
+    policy.push_str("deny contains msg if {\n    h1\n    msg := \"deep chain\"\n}\n");
+    policy
+}
+
+const NESTED_HELPER_INPUT: &str = r#"{
+    "deployment": { "resourceGroupName": "prod-rg", "location": "eastus" }
+}"#;
+
+/// A chain deeper than `MAX_HELPER_DEPTH` must say so on the deepest surfaced
+/// condition, rather than looking identical to a condition with no helper
+/// behind it.
+#[test]
+fn causality_10_deep_helper_chain_reports_truncation() {
+    let policy = nested_helper_policy(9);
+    let report = run_causality_full(&policy, NESTED_HELPER_INPUT, "data.bicep.deny");
+
+    assert!(
+        has_truncation_flag(&report),
+        "a helper chain deeper than the recursion cap must report truncation somewhere; \
+         report: {report:#?}"
+    );
+}
+
+/// Control: a chain well inside the cap must omit the key entirely, so the
+/// flag cannot be always-on.
+#[test]
+fn causality_10_shallow_helper_chain_omits_truncation() {
+    let policy = nested_helper_policy(2);
+    let report = run_causality_full(&policy, NESTED_HELPER_INPUT, "data.bicep.deny");
+
+    assert!(
+        !has_truncation_flag(&report),
+        "a chain inside the cap must not report truncation; report: {report:#?}"
+    );
+}
+
+// ===========================================================================
 // Causality-9: engine report emission is deterministic.
 //
 // A host observed repeated evaluations of an unchanged policy+input producing
