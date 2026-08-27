@@ -340,6 +340,15 @@ pub struct ResidualCondition {
     /// into the chain. Absent for a condition recorded directly in a rule body.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub call_chain: Vec<CallFrameInfo>,
+    /// True when `call_chain` was cut off at `MAX_HELPER_DEPTH` and deeper
+    /// calling frames exist but are not reported. Mirrors
+    /// `ConditionExplanation::helper_conditions_truncated` so the two
+    /// explanation surfaces agree on how deep they follow helper calls, and so
+    /// a short chain caused by the cap is distinguishable from a genuinely
+    /// short one. `call_chain[0]` is retained regardless, because it is the key
+    /// consumers join a residual back to its violation on.
+    #[serde(skip_serializing_if = "core::ops::Not::not")]
+    pub call_chain_truncated: bool,
 }
 
 /// One calling rule frame for a residual recorded inside a helper.
@@ -747,6 +756,7 @@ fn assumption_to_residual_conditions(
                 .collect();
 
             if !matching_keys.is_empty() {
+                let (call_chain, call_chain_truncated) = call_chain_attribution(a, program);
                 return matching_keys
                     .into_iter()
                     .map(|key| {
@@ -774,7 +784,8 @@ fn assumption_to_residual_conditions(
                             source_row,
                             source_col,
                             source_rule_start_row,
-                            call_chain: call_chain_attribution(a, program),
+                            call_chain: call_chain.clone(),
+                            call_chain_truncated,
                         }
                     })
                     .collect();
@@ -799,6 +810,7 @@ fn assumption_to_residual(
     };
     let (source_rule, source_file, source_row, source_col, source_rule_start_row) =
         source_attribution(a, program);
+    let (call_chain, call_chain_truncated) = call_chain_attribution(a, program);
     ResidualCondition {
         condition: residual_condition_text(a, program),
         operator: a.operator.clone(),
@@ -827,7 +839,8 @@ fn assumption_to_residual(
         source_row,
         source_col,
         source_rule_start_row,
-        call_chain: call_chain_attribution(a, program),
+        call_chain,
+        call_chain_truncated,
     }
 }
 
@@ -953,13 +966,25 @@ fn instruction_row(program: &Program, pc: u32) -> Option<u32> {
 }
 
 /// Resolve the recorded calling frames into names, files and rows, outermost
-/// first.
+/// first, bounded by `MAX_HELPER_DEPTH`.
+///
+/// The cap is applied *here*, on the reported chain, and deliberately not on
+/// the recorded one: `group_meta_of` derives `caller_conjunctions` from the
+/// full `Assumption::call_chain`, so truncating at record time would break the
+/// DNF distribution's search for a parent group. Frames are dropped from the
+/// deep end, which keeps `call_chain[0]` and matches how causality stops
+/// descending rather than discarding its outermost context.
+///
+/// Returns the frames and whether any were dropped.
 fn call_chain_attribution(
     a: &crate::evaluation_trace::Assumption,
     program: &Program,
-) -> Vec<CallFrameInfo> {
-    a.call_chain
+) -> (Vec<CallFrameInfo>, bool) {
+    let truncated = a.call_chain.len() > MAX_HELPER_DEPTH;
+    let frames = a
+        .call_chain
         .iter()
+        .take(MAX_HELPER_DEPTH)
         .map(|frame| {
             let body_span = rule_body_span(program, frame.rule_index, frame.definition_index);
             CallFrameInfo {
@@ -976,7 +1001,8 @@ fn call_chain_attribution(
                 call_row: instruction_row(program, frame.call_pc),
             }
         })
-        .collect()
+        .collect();
+    (frames, truncated)
 }
 
 /// Render a residual's condition text for display.

@@ -2964,3 +2964,93 @@ fn pe_72_distribution_overflow_falls_back_and_warns() {
          warnings: {warnings:?}"
     );
 }
+
+/// Build a policy whose residual sits `helper_count` helper calls below `deny`.
+/// The innermost helper holds the only unknown-dependent condition, so the
+/// recorded chain is `deny` plus every intermediate helper.
+fn nested_helper_policy(helper_count: usize) -> String {
+    let mut policy = String::from("package bicep\nimport future.keywords\n\n");
+    policy.push_str(&format!(
+        "h{helper_count} if input.deployment.resourceGroupName == \"prod\"\n"
+    ));
+    for level in (1..helper_count).rev() {
+        policy.push_str(&format!("h{level} if h{}\n", level + 1));
+    }
+    policy.push_str("\ndeny contains msg if {\n    h1\n    msg := \"nested\"\n}\n");
+    policy
+}
+
+/// pe_73: a chain deeper than `MAX_HELPER_DEPTH` is cut off at the cap, and the
+/// cut is reported rather than silent. Without the flag a capped chain is
+/// indistinguishable from a genuinely shallow one, which is the same
+/// silent-truncation problem Step 1a fixed for causality.
+///
+/// Frames are dropped from the deep end so `call_chain[0]` survives: consumers
+/// join a residual back to its violation on the owning rule, so truncating the
+/// other way would break attribution rather than merely shorten it.
+#[test]
+fn pe_73_call_chain_beyond_depth_cap_is_truncated_and_reported() {
+    // deny -> h1 -> ... -> h9 records frames [deny, h1..h8] = 9, one past the cap.
+    let policy = nested_helper_policy(9);
+    let result = run_pe_with_unknowns(
+        &policy,
+        Some("{}"),
+        None,
+        "data.bicep.deny",
+        Some(vec!["input.deployment".into()]),
+    );
+    eprintln!("pe_73: {}", serde_json::to_string_pretty(&result).unwrap());
+
+    let cond = find_residual_by_input_path(&result, "input.deployment.resourceGroupName");
+    let chain = cond["call_chain"].as_array().unwrap_or_else(|| {
+        panic!("call_chain must be present on a helper residual; got: {cond:#?}")
+    });
+
+    assert_eq!(
+        chain.len(),
+        8,
+        "chain must be capped at MAX_HELPER_DEPTH; got: {chain:#?}"
+    );
+    assert_eq!(
+        chain[0]["rule"].as_str(),
+        Some("data.bicep.deny"),
+        "truncation must drop the deep end so the owning rule survives; got: {chain:#?}"
+    );
+    assert_eq!(
+        cond["call_chain_truncated"].as_bool(),
+        Some(true),
+        "a cut-off chain must say so, otherwise it reads as genuinely shallow; got: {cond:#?}"
+    );
+}
+
+/// pe_74: boundary control for pe_73. A chain of exactly `MAX_HELPER_DEPTH`
+/// frames is complete, so the flag must be absent rather than merely false —
+/// this pins the off-by-one and proves pe_73's flag is not always set.
+#[test]
+fn pe_74_call_chain_at_depth_cap_is_not_truncated() {
+    // deny -> h1 -> ... -> h8 records frames [deny, h1..h7] = 8, exactly the cap.
+    let policy = nested_helper_policy(8);
+    let result = run_pe_with_unknowns(
+        &policy,
+        Some("{}"),
+        None,
+        "data.bicep.deny",
+        Some(vec!["input.deployment".into()]),
+    );
+    eprintln!("pe_74: {}", serde_json::to_string_pretty(&result).unwrap());
+
+    let cond = find_residual_by_input_path(&result, "input.deployment.resourceGroupName");
+    let chain = cond["call_chain"].as_array().unwrap_or_else(|| {
+        panic!("call_chain must be present on a helper residual; got: {cond:#?}")
+    });
+
+    assert_eq!(
+        chain.len(),
+        8,
+        "a chain exactly at the cap must be reported in full; got: {chain:#?}"
+    );
+    assert!(
+        cond.get("call_chain_truncated").is_none(),
+        "an untruncated chain must omit the flag, so shallow output is unchanged; got: {cond:#?}"
+    );
+}
