@@ -738,10 +738,13 @@ impl RegoVM {
                         let condition_text =
                             alloc::format!("collection at {input_path} exists for iteration");
                         if matches!(mode, LoopMode::Every) {
-                            self.trace.warnings.push(alloc::format!(
-                                "every over unknown collection '{input_path}' at PC {} is undefined; see residual_queries for the condition it depends on",
-                                self.pc
-                            ));
+                            self.trace.warnings.push(crate::evaluation_trace::PartialEvalWarning {
+                                code: crate::evaluation_trace::PartialEvalWarningCode::EveryOverUnknown,
+                                message: alloc::format!(
+                                    "every over unknown collection '{input_path}' at PC {} is undefined; see residual_queries for the condition it depends on",
+                                    self.pc
+                                ),
+                            });
                         }
                         self.trace.record_assumption(
                             crate::evaluation_trace::AssumptionKind::CollectionExists,

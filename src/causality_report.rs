@@ -380,9 +380,11 @@ pub struct PartialEvalResult {
     pub result: Value,
     /// DNF residual queries: outer vec is OR, inner vec is AND.
     pub residual_queries: Vec<Vec<ResidualCondition>>,
-    /// Warnings or informational messages.
+    /// Non-fatal caveats about this result. Consumers should switch on
+    /// `code`; `message` carries engine-internal detail and is not
+    /// author-facing.
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub warnings: Vec<String>,
+    pub warnings: Vec<crate::evaluation_trace::PartialEvalWarning>,
 }
 
 /// Grouping metadata for one residual disjunct, taken from the assumptions
@@ -697,12 +699,13 @@ pub fn materialize_pe(
 
     let mut warnings = trace.warnings.clone();
     let residual_queries = distribute_call_conjunctions(&groups).unwrap_or_else(|| {
-        warnings.push(
-            "residual could not be distributed within the disjunct limit; conditions from \
-             called rules are reported as separate alternatives, which is broader than the \
-             policy requires"
+        warnings.push(crate::evaluation_trace::PartialEvalWarning {
+            code: crate::evaluation_trace::PartialEvalWarningCode::DistributionOverflow,
+            message: "residual could not be distributed within the disjunct limit; conditions \
+                      from called rules are reported as separate alternatives, which is broader \
+                      than the policy requires"
                 .to_string(),
-        );
+        });
         groups.iter().map(|(_, conds)| conds.clone()).collect()
     });
 

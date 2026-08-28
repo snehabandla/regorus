@@ -545,13 +545,13 @@ allow if {
         "should have comprehension soundness warning, got: {}",
         serde_json::to_string_pretty(&result).unwrap()
     );
-    let has_comprehension_warning = warnings.unwrap().iter().any(|w| {
-        w.as_str()
-            .is_some_and(|s| s.contains("comprehension") && s.contains("conditional"))
-    });
+    let has_comprehension_warning = warnings
+        .unwrap()
+        .iter()
+        .any(|w| w["code"] == "comprehension_unsound");
     assert!(
         has_comprehension_warning,
-        "should warn about comprehension being conditional on assumed inputs"
+        "should warn by code that the comprehension is conditional on assumed inputs"
     );
 }
 
@@ -661,13 +661,13 @@ allow if {
         "should have a warning about every over unknown collection, got: {}",
         serde_json::to_string_pretty(&result).unwrap()
     );
-    let has_every_warning = warnings.unwrap().iter().any(|w| {
-        w.as_str()
-            .is_some_and(|s| s.contains("every") && s.contains("unknown collection"))
-    });
+    let has_every_warning = warnings
+        .unwrap()
+        .iter()
+        .any(|w| w["code"] == "every_over_unknown");
     assert!(
         has_every_warning,
-        "should warn about every over unknown collection, got: {}",
+        "should warn by code about every over an unknown collection, got: {}",
         serde_json::to_string_pretty(&result).unwrap()
     );
 
@@ -2959,9 +2959,9 @@ fn pe_72_distribution_overflow_falls_back_and_warns() {
     assert!(
         warnings
             .iter()
-            .any(|w| w.as_str().unwrap_or_default().contains("distributed")),
-        "falling back to the undistributed shape must be reported rather than silent; \
-         warnings: {warnings:?}"
+            .any(|w| w["code"] == "distribution_overflow"),
+        "the fallback must be reported by a stable code rather than by message text, so a \
+         reworded message cannot silently break consumers; warnings: {warnings:?}"
     );
 }
 

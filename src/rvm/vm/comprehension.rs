@@ -597,11 +597,16 @@ impl RegoVM {
             && self.explanation_settings.eval_mode
                 == crate::evaluation_trace::EvaluationMode::PartialEval
         {
-            self.trace.warnings.push(alloc::format!(
-                "comprehension result at PC {} is conditional on assumed inputs; \
-                 aggregations over this result may be unsound",
-                self.pc
-            ));
+            self.trace
+                .warnings
+                .push(crate::evaluation_trace::PartialEvalWarning {
+                    code: crate::evaluation_trace::PartialEvalWarningCode::ComprehensionUnsound,
+                    message: alloc::format!(
+                        "comprehension result at PC {} is conditional on assumed inputs; \
+                         aggregations over this result may be unsound",
+                        self.pc
+                    ),
+                });
             // Record an assumption that the comprehension depends on unknown input.
             if let Some(ref hint) = context.input_provenance_hint {
                 let (rule_index, definition_index) = self.current_rule_scope();
@@ -658,11 +663,17 @@ impl RegoVM {
                         && self.explanation_settings.eval_mode
                             == crate::evaluation_trace::EvaluationMode::PartialEval
                     {
-                        self.trace.warnings.push(alloc::format!(
-                            "comprehension result at PC {} is conditional on assumed inputs; \
-                             aggregations over this result may be unsound",
-                            self.pc
-                        ));
+                        self.trace.warnings.push(
+                            crate::evaluation_trace::PartialEvalWarning {
+                                code:
+                                    crate::evaluation_trace::PartialEvalWarningCode::ComprehensionUnsound,
+                                message: alloc::format!(
+                                    "comprehension result at PC {} is conditional on assumed inputs; \
+                                     aggregations over this result may be unsound",
+                                    self.pc
+                                ),
+                            },
+                        );
                         if let Some(ref hint) = context.input_provenance_hint {
                             let (rule_index, definition_index) = self.current_rule_scope();
                             let iteration_index = self.current_loop_iteration_index();

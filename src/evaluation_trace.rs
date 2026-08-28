@@ -326,6 +326,44 @@ pub enum AssumptionKind {
 }
 
 // ---------------------------------------------------------------------------
+// Warnings
+// ---------------------------------------------------------------------------
+
+/// Stable identifier for a partial-evaluation warning.
+///
+/// Consumers switch on this rather than matching the message text, so a
+/// message can be reworded or translated without breaking them. Adding a
+/// variant is not a breaking change for consumers that handle unknown codes,
+/// hence `#[non_exhaustive]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PartialEvalWarningCode {
+    /// The residual could not be distributed within the disjunct limit, so it
+    /// is reported in its undistributed form: a strict over-approximation that
+    /// says the policy applies more often than it really does.
+    DistributionOverflow,
+    /// A comprehension yielded a value that depends on an assumed input, so
+    /// aggregations over that result may be unsound.
+    ComprehensionUnsound,
+    /// An `every` ran over a collection at an unknown path and is therefore
+    /// undefined rather than vacuously true.
+    EveryOverUnknown,
+}
+
+/// A non-fatal caveat about a partial-evaluation result.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PartialEvalWarning {
+    /// What kind of caveat this is. Part of the contract; never reworded.
+    pub code: PartialEvalWarningCode,
+    /// Diagnostic detail, including engine-internal context such as program
+    /// counters. Intended for engine debugging, not for display to a policy
+    /// author - a consumer that surfaces warnings should phrase its own
+    /// message from `code`.
+    pub message: String,
+}
+
+// ---------------------------------------------------------------------------
 // EvaluationTrace
 // ---------------------------------------------------------------------------
 
@@ -348,8 +386,8 @@ pub struct EvaluationTrace {
     pub emission_outcomes: Vec<EmissionOutcome>,
     /// Assumptions from unknown input handling.
     pub assumptions: Vec<Assumption>,
-    /// Warnings generated during evaluation (e.g. comprehension soundness).
-    pub warnings: Vec<String>,
+    /// Non-fatal caveats about the partial-evaluation result.
+    pub warnings: Vec<PartialEvalWarning>,
     /// Monotonically increasing counter for unique iteration IDs.
     pub next_iteration_id: u32,
     /// Monotonically increasing counter for conjunction scope IDs.
