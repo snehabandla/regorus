@@ -8,7 +8,11 @@
     <TestingPlatformShowTestsFailure>true</TestingPlatformShowTestsFailure>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
-  
+
+  <PropertyGroup Condition="'$(EnableRegorusTestHooks)' == 'true'">
+    <DefineConstants>$(DefineConstants);REGORUS_FFI_TEST_HOOKS</DefineConstants>
+  </PropertyGroup>
+
   <PropertyGroup>
     <UsePackageReference Condition="'$(UsePackageReference)' == ''">false</UsePackageReference>
   </PropertyGroup>

@@ -16,7 +16,7 @@ namespace Regorus.Internal
             return status switch
             {
                 RegorusStatus.Panic => new InvalidOperationException($"Regorus engine panicked: {details}"),
-                RegorusStatus.Poisoned => new InvalidOperationException($"Regorus engine is poisoned: {details}"),
+                RegorusStatus.Poisoned => new global::Regorus.RegorusPoisonedException($"Regorus engine is poisoned: {details}"),
                 _ => new InvalidOperationException(details),
             };
         }
