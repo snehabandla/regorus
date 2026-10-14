@@ -250,7 +250,9 @@ pub struct ResidualCondition {
     /// The comparison operator, e.g. `"=="`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operator: Option<String>,
-    /// The input path that is unknown, e.g. `"input.document.status"`.
+    /// The canonical input provenance path that is unknown, e.g.
+    /// `"input.document.status"`. This path identifies contributing input and
+    /// is not necessarily the textual subject rendered in `condition`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_path: Option<String>,
     /// The concrete value being compared against.
@@ -396,7 +398,7 @@ pub fn materialize_pe(
         .into_values()
         .filter_map(|mut conds| {
             conds.dedup_by(|a, b| a.condition == b.condition && a.operator == b.operator);
-            conds.retain(|c| !is_empty_placeholder(c));
+            filter_empty_placeholders_recursive(&mut conds);
             if conds.is_empty() {
                 None
             } else {
@@ -509,7 +511,10 @@ fn assumption_to_residual(
         input_path: if a.input_path.is_empty() {
             None
         } else {
-            Some(a.input_path.clone())
+            Some(match kind_str {
+                "exists" | "condition_holds" => strip_iteration_suffix(&a.input_path),
+                _ => a.input_path.clone(),
+            })
         },
         value: a.assumed_value.clone(),
         kind: kind_str.to_string(),
@@ -520,6 +525,11 @@ fn assumption_to_residual(
         source_col,
         source_rule_start_row,
     }
+}
+
+/// Strip a trailing iterator placeholder from an input path.
+fn strip_iteration_suffix(path: &str) -> String {
+    path.strip_suffix("[_]").unwrap_or(path).to_string()
 }
 
 type SourceAttribution = (
@@ -614,6 +624,16 @@ fn is_empty_placeholder(cond: &ResidualCondition) -> bool {
         && cond.input_path.is_none()
         && cond.operator.is_none()
         && cond.negated_conditions.is_empty()
+}
+
+/// Recursively remove information-free negation placeholders.
+fn filter_empty_placeholders_recursive(conditions: &mut Vec<ResidualCondition>) {
+    for cond in conditions.iter_mut() {
+        if cond.kind == "negation_holds" && !cond.negated_conditions.is_empty() {
+            filter_empty_placeholders_recursive(&mut cond.negated_conditions);
+        }
+    }
+    conditions.retain(|cond| !is_empty_placeholder(cond));
 }
 
 /// Recursively attach inner negation conditions to any `negation_holds`
@@ -1384,12 +1404,12 @@ fn format_condition_kind(kind: &crate::static_provenance::ConditionKind) -> Stri
 #[cfg(all(test, feature = "explanations"))]
 #[allow(clippy::indexing_slicing, clippy::unwrap_used)]
 mod tests {
-    use alloc::vec;
+    use alloc::{vec, vec::Vec};
 
     use super::{
-        dedupe_emission_conditions, materialize, materialize_condition_explanations,
-        materialize_conditions, materialize_rule_emissions, ConditionExplanation,
-        OperandExplanation,
+        dedupe_emission_conditions, filter_empty_placeholders_recursive, is_empty_placeholder,
+        materialize, materialize_condition_explanations, materialize_conditions,
+        materialize_rule_emissions, ConditionExplanation, OperandExplanation, ResidualCondition,
     };
     use crate::evaluation_trace::{
         AssumptionKind, ConditionMode, EvaluationTrace, ExplanationDetail, ExplanationScope,
@@ -1412,6 +1432,53 @@ mod tests {
             eval_mode: crate::evaluation_trace::EvaluationMode::Causality,
             unknowns: vec![alloc::string::String::from("input")],
         }
+    }
+
+    #[test]
+    fn pe_6_recursively_filters_empty_negation_placeholders() {
+        fn condition(
+            kind: &str,
+            text: &str,
+            negated_conditions: Vec<ResidualCondition>,
+        ) -> ResidualCondition {
+            ResidualCondition {
+                condition: text.into(),
+                operator: None,
+                input_path: None,
+                value: None,
+                kind: kind.into(),
+                negated_conditions,
+                source_rule: None,
+                source_file: None,
+                source_row: None,
+                source_col: None,
+                source_rule_start_row: None,
+            }
+        }
+
+        let empty_nested = condition("negation_holds", "", Vec::new());
+        let meaningful_nested = condition("condition_holds", "input.document.status", Vec::new());
+        let outer = condition(
+            "negation_holds",
+            "not is_restricted(input.document)",
+            vec![empty_nested, meaningful_nested],
+        );
+        let empty_top_level = condition("negation_holds", "", Vec::new());
+        let mut conditions = vec![outer, empty_top_level];
+        let mut top_level_only = conditions.clone();
+
+        top_level_only.retain(|condition| !is_empty_placeholder(condition));
+        assert_eq!(top_level_only.len(), 1);
+        assert_eq!(top_level_only[0].negated_conditions.len(), 2);
+
+        filter_empty_placeholders_recursive(&mut conditions);
+
+        assert_eq!(conditions.len(), 1);
+        assert_eq!(conditions[0].negated_conditions.len(), 1);
+        assert_eq!(
+            conditions[0].negated_conditions[0].condition,
+            "input.document.status"
+        );
     }
 
     fn settings_with_detail(

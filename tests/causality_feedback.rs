@@ -619,3 +619,96 @@ deny contains msg if {
         "expected exactly {{5, 12}} distinct source_rule_start_row values across disjuncts; got {start_rows:?}"
     );
 }
+
+// ===========================================================================
+// PE-6: canonicalize residual input paths and recursively filter empty
+// negation placeholders.
+// ===========================================================================
+#[test]
+fn pe_6_input_path_strips_iteration_suffix_on_exists_and_condition_holds() {
+    let policy = r#"
+package bicep
+import rego.v1
+
+deny contains msg if {
+    some group in input.deployment.claims.groups
+    group == "security"
+    msg := "security group must not be present"
+}
+"#;
+
+    let report = run_pe(policy, "{}", "data.bicep.deny");
+    let residual_queries = report
+        .get("residual_queries")
+        .and_then(|value| value.as_array())
+        .unwrap_or_else(|| panic!("missing residual_queries; report: {report:#?}"));
+    let mut saw_exists = false;
+    let mut saw_condition_holds = false;
+    for disjunct in residual_queries {
+        for cond in disjunct.as_array().expect("disjunct is array") {
+            let kind = cond
+                .get("kind")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let input_path = cond
+                .get("input_path")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            assert!(
+                !input_path.ends_with("[_]"),
+                "input_path must not carry [_] suffix on kind={kind}; got '{input_path}' in {cond:#?}"
+            );
+            if kind == "exists" {
+                saw_exists = true;
+                assert_eq!(input_path, "input.deployment.claims.groups");
+            }
+            if kind == "condition_holds" {
+                saw_condition_holds = true;
+                assert_eq!(input_path, "input.deployment.claims.groups");
+            }
+        }
+    }
+    assert!(
+        saw_exists,
+        "expected an exists conjunct; report: {report:#?}"
+    );
+    assert!(
+        saw_condition_holds,
+        "expected a condition_holds conjunct; report: {report:#?}"
+    );
+}
+
+#[test]
+fn pe_6_collection_exists_stays_clean() {
+    let policy = r#"
+package bicep
+import rego.v1
+
+deny contains msg if {
+    some group in input.deployment.claims.groups
+    group == "security"
+    msg := "security group must not be present"
+}
+"#;
+
+    let report = run_pe(policy, "{}", "data.bicep.deny");
+    let residual_queries = report["residual_queries"]
+        .as_array()
+        .expect("residual_queries");
+    let mut saw_collection_exists = false;
+    for disjunct in residual_queries {
+        for cond in disjunct.as_array().expect("disjunct is array") {
+            if cond.get("kind").and_then(|value| value.as_str()) == Some("collection_exists") {
+                saw_collection_exists = true;
+                assert_eq!(
+                    cond.get("input_path").and_then(|value| value.as_str()),
+                    Some("input.deployment.claims.groups")
+                );
+            }
+        }
+    }
+    assert!(
+        saw_collection_exists,
+        "expected a collection_exists conjunct; report: {report:#?}"
+    );
+}
