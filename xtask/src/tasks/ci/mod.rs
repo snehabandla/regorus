@@ -70,6 +70,7 @@ impl CiReleaseCommand {
             include_fmt: true,
             include_run_example: true,
             include_azure_policy: !self.skip_azure_policy,
+            include_azure_policy_explanations: !self.skip_azure_policy,
             include_azure_rbac: !self.skip_azure_rbac,
             include_all_features_build: !self.skip_all_features_build,
             include_no_default_features_tests: !self.skip_no_default_features_tests,
@@ -87,6 +88,7 @@ impl CiDebugCommand {
             include_fmt: false,
             include_run_example: false,
             include_azure_policy: false,
+            include_azure_policy_explanations: true,
             include_azure_rbac: true,
             include_all_features_build: true,
             include_no_default_features_tests: true,
@@ -102,6 +104,7 @@ struct CiSuiteConfig {
     include_fmt: bool,
     include_run_example: bool,
     include_azure_policy: bool,
+    include_azure_policy_explanations: bool,
     include_azure_rbac: bool,
     include_all_features_build: bool,
     include_no_default_features_tests: bool,
@@ -186,6 +189,18 @@ fn run_ci_suite(config: CiSuiteConfig) -> Result<()> {
         "cargo test (ci)",
     )?;
 
+    let explanation_features = explanation_features(config.include_azure_policy_explanations);
+    let explanation_label = format!("cargo test --features {} (ci)", explanation_features);
+    run_ci_cargo_step(
+        &workspace,
+        "test",
+        config.release,
+        config.frozen,
+        Some(explanation_features),
+        &[],
+        &explanation_label,
+    )?;
+
     if config.include_run_example {
         run_example(
             &workspace,
@@ -247,6 +262,14 @@ fn run_ci_suite(config: CiSuiteConfig) -> Result<()> {
     check_feature_combinations(&workspace, config.release, config.frozen)?;
 
     Ok(())
+}
+
+fn explanation_features(include_azure_policy: bool) -> &'static str {
+    if include_azure_policy {
+        "azure_policy,explanations"
+    } else {
+        "explanations"
+    }
 }
 
 fn join_features(features: &[String]) -> Option<String> {
@@ -380,6 +403,10 @@ fn base_cargo_args(
 /// to keep CI fast.
 fn check_feature_combinations(workspace: &Path, release: bool, frozen: bool) -> Result<()> {
     let combos: &[&str] = &[
+        // Public standalone features must encode their own transitive
+        // requirements rather than relying on the default feature set.
+        "rvm",
+        "explanations",
         // Issue #595: library consumer with std + arc + rvm but no full-opa.
         // Validates indexmap/std propagation via the weak-dep syntax.
         "std,arc,rvm",
@@ -411,5 +438,17 @@ fn check_feature_combinations(workspace: &Path, release: bool, frozen: bool) -> 
             &label,
         )?;
     }
+
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::explanation_features;
+
+    #[test]
+    fn explanation_feature_selection_respects_azure_policy_skip() {
+        assert_eq!(explanation_features(false), "explanations");
+        assert_eq!(explanation_features(true), "azure_policy,explanations");
+    }
 }
