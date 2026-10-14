@@ -13,6 +13,10 @@
     <UsePackageReference Condition="'$(UsePackageReference)' == ''">false</UsePackageReference>
   </PropertyGroup>
 
+  <PropertyGroup Condition="'$(EnableRegorusTestHooks)' == 'true' And '$(UsePackageReference)' != 'true'">
+    <DefineConstants>$(DefineConstants);REGORUS_FFI_TEST_HOOKS</DefineConstants>
+  </PropertyGroup>
+
   <ItemGroup>
     <None Include="../../../tests/**/*.*" Link="tests/%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
     <Compile Remove="AssumptionTests.cs" />
