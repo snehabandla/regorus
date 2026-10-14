@@ -21,6 +21,9 @@ pub(super) enum InstructionOutcome {
     Suspend { reason: SuspendReason },
 }
 
+#[cfg(feature = "explanations")]
+type GuardOperandCapture = (Option<Value>, Option<String>, Option<Value>, Option<String>);
+
 impl RegoVM {
     #[cfg(feature = "explanations")]
     pub(super) fn runtime_path_for_register(&self, register: u8) -> Option<alloc::string::String> {
@@ -168,6 +171,21 @@ impl RegoVM {
             None => return false,
         };
 
+        let (operator, assumed_value) = self
+            .program
+            .builtin_info_table
+            .get(usize::from(params.builtin_index))
+            .and_then(|info| {
+                let (_, value_idx) = crate::static_provenance::builtin_operand_indices(&info.name)?;
+                let value_reg = *params.arg_registers().get(value_idx)?;
+                let value = self
+                    .get_register(value_reg)
+                    .ok()
+                    .and_then(|value| (value != &Value::Undefined).then(|| value.clone()));
+                Some((Some(info.name.clone()), value))
+            })
+            .unwrap_or((None, None));
+
         let (rule_index, definition_index) = self.current_rule_scope();
         let iteration_index = self.current_loop_iteration_index();
         self.trace.record_assumption(
@@ -175,14 +193,31 @@ impl RegoVM {
             input_path,
             condition_text,
             u32::try_from(self.pc).unwrap_or(u32::MAX),
-            None,
-            None,
+            operator,
+            assumed_value,
             rule_index,
             definition_index,
             iteration_index,
             self.current_conjunction_id(),
         );
         true
+    }
+
+    #[cfg(feature = "explanations")]
+    fn capture_builtin_guard_operands(&self) -> Option<GuardOperandCapture> {
+        let info = self.program.condition_infos.get(self.pc)?.as_ref()?;
+        info.builtin_name.as_ref()?;
+        let operands = info.operands.as_ref()?;
+        Some((
+            self.get_register(operands.left_reg).ok().cloned(),
+            self.provenance
+                .get(operands.left_reg)
+                .map(|path| path.as_ref().to_string()),
+            self.get_register(operands.right_reg).ok().cloned(),
+            self.provenance
+                .get(operands.right_reg)
+                .map(|path| path.as_ref().to_string()),
+        ))
     }
 
     #[cfg(feature = "explanations")]
@@ -870,16 +905,27 @@ impl RegoVM {
                 #[cfg(feature = "explanations")]
                 if self.explanation_settings.enabled {
                     let pc = u32::try_from(self.pc).unwrap_or(u32::MAX);
+                    let (actual, actual_path, expected, expected_path) =
+                        if let Some(operands) = self.capture_builtin_guard_operands() {
+                            operands
+                        } else {
+                            (
+                                Some(value),
+                                self.provenance
+                                    .get(register)
+                                    .map(|path| path.as_ref().to_string()),
+                                None,
+                                None,
+                            )
+                        };
                     self.trace.record_condition(
                         pc,
                         passed,
                         assumed,
-                        Some(value),
-                        self.provenance
-                            .get(register)
-                            .map(|path| path.as_ref().to_string()),
-                        None,
-                        None,
+                        actual,
+                        actual_path,
+                        expected,
+                        expected_path,
                     );
                 }
                 self.handle_condition(passed)?;

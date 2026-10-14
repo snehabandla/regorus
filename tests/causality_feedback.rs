@@ -86,6 +86,37 @@ fn all_conditions(report: &serde_json::Value) -> Vec<&serde_json::Value> {
     out
 }
 
+fn assert_builtin_condition_shape(
+    report: &serde_json::Value,
+    text_needle: &str,
+    expected_builtin_name: &str,
+    expected_subject_provenance_contains: &str,
+    expected_right_value: serde_json::Value,
+) {
+    let cond = find_condition(report, text_needle).unwrap_or_else(|| {
+        panic!("missing builtin condition matching '{text_needle}'; report: {report:#?}")
+    });
+    assert_eq!(cond.get("kind").and_then(|v| v.as_str()), Some("builtin"));
+    assert_eq!(
+        cond.get("builtin_name").and_then(|v| v.as_str()),
+        Some(expected_builtin_name)
+    );
+    let left_provenance = cond
+        .get("left")
+        .and_then(|left| left.get("provenance"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(
+        left_provenance.starts_with("input.resources")
+            && left_provenance.contains(expected_subject_provenance_contains),
+        "unexpected subject provenance for {expected_builtin_name}: {cond:#?}"
+    );
+    assert_eq!(
+        cond.get("right").and_then(|right| right.get("value")),
+        Some(&expected_right_value)
+    );
+}
+
 // ===========================================================================
 // Causality-2:  `not X == Y` should carry operator/operand provenance
 // ===========================================================================
@@ -539,6 +570,302 @@ deny contains msg if {
     assert!(
         found_location_cond,
         "expected a residual condition referencing input.deployment.location; got: {result:#?}"
+    );
+}
+
+// ===========================================================================
+// Causality-5(a): builtin guards carry structured operands.
+// ===========================================================================
+
+#[test]
+fn causality_5a_startswith_carries_structured_operands() {
+    let policy = r#"
+package bicep
+import rego.v1
+
+deny contains msg if {
+    some resource in input.resources
+    resource.type == "Microsoft.Storage/storageAccounts"
+    lower(resource.name) == "premiumsa"
+    startswith(resource.sku.name, "Premium")
+    msg := sprintf("Storage '%s' uses Premium SKU", [resource.name])
+}
+"#;
+    let input = r#"{
+        "resources": [{
+            "type": "Microsoft.Storage/storageAccounts",
+            "name": "premiumSA",
+            "sku": { "name": "Premium_LRS" }
+        }]
+    }"#;
+
+    let report = run_causality_full(policy, input, "data.bicep.deny");
+    assert_builtin_condition_shape(
+        &report,
+        "startswith(resource.sku.name",
+        "startswith",
+        "sku.name",
+        serde_json::json!("Premium"),
+    );
+
+    for needle in ["resource.type ==", "lower(resource.name) =="] {
+        let condition = find_condition(&report, needle)
+            .unwrap_or_else(|| panic!("missing negative control '{needle}': {report:#?}"));
+        assert_eq!(condition["kind"], "comparison");
+        assert!(
+            condition.get("builtin_name").is_none(),
+            "non-guard builtin/comparison must not become a builtin condition: {condition:#?}"
+        );
+    }
+
+    let report = run_causality_full(
+        r#"
+package bicep
+import rego.v1
+
+result := startswith("x", input.a)
+result := false if {
+    input.b == "y"
+}
+"#,
+        r#"{"a":"q","b":"y","secret":"s3cr3t"}"#,
+        "data.bicep.result",
+    );
+    let condition = find_condition(&report, "input.b ==")
+        .unwrap_or_else(|| panic!("missing cross-definition negative control: {report:#?}"));
+    assert_eq!(condition["kind"], "comparison");
+    assert!(condition.get("builtin_name").is_none());
+    assert!(
+        condition["left"]["provenance"]
+            .as_str()
+            .is_some_and(|path| path.contains("input.b")),
+        "comparison picked up stale builtin operands: {condition:#?}"
+    );
+
+    let report = run_causality_full(
+        r#"
+package bicep
+import rego.v1
+
+deny contains msg if {
+    some resource in input.resources
+    startswith(resource.name, "prod-", false)
+    msg := resource.name
+}
+"#,
+        r#"{"resources":[{"name":"dev-svc"}]}"#,
+        "data.bicep.deny",
+    );
+    let condition = find_condition(&report, "startswith(resource.name")
+        .unwrap_or_else(|| panic!("missing output-argument negative control: {report:#?}"));
+    assert_ne!(condition["kind"], "builtin");
+    assert!(condition.get("builtin_name").is_none());
+}
+
+#[test]
+fn causality_5a_pe_residual_carries_builtin_operator_and_value() {
+    let policy = r#"
+package bicep
+import rego.v1
+
+deny contains msg if {
+    some resource in input.resources
+    startswith(input.deployment.resourceGroupName, "prod-")
+    msg := sprintf("Resource '%s' in prod group", [resource.name])
+}
+"#;
+    let input = r#"{"resources": [{ "name": "sa1" }]}"#;
+
+    let result = run_pe(policy, input, "data.bicep.deny");
+    let condition = result["residual_queries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|query| query.as_array().unwrap())
+        .find(|condition| condition["operator"] == "startswith")
+        .unwrap_or_else(|| panic!("missing structured builtin residual: {result:#?}"));
+    assert_eq!(condition["value"], "prod-");
+    assert_eq!(
+        condition["input_path"],
+        "input.deployment.resourceGroupName"
+    );
+}
+
+#[test]
+fn causality_5a_negated_builtin_still_carries_operands() {
+    let policy = r#"
+package bicep
+import rego.v1
+
+deny contains msg if {
+    some resource in input.resources
+    not startswith(resource.name, "test-")
+    msg := sprintf("Resource '%s' must start with test-", [resource.name])
+}
+"#;
+    let input = r#"{"resources": [{ "name": "prodResource1" }]}"#;
+
+    let report = run_causality_full(policy, input, "data.bicep.deny");
+    let condition = find_condition(&report, "not startswith(resource.name")
+        .unwrap_or_else(|| panic!("missing negated builtin condition: {report:#?}"));
+    assert_eq!(condition["kind"], "negation");
+    assert_eq!(condition["builtin_name"], "startswith");
+    assert!(
+        condition["left"]["provenance"]
+            .as_str()
+            .is_some_and(|path| path.contains("name")),
+        "missing subject provenance: {condition:#?}"
+    );
+    assert_eq!(condition["right"]["value"], "test-");
+}
+
+#[test]
+fn causality_5a_regex_match_carries_reversed_operands() {
+    let policy = r#"
+package bicep
+import rego.v1
+
+deny contains msg if {
+    some resource in input.resources
+    regex.match("^prod-", resource.name)
+    msg := sprintf("Resource '%s' uses prod prefix", [resource.name])
+}
+"#;
+    let input = r#"{"resources": [{ "name": "prod-svc1" }]}"#;
+    let report = run_causality_full(policy, input, "data.bicep.deny");
+    assert_builtin_condition_shape(
+        &report,
+        "regex.match",
+        "regex.match",
+        "name",
+        serde_json::json!("^prod-"),
+    );
+}
+
+#[test]
+fn causality_5a_endswith_covered() {
+    let policy = r#"
+package bicep
+import rego.v1
+deny contains msg if {
+    some resource in input.resources
+    endswith(resource.name, "-prod")
+    msg := resource.name
+}
+"#;
+    let report = run_causality_full(
+        policy,
+        r#"{"resources": [{ "name": "svc-prod" }]}"#,
+        "data.bicep.deny",
+    );
+    assert_builtin_condition_shape(
+        &report,
+        "endswith(resource.name",
+        "endswith",
+        "name",
+        serde_json::json!("-prod"),
+    );
+}
+
+#[test]
+fn causality_5a_contains_builtin_covered() {
+    let policy = r#"
+package bicep
+import rego.v1
+deny contains msg if {
+    some resource in input.resources
+    contains(resource.name, "prod")
+    msg := resource.name
+}
+"#;
+    let report = run_causality_full(
+        policy,
+        r#"{"resources": [{ "name": "sa-prod-eastus" }]}"#,
+        "data.bicep.deny",
+    );
+    assert_builtin_condition_shape(
+        &report,
+        "contains(resource.name",
+        "contains",
+        "name",
+        serde_json::json!("prod"),
+    );
+}
+
+#[test]
+fn causality_5a_any_prefix_match_covered() {
+    let policy = r#"
+package bicep
+import rego.v1
+deny contains msg if {
+    some resource in input.resources
+    strings.any_prefix_match(resource.name, ["prod-", "prd-"])
+    msg := resource.name
+}
+"#;
+    let report = run_causality_full(
+        policy,
+        r#"{"resources": [{ "name": "prod-svc1" }]}"#,
+        "data.bicep.deny",
+    );
+    assert_builtin_condition_shape(
+        &report,
+        "strings.any_prefix_match",
+        "strings.any_prefix_match",
+        "name",
+        serde_json::json!(["prod-", "prd-"]),
+    );
+}
+
+#[test]
+fn causality_5a_any_suffix_match_covered() {
+    let policy = r#"
+package bicep
+import rego.v1
+deny contains msg if {
+    some resource in input.resources
+    strings.any_suffix_match(resource.name, ["-prod", "-prd"])
+    msg := resource.name
+}
+"#;
+    let report = run_causality_full(
+        policy,
+        r#"{"resources": [{ "name": "svc1-prod" }]}"#,
+        "data.bicep.deny",
+    );
+    assert_builtin_condition_shape(
+        &report,
+        "strings.any_suffix_match",
+        "strings.any_suffix_match",
+        "name",
+        serde_json::json!(["-prod", "-prd"]),
+    );
+}
+
+#[test]
+fn causality_5a_cidr_contains_covered() {
+    let policy = r#"
+package bicep
+import rego.v1
+deny contains msg if {
+    some resource in input.resources
+    net.cidr_contains("10.0.0.0/8", resource.properties.ipAddress)
+    msg := resource.name
+}
+"#;
+    let input = r#"{
+        "resources": [{
+            "name": "vm1",
+            "properties": { "ipAddress": "10.1.2.3" }
+        }]
+    }"#;
+    let report = run_causality_full(policy, input, "data.bicep.deny");
+    assert_builtin_condition_shape(
+        &report,
+        "net.cidr_contains",
+        "net.cidr_contains",
+        "ipAddress",
+        serde_json::json!("10.0.0.0/8"),
     );
 }
 
