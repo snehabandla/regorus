@@ -541,3 +541,253 @@ deny contains msg if {
         "expected a residual condition referencing input.deployment.location; got: {result:#?}"
     );
 }
+
+// ===========================================================================
+// Causality-9: engine report emission is deterministic.
+// ===========================================================================
+
+fn run_causality_full_raw(policy: &str, input_json: &str, entrypoint_str: &str) -> String {
+    let mut engine = Engine::new();
+    engine
+        .add_policy("test.rego".into(), policy.into())
+        .unwrap();
+
+    let entrypoint: Rc<str> = entrypoint_str.into();
+    let compiled = engine.compile_with_entrypoint(&entrypoint).unwrap();
+    let program =
+        languages::rego::compiler::Compiler::compile_from_policy(&compiled, &[entrypoint.as_ref()])
+            .unwrap();
+
+    let mut vm = rvm::RegoVM::new_with_policy(compiled);
+    vm.load_program(program);
+    vm.set_explanation_settings(evaluation_trace::ExplanationSettings {
+        enabled: true,
+        value_mode: evaluation_trace::ValueMode::Full,
+        condition_mode: evaluation_trace::ConditionMode::AllContributing,
+        scope: evaluation_trace::ExplanationScope::AllEmissions,
+        detail: evaluation_trace::ExplanationDetail::Full,
+        emission_index: None,
+        emission_value: None,
+        assume_unknown_input: false,
+        eval_mode: evaluation_trace::EvaluationMode::Causality,
+        ..Default::default()
+    });
+
+    let input: Value = serde_json::from_str(input_json).unwrap();
+    vm.set_input(input);
+    let value = vm.execute_entry_point_by_name(entrypoint_str).unwrap();
+    vm.take_causality_report(value).unwrap()
+}
+
+fn run_pe_raw(policy: &str, input_json: &str, entrypoint_str: &str) -> String {
+    let mut engine = Engine::new();
+    engine
+        .add_policy("policy.rego".into(), policy.into())
+        .unwrap();
+
+    let entrypoint: Rc<str> = entrypoint_str.into();
+    let compiled = engine.compile_with_entrypoint(&entrypoint).unwrap();
+    let program =
+        languages::rego::compiler::Compiler::compile_from_policy(&compiled, &[entrypoint.as_ref()])
+            .unwrap();
+
+    let mut vm = rvm::RegoVM::new_with_policy(compiled);
+    vm.load_program(program);
+    vm.set_explanation_settings(evaluation_trace::ExplanationSettings {
+        enabled: true,
+        value_mode: evaluation_trace::ValueMode::Full,
+        condition_mode: evaluation_trace::ConditionMode::AllContributing,
+        scope: evaluation_trace::ExplanationScope::AllEmissions,
+        detail: evaluation_trace::ExplanationDetail::Full,
+        emission_index: None,
+        emission_value: None,
+        assume_unknown_input: true,
+        eval_mode: evaluation_trace::EvaluationMode::PartialEval,
+        unknowns: vec!["input.deployment".into()],
+    });
+
+    let input: Value = serde_json::from_str(input_json).unwrap();
+    vm.set_input(input);
+    let value = vm.execute_entry_point_by_name(entrypoint_str).unwrap();
+    vm.take_partial_eval_result(value).unwrap()
+}
+
+const DETERMINISM_POLICY: &str = r#"
+package bicep
+import rego.v1
+
+in_prod if {
+    input.deployment.resourceGroupName == "prod-rg"
+}
+
+deny contains msg if {
+    some r in input.resources
+    r.type == "Microsoft.Storage/storageAccounts"
+    r.properties.supportsHttpsTrafficOnly == false
+    msg := sprintf("Storage '%s' must enable HTTPS", [r.name])
+}
+
+deny contains msg if {
+    some r in input.resources
+    r.type == "Microsoft.Storage/storageAccounts"
+    r.properties.allowBlobPublicAccess == true
+    msg := sprintf("Storage '%s' must not allow public blobs", [r.name])
+}
+
+deny contains msg if {
+    some r in input.resources
+    r.type == "Microsoft.Network/networkSecurityGroups"
+    some rule in r.properties.securityRules
+    rule.properties.access == "Allow"
+    rule.properties.sourceAddressPrefix == "*"
+    msg := sprintf("NSG '%s' has open ingress rule '%s'", [r.name, rule.name])
+}
+
+deny contains msg if {
+    some r in input.resources
+    r.type == "Microsoft.KeyVault/vaults"
+    r.properties.enableSoftDelete == false
+    in_prod
+    msg := sprintf("KV '%s' in prod must enable soft delete", [r.name])
+}
+"#;
+
+const DETERMINISM_INPUT: &str = r#"{
+    "resources": [
+        {
+            "type": "Microsoft.Storage/storageAccounts",
+            "name": "stg1",
+            "properties": {
+                "supportsHttpsTrafficOnly": false,
+                "allowBlobPublicAccess": true
+            }
+        },
+        {
+            "type": "Microsoft.Storage/storageAccounts",
+            "name": "stg2",
+            "properties": {
+                "supportsHttpsTrafficOnly": true,
+                "allowBlobPublicAccess": false
+            }
+        },
+        {
+            "type": "Microsoft.Network/networkSecurityGroups",
+            "name": "nsg1",
+            "properties": {
+                "securityRules": [
+                    {"name": "rule1", "properties": {"access": "Allow", "sourceAddressPrefix": "*"}},
+                    {"name": "rule2", "properties": {"access": "Deny", "sourceAddressPrefix": "10.0.0.0/8"}}
+                ]
+            }
+        },
+        {
+            "type": "Microsoft.KeyVault/vaults",
+            "name": "kv1",
+            "properties": {
+                "enableSoftDelete": false
+            }
+        }
+    ],
+    "deployment": {
+        "resourceGroupName": "prod-rg"
+    }
+}"#;
+
+const PE_DETERMINISM_POLICY: &str = r#"
+package bicep
+import rego.v1
+
+deny contains msg if {
+    input.deployment.status == "public"
+    input.deployment.department == input.request.department
+    msg := "public deployment"
+}
+
+deny contains msg if {
+    input.deployment.owner == input.request.user
+    msg := "owned deployment"
+}
+"#;
+
+const PE_DETERMINISM_INPUT: &str = r#"{
+    "request": {
+        "department": "engineering",
+        "user": "alice"
+    }
+}"#;
+
+fn assert_nontrivial_residuals(raw: &str) {
+    let result: serde_json::Value = serde_json::from_str(raw).unwrap();
+    let queries = result["residual_queries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing residual_queries; got: {result:#?}"));
+    assert!(
+        queries.len() >= 2,
+        "expected at least two residual disjuncts; got: {result:#?}"
+    );
+    let max_condition_count = queries
+        .iter()
+        .map(|query| query.as_array().map_or(0, Vec::len))
+        .max()
+        .unwrap_or(0);
+    assert!(
+        max_condition_count >= 2,
+        "expected a residual disjunct with at least two conditions; got: {result:#?}"
+    );
+}
+
+#[test]
+fn causality_9_report_is_deterministic() {
+    let first = run_causality_full_raw(DETERMINISM_POLICY, DETERMINISM_INPUT, "data.bicep.deny");
+    let second = run_causality_full_raw(DETERMINISM_POLICY, DETERMINISM_INPUT, "data.bicep.deny");
+    assert_eq!(
+        first, second,
+        "two causality runs on identical inputs must produce byte-identical reports"
+    );
+
+    let changed_input = DETERMINISM_INPUT.replace("\"prod-rg\"", "\"dev-rg\"");
+    let changed = run_causality_full_raw(DETERMINISM_POLICY, &changed_input, "data.bicep.deny");
+    assert_ne!(
+        first, changed,
+        "the determinism comparison must remain sensitive to a genuinely different report"
+    );
+}
+
+#[test]
+fn causality_9_pe_residual_order_stable() {
+    let first = run_pe_raw(
+        PE_DETERMINISM_POLICY,
+        PE_DETERMINISM_INPUT,
+        "data.bicep.deny",
+    );
+    let second = run_pe_raw(
+        PE_DETERMINISM_POLICY,
+        PE_DETERMINISM_INPUT,
+        "data.bicep.deny",
+    );
+    assert_nontrivial_residuals(&first);
+    assert_eq!(
+        first, second,
+        "two PE runs on identical inputs must produce byte-identical residual output"
+    );
+
+    let changed_input = PE_DETERMINISM_INPUT.replace("\"alice\"", "\"bob\"");
+    let changed = run_pe_raw(PE_DETERMINISM_POLICY, &changed_input, "data.bicep.deny");
+    assert_nontrivial_residuals(&changed);
+    assert_ne!(
+        first, changed,
+        "the PE determinism comparison must remain sensitive to a genuinely different residual"
+    );
+}
+
+#[test]
+fn causality_9_report_stable_across_ten_runs() {
+    let first = run_causality_full_raw(DETERMINISM_POLICY, DETERMINISM_INPUT, "data.bicep.deny");
+    for run in 1..10 {
+        let next = run_causality_full_raw(DETERMINISM_POLICY, DETERMINISM_INPUT, "data.bicep.deny");
+        assert_eq!(
+            first, next,
+            "causality report changed between run 0 and run {run}"
+        );
+    }
+}
