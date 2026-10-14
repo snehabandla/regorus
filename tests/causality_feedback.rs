@@ -147,9 +147,10 @@ deny contains msg if {
 
     assert_eq!(
         cond.get("kind").and_then(|v| v.as_str()),
-        Some("negation"),
-        "not <comparison> should carry kind=negation, not truthiness; got: {cond:#?}"
+        Some("comparison"),
+        "not <comparison> should retain comparison kind; got: {cond:#?}"
     );
+    assert_eq!(cond.get("negated").and_then(|v| v.as_bool()), Some(true));
     assert_eq!(
         cond.get("operator").and_then(|v| v.as_str()),
         Some("=="),
@@ -197,9 +198,10 @@ deny contains msg if {
 
     assert_eq!(
         cond.get("kind").and_then(|v| v.as_str()),
-        Some("negation"),
-        "not <builtin> should be reported as kind=negation, not truthiness; got: {cond:#?}"
+        Some("builtin"),
+        "not <builtin> should retain builtin kind; got: {cond:#?}"
     );
+    assert_eq!(cond.get("negated").and_then(|v| v.as_bool()), Some(true));
 
     // For builtin-call negations we may not surface an operator, but we
     // should at least attach the input-rooted provenance of the argument
@@ -708,7 +710,8 @@ deny contains msg if {
     let report = run_causality_full(policy, input, "data.bicep.deny");
     let condition = find_condition(&report, "not startswith(resource.name")
         .unwrap_or_else(|| panic!("missing negated builtin condition: {report:#?}"));
-    assert_eq!(condition["kind"], "negation");
+    assert_eq!(condition["kind"], "builtin");
+    assert_eq!(condition["negated"], true);
     assert_eq!(condition["builtin_name"], "startswith");
     assert!(
         condition["left"]["provenance"]
@@ -867,6 +870,117 @@ deny contains msg if {
         "ipAddress",
         serde_json::json!("10.0.0.0/8"),
     );
+}
+
+// ===========================================================================
+// Causality-5(b): negation is orthogonal to condition kind.
+// ===========================================================================
+
+#[test]
+fn causality_5b_negated_comparison_full_shape() {
+    let policy = r#"
+package bicep
+import rego.v1
+
+deny contains msg if {
+    some resource in input.resources
+    not resource.properties.minimumTlsVersion == "TLS1_0"
+    msg := resource.name
+}
+"#;
+    let input = r#"{
+        "resources": [{
+            "name": "stg1",
+            "properties": { "minimumTlsVersion": "TLS1_2" }
+        }]
+    }"#;
+
+    let report = run_causality_full(policy, input, "data.bicep.deny");
+    let condition = find_condition(&report, "not resource.properties.minimumTlsVersion")
+        .unwrap_or_else(|| panic!("missing negated comparison: {report:#?}"));
+    assert_eq!(condition["kind"], "comparison");
+    assert_eq!(condition["negated"], true);
+    assert_eq!(condition["operator"], "==");
+    assert!(condition["left"]["provenance"]
+        .as_str()
+        .is_some_and(|path| path.contains("minimumTlsVersion")));
+    assert_eq!(condition["right"]["value"], "TLS1_0");
+}
+
+#[test]
+fn causality_5b_opaque_negation_emits_truthiness() {
+    let policy = r#"
+package bicep
+import rego.v1
+
+deny contains msg if {
+    some resource in input.resources
+    not is_string(resource.name)
+    msg := "resource.name must be a string"
+}
+"#;
+    let report = run_causality_full(
+        policy,
+        r#"{"resources": [{ "name": 42 }]}"#,
+        "data.bicep.deny",
+    );
+    let condition = find_condition(&report, "not is_string(resource.name")
+        .unwrap_or_else(|| panic!("missing opaque negation: {report:#?}"));
+    assert_eq!(condition["kind"], "truthiness");
+    assert_eq!(condition["negated"], true);
+    assert!(
+        all_conditions(&report)
+            .iter()
+            .filter(|candidate| *candidate != &condition)
+            .all(|candidate| candidate.get("negated").is_none()),
+        "negation leaked to unrelated conditions: {report:#?}"
+    );
+
+    let report = run_causality_full(
+        r#"
+package bicep
+import rego.v1
+
+deny contains "input" if {
+    not input.disabled
+}
+
+deny contains "literal" if {
+    not false
+}
+"#,
+        r#"{"disabled":false}"#,
+        "data.bicep.deny",
+    );
+    for needle in ["not input.disabled", "not false"] {
+        let condition = find_condition(&report, needle)
+            .unwrap_or_else(|| panic!("missing truthiness negation '{needle}': {report:#?}"));
+        assert_eq!(condition["kind"], "truthiness");
+        assert_eq!(condition["negated"], true);
+    }
+}
+
+#[test]
+fn causality_5b_positive_omits_negated_key() {
+    let policy = r#"
+package bicep
+import rego.v1
+
+deny contains msg if {
+    some resource in input.resources
+    resource.type == "Microsoft.Storage/storageAccounts"
+    msg := resource.name
+}
+"#;
+    let report = run_causality_full(
+        policy,
+        r#"{"resources": [{"type":"Microsoft.Storage/storageAccounts","name":"stg1"}]}"#,
+        "data.bicep.deny",
+    );
+    let condition = find_condition(&report, "resource.type ==")
+        .unwrap_or_else(|| panic!("missing positive comparison: {report:#?}"));
+    assert_eq!(condition["kind"], "comparison");
+    assert!(condition.get("negated").is_none());
 }
 
 // ===========================================================================

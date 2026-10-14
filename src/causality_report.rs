@@ -188,6 +188,13 @@ pub struct ConditionExplanation {
     /// For builtin conditions: the builtin function name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub builtin_name: Option<String>,
+    /// Whether this condition's truth is inverted.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub negated: bool,
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Witness summary for a loop-backed condition.
@@ -1048,6 +1055,7 @@ fn materialize_condition_explanations(
         let witness = materialize_loop_witness(outcome, trace);
         let binding_name = static_info.and_then(|i| i.binding_name.clone());
         let builtin_name = static_info.and_then(|i| i.builtin_name.clone());
+        let negated = static_info.is_some_and(|i| i.negated);
         let text = decorate_condition_text(base_text, static_info, left.as_ref());
 
         conditions.push(ConditionExplanation {
@@ -1061,6 +1069,7 @@ fn materialize_condition_explanations(
             witness,
             binding_name,
             builtin_name,
+            negated,
         });
     }
 
@@ -1354,7 +1363,6 @@ fn format_condition_kind(kind: &crate::static_provenance::ConditionKind) -> Stri
         ConditionKind::Truthiness => "truthiness",
         ConditionKind::Existence => "existence",
         ConditionKind::EqualityAssertion => "equality_assertion",
-        ConditionKind::Negation => "negation",
         ConditionKind::Binding => "binding",
         ConditionKind::Builtin => "builtin",
     }
@@ -1427,6 +1435,7 @@ mod tests {
                 has_input_operand: false,
                 binding_name: None,
                 builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1438,6 +1447,7 @@ mod tests {
                 has_input_operand: false,
                 binding_name: None,
                 builtin_name: None,
+                negated: false,
             }),
         ];
 
@@ -1489,6 +1499,7 @@ mod tests {
                 has_input_operand: false,
                 binding_name: None,
                 builtin_name: None,
+                negated: false,
             }),
         ];
 
@@ -1532,6 +1543,7 @@ mod tests {
                 has_input_operand: false,
                 binding_name: None,
                 builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1543,6 +1555,7 @@ mod tests {
                 has_input_operand: false,
                 binding_name: None,
                 builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1554,6 +1567,7 @@ mod tests {
                 has_input_operand: false,
                 binding_name: None,
                 builtin_name: None,
+                negated: false,
             }),
         ];
         let rule_info = RuleInfo::new(
@@ -1630,6 +1644,7 @@ mod tests {
                 has_input_operand: false,
                 binding_name: None,
                 builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1641,6 +1656,7 @@ mod tests {
                 has_input_operand: false,
                 binding_name: None,
                 builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1652,6 +1668,7 @@ mod tests {
                 has_input_operand: false,
                 binding_name: None,
                 builtin_name: None,
+                negated: false,
             }),
         ];
         let rule_info = RuleInfo::new(
@@ -1716,6 +1733,7 @@ mod tests {
                 has_input_operand: false,
                 binding_name: None,
                 builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1727,6 +1745,7 @@ mod tests {
                 has_input_operand: false,
                 binding_name: None,
                 builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1738,6 +1757,7 @@ mod tests {
                 has_input_operand: false,
                 binding_name: None,
                 builtin_name: None,
+                negated: false,
             }),
         ];
         let rule_info = RuleInfo::new(
@@ -1800,6 +1820,7 @@ mod tests {
                 has_input_operand: false,
                 binding_name: None,
                 builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1811,6 +1832,7 @@ mod tests {
                 has_input_operand: false,
                 binding_name: None,
                 builtin_name: None,
+                negated: false,
             }),
         ];
         let rule_info = RuleInfo::new(
@@ -1873,6 +1895,7 @@ mod tests {
                 has_input_operand: false,
                 binding_name: None,
                 builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1884,6 +1907,7 @@ mod tests {
                 has_input_operand: false,
                 binding_name: None,
                 builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1895,6 +1919,7 @@ mod tests {
                 has_input_operand: false,
                 binding_name: None,
                 builtin_name: None,
+                negated: false,
             }),
         ];
 
@@ -1961,6 +1986,7 @@ mod tests {
                 has_input_operand: false,
                 binding_name: None,
                 builtin_name: None,
+                negated: false,
             }),
         ];
 
@@ -2014,6 +2040,7 @@ mod tests {
                 has_input_operand: false,
                 binding_name: None,
                 builtin_name: None,
+                negated: false,
             }),
             None,
         ];
@@ -2081,6 +2108,7 @@ mod tests {
                 has_input_operand: false,
                 binding_name: None,
                 builtin_name: None,
+                negated: false,
             }),
         ];
 
@@ -2133,6 +2161,7 @@ mod tests {
                 has_input_operand: false,
                 binding_name: None,
                 builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -2144,6 +2173,7 @@ mod tests {
                 has_input_operand: false,
                 binding_name: None,
                 builtin_name: None,
+                negated: false,
             }),
         ];
 
@@ -2227,6 +2257,7 @@ mod tests {
                 has_input_operand: false,
                 binding_name: None,
                 builtin_name: None,
+                negated: false,
             }),
         ];
 
@@ -2272,6 +2303,7 @@ mod tests {
                 witness: None,
                 binding_name: None,
                 builtin_name: None,
+                negated: false,
             },
             ConditionExplanation {
                 text: "some item in coll [matched: b]".into(),
@@ -2288,6 +2320,7 @@ mod tests {
                 witness: None,
                 binding_name: None,
                 builtin_name: None,
+                negated: false,
             },
         ];
 

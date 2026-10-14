@@ -221,6 +221,25 @@ impl RegoVM {
     }
 
     #[cfg(feature = "explanations")]
+    fn capture_negated_comparison_operands(&self) -> Option<GuardOperandCapture> {
+        let info = self.program.condition_infos.get(self.pc)?.as_ref()?;
+        if !info.negated || info.builtin_name.is_some() || info.operator.is_none() {
+            return None;
+        }
+        let operands = info.operands.as_ref()?;
+        Some((
+            self.get_register(operands.left_reg).ok().cloned(),
+            self.provenance
+                .get(operands.left_reg)
+                .map(|path| path.as_ref().to_string()),
+            self.get_register(operands.right_reg).ok().cloned(),
+            self.provenance
+                .get(operands.right_reg)
+                .map(|path| path.as_ref().to_string()),
+        ))
+    }
+
+    #[cfg(feature = "explanations")]
     fn maybe_assume_guard_condition(&mut self, register: u8, mode: GuardMode) -> bool {
         if !self.explanation_settings.assume_unknown_input {
             return false;
@@ -907,6 +926,8 @@ impl RegoVM {
                     let pc = u32::try_from(self.pc).unwrap_or(u32::MAX);
                     let (actual, actual_path, expected, expected_path) =
                         if let Some(operands) = self.capture_builtin_guard_operands() {
+                            operands
+                        } else if let Some(operands) = self.capture_negated_comparison_operands() {
                             operands
                         } else {
                             (

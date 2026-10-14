@@ -185,8 +185,6 @@ pub enum ConditionKind {
     Existence,
     /// An equality assertion (`AssertEq`).
     EqualityAssertion,
-    /// A negation guard (`not expr`).
-    Negation,
     /// A variable binding (`:=` assignment).
     Binding,
     /// A structured predicate builtin.
@@ -251,6 +249,8 @@ pub struct StaticConditionInfo {
     pub binding_name: Option<String>,
     /// For builtin conditions: the builtin function name.
     pub builtin_name: Option<String>,
+    /// Whether this condition's truth is inverted.
+    pub negated: bool,
 }
 
 impl StaticConditionInfo {
@@ -414,6 +414,7 @@ fn analyze_instruction(
                         has_input_operand: has_input,
                         binding_name: Some(binding_name),
                         builtin_name: None,
+                        negated: false,
                     });
                 }
             }
@@ -949,6 +950,7 @@ fn build_guard_condition_info(
                     has_input_operand: has_input,
                     binding_name: None,
                     builtin_name: None,
+                    negated: false,
                 }
             } else if let Some((name, operands)) = peek_preceding_builtin(pc, reg_prov, program) {
                 let has_input = operands
@@ -982,6 +984,7 @@ fn build_guard_condition_info(
                     has_input_operand: has_input,
                     binding_name: None,
                     builtin_name: Some(name),
+                    negated: false,
                 }
             } else if let Some(neg) = peek_through_negation(pc, reg_prov, program) {
                 // `not <expr>` — Guard fires on `Not(inner)`.  Surface the
@@ -1038,25 +1041,43 @@ fn build_guard_condition_info(
                     })
                 });
 
+                let inferred_kind = if neg.builtin_name.is_some() {
+                    ConditionKind::Builtin
+                } else if neg.operator.is_some() {
+                    ConditionKind::Comparison
+                } else {
+                    ConditionKind::Truthiness
+                };
                 StaticConditionInfo {
                     checked_register: register,
                     checked_provenance: effective_provenance,
                     operands,
                     text,
-                    kind: ConditionKind::Negation,
+                    kind: inferred_kind,
                     operator: neg.operator,
                     has_input_operand: has_input,
                     binding_name: None,
                     builtin_name: neg.builtin_name,
+                    negated: true,
                 }
             } else {
                 // Generic truthiness guard.
-                let has_input = checked_provenance
+                let (truthiness_provenance, negated) =
+                    match program.instructions.get(pc.saturating_sub(1)).copied() {
+                        Some(Instruction::Not { dest, operand }) if dest == register => (
+                            get_provenance(reg_prov, operand)
+                                .cloned()
+                                .or(checked_provenance),
+                            true,
+                        ),
+                        _ => (checked_provenance, false),
+                    };
+                let has_input = truthiness_provenance
                     .as_ref()
                     .is_some_and(Provenance::is_input_rooted);
                 StaticConditionInfo {
                     checked_register: register,
-                    checked_provenance,
+                    checked_provenance: truthiness_provenance,
                     operands: None,
                     text,
                     kind: ConditionKind::Truthiness,
@@ -1064,6 +1085,7 @@ fn build_guard_condition_info(
                     has_input_operand: has_input,
                     binding_name: None,
                     builtin_name: None,
+                    negated,
                 }
             }
         }
@@ -1081,6 +1103,7 @@ fn build_guard_condition_info(
                 has_input_operand: has_input,
                 binding_name: None,
                 builtin_name: None,
+                negated: false,
             }
         }
         GuardMode::Not => {
@@ -1092,11 +1115,12 @@ fn build_guard_condition_info(
                 checked_provenance,
                 operands: None,
                 text,
-                kind: ConditionKind::Negation,
+                kind: ConditionKind::Truthiness,
                 operator: None,
                 has_input_operand: has_input,
                 binding_name: None,
                 builtin_name: None,
+                negated: true,
             }
         }
     }
@@ -1129,6 +1153,7 @@ fn build_assert_eq_condition_info(
         has_input_operand: has_input,
         binding_name: None,
         builtin_name: None,
+        negated: false,
     }
 }
 
