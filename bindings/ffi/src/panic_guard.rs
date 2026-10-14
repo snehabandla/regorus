@@ -1,10 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Minimal helpers for catching panics inside the FFI layer.
-//!
-//! These are not yet wired into the exported functions; they will
-//! be used once the integration work is complete.
+//! Helpers for catching panics inside the FFI layer.
 
 extern crate alloc;
 
@@ -15,58 +12,8 @@ use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "std")]
 use std::{
     backtrace::Backtrace,
-    cell::RefCell,
     panic::{self, AssertUnwindSafe},
 };
-
-#[cfg(feature = "std")]
-thread_local! {
-    // Stashes the formatted panic + backtrace for whichever call last panicked on this thread.
-    static PANIC_BACKTRACE: RefCell<Option<String>> = const { RefCell::new(None) };
-}
-
-#[cfg(feature = "std")]
-type PanicHook = dyn Fn(&panic::PanicHookInfo<'_>) + Sync + Send + 'static;
-
-#[cfg(feature = "std")]
-/// RAII helper that installs a per-call panic hook and restores the prior hook on drop.
-struct PanicHookGuard {
-    previous: Option<Box<PanicHook>>,
-}
-
-#[cfg(feature = "std")]
-impl PanicHookGuard {
-    fn install() -> Self {
-        // Remember whatever hook the embedding application already registered.
-        let previous = panic::take_hook();
-        PANIC_BACKTRACE.with(|slot| {
-            slot.replace(None);
-        });
-        // Install our temporary hook so we can capture a backtrace for this invocation.
-        panic::set_hook(Box::new(|info| {
-            let backtrace = Backtrace::force_capture();
-            PANIC_BACKTRACE.with(|slot| {
-                slot.replace(Some(format!(
-                    "panic hook observed: {}\nbacktrace:\n{:#?}",
-                    info, backtrace
-                )));
-            });
-        }));
-        Self {
-            previous: Some(previous),
-        }
-    }
-}
-
-#[cfg(feature = "std")]
-impl Drop for PanicHookGuard {
-    fn drop(&mut self) {
-        if let Some(previous) = self.previous.take() {
-            // Restore the original panic hook before we return control to the host.
-            panic::set_hook(previous);
-        }
-    }
-}
 
 static POISONED: AtomicBool = AtomicBool::new(false);
 
@@ -99,7 +46,7 @@ pub(crate) fn lock_poison_test_state() -> PoisonTestLock {
     );
     let lock = POISON_TEST_GATE
         .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     increment_poison_test_gate_depth();
     PoisonTestLock { lock: Some(lock) }
 }
@@ -126,9 +73,15 @@ fn poison_test_call_lock() -> PoisonTestCallLock {
     } else {
         let lock = POISON_TEST_GATE
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         PoisonTestCallLock { lock: Some(lock) }
     }
+}
+
+#[cfg(all(test, feature = "std"))]
+fn bypass_poison_test_gate() -> PoisonTestCallLock {
+    increment_poison_test_gate_depth();
+    PoisonTestCallLock { lock: None }
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -151,6 +104,7 @@ pub(crate) enum GuardResult<T> {
     /// Closure completed successfully.
     Success(T),
     /// Closure panicked; contains a best-effort string payload.
+    #[cfg(feature = "std")]
     Panic(String),
 }
 
@@ -171,12 +125,9 @@ where
     // Upon unwind, we mark regorus as poisoned and disallow further use.
     #[cfg(feature = "std")]
     {
-        let outcome = {
-            let _hook_guard = PanicHookGuard::install();
-            match panic::catch_unwind(AssertUnwindSafe(f)) {
-                Ok(value) => GuardResult::Success(value),
-                Err(payload) => GuardResult::Panic(panic_message_to_string(payload)),
-            }
+        let outcome = match panic::catch_unwind(AssertUnwindSafe(f)) {
+            Ok(value) => GuardResult::Success(value),
+            Err(payload) => GuardResult::Panic(panic_message_to_string(payload)),
         };
         finalize(outcome)
     }
@@ -188,6 +139,7 @@ where
 fn finalize(outcome: GuardResult<RegorusResult>) -> RegorusResult {
     match outcome {
         GuardResult::Success(result) => result,
+        #[cfg(feature = "std")]
         GuardResult::Panic(message) => {
             trip_poison();
             RegorusResult::err_with_message(RegorusStatus::Panic, message)
@@ -205,17 +157,10 @@ fn panic_message_to_string(payload: Box<dyn core::any::Any + Send + 'static>) ->
         String::from("regorus encountered panic")
     };
 
-    if let Some(backtrace) = take_panic_backtrace() {
-        message.push('\n');
-        message.push_str(&backtrace);
-    }
+    message.push_str("\nbacktrace captured after unwind:\n");
+    message.push_str(&format!("{:#?}", Backtrace::force_capture()));
 
     message
-}
-
-#[cfg(feature = "std")]
-fn take_panic_backtrace() -> Option<String> {
-    PANIC_BACKTRACE.with(|slot| slot.borrow_mut().take())
 }
 
 fn poisoned_result() -> RegorusResult {
@@ -225,6 +170,7 @@ fn poisoned_result() -> RegorusResult {
     )
 }
 
+#[cfg(feature = "std")]
 fn trip_poison() {
     POISONED.store(true, Ordering::Release);
 }
@@ -239,52 +185,125 @@ pub(crate) fn reset_poison() {
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
-    use super::with_unwind_guard;
-    use crate::common::{regorus_result_drop, RegorusResult, RegorusStatus};
-    use std::sync::mpsc;
+    use super::{
+        bypass_poison_test_gate, lock_poison_test_state, reset_poison, with_unwind_guard,
+        POISON_TEST_GATE,
+    };
+    use crate::common::{RegorusResult, RegorusStatus};
+    use std::panic::{self, AssertUnwindSafe};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc};
+    use std::thread;
     use std::time::Duration;
 
     #[test]
-    fn ordinary_guarded_calls_are_not_serialized_by_the_poison_test_gate() {
-        let (first_entered_sender, first_entered_receiver) = mpsc::channel();
-        let (second_entered_sender, second_entered_receiver) = mpsc::channel();
+    fn concurrent_guards_preserve_the_host_panic_hook() {
+        {
+            let _poison_test_lock = lock_poison_test_state();
+            reset_poison();
+        }
+        let ordinary_calls_lock = POISON_TEST_GATE
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original_hook: Arc<dyn Fn(&panic::PanicHookInfo<'_>) + Sync + Send + 'static> =
+            panic::take_hook().into();
+        let host_hook_calls = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&host_hook_calls);
+        let forwarded_hook = Arc::clone(&original_hook);
+        let test_thread_id = thread::current().id();
+        panic::set_hook(Box::new(move |info| {
+            if thread::current().id() == test_thread_id {
+                calls.fetch_add(1, Ordering::SeqCst);
+            } else {
+                forwarded_hook(info);
+            }
+        }));
 
-        let first = std::thread::spawn(move || {
-            let result = with_unwind_guard(|| {
-                let _ = first_entered_sender.send(());
-                let second_entered = second_entered_receiver
-                    .recv_timeout(Duration::from_secs(1))
-                    .is_ok();
-                RegorusResult::ok_bool(second_entered)
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+            let (a_entered_tx, a_entered_rx) = mpsc::channel();
+            let (release_a_tx, release_a_rx) = mpsc::channel();
+            let thread_a = thread::spawn(move || {
+                let _bypass = bypass_poison_test_gate();
+                let result = with_unwind_guard(|| {
+                    a_entered_tx.send(()).expect("signal thread A entry");
+                    RegorusResult::ok_bool(
+                        release_a_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+                    )
+                });
+                matches!(result.status, RegorusStatus::Ok) && result.bool_value
             });
-            let success = matches!(result.status, RegorusStatus::Ok) && result.bool_value;
-            regorus_result_drop(result);
-            success
-        });
+            let a_entered = a_entered_rx.recv_timeout(Duration::from_secs(2)).is_ok();
 
+            let (b_entered_tx, b_entered_rx) = mpsc::channel();
+            let (release_b_tx, release_b_rx) = mpsc::channel();
+            let thread_b = thread::spawn(move || {
+                let _bypass = bypass_poison_test_gate();
+                let result = with_unwind_guard(|| {
+                    b_entered_tx.send(()).expect("signal thread B entry");
+                    RegorusResult::ok_bool(
+                        release_b_rx.recv_timeout(Duration::from_secs(2)).is_ok(),
+                    )
+                });
+                matches!(result.status, RegorusStatus::Ok) && result.bool_value
+            });
+            let b_entered = b_entered_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+
+            let _ = release_a_tx.send(());
+            let _ = release_b_tx.send(());
+            let a_succeeded = thread_a.join().unwrap_or(false);
+            let b_succeeded = thread_b.join().unwrap_or(false);
+
+            drop(ordinary_calls_lock);
+            let _poison_test_lock = lock_poison_test_state();
+            reset_poison();
+            let probe = panic::catch_unwind(AssertUnwindSafe(|| {
+                panic!("probe the host hook after overlapping guards");
+            }));
+            let guarded_panic = with_unwind_guard(|| {
+                panic!("probe panic containment without replacing the host hook")
+            });
+            let observed_calls = host_hook_calls.load(Ordering::SeqCst);
+            reset_poison();
+
+            (
+                a_entered,
+                b_entered,
+                a_succeeded,
+                b_succeeded,
+                probe.is_err(),
+                matches!(guarded_panic.status, RegorusStatus::Panic),
+                observed_calls,
+            )
+        }));
+
+        let _installed_hook = panic::take_hook();
+        panic::set_hook(Box::new(move |info| original_hook(info)));
+        {
+            let _poison_test_lock = lock_poison_test_state();
+            reset_poison();
+        }
+
+        let (
+            a_entered,
+            b_entered,
+            a_succeeded,
+            b_succeeded,
+            probe_panicked,
+            guarded_panic_caught,
+            observed_calls,
+        ) = outcome.unwrap_or_else(|payload| panic::resume_unwind(payload));
+        assert!(a_entered, "thread A did not enter its guard");
         assert!(
-            first_entered_receiver
-                .recv_timeout(Duration::from_secs(1))
-                .is_ok(),
-            "first guarded call did not start"
+            b_entered,
+            "thread B did not overlap thread A inside its guard"
         );
-
-        let second = std::thread::spawn(move || {
-            let result = with_unwind_guard(|| {
-                let _ = second_entered_sender.send(());
-                RegorusResult::ok_void()
-            });
-            let success = matches!(result.status, RegorusStatus::Ok);
-            regorus_result_drop(result);
-            success
-        });
-
-        let first_success = first.join().unwrap_or(false);
-        let second_success = second.join().unwrap_or(false);
-        assert!(second_success, "second guarded call did not complete");
-        assert!(
-            first_success,
-            "ordinary guarded calls were serialized by the poison test gate"
+        assert!(a_succeeded, "thread A did not complete");
+        assert!(b_succeeded, "thread B did not complete");
+        assert!(probe_panicked, "the probe panic must be caught");
+        assert!(guarded_panic_caught);
+        assert_eq!(
+            observed_calls, 2,
+            "overlapping calls and a guarded panic must preserve the host panic hook"
         );
     }
 }
