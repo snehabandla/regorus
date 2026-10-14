@@ -277,6 +277,10 @@ pub struct ResidualCondition {
     /// 1-based source column for the condition.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_col: Option<u32>,
+    /// 1-based source line of the first instruction in the rule definition
+    /// that produced this condition.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_rule_start_row: Option<u32>,
 }
 
 /// Result of partial evaluation.
@@ -432,7 +436,8 @@ fn assumption_to_residual_conditions(
     a: &crate::evaluation_trace::Assumption,
     program: &Program,
 ) -> Vec<ResidualCondition> {
-    let (source_rule, source_file, source_row, source_col) = source_attribution(a, program);
+    let (source_rule, source_file, source_row, source_col, source_rule_start_row) =
+        source_attribution(a, program);
 
     // Check for data-key inversion.
     if let (Some(ref ctx), Some(ref cmp_value), Some(ref op)) =
@@ -473,6 +478,7 @@ fn assumption_to_residual_conditions(
                             source_file: source_file.clone(),
                             source_row,
                             source_col,
+                            source_rule_start_row,
                         }
                     })
                     .collect();
@@ -495,7 +501,8 @@ fn assumption_to_residual(
         AssumptionKind::CollectionExists => "collection_exists",
         AssumptionKind::NegationHolds => "negation_holds",
     };
-    let (source_rule, source_file, source_row, source_col) = source_attribution(a, program);
+    let (source_rule, source_file, source_row, source_col, source_rule_start_row) =
+        source_attribution(a, program);
     ResidualCondition {
         condition: strip_trailing_comment(&a.condition_text),
         operator: a.operator.clone(),
@@ -511,14 +518,23 @@ fn assumption_to_residual(
         source_file,
         source_row,
         source_col,
+        source_rule_start_row,
     }
 }
 
-/// Look up (rule_name, source_file, row, col) for an assumption.
+type SourceAttribution = (
+    Option<String>,
+    Option<String>,
+    Option<u32>,
+    Option<u32>,
+    Option<u32>,
+);
+
+/// Look up (rule_name, source_file, row, col, rule_start_row) for an assumption.
 fn source_attribution(
     a: &crate::evaluation_trace::Assumption,
     program: &Program,
-) -> (Option<String>, Option<String>, Option<u32>, Option<u32>) {
+) -> SourceAttribution {
     let rule_name = program
         .rule_infos
         .get(usize::from(a.rule_index))
@@ -541,7 +557,17 @@ fn source_attribution(
             )
         })
         .unwrap_or((None, None, None));
-    (rule_name, file, row, col)
+    let rule_start_row = program
+        .rule_infos
+        .get(usize::from(a.rule_index))
+        .and_then(|info| info.definitions.get(usize::from(a.definition_index)))
+        .and_then(|body_pcs| body_pcs.first())
+        .and_then(|pc| usize::try_from(*pc).ok())
+        .and_then(|pc| program.instruction_spans.get(pc))
+        .and_then(Option::as_ref)
+        .map(|span| u32::try_from(span.line).unwrap_or(u32::MAX));
+
+    (rule_name, file, row, col, rule_start_row)
 }
 
 /// Strip a trailing Rego comment (`# ...`) from a rendered condition string,

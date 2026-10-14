@@ -9,6 +9,7 @@
 #![cfg(all(feature = "rvm", feature = "explanations"))]
 
 use regorus::*;
+use std::collections::HashSet;
 
 fn run_causality_full(policy: &str, input_json: &str, entrypoint_str: &str) -> serde_json::Value {
     let mut engine = Engine::new();
@@ -539,5 +540,82 @@ deny contains msg if {
     assert!(
         found_location_cond,
         "expected a residual condition referencing input.deployment.location; got: {result:#?}"
+    );
+}
+
+// ===========================================================================
+// PE-5: PE residual conjuncts identify the definition that produced them.
+// ===========================================================================
+#[test]
+fn pe_5_residual_carries_source_rule_start_row_for_multi_definition_rules() {
+    let policy = r#"
+package bicep
+import rego.v1
+
+deny contains msg if {
+    some r in input.resources
+    input.deployment.resourceGroupName == "prod-rg"
+    r.properties.supportsHttpsTrafficOnly == false
+    msg := sprintf("[https] Storage '%s' in prod-rg must enable HTTPS", [r.name])
+}
+
+deny contains msg if {
+    some r in input.resources
+    input.deployment.location == "eastus"
+    r.properties.allowBlobPublicAccess == true
+    msg := sprintf("[blob] Storage '%s' in eastus must not allow public blobs", [r.name])
+}
+"#;
+    let input = r#"{
+        "resources": [{
+            "type": "Microsoft.Storage/storageAccounts",
+            "name": "demopeissue5",
+            "location": "eastus",
+            "properties": {
+                "supportsHttpsTrafficOnly": false,
+                "allowBlobPublicAccess": true
+            }
+        }]
+    }"#;
+
+    let result = run_pe(policy, input, "data.bicep.deny");
+    let queries = result["residual_queries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing residual_queries; got: {result:#?}"));
+
+    assert!(
+        !queries.is_empty(),
+        "expected at least one residual disjunct; got: {result:#?}"
+    );
+
+    let mut start_rows: HashSet<u64> = HashSet::new();
+    for (i, disjunct) in queries.iter().enumerate() {
+        for (j, cond) in disjunct.as_array().unwrap().iter().enumerate() {
+            let source_rule_start_row = cond
+                .get("source_rule_start_row")
+                .and_then(|value| value.as_u64())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "disjunct {i}, condition {j}: source_rule_start_row missing; got: {cond:#?}"
+                    )
+                });
+            let source_row = cond
+                .get("source_row")
+                .and_then(|value| value.as_u64())
+                .unwrap_or_else(|| {
+                    panic!("disjunct {i}, condition {j}: source_row missing; got: {cond:#?}")
+                });
+            assert!(
+                source_rule_start_row <= source_row,
+                "disjunct {i}, condition {j}: rule-start row {source_rule_start_row} must be at or before condition row {source_row}; got: {cond:#?}"
+            );
+            start_rows.insert(source_rule_start_row);
+        }
+    }
+
+    let expected: HashSet<u64> = [5, 12].into_iter().collect();
+    assert_eq!(
+        start_rows, expected,
+        "expected exactly {{5, 12}} distinct source_rule_start_row values across disjuncts; got {start_rows:?}"
     );
 }
