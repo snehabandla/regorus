@@ -133,6 +133,9 @@ impl RegoVM {
             let def_assumptions_start = self.trace.assumptions.len();
 
             #[cfg(feature = "explanations")]
+            let def_start_emissions = self.trace.emission_outcomes.len();
+
+            #[cfg(feature = "explanations")]
             let mut def_succeeded = false;
 
             for (body_entry_point_idx, body_entry_point) in definition_bodies.iter().enumerate() {
@@ -281,6 +284,14 @@ impl RegoVM {
                         u16::try_from(def_idx).unwrap_or(u16::MAX),
                         def_succeeded,
                         None,
+                    );
+
+                    self.orphan_assumptions_if_definition_did_not_emit(
+                        rule_index,
+                        def_idx,
+                        rule_info.rule_type.clone(),
+                        def_assumptions_start,
+                        def_start_emissions,
                     );
                 }
                 self.pop_conjunction_scope();
@@ -702,6 +713,8 @@ impl RegoVM {
             #[cfg(feature = "explanations")]
             assumptions_at_def_start: 0,
             #[cfg(feature = "explanations")]
+            emissions_at_def_start: 0,
+            #[cfg(feature = "explanations")]
             pe_any_def_resolved: false,
             #[cfg(feature = "explanations")]
             pe_any_def_has_assumptions: false,
@@ -794,6 +807,7 @@ impl RegoVM {
                     self.push_conjunction_scope();
                     frame_data.conjunction_scope_active = true;
                     frame_data.assumptions_at_def_start = self.trace.assumptions.len();
+                    frame_data.emissions_at_def_start = self.trace.emission_outcomes.len();
                 }
 
                 if let Some(ctx) = self.call_rule_stack.last_mut() {
@@ -877,6 +891,41 @@ impl RegoVM {
         }
     }
 
+    #[cfg(feature = "explanations")]
+    fn orphan_assumptions_if_definition_did_not_emit(
+        &mut self,
+        rule_index: u16,
+        definition_index: usize,
+        rule_type: RuleType,
+        assumptions_start: usize,
+        emissions_start: usize,
+    ) {
+        if !matches!(rule_type, RuleType::PartialSet | RuleType::PartialObject) {
+            return;
+        }
+
+        let definition_index = u16::try_from(definition_index).unwrap_or(u16::MAX);
+        let definition_emitted = self
+            .trace
+            .emission_outcomes
+            .get(emissions_start..)
+            .is_some_and(|emissions| {
+                emissions.iter().any(|emission| {
+                    emission.rule_index == rule_index
+                        && emission.definition_index == definition_index
+                })
+            });
+        if definition_emitted {
+            return;
+        }
+
+        if let Some(recorded) = self.trace.assumptions.get_mut(assumptions_start..) {
+            for assumption in recorded {
+                assumption.orphaned = true;
+            }
+        }
+    }
+
     /// Pop the conjunction scope for the current definition in a suspendable
     /// rule frame, and track PE definitiveness.
     #[cfg(feature = "explanations")]
@@ -901,6 +950,16 @@ impl RegoVM {
                 def_idx,
                 frame_data.current_def_succeeded,
                 None,
+            );
+        }
+
+        if self.explanation_settings.enabled {
+            self.orphan_assumptions_if_definition_did_not_emit(
+                frame_data.rule_index,
+                frame_data.current_definition_index,
+                frame_data.rule_type.clone(),
+                frame_data.assumptions_at_def_start,
+                frame_data.emissions_at_def_start,
             );
         }
 

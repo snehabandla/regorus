@@ -27,6 +27,24 @@ fn run_pe_with_unknowns(
     entrypoint_str: &str,
     unknowns: Option<Vec<String>>,
 ) -> serde_json::Value {
+    run_pe_with_unknowns_and_mode(
+        policy,
+        input_json,
+        data_json,
+        entrypoint_str,
+        unknowns,
+        rvm::vm::ExecutionMode::RunToCompletion,
+    )
+}
+
+fn run_pe_with_unknowns_and_mode(
+    policy: &str,
+    input_json: Option<&str>,
+    data_json: Option<&str>,
+    entrypoint_str: &str,
+    unknowns: Option<Vec<String>>,
+    execution_mode: rvm::vm::ExecutionMode,
+) -> serde_json::Value {
     let mut engine = Engine::new();
     engine
         .add_policy("test.rego".into(), policy.into())
@@ -39,6 +57,7 @@ fn run_pe_with_unknowns(
             .unwrap();
 
     let mut vm = rvm::RegoVM::new_with_policy(compiled);
+    vm.set_execution_mode(execution_mode);
     vm.load_program(program);
     vm.set_explanation_settings(evaluation_trace::ExplanationSettings {
         enabled: true,
@@ -2176,4 +2195,263 @@ allow if { input.resource.public == true }
         0,
         "second def uses known input.resource — result definitive"
     );
+}
+
+#[test]
+fn pe_61_helper_gate_prunes_on_concrete_false_downstream() {
+    let policy = r#"
+package bicep
+import future.keywords
+
+in_resource_group(fragment) if contains(input.deployment.resourceGroupName, fragment)
+
+deny contains msg if {
+    in_resource_group("prod")
+    some _, resource in input.resources
+    resource.type == "Microsoft.Storage/storageAccounts"
+    resource.properties.allowBlobPublicAccess == true
+    msg := "allowBlobPublicAccess must be false in prod-rg"
+}
+"#;
+    let input = r#"{
+        "resources": [{
+            "type": "Microsoft.Storage/storageAccounts",
+            "name": "compliantStorage",
+            "properties": { "allowBlobPublicAccess": false }
+        }]
+    }"#;
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some(input),
+            None,
+            "data.bicep.deny",
+            Some(vec!["input.deployment".into()]),
+            mode,
+        );
+
+        assert!(
+            result["residual_queries"].as_array().unwrap().is_empty(),
+            "helper-gate assumption must be pruned in {mode:?} mode when downstream is concretely false; got {result:#?}"
+        );
+        assert!(result["result"].as_array().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn pe_62_inline_gate_prunes_on_concrete_false_downstream() {
+    let policy = r#"
+package bicep
+import future.keywords
+
+deny contains msg if {
+    contains(input.deployment.resourceGroupName, "prod")
+    some _, resource in input.resources
+    resource.type == "Microsoft.Storage/storageAccounts"
+    resource.properties.allowBlobPublicAccess == true
+    msg := "allowBlobPublicAccess must be false in prod-rg"
+}
+"#;
+    let input = r#"{
+        "resources": [{
+            "type": "Microsoft.Storage/storageAccounts",
+            "name": "compliantStorage",
+            "properties": { "allowBlobPublicAccess": false }
+        }]
+    }"#;
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some(input),
+            None,
+            "data.bicep.deny",
+            Some(vec!["input.deployment".into()]),
+            mode,
+        );
+
+        assert!(
+            result["residual_queries"].as_array().unwrap().is_empty(),
+            "inline-gate assumption must be pruned in {mode:?} mode when downstream is concretely false; got {result:#?}"
+        );
+        assert!(result["result"].as_array().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn pe_63_helper_gate_keeps_when_downstream_symbolic() {
+    let policy = r#"
+package bicep
+import future.keywords
+
+in_resource_group(fragment) if contains(input.deployment.resourceGroupName, fragment)
+
+deny contains msg if {
+    in_resource_group("prod")
+    some _, resource in input.resources
+    resource.type == "Microsoft.Storage/storageAccounts"
+    resource.properties.allowBlobPublicAccess == true
+    msg := "allowBlobPublicAccess must be false in prod-rg"
+}
+"#;
+
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result =
+            run_pe_with_unknowns_and_mode(policy, None, None, "data.bicep.deny", None, mode);
+
+        assert!(
+            !result["residual_queries"].as_array().unwrap().is_empty(),
+            "a symbolic downstream must preserve the helper-gate assumption in {mode:?} mode"
+        );
+    }
+}
+
+#[test]
+fn pe_64_helper_gate_emits_on_noncompliant_resource() {
+    let policy = r#"
+package bicep
+import future.keywords
+
+in_resource_group(fragment) if contains(input.deployment.resourceGroupName, fragment)
+
+deny contains msg if {
+    in_resource_group("prod")
+    some _, resource in input.resources
+    resource.type == "Microsoft.Storage/storageAccounts"
+    resource.properties.allowBlobPublicAccess == true
+    msg := "allowBlobPublicAccess must be false in prod-rg"
+}
+"#;
+    let input = r#"{
+        "resources": [{
+            "type": "Microsoft.Storage/storageAccounts",
+            "name": "openStorage",
+            "properties": { "allowBlobPublicAccess": true }
+        }]
+    }"#;
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some(input),
+            None,
+            "data.bicep.deny",
+            Some(vec!["input.deployment".into()]),
+            mode,
+        );
+
+        let queries = result["residual_queries"].as_array().unwrap();
+        assert!(
+            !queries.is_empty(),
+            "a noncompliant resource must preserve the helper-gate residual in {mode:?} mode"
+        );
+        assert!(result["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some("allowBlobPublicAccess must be false in prod-rg")));
+        assert!(queries.iter().any(|query| {
+            query.as_array().is_some_and(|terms| {
+                terms.iter().any(|term| {
+                    term["input_path"].as_str() == Some("input.deployment.resourceGroupName")
+                })
+            })
+        }));
+    }
+}
+
+fn assert_partial_object_emission_preserves_residual(policy: &str, entrypoint: &str) {
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(policy, None, None, entrypoint, None, mode);
+        let queries = result["residual_queries"].as_array().unwrap();
+        assert!(
+            queries.iter().any(|query| {
+                query.as_array().is_some_and(|terms| {
+                    terms.iter().any(|term| {
+                        term["input_path"].as_str() == Some("input.enabled")
+                    })
+                })
+            }),
+            "an emitting partial object must preserve its symbolic gate in {mode:?} mode; got {result:#?}"
+        );
+    }
+}
+
+#[test]
+fn pe_orphan_single_key_partial_object_preserves_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+items[key] := "v" if {
+    key := "a"
+    input.enabled == true
+}
+"#;
+
+    assert_partial_object_emission_preserves_residual(policy, "data.test.items");
+}
+
+#[test]
+fn pe_orphan_multi_value_partial_object_preserves_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+items[key] contains "v" if {
+    key := "a"
+    input.enabled == true
+}
+"#;
+
+    assert_partial_object_emission_preserves_residual(policy, "data.test.items");
+}
+
+#[test]
+fn pe_orphan_nested_partial_rule_emission_does_not_save_caller_assumptions() {
+    let policy = r#"
+package test
+import rego.v1
+
+helper contains "x" if { true }
+
+deny contains "bad" if {
+    input.gate == true
+    count(helper) > 0
+    input.reject == true
+}
+"#;
+    let input = r#"{"reject": false}"#;
+
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some(input),
+            None,
+            "data.test.deny",
+            Some(vec!["input.gate".into()]),
+            mode,
+        );
+        assert!(
+            result["residual_queries"].as_array().unwrap().is_empty(),
+            "a nested helper emission must not preserve assumptions from a non-emitting caller in {mode:?} mode; got {result:#?}"
+        );
+        assert!(result["result"].as_array().unwrap().is_empty());
+    }
 }

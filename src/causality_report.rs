@@ -334,6 +334,9 @@ pub fn materialize_pe(
 
     // First pass: collect inner-negation assumptions into negation_inner.
     for a in &trace.assumptions {
+        if a.orphaned {
+            continue;
+        }
         if let Some(neg_scope) = a.negation_scope_id {
             let cond = assumption_to_residual(a, program);
             negation_inner.entry(neg_scope).or_default().push(cond);
@@ -342,6 +345,9 @@ pub fn materialize_pe(
 
     // Second pass: build disjuncts from top-level (non-negation-inner) assumptions.
     for a in &trace.assumptions {
+        if a.orphaned {
+            continue;
+        }
         // Skip assumptions that belong inside a negation body — they will be
         // attached to the NegationHolds parent below.
         if a.negation_scope_id.is_some() {

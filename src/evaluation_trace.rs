@@ -247,6 +247,12 @@ pub struct Assumption {
     /// an unknown input key (e.g. `data.perms[input.role]`), this captures
     /// the concrete data object so `materialize_pe` can invert the lookup.
     pub data_lookup_context: Option<DataLookupContext>,
+    /// Whether the enclosing partial-rule definition emitted no value.
+    ///
+    /// Partial evaluation omits orphaned assumptions because they cannot
+    /// contribute to an observable result. Causality materialization ignores
+    /// this flag.
+    pub orphaned: bool,
 }
 
 /// Context for inverting a data lookup during partial evaluation.
@@ -525,6 +531,7 @@ impl EvaluationTrace {
             negation_scope_id,
             owned_negation_scope_id: None,
             data_lookup_context: None,
+            orphaned: false,
         });
     }
 

@@ -980,7 +980,45 @@ impl RegoVM {
                 let mut obj_value = self.take_register(obj)?;
 
                 if let Ok(obj_mut) = obj_value.as_object_mut() {
+                    #[cfg(feature = "explanations")]
+                    let emission = self
+                        .explanation_settings
+                        .enabled
+                        .then(|| self.call_rule_stack.last())
+                        .flatten()
+                        .filter(|ctx| {
+                            ctx.rule_type == crate::rvm::program::RuleType::PartialObject
+                                && obj == ctx.result_reg
+                        })
+                        .map(|ctx| {
+                            (
+                                ctx.rule_index,
+                                u16::try_from(ctx.current_definition_index).unwrap_or(u16::MAX),
+                                u32::try_from(ctx.current_body_condition_start).unwrap_or(u32::MAX),
+                                value_value.clone(),
+                            )
+                        });
+
                     obj_mut.insert(key_value, value_value);
+
+                    #[cfg(feature = "explanations")]
+                    if let Some((
+                        rule_index,
+                        definition_index,
+                        condition_start_index,
+                        emitted_value,
+                    )) = emission
+                    {
+                        let condition_end_index =
+                            u32::try_from(self.trace.condition_outcomes.len()).unwrap_or(u32::MAX);
+                        self.trace.record_emission(
+                            rule_index,
+                            definition_index,
+                            condition_start_index,
+                            condition_end_index,
+                            emitted_value,
+                        );
+                    }
                     self.set_register(obj, obj_value)?;
                 } else {
                     let offending = obj_value.clone();
@@ -1012,6 +1050,25 @@ impl RegoVM {
                     .collect::<core::result::Result<_, _>>()?;
                 let leaf_value = self.get_register(params.value)?.clone();
 
+                #[cfg(feature = "explanations")]
+                let emission = self
+                    .explanation_settings
+                    .enabled
+                    .then(|| self.call_rule_stack.last())
+                    .flatten()
+                    .filter(|ctx| {
+                        ctx.rule_type == crate::rvm::program::RuleType::PartialObject
+                            && params.obj == ctx.result_reg
+                    })
+                    .map(|ctx| {
+                        (
+                            ctx.rule_index,
+                            u16::try_from(ctx.current_definition_index).unwrap_or(u16::MAX),
+                            u32::try_from(ctx.current_body_condition_start).unwrap_or(u32::MAX),
+                            leaf_value.clone(),
+                        )
+                    });
+
                 let mut root = self.take_register(params.obj)?;
                 self.object_deep_set(
                     &mut root,
@@ -1020,6 +1077,21 @@ impl RegoVM {
                     params.multi_value,
                     params.obj,
                 )?;
+
+                #[cfg(feature = "explanations")]
+                if let Some((rule_index, definition_index, condition_start_index, emitted_value)) =
+                    emission
+                {
+                    let condition_end_index =
+                        u32::try_from(self.trace.condition_outcomes.len()).unwrap_or(u32::MAX);
+                    self.trace.record_emission(
+                        rule_index,
+                        definition_index,
+                        condition_start_index,
+                        condition_end_index,
+                        emitted_value,
+                    );
+                }
                 self.set_register(params.obj, root)?;
                 Ok(InstructionOutcome::Continue)
             }
