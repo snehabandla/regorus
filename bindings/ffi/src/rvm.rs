@@ -971,8 +971,13 @@ mod unsupported_memory_budget_tests {
 /// * `has_emission_value`: Whether `emission_value_json` should be used.
 /// * `emission_value_json`: JSON literal or raw string to match against emitted values.
 /// * `assume_unknown_input`: Whether to assume unknown input fields exist.
+/// * `eval_mode`: 0 = Causality (default), 1 = PartialEval.
+/// * `unknowns`: Pointer to an array of UTF-8 paths declared as unknown.
+/// * `unknowns_len`: Number of entries in the `unknowns` array. A null pointer with zero entries
+///   defaults to `["input"]`; a non-null pointer with zero entries means no paths are unknown.
 #[no_mangle]
 #[cfg(feature = "explanations")]
+#[allow(clippy::too_many_arguments)]
 pub extern "C" fn regorus_rvm_set_explanation_settings(
     vm: *mut RegorusRvm,
     enabled: bool,
@@ -985,6 +990,9 @@ pub extern "C" fn regorus_rvm_set_explanation_settings(
     has_emission_value: bool,
     emission_value_json: *const c_char,
     assume_unknown_input: bool,
+    eval_mode: u8,
+    unknowns: *const *const c_char,
+    unknowns_len: usize,
 ) -> RegorusResult {
     with_unwind_guard(|| {
         to_regorus_result(|| -> Result<()> {
@@ -1045,6 +1053,32 @@ pub extern "C" fn regorus_rvm_set_explanation_settings(
             } else {
                 None
             };
+            let eval_mode = match eval_mode {
+                0 => regorus::evaluation_trace::EvaluationMode::Causality,
+                1 => regorus::evaluation_trace::EvaluationMode::PartialEval,
+                _ => {
+                    return Err(anyhow!(
+                        "invalid eval_mode; expected 0 (Causality) or 1 (PartialEval)"
+                    ))
+                }
+            };
+            let unknowns = if unknowns.is_null() && unknowns_len == 0 {
+                alloc::vec![String::from("input")]
+            } else if unknowns_len == 0 {
+                Vec::new()
+            } else {
+                let unknowns = convert_c_strings(unknowns, unknowns_len, "unknown path")?;
+                for (index, path) in unknowns.iter().enumerate() {
+                    if path.is_empty()
+                        || path.trim() != path
+                        || path.ends_with('.')
+                        || path.ends_with('[')
+                    {
+                        return Err(anyhow!("invalid unknown path at index {index}: {path:?}"));
+                    }
+                }
+                unknowns
+            };
             guard.set_explanation_settings(regorus::evaluation_trace::ExplanationSettings {
                 enabled,
                 value_mode: vm_mode,
@@ -1054,8 +1088,8 @@ pub extern "C" fn regorus_rvm_set_explanation_settings(
                 emission_index,
                 emission_value,
                 assume_unknown_input,
-                eval_mode: regorus::evaluation_trace::EvaluationMode::default(),
-                unknowns: alloc::vec![String::from("input")],
+                eval_mode,
+                unknowns,
             });
             Ok(())
         }())
@@ -1080,27 +1114,201 @@ pub extern "C" fn regorus_rvm_take_causality_report(vm: *mut RegorusRvm) -> Rego
     })
 }
 
+/// Take the partial-evaluation result from the most recent RVM evaluation as JSON.
+///
+/// `value_json` optionally supplies the query result used to render the residual. Pass null to
+/// use `Value::Undefined`.
+#[no_mangle]
+#[cfg(feature = "explanations")]
+pub extern "C" fn regorus_rvm_take_partial_eval_result(
+    vm: *mut RegorusRvm,
+    value_json: *const c_char,
+) -> RegorusResult {
+    with_unwind_guard(|| {
+        let output = || -> Result<String> {
+            let vm = to_ref(vm)?;
+            let mut guard = vm.try_write()?;
+            let value = if value_json.is_null() {
+                Value::Undefined
+            } else {
+                Value::from_json_str(&from_c_str(value_json)?)?
+            };
+            guard
+                .take_partial_eval_result(value)
+                .map_err(|error| anyhow!("{error}"))
+        }();
+
+        match output {
+            Ok(output) => RegorusResult::ok_string(output),
+            Err(error) => to_regorus_result(Err(error)),
+        }
+    })
+}
+
+#[cfg(all(test, feature = "explanations"))]
+mod explanation_tests {
+    use super::{regorus_rvm_drop, regorus_rvm_new, regorus_rvm_set_explanation_settings};
+    use crate::common::{regorus_result_drop, RegorusStatus};
+    use alloc::ffi::CString;
+    use core::ffi::c_char;
+    use core::ptr::{self, NonNull};
+
+    #[test]
+    fn explanation_settings_accept_partial_eval_with_explicit_unknowns() {
+        let vm = regorus_rvm_new();
+        let unknown = CString::new("input.role").unwrap();
+        let unknowns = [unknown.as_ptr()];
+        let result = regorus_rvm_set_explanation_settings(
+            vm,
+            true,
+            0,
+            0,
+            0,
+            1,
+            false,
+            0,
+            false,
+            ptr::null(),
+            true,
+            1,
+            unknowns.as_ptr(),
+            unknowns.len(),
+        );
+
+        assert!(matches!(result.status, RegorusStatus::Ok));
+        regorus_result_drop(result);
+        regorus_rvm_drop(vm);
+    }
+
+    #[test]
+    fn explanation_settings_reject_invalid_evaluation_mode() {
+        let vm = regorus_rvm_new();
+        let result = regorus_rvm_set_explanation_settings(
+            vm,
+            true,
+            0,
+            0,
+            0,
+            1,
+            false,
+            0,
+            false,
+            ptr::null(),
+            true,
+            2,
+            ptr::null(),
+            0,
+        );
+
+        assert!(matches!(result.status, RegorusStatus::Error));
+        regorus_result_drop(result);
+        regorus_rvm_drop(vm);
+    }
+
+    #[test]
+    fn explanation_settings_reject_oversized_unknown_count_without_poisoning() {
+        let vm = regorus_rvm_new();
+        let result = regorus_rvm_set_explanation_settings(
+            vm,
+            true,
+            0,
+            0,
+            0,
+            1,
+            false,
+            0,
+            false,
+            ptr::null(),
+            true,
+            1,
+            NonNull::<*const c_char>::dangling().as_ptr(),
+            usize::MAX,
+        );
+        assert!(matches!(result.status, RegorusStatus::Error));
+        regorus_result_drop(result);
+
+        let valid_result = regorus_rvm_set_explanation_settings(
+            vm,
+            true,
+            0,
+            0,
+            0,
+            1,
+            false,
+            0,
+            false,
+            ptr::null(),
+            true,
+            1,
+            ptr::null(),
+            0,
+        );
+        assert!(matches!(valid_result.status, RegorusStatus::Ok));
+        regorus_result_drop(valid_result);
+        regorus_rvm_drop(vm);
+    }
+
+    #[test]
+    fn explanation_settings_reject_null_unknown_path_element() {
+        let vm = regorus_rvm_new();
+        let unknowns = [ptr::null()];
+        let result = regorus_rvm_set_explanation_settings(
+            vm,
+            true,
+            0,
+            0,
+            0,
+            1,
+            false,
+            0,
+            false,
+            ptr::null(),
+            true,
+            1,
+            unknowns.as_ptr(),
+            unknowns.len(),
+        );
+
+        assert!(matches!(result.status, RegorusStatus::Error));
+        regorus_result_drop(result);
+        regorus_rvm_drop(vm);
+    }
+}
+
 fn convert_c_entry_points(
     entry_points: *const *const c_char,
     entry_points_len: usize,
 ) -> Result<Vec<String>> {
-    if entry_points.is_null() && entry_points_len > 0 {
-        return Err(anyhow!("null entry_points pointer"));
+    convert_c_strings(entry_points, entry_points_len, "entry point")
+}
+
+fn convert_c_strings(
+    values: *const *const c_char,
+    values_len: usize,
+    description: &str,
+) -> Result<Vec<String>> {
+    if values.is_null() && values_len > 0 {
+        return Err(anyhow!("null {description} pointer"));
+    }
+    let max_elements = (isize::MAX as usize) / core::mem::size_of::<*const c_char>();
+    if values_len > max_elements {
+        return Err(anyhow!("{description} count exceeds addressable memory"));
     }
 
-    let mut entry_points_vec = Vec::with_capacity(entry_points_len);
-    for i in 0..entry_points_len {
+    let mut strings = Vec::new();
+    strings
+        .try_reserve_exact(values_len)
+        .map_err(|error| anyhow!("unable to reserve {description} array: {error}"))?;
+    for index in 0..values_len {
         unsafe {
-            let entry_ptr = entry_points.add(i);
-            if entry_ptr.is_null() {
-                return Err(anyhow!("null entry point at index {i}"));
+            let value_ptr = values.add(index);
+            if (*value_ptr).is_null() {
+                return Err(anyhow!("null {description} at index {index}"));
             }
-            let entry = from_c_str(*entry_ptr)?;
-            entry_points_vec.push(entry);
+            strings.push(from_c_str(*value_ptr)?);
         }
     }
-
-    Ok(entry_points_vec)
+    Ok(strings)
 }
 
 fn convert_c_modules_to_rust(
