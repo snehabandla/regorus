@@ -1393,12 +1393,14 @@ pub extern "C" fn regorus_engine_compile_program_with_entrypoints(
 
 #[cfg(all(test, feature = "std"))]
 mod namespace_tests {
+    #[cfg(feature = "rvm")]
+    use super::regorus_engine_compile_program_with_entrypoints;
     #[cfg(feature = "azure_policy")]
     use super::regorus_engine_get_policy_package_names;
     use super::{
-        regorus_engine_add_policy, regorus_engine_compile_program_with_entrypoints,
-        regorus_engine_drop, regorus_engine_eval_rule, regorus_engine_get_packages,
-        regorus_engine_get_policy_package_components, regorus_engine_new,
+        regorus_engine_add_policy, regorus_engine_drop, regorus_engine_eval_rule,
+        regorus_engine_get_packages, regorus_engine_get_policy_package_components,
+        regorus_engine_new,
     };
     use crate::common::{regorus_result_drop, RegorusStatus};
     use core::ffi::CStr;

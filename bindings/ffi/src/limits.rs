@@ -252,7 +252,7 @@ pub extern "C" fn regorus_clear_cache() -> RegorusResult {
     RegorusResult::ok_void()
 }
 
-#[cfg(all(test, feature = "allocator-memory-limits", not(miri)))]
+#[cfg(all(test, feature = "std", feature = "allocator-memory-limits", not(miri)))]
 mod tests {
     #[cfg(feature = "allocator-memory-limits")]
     use super::RegorusMemoryBudgetConfig;
