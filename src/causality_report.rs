@@ -15,9 +15,10 @@ use serde::Serialize;
 
 use crate::evaluation_trace::{
     AssumptionKind, ConditionMode, ConditionOutcome, EvaluationTrace, ExplanationDetail,
-    ExplanationScope, ExplanationSettings, RuleOutcome, ValueMode,
+    ExplanationScope, ExplanationSettings, RuleInvocation, RuleOutcome, ValueMode,
 };
 use crate::rvm::program::Program;
+use crate::rvm::Instruction;
 use crate::static_provenance::{Provenance, ProvenanceRoot};
 use crate::value::Value;
 
@@ -185,6 +186,22 @@ pub struct ConditionExplanation {
     /// For binding conditions (`:=`): the variable name being bound.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding_name: Option<String>,
+    /// For builtin conditions: the builtin function name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub builtin_name: Option<String>,
+    /// Whether this condition's truth is inverted.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub negated: bool,
+    /// Conditions evaluated inside the helper invoked by this condition.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub helper_conditions: Vec<ConditionExplanation>,
+    /// Whether helper expansion stopped at the configured depth cap.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub helper_conditions_truncated: bool,
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Witness summary for a loop-backed condition.
@@ -849,6 +866,608 @@ fn materialize_conditions(
     )
 }
 
+const MAX_HELPER_DEPTH: usize = 8;
+
+fn detect_helper_call_at_guard(outer_pc: usize, program: &Program) -> Option<(u16, usize, u8)> {
+    let Instruction::Guard { register, .. } = *program.instructions.get(outer_pc)? else {
+        return None;
+    };
+    let preceding_pc = outer_pc.checked_sub(1)?;
+    let preceding = program.instructions.get(preceding_pc)?;
+    if let Some(rule_index) = call_writes_to(preceding, register, program) {
+        return Some((rule_index, preceding_pc, register));
+    }
+    let Instruction::Not { dest, operand } = *preceding else {
+        return None;
+    };
+    if dest != register {
+        return None;
+    }
+    let call_pc = preceding_pc.checked_sub(1)?;
+    call_writes_to(program.instructions.get(call_pc)?, operand, program)
+        .map(|rule_index| (rule_index, call_pc, operand))
+}
+
+fn call_writes_to(instruction: &Instruction, target: u8, program: &Program) -> Option<u16> {
+    match *instruction {
+        Instruction::CallRule { dest, rule_index } if dest == target => Some(rule_index),
+        Instruction::FunctionCall { params_index } => {
+            let params = program
+                .instruction_data
+                .function_call_params
+                .get(usize::from(params_index))?;
+            (params.dest == target).then_some(params.func_rule_index)
+        }
+        _ => None,
+    }
+}
+
+fn collect_condition_outcomes_in_window(
+    condition_start_index: usize,
+    condition_end_index: usize,
+    trace: &EvaluationTrace,
+) -> Vec<(usize, &ConditionOutcome)> {
+    trace
+        .condition_outcomes
+        .get(condition_start_index..condition_end_index)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(offset, outcome)| (condition_start_index.saturating_add(offset), outcome))
+        .collect()
+}
+
+fn lookup_helper_invocation(
+    helper_rule_index: u16,
+    outer_outcome_index: usize,
+    invocations: &[RuleInvocation],
+) -> (Option<&RuleInvocation>, usize) {
+    let mut inspections = 0_usize;
+    let mut low = 0_usize;
+    let mut high = invocations.len();
+    while low < high {
+        inspections = inspections.saturating_add(1);
+        let middle = low.saturating_add(high.saturating_sub(low) / 2);
+        if invocations
+            .get(middle)
+            .is_some_and(|invocation| invocation.condition_end_index <= outer_outcome_index)
+        {
+            low = middle.saturating_add(1);
+        } else {
+            high = middle;
+        }
+    }
+
+    debug_assert!(
+        low.checked_sub(1)
+            .and_then(|index| invocations.get(index))
+            .is_none_or(|invocation| invocation.condition_end_index <= outer_outcome_index)
+            && invocations
+                .get(low)
+                .is_none_or(|invocation| invocation.condition_end_index > outer_outcome_index),
+        "rule invocation condition windows must be ordered"
+    );
+
+    for invocation in invocations.get(..low).unwrap_or(&[]).iter().rev() {
+        inspections = inspections.saturating_add(1);
+        if invocation.rule_index == helper_rule_index {
+            return (Some(invocation), inspections);
+        }
+    }
+
+    (None, inspections)
+}
+
+fn suppress_attached_helper_outcomes<'a>(
+    relevant_outcomes: Vec<(usize, &'a ConditionOutcome)>,
+    attachment_outcomes: &[(usize, &'a ConditionOutcome)],
+    program: &Program,
+    trace: &EvaluationTrace,
+) -> Vec<(usize, &'a ConditionOutcome)> {
+    let mut attached_windows: Vec<(usize, usize)> = attachment_outcomes
+        .iter()
+        .filter_map(|(outcome_index, outcome)| {
+            let pc = usize::try_from(outcome.pc).ok()?;
+            let (helper_rule_index, _, _) = detect_helper_call_at_guard(pc, program)?;
+            lookup_helper_invocation(helper_rule_index, *outcome_index, &trace.rule_invocations)
+                .0
+                .map(|invocation| {
+                    (
+                        invocation.condition_start_index,
+                        invocation.condition_end_index,
+                    )
+                })
+        })
+        .collect();
+    attached_windows.sort_unstable();
+
+    let mut merged_windows: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in attached_windows {
+        if let Some(last) = merged_windows.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged_windows.push((start, end));
+    }
+
+    let mut visible = Vec::with_capacity(relevant_outcomes.len());
+    let mut window_index = 0_usize;
+    for outcome in relevant_outcomes {
+        while merged_windows
+            .get(window_index)
+            .is_some_and(|(_, end)| *end <= outcome.0)
+        {
+            window_index = window_index.saturating_add(1);
+        }
+        let is_attached = merged_windows
+            .get(window_index)
+            .is_some_and(|(start, end)| *start <= outcome.0 && outcome.0 < *end);
+        if !is_attached {
+            visible.push(outcome);
+        }
+    }
+    visible
+}
+
+fn materialize_helper_conditions(
+    outer_pc: usize,
+    outer_outcome_index: usize,
+    program: &Program,
+    trace: &EvaluationTrace,
+    settings: &ExplanationSettings,
+    depth: usize,
+) -> (Vec<ConditionExplanation>, bool) {
+    let Some((helper_rule_index, call_pc, _dest_register)) =
+        detect_helper_call_at_guard(outer_pc, program)
+    else {
+        return (Vec::new(), false);
+    };
+    let Some(invocation) = lookup_helper_invocation(
+        helper_rule_index,
+        outer_outcome_index,
+        &trace.rule_invocations,
+    )
+    .0
+    else {
+        return (Vec::new(), false);
+    };
+    let inner_outcomes = collect_condition_outcomes_in_window(
+        invocation.condition_start_index,
+        invocation.condition_end_index,
+        trace,
+    );
+    if inner_outcomes.is_empty() {
+        return (Vec::new(), false);
+    }
+    if depth >= MAX_HELPER_DEPTH {
+        return (Vec::new(), true);
+    }
+    let selected_outcomes = select_condition_outcomes_from_slice(inner_outcomes, settings);
+    let invocation_outcomes = collect_condition_outcomes_in_window(
+        invocation.condition_start_index,
+        invocation.condition_end_index,
+        trace,
+    );
+    let visible_outcomes =
+        suppress_attached_helper_outcomes(selected_outcomes, &invocation_outcomes, program, trace);
+    let rewrite_scopes = visible_outcomes
+        .iter()
+        .map(|(_, outcome)| outcome.rule_index == helper_rule_index)
+        .collect::<Vec<_>>();
+    let mut conditions = materialize_condition_explanations_at_depth(
+        visible_outcomes,
+        program,
+        trace,
+        settings,
+        depth.saturating_add(1),
+        false,
+    );
+    let substitutions = extract_helper_arg_substitutions(call_pc, helper_rule_index, program);
+    let substitutions = substitutions
+        .into_iter()
+        .filter(|(parameter, _)| {
+            !conditions
+                .iter()
+                .zip(&rewrite_scopes)
+                .any(|(condition, belongs_to_helper)| {
+                    *belongs_to_helper
+                        && (condition.binding_name.as_deref() == Some(parameter)
+                            || condition_text_shadows_parameter(&condition.text, parameter))
+                })
+        })
+        .collect::<Vec<_>>();
+    let helper_name = program
+        .rule_infos
+        .get(usize::from(helper_rule_index))
+        .and_then(|rule| rule.name.rsplit('.').next())
+        .unwrap_or("");
+    for (condition, belongs_to_helper) in conditions.iter_mut().zip(rewrite_scopes) {
+        if belongs_to_helper {
+            condition.text = rewrite_helper_body_text(&condition.text, helper_name, &substitutions);
+        }
+    }
+    conditions.retain(|condition| !(condition.kind == "unknown" && condition.text.is_empty()));
+    (conditions, false)
+}
+
+fn extract_helper_arg_substitutions(
+    call_pc: usize,
+    helper_rule_index: u16,
+    program: &Program,
+) -> Vec<(String, String)> {
+    let Some(&Instruction::FunctionCall { params_index }) = program.instructions.get(call_pc)
+    else {
+        return Vec::new();
+    };
+    let Some(params) = program
+        .instruction_data
+        .function_call_params
+        .get(usize::from(params_index))
+    else {
+        return Vec::new();
+    };
+    let Some(function_info) = program
+        .rule_infos
+        .get(usize::from(helper_rule_index))
+        .filter(|rule| rule.definitions.len() == 1)
+        .and_then(|rule| rule.function_info.as_ref())
+    else {
+        return Vec::new();
+    };
+
+    let mut substitutions = Vec::new();
+    for (index, parameter) in function_info.param_names.iter().enumerate() {
+        let Some(&argument_register) = params.arg_registers().get(index) else {
+            break;
+        };
+        if let Some(literal) = find_literal_load(call_pc, argument_register, program) {
+            substitutions.push((parameter.clone(), literal));
+        }
+    }
+    substitutions
+}
+
+fn find_literal_load(pc: usize, target_register: u8, program: &Program) -> Option<String> {
+    let mut current = pc;
+    while current > 0 {
+        current = current.saturating_sub(1);
+        let instruction = program.instructions.get(current)?;
+        match *instruction {
+            Instruction::Load { dest, literal_idx } => {
+                if dest != target_register {
+                    continue;
+                }
+                return program
+                    .literals
+                    .get(usize::from(literal_idx))
+                    .and_then(format_literal_for_substitution);
+            }
+            Instruction::LoadTrue { dest } if dest == target_register => {
+                return Some("true".into());
+            }
+            Instruction::LoadFalse { dest } if dest == target_register => {
+                return Some("false".into());
+            }
+            Instruction::LoadNull { dest } if dest == target_register => {
+                return Some("null".into());
+            }
+            Instruction::LoadBool { dest, value } if dest == target_register => {
+                return Some(value.to_string());
+            }
+            Instruction::LoadTrue { .. }
+            | Instruction::LoadFalse { .. }
+            | Instruction::LoadNull { .. }
+            | Instruction::LoadBool { .. } => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn format_literal_for_substitution(value: &Value) -> Option<String> {
+    match value {
+        Value::Number(number) => Some(alloc::format!("{number:?}")),
+        Value::String(_) | Value::Null | Value::Bool(_) => value.to_json_str().ok(),
+        _ => None,
+    }
+}
+
+fn rewrite_helper_body_text(
+    text: &str,
+    helper_name: &str,
+    substitutions: &[(String, String)],
+) -> String {
+    const SEPARATOR: &str = " if ";
+    let has_helper_head = !helper_name.is_empty()
+        && text.starts_with(helper_name)
+        && text
+            .get(helper_name.len()..)
+            .is_some_and(|suffix| suffix.starts_with('(') || suffix.starts_with(SEPARATOR));
+    let body = if has_helper_head {
+        find_rule_body_separator(text)
+            .and_then(|position| position.checked_add(SEPARATOR.len()))
+            .and_then(|body_start| text.get(body_start..))
+            .unwrap_or(text)
+    } else {
+        text
+    };
+    let suffix_start = find_report_suffix(body).unwrap_or(body.len());
+    let (expression, suffix) = body.split_at(suffix_start);
+    let mut rewritten = substitute_identifiers(expression, substitutions);
+    rewritten.push_str(suffix);
+    rewritten
+}
+
+fn find_report_suffix(text: &str) -> Option<usize> {
+    const MARKERS: [&str; 2] = [" [matched: ", " [loop: "];
+    let mut quote = None;
+    let mut escaped = false;
+    let mut in_comment = false;
+    for (index, character) in text.char_indices() {
+        if in_comment {
+            if character == '\n' {
+                in_comment = false;
+            }
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if delimiter == '"' && character == '\\' && !escaped {
+                escaped = true;
+                continue;
+            }
+            if character == delimiter && !escaped {
+                quote = None;
+            }
+            escaped = false;
+            continue;
+        }
+        if character == '"' || character == '`' {
+            quote = Some(character);
+            continue;
+        }
+        if character == '#' {
+            in_comment = true;
+            continue;
+        }
+        if MARKERS
+            .iter()
+            .any(|marker| text[index..].starts_with(marker))
+        {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn condition_text_shadows_parameter(text: &str, parameter: &str) -> bool {
+    let identifiers = source_identifiers(text);
+    identifiers.iter().enumerate().any(|(index, identifier)| {
+        if *identifier != "every" && *identifier != "some" {
+            return false;
+        }
+        identifiers
+            .get(index.saturating_add(1)..)
+            .unwrap_or(&[])
+            .iter()
+            .take_while(|candidate| **candidate != "in")
+            .any(|candidate| *candidate == parameter)
+            || identifiers
+                .get(index.saturating_add(1))
+                .is_some_and(|candidate| *candidate == parameter)
+    })
+}
+
+fn source_identifiers(text: &str) -> Vec<&str> {
+    let mut identifiers = Vec::new();
+    let mut characters = text.char_indices().peekable();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut in_comment = false;
+    while let Some((start, character)) = characters.next() {
+        if in_comment {
+            if character == '\n' {
+                in_comment = false;
+            }
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if delimiter == '"' && character == '\\' && !escaped {
+                escaped = true;
+                continue;
+            }
+            if character == delimiter && !escaped {
+                quote = None;
+            }
+            escaped = false;
+            continue;
+        }
+        if character == '"' || character == '`' {
+            quote = Some(character);
+            continue;
+        }
+        if character == '#' {
+            in_comment = true;
+            continue;
+        }
+        if !is_identifier_start(character) {
+            continue;
+        }
+
+        let mut end = start.saturating_add(character.len_utf8());
+        while let Some(&(index, next)) = characters.peek() {
+            if !is_identifier_char(next) {
+                break;
+            }
+            characters.next();
+            end = index.saturating_add(next.len_utf8());
+        }
+        identifiers.push(&text[start..end]);
+    }
+    identifiers
+}
+
+fn find_rule_body_separator(text: &str) -> Option<usize> {
+    const SEPARATOR: &str = " if ";
+    let mut quote = None;
+    let mut escaped = false;
+    let mut paren_depth = 0_u32;
+    let mut bracket_depth = 0_u32;
+    let mut brace_depth = 0_u32;
+    for (index, character) in text.char_indices() {
+        if let Some(delimiter) = quote {
+            if delimiter == '"' && character == '\\' && !escaped {
+                escaped = true;
+                continue;
+            }
+            if character == delimiter && !escaped {
+                quote = None;
+            }
+            escaped = false;
+            continue;
+        }
+        if character == '"' || character == '`' {
+            quote = Some(character);
+            continue;
+        }
+        match character {
+            '(' => paren_depth = paren_depth.saturating_add(1),
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth = bracket_depth.saturating_add(1),
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth = brace_depth.saturating_add(1),
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            ' ' if paren_depth == 0
+                && bracket_depth == 0
+                && brace_depth == 0
+                && text[index..].starts_with(SEPARATOR) =>
+            {
+                return Some(index);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn substitute_identifiers(text: &str, substitutions: &[(String, String)]) -> String {
+    if substitutions.is_empty() {
+        return text.to_string();
+    }
+    let mut output = String::with_capacity(text.len());
+    let mut characters = text.char_indices().peekable();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut in_comment = false;
+    while let Some((start, character)) = characters.next() {
+        if in_comment {
+            output.push(character);
+            if character == '\n' {
+                in_comment = false;
+            }
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            output.push(character);
+            if delimiter == '"' && character == '\\' && !escaped {
+                escaped = true;
+                continue;
+            }
+            if character == delimiter && !escaped {
+                quote = None;
+            }
+            escaped = false;
+            continue;
+        }
+        if character == '"' || character == '`' {
+            quote = Some(character);
+            output.push(character);
+            continue;
+        }
+        if character == '#' {
+            in_comment = true;
+            output.push(character);
+            continue;
+        }
+        if !is_identifier_start(character) {
+            output.push(character);
+            continue;
+        }
+
+        let mut end = start.saturating_add(character.len_utf8());
+        while let Some(&(index, next)) = characters.peek() {
+            if !is_identifier_char(next) {
+                break;
+            }
+            characters.next();
+            end = index.saturating_add(next.len_utf8());
+        }
+        let identifier = &text[start..end];
+        let previous = text[..start].chars().next_back();
+        let next = text[end..]
+            .chars()
+            .find(|next_character| !next_character.is_whitespace());
+        let is_reference_component = previous == Some('.') || next == Some('.');
+        let is_callee = next == Some('(');
+        let is_exponent = identifier
+            .chars()
+            .next()
+            .is_some_and(|first_character| first_character == 'e' || first_character == 'E')
+            && previous.is_some_and(|previous_character| {
+                previous_character.is_ascii_digit() || previous_character == '.'
+            });
+        if !is_reference_component && !is_callee && !is_exponent {
+            if let Some((_, replacement)) = substitutions
+                .iter()
+                .find(|(parameter, _)| parameter == identifier)
+            {
+                output.push_str(replacement);
+                continue;
+            }
+        }
+        output.push_str(identifier);
+    }
+    output
+}
+
+const fn is_identifier_start(character: char) -> bool {
+    character.is_ascii_alphabetic() || character == '_'
+}
+
+const fn is_identifier_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_'
+}
+
+fn derive_left_provenance_from_helper(
+    left: Option<OperandExplanation>,
+    helper_conditions: &[ConditionExplanation],
+    helper_failed: bool,
+) -> Option<OperandExplanation> {
+    let existing = left?;
+    if existing.provenance.is_some() || !helper_failed {
+        return Some(existing);
+    }
+    let provenance = helper_conditions.iter().rev().find_map(|condition| {
+        (condition.outcome == "failure")
+            .then(|| {
+                condition
+                    .left
+                    .as_ref()
+                    .and_then(|operand| operand.provenance.clone())
+            })
+            .flatten()
+    });
+    match provenance {
+        Some(provenance) => Some(OperandExplanation {
+            value: existing.value,
+            provenance: Some(provenance),
+            redacted: existing.redacted,
+        }),
+        None => Some(existing),
+    }
+}
+
 fn materialize_condition_window(
     condition_start_index: u32,
     condition_end_index: u32,
@@ -856,15 +1475,15 @@ fn materialize_condition_window(
     trace: &EvaluationTrace,
     settings: &ExplanationSettings,
 ) -> Vec<ConditionExplanation> {
-    let relevant_outcomes = select_condition_outcomes_in_window(
-        condition_start_index,
-        condition_end_index,
-        trace,
-        settings,
-    );
+    let start_index = usize::try_from(condition_start_index).unwrap_or(usize::MAX);
+    let end_index = usize::try_from(condition_end_index).unwrap_or(usize::MAX);
+    let all_outcomes = collect_condition_outcomes_in_window(start_index, end_index, trace);
+    let relevant_outcomes = select_condition_outcomes_from_slice(all_outcomes.clone(), settings);
+    let visible_outcomes =
+        suppress_attached_helper_outcomes(relevant_outcomes, &all_outcomes, program, trace);
 
     finalize_condition_explanations(
-        materialize_condition_explanations(relevant_outcomes, program, trace, settings),
+        materialize_condition_explanations(visible_outcomes, program, trace, settings),
         settings,
         true,
     )
@@ -959,14 +1578,7 @@ fn dedupe_emission_conditions(conditions: Vec<ConditionExplanation>) -> Vec<Cond
 
     'outer: for condition in conditions {
         for existing in &deduped {
-            if existing.text == condition.text
-                && existing.outcome == condition.outcome
-                && existing.kind == condition.kind
-                && existing.operator == condition.operator
-                && operands_match(existing.left.as_ref(), condition.left.as_ref())
-                && operands_match(existing.right.as_ref(), condition.right.as_ref())
-                && witnesses_match(existing.witness.as_ref(), condition.witness.as_ref())
-            {
+            if condition_explanations_match(existing, &condition) {
                 continue 'outer;
             }
         }
@@ -975,6 +1587,26 @@ fn dedupe_emission_conditions(conditions: Vec<ConditionExplanation>) -> Vec<Cond
     }
 
     deduped
+}
+
+fn condition_explanations_match(left: &ConditionExplanation, right: &ConditionExplanation) -> bool {
+    left.text == right.text
+        && left.outcome == right.outcome
+        && left.kind == right.kind
+        && left.operator == right.operator
+        && left.binding_name == right.binding_name
+        && left.builtin_name == right.builtin_name
+        && left.negated == right.negated
+        && left.helper_conditions_truncated == right.helper_conditions_truncated
+        && operands_match(left.left.as_ref(), right.left.as_ref())
+        && operands_match(left.right.as_ref(), right.right.as_ref())
+        && witnesses_match(left.witness.as_ref(), right.witness.as_ref())
+        && left.helper_conditions.len() == right.helper_conditions.len()
+        && left
+            .helper_conditions
+            .iter()
+            .zip(&right.helper_conditions)
+            .all(|(left, right)| condition_explanations_match(left, right))
 }
 
 fn operands_match(left: Option<&OperandExplanation>, right: Option<&OperandExplanation>) -> bool {
@@ -1011,9 +1643,27 @@ fn materialize_condition_explanations(
     trace: &EvaluationTrace,
     settings: &ExplanationSettings,
 ) -> Vec<ConditionExplanation> {
+    materialize_condition_explanations_at_depth(
+        relevant_outcomes,
+        program,
+        trace,
+        settings,
+        0,
+        true,
+    )
+}
+
+fn materialize_condition_explanations_at_depth(
+    relevant_outcomes: Vec<(usize, &ConditionOutcome)>,
+    program: &Program,
+    trace: &EvaluationTrace,
+    settings: &ExplanationSettings,
+    depth: usize,
+    allow_unanchored_loop_fallback: bool,
+) -> Vec<ConditionExplanation> {
     let mut conditions: Vec<ConditionExplanation> = Vec::new();
 
-    for (_, outcome) in &relevant_outcomes {
+    for (outcome_index, outcome) in &relevant_outcomes {
         let pc_usize: usize = outcome.pc.try_into().unwrap_or(0);
 
         let static_info = program
@@ -1044,7 +1694,20 @@ fn materialize_condition_explanations(
         let (left, right) = materialize_operands(outcome, static_info, trace, settings);
         let witness = materialize_loop_witness(outcome, trace);
         let binding_name = static_info.and_then(|i| i.binding_name.clone());
+        let builtin_name = static_info.and_then(|i| i.builtin_name.clone());
+        let negated = static_info.is_some_and(|i| i.negated);
         let text = decorate_condition_text(base_text, static_info, left.as_ref());
+        let (helper_conditions, helper_conditions_truncated) = materialize_helper_conditions(
+            pc_usize,
+            *outcome_index,
+            program,
+            trace,
+            settings,
+            depth,
+        );
+        let helper_failed = !outcome.assumed && outcome.passed == negated;
+        let left = derive_left_provenance_from_helper(left, &helper_conditions, helper_failed);
+        let helper_conditions = finalize_condition_explanations(helper_conditions, settings, false);
 
         conditions.push(ConditionExplanation {
             text,
@@ -1056,6 +1719,10 @@ fn materialize_condition_explanations(
             right,
             witness,
             binding_name,
+            builtin_name,
+            negated,
+            helper_conditions,
+            helper_conditions_truncated,
         });
     }
 
@@ -1063,7 +1730,11 @@ fn materialize_condition_explanations(
         .iter()
         .all(|condition| condition.witness.is_none())
     {
-        if let Some(witness) = materialize_fallback_loop_witness(&relevant_outcomes, trace) {
+        if let Some(witness) = materialize_fallback_loop_witness(
+            &relevant_outcomes,
+            trace,
+            allow_unanchored_loop_fallback,
+        ) {
             if let Some(last) = conditions.last_mut() {
                 last.witness = Some(witness);
             }
@@ -1076,6 +1747,7 @@ fn materialize_condition_explanations(
 fn materialize_fallback_loop_witness(
     relevant_outcomes: &[(usize, &ConditionOutcome)],
     trace: &EvaluationTrace,
+    allow_unanchored_fallback: bool,
 ) -> Option<LoopWitnessExplanation> {
     let selected_indices: Vec<u32> = relevant_outcomes
         .iter()
@@ -1090,7 +1762,11 @@ fn materialize_fallback_loop_witness(
             stat.anchor_condition_idx
                 .is_some_and(|idx| selected_indices.contains(&idx))
         })
-        .or_else(|| trace.loop_stats.last())?;
+        .or_else(|| {
+            allow_unanchored_fallback
+                .then(|| trace.loop_stats.last())
+                .flatten()
+        })?;
 
     Some(LoopWitnessExplanation {
         total_iterations: stat.total_iterations,
@@ -1165,27 +1841,6 @@ fn select_condition_outcomes<'a>(
         .iter()
         .enumerate()
         .filter(|outcome| outcome.1.pc >= first_pc && outcome.1.pc <= last_pc)
-        .collect();
-
-    select_condition_outcomes_from_slice(outcomes, settings)
-}
-
-fn select_condition_outcomes_in_window<'a>(
-    condition_start_index: u32,
-    condition_end_index: u32,
-    trace: &'a EvaluationTrace,
-    settings: &ExplanationSettings,
-) -> Vec<(usize, &'a ConditionOutcome)> {
-    let start_idx = usize::try_from(condition_start_index).unwrap_or(usize::MAX);
-    let end_idx = usize::try_from(condition_end_index).unwrap_or(usize::MAX);
-
-    let outcomes: Vec<(usize, &ConditionOutcome)> = trace
-        .condition_outcomes
-        .get(start_idx..end_idx)
-        .unwrap_or(&[])
-        .iter()
-        .enumerate()
-        .map(|(offset, outcome)| (start_idx.saturating_add(offset), outcome))
         .collect();
 
     select_condition_outcomes_from_slice(outcomes, settings)
@@ -1349,8 +2004,8 @@ fn format_condition_kind(kind: &crate::static_provenance::ConditionKind) -> Stri
         ConditionKind::Truthiness => "truthiness",
         ConditionKind::Existence => "existence",
         ConditionKind::EqualityAssertion => "equality_assertion",
-        ConditionKind::Negation => "negation",
         ConditionKind::Binding => "binding",
+        ConditionKind::Builtin => "builtin",
     }
     .to_string()
 }
@@ -1358,16 +2013,16 @@ fn format_condition_kind(kind: &crate::static_provenance::ConditionKind) -> Stri
 #[cfg(all(test, feature = "explanations"))]
 #[allow(clippy::indexing_slicing, clippy::unwrap_used)]
 mod tests {
-    use alloc::vec;
+    use alloc::{vec, vec::Vec};
 
     use super::{
-        dedupe_emission_conditions, materialize, materialize_condition_explanations,
-        materialize_conditions, materialize_rule_emissions, ConditionExplanation,
-        OperandExplanation,
+        dedupe_emission_conditions, lookup_helper_invocation, materialize,
+        materialize_condition_explanations, materialize_conditions, materialize_rule_emissions,
+        substitute_identifiers, ConditionExplanation, OperandExplanation,
     };
     use crate::evaluation_trace::{
         AssumptionKind, ConditionMode, EvaluationTrace, ExplanationDetail, ExplanationScope,
-        ExplanationSettings, ValueMode,
+        ExplanationSettings, RuleInvocation, ValueMode,
     };
     use crate::rvm::program::{Program, RuleInfo, RuleType, SourceFile, SpanInfo};
     use crate::static_provenance::{ConditionKind, StaticConditionInfo};
@@ -1399,6 +2054,43 @@ mod tests {
     }
 
     #[test]
+    fn helper_invocation_lookup_bounds_repeated_helper_search() {
+        let invocations = (0..1024)
+            .map(|index| RuleInvocation {
+                call_pc: index,
+                dest_register: 0,
+                rule_index: 7,
+                condition_start_index: index,
+                condition_end_index: index.saturating_add(1),
+            })
+            .collect::<Vec<_>>();
+
+        let (invocation, inspections) = lookup_helper_invocation(7, 512, &invocations);
+
+        assert_eq!(invocation.map(|value| value.condition_end_index), Some(512));
+        assert!(
+            inspections <= 12,
+            "eligible-prefix lookup inspected {inspections} entries"
+        );
+    }
+
+    #[test]
+    fn helper_substitution_rewrites_only_variable_occurrences() {
+        let substitutions = vec![
+            ("startswith".into(), "\"prod\"".into()),
+            ("pkg".into(), "\"wrong\"".into()),
+            ("name".into(), "\"storage\"".into()),
+            ("e3".into(), "2".into()),
+        ];
+        let text = "startswith(input.name, startswith) && pkg.check(input.name) && input.limit < 1e3 && name == \"name\"";
+
+        assert_eq!(
+            substitute_identifiers(text, &substitutions),
+            "startswith(input.name, \"prod\") && pkg.check(input.name) && input.limit < 1e3 && \"storage\" == \"name\""
+        );
+    }
+
+    #[test]
     fn primary_only_keeps_last_outcome_per_condition_site() {
         let mut program = Program::new();
         program
@@ -1420,6 +2112,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1430,13 +2124,15 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
         ];
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, None, None, None, None);
-        trace.record_condition(1, false, false, None, None, None, None);
-        trace.record_condition(2, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
+        trace.record_condition(1, false, false, None, None, None, None, 0);
+        trace.record_condition(2, true, false, None, None, None, None, 0);
 
         let conditions = materialize_conditions(
             1,
@@ -1480,12 +2176,14 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
         ];
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, None, None, None, None);
-        trace.record_condition(1, false, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
+        trace.record_condition(1, false, false, None, None, None, None, 0);
 
         let conditions = materialize_conditions(
             1,
@@ -1522,6 +2220,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1532,6 +2232,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1542,6 +2244,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
         ];
         let rule_info = RuleInfo::new(
@@ -1554,13 +2258,13 @@ mod tests {
         program.rule_infos.push(rule_info.clone());
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, None, None, None, None);
-        trace.record_condition(2, true, false, None, None, None, None);
-        trace.record_condition(3, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
+        trace.record_condition(2, true, false, None, None, None, None, 0);
+        trace.record_condition(3, true, false, None, None, None, None, 0);
         trace.record_emission(0, 0, 0, 3, Value::from("violation a"));
-        trace.record_condition(1, true, false, None, None, None, None);
-        trace.record_condition(2, true, false, None, None, None, None);
-        trace.record_condition(3, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
+        trace.record_condition(2, true, false, None, None, None, None, 0);
+        trace.record_condition(3, true, false, None, None, None, None, 0);
         trace.record_emission(0, 0, 3, 6, Value::from("violation b"));
         trace.record_emission(0, 0, 3, 6, Value::from("violation b"));
 
@@ -1617,6 +2321,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1627,6 +2333,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1637,6 +2345,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
         ];
         let rule_info = RuleInfo::new(
@@ -1649,13 +2359,13 @@ mod tests {
         program.rule_infos.push(rule_info.clone());
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, None, None, None, None);
-        trace.record_condition(2, true, false, None, None, None, None);
-        trace.record_condition(3, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
+        trace.record_condition(2, true, false, None, None, None, None, 0);
+        trace.record_condition(3, true, false, None, None, None, None, 0);
         trace.record_emission(0, 0, 0, 3, Value::from("violation a"));
-        trace.record_condition(1, true, false, None, None, None, None);
-        trace.record_condition(2, true, false, None, None, None, None);
-        trace.record_condition(3, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
+        trace.record_condition(2, true, false, None, None, None, None, 0);
+        trace.record_condition(3, true, false, None, None, None, None, 0);
         trace.record_emission(0, 0, 3, 6, Value::from("violation b"));
 
         let emissions = materialize_rule_emissions(
@@ -1700,6 +2410,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1710,6 +2422,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1720,6 +2434,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
         ];
         let rule_info = RuleInfo::new(
@@ -1732,13 +2448,13 @@ mod tests {
         program.rule_infos.push(rule_info.clone());
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, None, None, None, None);
-        trace.record_condition(2, true, false, None, None, None, None);
-        trace.record_condition(3, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
+        trace.record_condition(2, true, false, None, None, None, None, 0);
+        trace.record_condition(3, true, false, None, None, None, None, 0);
         trace.record_emission(0, 0, 0, 3, Value::from("violation a"));
-        trace.record_condition(1, true, false, None, None, None, None);
-        trace.record_condition(2, true, false, None, None, None, None);
-        trace.record_condition(3, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
+        trace.record_condition(2, true, false, None, None, None, None, 0);
+        trace.record_condition(3, true, false, None, None, None, None, 0);
         trace.record_emission(0, 0, 3, 6, Value::from("violation b"));
 
         let emissions = materialize_rule_emissions(
@@ -1781,6 +2497,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1791,6 +2509,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
         ];
         let rule_info = RuleInfo::new(
@@ -1803,8 +2523,8 @@ mod tests {
         program.rule_infos.push(rule_info.clone());
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, None, None, None, None);
-        trace.record_condition(2, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
+        trace.record_condition(2, true, false, None, None, None, None, 0);
         trace.record_emission(0, 0, 0, 2, Value::from("violation a"));
 
         let standard = materialize_rule_emissions(
@@ -1852,6 +2572,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1862,6 +2584,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -1872,11 +2596,13 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
         ];
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
         trace.record_condition(
             2,
             true,
@@ -1885,6 +2611,7 @@ mod tests {
             None,
             None,
             None,
+            0,
         );
         trace.attach_loop_stat_to_last_condition(
             2,
@@ -1893,7 +2620,7 @@ mod tests {
             Some(Value::from(1_u64)),
             Some(Value::from("match-a")),
         );
-        trace.record_condition(3, true, false, None, None, None, None);
+        trace.record_condition(3, true, false, None, None, None, None, 0);
 
         let conditions = materialize_conditions(
             1,
@@ -1937,11 +2664,13 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
         ];
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, Some(Value::Bool(true)), None, None, None);
+        trace.record_condition(1, true, false, Some(Value::Bool(true)), None, None, None, 0);
         trace.attach_loop_stat_to_last_condition(
             1,
             3,
@@ -1989,6 +2718,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
             None,
         ];
@@ -2007,7 +2738,7 @@ mod tests {
         program.rule_infos.push(rule_info);
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
         trace.record_rule_outcome(0, 0, true, Some(Value::from("violation a")));
         trace.record_emission(0, 0, 0, 1, Value::from("violation a"));
         trace.record_assumption(
@@ -2055,11 +2786,13 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
         ];
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, Some(Value::Bool(true)), None, None, None);
+        trace.record_condition(1, true, false, Some(Value::Bool(true)), None, None, None, 0);
         trace.attach_loop_stat_to_last_condition(
             1,
             3,
@@ -2106,6 +2839,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
             Some(StaticConditionInfo {
                 checked_register: 0,
@@ -2116,12 +2851,23 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
         ];
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, Some(Value::Bool(true)), None, None, None);
-        trace.record_condition(2, false, false, Some(Value::Bool(false)), None, None, None);
+        trace.record_condition(1, true, false, Some(Value::Bool(true)), None, None, None, 0);
+        trace.record_condition(
+            2,
+            false,
+            false,
+            Some(Value::Bool(false)),
+            None,
+            None,
+            None,
+            0,
+        );
         trace.record_loop(
             2,
             Some(1),
@@ -2198,6 +2944,8 @@ mod tests {
                 operator: None,
                 has_input_operand: false,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
             }),
         ];
 
@@ -2210,6 +2958,7 @@ mod tests {
             None,
             None,
             None,
+            0,
         );
 
         let conditions = materialize_condition_explanations(
@@ -2242,6 +2991,10 @@ mod tests {
                 right: None,
                 witness: None,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
+                helper_conditions: alloc::vec::Vec::new(),
+                helper_conditions_truncated: false,
             },
             ConditionExplanation {
                 text: "some item in coll [matched: b]".into(),
@@ -2257,6 +3010,10 @@ mod tests {
                 right: None,
                 witness: None,
                 binding_name: None,
+                builtin_name: None,
+                negated: false,
+                helper_conditions: alloc::vec::Vec::new(),
+                helper_conditions_truncated: false,
             },
         ];
 

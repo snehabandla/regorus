@@ -155,6 +155,18 @@ pub struct ConditionOutcome {
     pub expected_path: Option<String>,
     /// Index of the loop summary in `loop_stats`, if this condition has one.
     pub loop_stat_idx: Option<ValueIdx>,
+    /// Rule index active when this outcome was recorded.
+    pub rule_index: u16,
+}
+
+/// Condition-outcome window produced by one completed rule invocation.
+#[derive(Debug, Clone)]
+pub struct RuleInvocation {
+    pub call_pc: usize,
+    pub dest_register: u8,
+    pub rule_index: u16,
+    pub condition_start_index: usize,
+    pub condition_end_index: usize,
 }
 
 /// Statistics for a completed loop.
@@ -288,6 +300,8 @@ pub enum AssumptionKind {
 pub struct EvaluationTrace {
     /// Condition outcomes in evaluation order.
     pub condition_outcomes: Vec<ConditionOutcome>,
+    /// Completed rule invocations in evaluation order.
+    pub rule_invocations: Vec<RuleInvocation>,
     /// Captured runtime values (Rc-bumped, no deep copy).
     pub captured_values: Vec<Value>,
     /// Loop statistics.
@@ -324,6 +338,7 @@ impl EvaluationTrace {
     /// Clear the trace for reuse.
     pub fn clear(&mut self) {
         self.condition_outcomes.clear();
+        self.rule_invocations.clear();
         self.captured_values.clear();
         self.loop_stats.clear();
         self.rule_outcomes.clear();
@@ -340,6 +355,7 @@ impl EvaluationTrace {
     /// Returns true if the trace is empty (nothing recorded).
     pub const fn is_empty(&self) -> bool {
         self.condition_outcomes.is_empty()
+            && self.rule_invocations.is_empty()
             && self.loop_stats.is_empty()
             && self.rule_outcomes.is_empty()
             && self.assumptions.is_empty()
@@ -364,6 +380,7 @@ impl EvaluationTrace {
         actual_path: Option<String>,
         expected: Option<Value>,
         expected_path: Option<String>,
+        rule_index: u16,
     ) {
         let actual_idx = actual.and_then(|v| self.capture_value(v));
         let expected_idx = expected.and_then(|v| self.capture_value(v));
@@ -376,6 +393,23 @@ impl EvaluationTrace {
             expected_value_idx: expected_idx,
             expected_path,
             loop_stat_idx: None,
+            rule_index,
+        });
+    }
+
+    pub fn record_rule_invocation(
+        &mut self,
+        call_pc: usize,
+        dest_register: u8,
+        rule_index: u16,
+        condition_start_index: usize,
+    ) {
+        self.rule_invocations.push(RuleInvocation {
+            call_pc,
+            dest_register,
+            rule_index,
+            condition_start_index,
+            condition_end_index: self.condition_outcomes.len(),
         });
     }
 
@@ -546,5 +580,21 @@ impl EvaluationTrace {
     /// Resolve a captured value by index.
     pub fn get_value(&self, idx: ValueIdx) -> Option<&Value> {
         self.captured_values.get(usize::from(idx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::EvaluationTrace;
+
+    #[test]
+    fn clear_removes_rule_invocations() {
+        let mut trace = EvaluationTrace::new();
+        trace.record_rule_invocation(1, 2, 3, 0);
+
+        assert!(!trace.is_empty());
+        trace.clear();
+        assert!(trace.rule_invocations.is_empty());
+        assert!(trace.is_empty());
     }
 }
