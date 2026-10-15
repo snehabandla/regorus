@@ -930,7 +930,7 @@ fn materialize_helper_conditions(
     settings: &ExplanationSettings,
     depth: usize,
 ) -> (Vec<ConditionExplanation>, bool) {
-    let Some((helper_rule_index, _call_pc, _dest_register)) =
+    let Some((helper_rule_index, call_pc, _dest_register)) =
         detect_helper_call_at_guard(outer_pc, program)
     else {
         return (Vec::new(), false);
@@ -954,16 +954,255 @@ fn materialize_helper_conditions(
         return (Vec::new(), true);
     }
     let selected_outcomes = select_condition_outcomes_from_slice(inner_outcomes, settings);
-    (
-        materialize_condition_explanations_at_depth(
-            selected_outcomes,
-            program,
-            trace,
-            settings,
-            depth.saturating_add(1),
-        ),
-        false,
-    )
+    let mut conditions = materialize_condition_explanations_at_depth(
+        selected_outcomes,
+        program,
+        trace,
+        settings,
+        depth.saturating_add(1),
+    );
+    let substitutions = extract_helper_arg_substitutions(call_pc, helper_rule_index, program);
+    let helper_name = program
+        .rule_infos
+        .get(usize::from(helper_rule_index))
+        .and_then(|rule| rule.name.rsplit('.').next())
+        .unwrap_or("");
+    for condition in &mut conditions {
+        condition.text = rewrite_helper_body_text(&condition.text, helper_name, &substitutions);
+    }
+    conditions.retain(|condition| !(condition.kind == "unknown" && condition.text.is_empty()));
+    (conditions, false)
+}
+
+fn extract_helper_arg_substitutions(
+    call_pc: usize,
+    helper_rule_index: u16,
+    program: &Program,
+) -> Vec<(String, String)> {
+    let Some(&Instruction::FunctionCall { params_index }) = program.instructions.get(call_pc)
+    else {
+        return Vec::new();
+    };
+    let Some(params) = program
+        .instruction_data
+        .function_call_params
+        .get(usize::from(params_index))
+    else {
+        return Vec::new();
+    };
+    let Some(function_info) = program
+        .rule_infos
+        .get(usize::from(helper_rule_index))
+        .and_then(|rule| rule.function_info.as_ref())
+    else {
+        return Vec::new();
+    };
+
+    let mut substitutions = Vec::new();
+    for (index, parameter) in function_info.param_names.iter().enumerate() {
+        let Some(&argument_register) = params.arg_registers().get(index) else {
+            break;
+        };
+        if let Some(literal) = find_literal_load(call_pc, argument_register, program) {
+            substitutions.push((parameter.clone(), literal));
+        }
+    }
+    substitutions
+}
+
+fn find_literal_load(pc: usize, target_register: u8, program: &Program) -> Option<String> {
+    let mut current = pc;
+    while current > 0 {
+        current = current.saturating_sub(1);
+        let instruction = program.instructions.get(current)?;
+        match *instruction {
+            Instruction::Load { dest, literal_idx } => {
+                if dest != target_register {
+                    continue;
+                }
+                return program
+                    .literals
+                    .get(usize::from(literal_idx))
+                    .and_then(format_literal_for_substitution);
+            }
+            Instruction::LoadTrue { dest } if dest == target_register => {
+                return Some("true".into());
+            }
+            Instruction::LoadFalse { dest } if dest == target_register => {
+                return Some("false".into());
+            }
+            Instruction::LoadNull { dest } if dest == target_register => {
+                return Some("null".into());
+            }
+            Instruction::LoadBool { dest, value } if dest == target_register => {
+                return Some(value.to_string());
+            }
+            Instruction::LoadTrue { .. }
+            | Instruction::LoadFalse { .. }
+            | Instruction::LoadNull { .. }
+            | Instruction::LoadBool { .. } => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn format_literal_for_substitution(value: &Value) -> Option<String> {
+    match value {
+        Value::String(_) | Value::Null | Value::Bool(_) | Value::Number(_) => {
+            value.to_json_str().ok()
+        }
+        _ => None,
+    }
+}
+
+fn rewrite_helper_body_text(
+    text: &str,
+    helper_name: &str,
+    substitutions: &[(String, String)],
+) -> String {
+    const SEPARATOR: &str = " if ";
+    let has_helper_head = !helper_name.is_empty()
+        && text.starts_with(helper_name)
+        && text
+            .get(helper_name.len()..)
+            .is_some_and(|suffix| suffix.starts_with('(') || suffix.starts_with(SEPARATOR));
+    let body = if has_helper_head {
+        find_rule_body_separator(text)
+            .and_then(|position| position.checked_add(SEPARATOR.len()))
+            .and_then(|body_start| text.get(body_start..))
+            .unwrap_or(text)
+    } else {
+        text
+    };
+    let suffix_start = [" [matched: ", " [loop: "]
+        .into_iter()
+        .filter_map(|marker| body.rfind(marker))
+        .min()
+        .unwrap_or(body.len());
+    let (expression, suffix) = body.split_at(suffix_start);
+    let mut rewritten = substitute_identifiers(expression, substitutions);
+    rewritten.push_str(suffix);
+    rewritten
+}
+
+fn find_rule_body_separator(text: &str) -> Option<usize> {
+    const SEPARATOR: &str = " if ";
+    let mut quote = None;
+    let mut escaped = false;
+    let mut paren_depth = 0_u32;
+    let mut bracket_depth = 0_u32;
+    let mut brace_depth = 0_u32;
+    for (index, character) in text.char_indices() {
+        if let Some(delimiter) = quote {
+            if delimiter == '"' && character == '\\' && !escaped {
+                escaped = true;
+                continue;
+            }
+            if character == delimiter && !escaped {
+                quote = None;
+            }
+            escaped = false;
+            continue;
+        }
+        if character == '"' || character == '`' {
+            quote = Some(character);
+            continue;
+        }
+        match character {
+            '(' => paren_depth = paren_depth.saturating_add(1),
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth = bracket_depth.saturating_add(1),
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth = brace_depth.saturating_add(1),
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            ' ' if paren_depth == 0
+                && bracket_depth == 0
+                && brace_depth == 0
+                && text[index..].starts_with(SEPARATOR) =>
+            {
+                return Some(index);
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn substitute_identifiers(text: &str, substitutions: &[(String, String)]) -> String {
+    if substitutions.is_empty() {
+        return text.to_string();
+    }
+    let mut output = String::with_capacity(text.len());
+    let mut characters = text.char_indices().peekable();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut in_comment = false;
+    while let Some((start, character)) = characters.next() {
+        if in_comment {
+            output.push(character);
+            if character == '\n' {
+                in_comment = false;
+            }
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            output.push(character);
+            if delimiter == '"' && character == '\\' && !escaped {
+                escaped = true;
+                continue;
+            }
+            if character == delimiter && !escaped {
+                quote = None;
+            }
+            escaped = false;
+            continue;
+        }
+        if character == '"' || character == '`' {
+            quote = Some(character);
+            output.push(character);
+            continue;
+        }
+        if character == '#' {
+            in_comment = true;
+            output.push(character);
+            continue;
+        }
+        if !is_identifier_start(character) {
+            output.push(character);
+            continue;
+        }
+
+        let mut end = start.saturating_add(character.len_utf8());
+        while let Some(&(index, next)) = characters.peek() {
+            if !is_identifier_char(next) {
+                break;
+            }
+            characters.next();
+            end = index.saturating_add(next.len_utf8());
+        }
+        let identifier = &text[start..end];
+        let is_field = text[..start].ends_with('.');
+        if !is_field {
+            if let Some((_, replacement)) = substitutions
+                .iter()
+                .find(|(parameter, _)| parameter == identifier)
+            {
+                output.push_str(replacement);
+                continue;
+            }
+        }
+        output.push_str(identifier);
+    }
+    output
+}
+
+const fn is_identifier_start(character: char) -> bool {
+    character.is_ascii_alphabetic() || character == '_'
+}
+
+const fn is_identifier_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_'
 }
 
 fn derive_left_provenance_from_helper(

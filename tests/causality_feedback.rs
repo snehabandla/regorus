@@ -1158,7 +1158,11 @@ h(n) := true if {
     assert_eq!(
         helpers
             .iter()
-            .filter(|helper| helper["text"] == "input.a == n")
+            .filter(|helper| {
+                helper["text"]
+                    .as_str()
+                    .is_some_and(|text| text.starts_with("input.a =="))
+            })
             .count(),
         1,
         "expected exactly one comparison from the current helper invocation: {helpers:#?}"
@@ -1200,7 +1204,7 @@ inner(n) if {
         .find(|helper| {
             helper["text"]
                 .as_str()
-                .is_some_and(|text| text.contains("inner(n)"))
+                .is_some_and(|text| text.starts_with("inner("))
         })
         .unwrap_or_else(|| panic!("missing nested helper guard: {helpers:#?}"));
     assert!(
@@ -1249,6 +1253,347 @@ _always := true
     let condition = find_condition(&report, "_always")
         .unwrap_or_else(|| panic!("missing empty helper condition: {report:#?}"));
     assert!(condition.get("helper_conditions").is_none());
+}
+
+const HELPER_SUBSTITUTION_POLICY: &str = r#"
+package bicep
+import rego.v1
+
+in_resource_group(fragment) if contains(input.deployment.resourceGroupName, fragment)
+
+deny contains msg if {
+    in_resource_group("prod")
+    some resource in input.resources
+    resource.type == "Microsoft.Storage/storageAccounts"
+    msg := resource.name
+}
+"#;
+
+const HELPER_SUBSTITUTION_INPUT: &str = r#"{
+    "deployment": { "resourceGroupName": "prod-eastus" },
+    "resources": [{
+        "type": "Microsoft.Storage/storageAccounts",
+        "name": "storage"
+    }]
+}"#;
+
+fn helper_conditions_for<'a>(
+    report: &'a serde_json::Value,
+    outer_text: &str,
+) -> &'a Vec<serde_json::Value> {
+    find_condition(report, outer_text)
+        .and_then(|condition| condition["helper_conditions"].as_array())
+        .unwrap_or_else(|| panic!("missing helper conditions for '{outer_text}': {report:#?}"))
+}
+
+#[test]
+fn causality_7_helper_single_arg_substituted() {
+    let report = run_causality_full(
+        HELPER_SUBSTITUTION_POLICY,
+        HELPER_SUBSTITUTION_INPUT,
+        "data.bicep.deny",
+    );
+    let builtin = helper_conditions_for(&report, "in_resource_group(\"prod\")")
+        .iter()
+        .find(|condition| condition["builtin_name"] == "contains")
+        .unwrap();
+    let text = builtin["text"].as_str().unwrap();
+    assert!(text.contains("\"prod\""));
+    assert!(!text.contains("fragment"));
+    assert!(!text.contains(" if "));
+
+    let report = run_causality_full(
+        r#"
+package escaped
+import rego.v1
+
+matches(value) if {
+    input.actual == value
+}
+
+result if {
+    matches("a\"b")
+}
+"#,
+        r#"{"actual":"a\"b"}"#,
+        "data.escaped.result",
+    );
+    let outer = all_conditions(&report)
+        .into_iter()
+        .find(|condition| {
+            condition["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("matches("))
+        })
+        .unwrap();
+    let text = outer["helper_conditions"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains(r#""a\"b""#),
+        "escaped literal was not rendered safely: {text}"
+    );
+}
+
+#[test]
+fn causality_7_helper_body_only_no_rule_head() {
+    let report = run_causality_full(
+        HELPER_SUBSTITUTION_POLICY,
+        HELPER_SUBSTITUTION_INPUT,
+        "data.bicep.deny",
+    );
+    let builtin = helper_conditions_for(&report, "in_resource_group(\"prod\")")
+        .iter()
+        .find(|condition| condition["builtin_name"] == "contains")
+        .unwrap();
+    let text = builtin["text"].as_str().unwrap();
+    assert!(text.starts_with("contains("));
+    assert!(!text.contains("in_resource_group"));
+
+    let report = run_causality_full(
+        r#"
+package quotedhead
+import rego.v1
+
+helper(x) := "left if right" if {
+    input.actual == x
+}
+
+result if {
+    helper(1)
+}
+"#,
+        r#"{"actual":1}"#,
+        "data.quotedhead.result",
+    );
+    let text = helper_conditions_for(&report, "helper(1)")
+        .iter()
+        .find_map(|condition| condition["text"].as_str())
+        .unwrap();
+    assert_eq!(text, "input.actual == 1");
+}
+
+#[test]
+fn causality_7_helper_multi_arg_substituted() {
+    let report = run_causality_full(
+        r#"
+package bicep
+import rego.v1
+
+rg_matches(expected, region) if {
+    input.deployment.resourceGroupName == expected
+    input.deployment.location == region
+}
+
+deny contains "matched" if {
+    rg_matches("prod-rg", "eastus")
+}
+"#,
+        r#"{"deployment":{"resourceGroupName":"prod-rg","location":"eastus"}}"#,
+        "data.bicep.deny",
+    );
+    let texts = helper_conditions_for(&report, "rg_matches(\"prod-rg\", \"eastus\")")
+        .iter()
+        .filter_map(|condition| condition["text"].as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(texts.contains("\"prod-rg\""));
+    assert!(texts.contains("\"eastus\""));
+    assert!(!texts.contains("expected"));
+    assert!(!texts.contains("region"));
+
+    let report = run_causality_full(
+        r#"
+package bicep
+import rego.v1
+
+matches(value) if {
+    input.actual == value
+}
+
+deny contains "one" if { matches("one") }
+deny contains "two" if { matches("two") }
+"#,
+        r#"{"actual":"two"}"#,
+        "data.bicep.deny",
+    );
+    let text = helper_conditions_for(&report, "matches(\"two\")")
+        .iter()
+        .find_map(|condition| condition["text"].as_str())
+        .unwrap();
+    assert!(text.contains("\"two\""));
+    assert!(!text.contains("\"one\""));
+
+    let report = run_causality_full(
+        r#"
+package collision
+import rego.v1
+
+check(a, b) if {
+    input.actual == a
+    input.region == b
+}
+
+result if {
+    check("b", "eastus")
+}
+"#,
+        r#"{"actual":"b","region":"eastus"}"#,
+        "data.collision.result",
+    );
+    let helpers = helper_conditions_for(&report, "check(\"b\", \"eastus\")");
+    let text = helpers
+        .iter()
+        .filter_map(|condition| condition["text"].as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(text.contains(r#"input.actual == "b""#));
+    assert!(!text.contains(r#""eastus""b""#));
+
+    let report = run_causality_full(
+        r#"
+package fields
+import rego.v1
+
+check(name) if {
+    input.name == name
+    input.label == "name"
+}
+
+result if {
+    check("actual")
+}
+"#,
+        r#"{"name":"actual","label":"name"}"#,
+        "data.fields.result",
+    );
+    let text = helper_conditions_for(&report, "check(\"actual\")")
+        .iter()
+        .filter_map(|condition| condition["text"].as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(text.contains(r#"input.name == "actual""#));
+    assert!(text.contains(r#"input.label == "name""#));
+
+    let report = run_causality_full(
+        r#"
+package arrays
+import rego.v1
+
+contains_item(n) if {
+    input.items == [n]
+}
+
+result if {
+    contains_item(1)
+}
+"#,
+        r#"{"items":[1]}"#,
+        "data.arrays.result",
+    );
+    let text = helper_conditions_for(&report, "contains_item(1)")
+        .iter()
+        .find_map(|condition| condition["text"].as_str())
+        .unwrap();
+    assert!(
+        text.contains("[1]"),
+        "array expression was mistaken for report metadata: {text}"
+    );
+
+    let report = run_causality_full(
+        r#"
+package collectionarg
+import rego.v1
+
+check(items) if {
+    input.items == items
+}
+
+result if {
+    check([1])
+}
+"#,
+        r#"{"items":[1]}"#,
+        "data.collectionarg.result",
+    );
+    let text = helper_conditions_for(&report, "check([1])")
+        .iter()
+        .find_map(|condition| condition["text"].as_str())
+        .unwrap();
+    assert!(
+        text.contains("items"),
+        "unsupported collection literal should remain unresolved: {text}"
+    );
+}
+
+#[test]
+fn causality_7_helper_dynamic_arg_no_substitution() {
+    let report = run_causality_full(
+        r#"
+package bicep
+import rego.v1
+
+is_bad(resource) if {
+    resource.type == "Microsoft.Storage/storageAccounts"
+    resource.properties.allowBlobPublicAccess == true
+    resource.note == "deny if bad"
+}
+
+deny contains "stale" if {
+    input.q == "x"
+    is_bad("stale")
+}
+
+deny contains "dynamic" if {
+    input.q == "x"
+    some resource in input.resources
+    is_bad(resource)
+}
+"#,
+        r#"{"resources":[{
+            "type":"Microsoft.Storage/storageAccounts",
+            "note":"deny if bad",
+            "properties":{"allowBlobPublicAccess":true}
+        }],"q":"x"}"#,
+        "data.bicep.deny",
+    );
+    let helpers = helper_conditions_for(&report, "is_bad(resource)");
+    assert!(helpers.iter().all(|condition| {
+        condition["text"]
+            .as_str()
+            .is_some_and(|text| !text.starts_with("is_bad"))
+    }));
+    assert!(helpers.iter().any(|condition| {
+        condition["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("resource"))
+    }));
+    assert!(
+        helpers.iter().all(|condition| !condition["text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("\"stale\"")),
+        "dynamic argument picked up a stale literal: {helpers:#?}"
+    );
+    assert!(
+        helpers.iter().any(|condition| {
+            condition["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("\"deny if bad\""))
+        }),
+        "body text containing ` if ` was truncated: {helpers:#?}"
+    );
+}
+
+#[test]
+fn causality_7_helper_no_empty_unknown_entries() {
+    let report = run_causality_full(
+        HELPER_SUBSTITUTION_POLICY,
+        HELPER_SUBSTITUTION_INPUT,
+        "data.bicep.deny",
+    );
+    let helpers = helper_conditions_for(&report, "in_resource_group(\"prod\")");
+    assert!(helpers.iter().all(|condition| {
+        !(condition["kind"] == "unknown" && condition["text"].as_str().is_some_and(str::is_empty))
+    }));
 }
 
 fn has_truncation_flag(value: &serde_json::Value) -> bool {
