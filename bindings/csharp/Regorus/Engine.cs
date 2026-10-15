@@ -52,6 +52,15 @@ namespace Regorus
         Standard = 1,
         Full = 2,
     }
+
+    /// <summary>
+    /// Controls whether evaluation produces a causality report or a partial-evaluation residual.
+    /// </summary>
+    public enum EvaluationMode : byte
+    {
+        Causality = 0,
+        PartialEval = 1,
+    }
 #endif
 
     /// <summary>

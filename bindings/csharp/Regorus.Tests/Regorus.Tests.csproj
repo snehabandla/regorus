@@ -13,6 +13,10 @@
     <UsePackageReference Condition="'$(UsePackageReference)' == ''">false</UsePackageReference>
   </PropertyGroup>
 
+  <PropertyGroup Condition="'$(EnableRegorusTestHooks)' == 'true' And '$(UsePackageReference)' != 'true'">
+    <DefineConstants>$(DefineConstants);REGORUS_FFI_TEST_HOOKS</DefineConstants>
+  </PropertyGroup>
+
   <ItemGroup>
     <None Include="../../../tests/**/*.*" Link="tests/%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
     <Compile Remove="AssumptionTests.cs" />
@@ -26,6 +30,50 @@
   <ItemGroup Condition="'$(UsePackageReference)' != 'true'">
     <ProjectReference Include="../Regorus/Regorus.csproj" />
   </ItemGroup>
+
+  <PropertyGroup Condition="'$(UsePackageReference)' != 'true'">
+    <RegorusFFIArtifactsProfile Condition="'$(Configuration)' == 'Release'">release</RegorusFFIArtifactsProfile>
+    <RegorusFFIArtifactsProfile Condition="'$(RegorusFFIArtifactsProfile)' == ''">debug</RegorusFFIArtifactsProfile>
+    <RegorusFFICargoProfileArg Condition="'$(Configuration)' == 'Release'">--release</RegorusFFICargoProfileArg>
+    <RegorusFFITestHooksArg Condition="'$(EnableRegorusTestHooks)' == 'true'">--features test-hooks</RegorusFFITestHooksArg>
+    <RegorusFFITargetDir Condition="'$(EnableRegorusTestHooks)' == 'true'">$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../ffi/target/test-hooks'))</RegorusFFITargetDir>
+    <RegorusFFITargetDir Condition="'$(RegorusFFITargetDir)' == ''">$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../ffi/target'))</RegorusFFITargetDir>
+    <RegorusProcessArchitecture>$([System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture)</RegorusProcessArchitecture>
+    <RegorusFFITarget Condition="$([MSBuild]::IsOSPlatform('Windows')) And '$(RegorusProcessArchitecture)' == 'X64'">x86_64-pc-windows-msvc</RegorusFFITarget>
+    <RegorusFFITarget Condition="$([MSBuild]::IsOSPlatform('Windows')) And '$(RegorusProcessArchitecture)' == 'Arm64'">aarch64-pc-windows-msvc</RegorusFFITarget>
+    <RegorusFFITarget Condition="$([MSBuild]::IsOSPlatform('Linux')) And '$(RegorusProcessArchitecture)' == 'X64'">x86_64-unknown-linux-gnu</RegorusFFITarget>
+    <RegorusFFITarget Condition="$([MSBuild]::IsOSPlatform('Linux')) And '$(RegorusProcessArchitecture)' == 'Arm64'">aarch64-unknown-linux-gnu</RegorusFFITarget>
+    <RegorusFFITarget Condition="$([MSBuild]::IsOSPlatform('OSX')) And '$(RegorusProcessArchitecture)' == 'X64'">x86_64-apple-darwin</RegorusFFITarget>
+    <RegorusFFITarget Condition="$([MSBuild]::IsOSPlatform('OSX')) And '$(RegorusProcessArchitecture)' == 'Arm64'">aarch64-apple-darwin</RegorusFFITarget>
+    <RegorusNativeLibraryName Condition="$([MSBuild]::IsOSPlatform('Windows'))">regorus_ffi.dll</RegorusNativeLibraryName>
+    <RegorusNativeLibraryName Condition="$([MSBuild]::IsOSPlatform('Linux'))">libregorus_ffi.so</RegorusNativeLibraryName>
+    <RegorusNativeLibraryName Condition="$([MSBuild]::IsOSPlatform('OSX'))">libregorus_ffi.dylib</RegorusNativeLibraryName>
+    <RegorusNativeLibraryPath>$(RegorusFFITargetDir)/$(RegorusFFITarget)/$(RegorusFFIArtifactsProfile)/$(RegorusNativeLibraryName)</RegorusNativeLibraryPath>
+  </PropertyGroup>
+
+  <Target Name="BuildLocalRegorusNativeLibrary"
+          BeforeTargets="EnsureLocalRegorusNativeLibrary"
+          Condition="'$(UsePackageReference)' != 'true'">
+    <Error Text="Project-reference tests do not support process architecture '$(RegorusProcessArchitecture)'."
+           Condition="'$(RegorusFFITarget)' == ''" />
+    <Exec WorkingDirectory="$(MSBuildThisFileDirectory)../../ffi"
+          Command="cargo build --locked --target-dir &quot;$(RegorusFFITargetDir)&quot; --target $(RegorusFFITarget) $(RegorusFFICargoProfileArg) $(RegorusFFITestHooksArg)" />
+  </Target>
+
+  <Target Name="EnsureLocalRegorusNativeLibrary"
+          BeforeTargets="Build"
+          Condition="'$(UsePackageReference)' != 'true'">
+    <Error Text="Local Regorus native library not found at '$(RegorusNativeLibraryPath)'."
+           Condition="!Exists('$(RegorusNativeLibraryPath)')" />
+  </Target>
+
+  <Target Name="CopyLocalRegorusNativeLibrary"
+          AfterTargets="Build"
+          Condition="'$(UsePackageReference)' != 'true'">
+    <Copy SourceFiles="$(RegorusNativeLibraryPath)"
+          DestinationFiles="$(TargetDir)$(RegorusNativeLibraryName)"
+          SkipUnchangedFiles="false" />
+  </Target>
 
   <ItemGroup Condition="'$(UsePackageReference)' == 'true'">
     <PackageReference Include="Microsoft.Regorus" />

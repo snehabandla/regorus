@@ -39,7 +39,9 @@ fn main() {
 }
 
 fn configure_builder(builder: cbindgen::Builder, experimental: bool) -> cbindgen::Builder {
-    let builder = builder.with_define("feature", "explanations", "REGORUS_EXPERIMENTAL");
+    let builder = builder
+        .with_define("feature", "explanations", "REGORUS_EXPERIMENTAL")
+        .with_define("feature", "test-hooks", "REGORUS_FFI_TEST_HOOKS");
     if experimental {
         builder.with_header("#define REGORUS_EXPERIMENTAL")
     } else {

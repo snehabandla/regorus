@@ -344,13 +344,35 @@ namespace Regorus
         /// <summary>
         /// Set explanation settings for causality tracking.
         /// </summary>
-        public void SetExplanationSettings(bool enabled, ExplanationValueMode valueMode = ExplanationValueMode.Redacted, ExplanationConditionMode conditionMode = ExplanationConditionMode.PrimaryOnly, ExplanationScope scope = ExplanationScope.AllEmissions, ExplanationDetail detail = ExplanationDetail.Standard, uint? emissionIndex = null, string? emissionValueJson = null, bool assumeUnknownInput = false)
+        public void SetExplanationSettings(bool enabled, ExplanationValueMode valueMode = ExplanationValueMode.Redacted, ExplanationConditionMode conditionMode = ExplanationConditionMode.PrimaryOnly, ExplanationScope scope = ExplanationScope.AllEmissions, ExplanationDetail detail = ExplanationDetail.Standard, uint? emissionIndex = null, string? emissionValueJson = null, bool assumeUnknownInput = false, EvaluationMode evaluationMode = EvaluationMode.Causality, IReadOnlyList<string>? unknowns = null)
         {
+            if (unknowns is not null)
+            {
+                for (int index = 0; index < unknowns.Count; index++)
+                {
+                    var path = unknowns[index] ?? throw new ArgumentException(
+                        $"Unknown path at index {index} must not be null.",
+                        nameof(unknowns));
+                    Utf8Marshaller.ThrowIfContainsNul(path, nameof(unknowns));
+                }
+            }
+
+            using var pinnedUnknowns = ModuleMarshalling.PinUtf8Strings(unknowns ?? Array.Empty<string>());
+
             if (emissionValueJson is null)
             {
                 UseHandle(vmPtr =>
                 {
-                    CheckAndDropResult(API.regorus_rvm_set_explanation_settings((RegorusRvm*)vmPtr, enabled, (byte)valueMode, (byte)conditionMode, (byte)scope, (byte)detail, emissionIndex.HasValue, emissionIndex.GetValueOrDefault(), false, null, assumeUnknownInput));
+                    fixed (IntPtr* unknownsPtr = pinnedUnknowns.Buffer)
+                    {
+                        IntPtr explicitEmptyMarker = IntPtr.Zero;
+                        var nativeUnknowns = unknowns is null
+                            ? null
+                            : pinnedUnknowns.Length == 0
+                                ? (byte**)&explicitEmptyMarker
+                                : (byte**)unknownsPtr;
+                        CheckAndDropResult(API.regorus_rvm_set_explanation_settings((RegorusRvm*)vmPtr, enabled, (byte)valueMode, (byte)conditionMode, (byte)scope, (byte)detail, emissionIndex.HasValue, emissionIndex.GetValueOrDefault(), false, null, assumeUnknownInput, (byte)evaluationMode, nativeUnknowns, (UIntPtr)pinnedUnknowns.Length));
+                    }
                     return 0;
                 });
 
@@ -361,7 +383,16 @@ namespace Regorus
             {
                 UseHandle(vmPtr =>
                 {
-                    CheckAndDropResult(API.regorus_rvm_set_explanation_settings((RegorusRvm*)vmPtr, enabled, (byte)valueMode, (byte)conditionMode, (byte)scope, (byte)detail, emissionIndex.HasValue, emissionIndex.GetValueOrDefault(), true, (byte*)emissionValuePtr, assumeUnknownInput));
+                    fixed (IntPtr* unknownsPtr = pinnedUnknowns.Buffer)
+                    {
+                        IntPtr explicitEmptyMarker = IntPtr.Zero;
+                        var nativeUnknowns = unknowns is null
+                            ? null
+                            : pinnedUnknowns.Length == 0
+                                ? (byte**)&explicitEmptyMarker
+                                : (byte**)unknownsPtr;
+                        CheckAndDropResult(API.regorus_rvm_set_explanation_settings((RegorusRvm*)vmPtr, enabled, (byte)valueMode, (byte)conditionMode, (byte)scope, (byte)detail, emissionIndex.HasValue, emissionIndex.GetValueOrDefault(), true, (byte*)emissionValuePtr, assumeUnknownInput, (byte)evaluationMode, nativeUnknowns, (UIntPtr)pinnedUnknowns.Length));
+                    }
                     return 0;
                 });
             });
@@ -375,6 +406,29 @@ namespace Regorus
             return UseHandle(vmPtr =>
             {
                 return CheckAndDropResult(API.regorus_rvm_take_causality_report((RegorusRvm*)vmPtr));
+            });
+        }
+
+        /// <summary>
+        /// Take the partial-evaluation result from the most recent evaluation as JSON.
+        /// </summary>
+        public string? TakePartialEvalResult(string? valueJson = null)
+        {
+            if (valueJson is null)
+            {
+                return UseHandle(vmPtr =>
+                {
+                    return CheckAndDropResult(API.regorus_rvm_take_partial_eval_result((RegorusRvm*)vmPtr, null));
+                });
+            }
+
+            Utf8Marshaller.ThrowIfContainsNul(valueJson, nameof(valueJson));
+            return Utf8Marshaller.WithUtf8(valueJson, valuePtr =>
+            {
+                return UseHandle(vmPtr =>
+                {
+                    return CheckAndDropResult(API.regorus_rvm_take_partial_eval_result((RegorusRvm*)vmPtr, (byte*)valuePtr));
+                });
             });
         }
 #endif

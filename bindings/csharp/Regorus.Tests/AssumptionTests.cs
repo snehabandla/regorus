@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
+using System;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
@@ -171,5 +172,127 @@ public sealed class AssumptionTests
 
         Assert.IsTrue(foundWitness,
             $"expected at least one condition with a loop witness.\nReport:\n{reportJson}");
+    }
+
+    [TestMethod]
+    public void Rvm_partial_eval_uses_explicit_unknown_paths()
+    {
+        using var engine = new Engine();
+        engine.AddPolicy("test.rego", SimplePolicy);
+
+        using var program = Program.CompileFromEngine(engine, new[] { "data.test.allow" });
+        using var vm = new Rvm();
+        vm.LoadProgram(program);
+        vm.SetExplanationSettings(
+            enabled: true,
+            valueMode: ExplanationValueMode.Full,
+            conditionMode: ExplanationConditionMode.AllContributing,
+            detail: ExplanationDetail.Full,
+            assumeUnknownInput: true,
+            evaluationMode: EvaluationMode.PartialEval,
+            unknowns: new[] { "input.role" });
+
+        vm.SetInputJson("{}");
+        var result = vm.ExecuteEntryPoint("data.test.allow");
+        Assert.AreEqual("true", result);
+
+        var reportJson = vm.TakePartialEvalResult(result);
+        Assert.IsNotNull(reportJson);
+        var report = JsonNode.Parse(reportJson!)!;
+        Assert.AreEqual(true, (bool?)report["result"]);
+
+        var residualQueries = report["residual_queries"]?.AsArray();
+        Assert.IsNotNull(residualQueries);
+        Assert.IsTrue(residualQueries!.Count > 0);
+        var selectedCondition = residualQueries[0]?[0];
+        Assert.AreEqual("input.role", (string?)selectedCondition?["input_path"]);
+        Assert.AreEqual("==", (string?)selectedCondition?["operator"]);
+        Assert.AreEqual("admin", (string?)selectedCondition?["value"]);
+
+        using var excludedVm = new Rvm();
+        excludedVm.LoadProgram(program);
+        excludedVm.SetExplanationSettings(
+            enabled: true,
+            assumeUnknownInput: true,
+            evaluationMode: EvaluationMode.PartialEval,
+            unknowns: new[] { "input.other" });
+        excludedVm.SetInputJson("{}");
+        Assert.AreEqual("false", excludedVm.ExecuteEntryPoint("data.test.allow"));
+        var excludedReport = JsonNode.Parse(excludedVm.TakePartialEvalResult("false")!)!;
+        Assert.AreEqual(0, excludedReport["residual_queries"]?.AsArray().Count);
+
+        using var emptyVm = new Rvm();
+        emptyVm.LoadProgram(program);
+        emptyVm.SetExplanationSettings(
+            enabled: true,
+            assumeUnknownInput: true,
+            evaluationMode: EvaluationMode.PartialEval,
+            unknowns: Array.Empty<string>());
+        emptyVm.SetInputJson("{}");
+        Assert.AreEqual("false", emptyVm.ExecuteEntryPoint("data.test.allow"));
+        var emptyReport = JsonNode.Parse(emptyVm.TakePartialEvalResult("false")!)!;
+        Assert.AreEqual(0, emptyReport["residual_queries"]?.AsArray().Count);
+
+        using var defaultVm = new Rvm();
+        defaultVm.LoadProgram(program);
+        defaultVm.SetExplanationSettings(
+            enabled: true,
+            assumeUnknownInput: true,
+            evaluationMode: EvaluationMode.PartialEval);
+        defaultVm.SetInputJson("{}");
+        Assert.AreEqual("true", defaultVm.ExecuteEntryPoint("data.test.allow"));
+        var defaultReport = JsonNode.Parse(defaultVm.TakePartialEvalResult("true")!)!;
+        Assert.AreEqual(
+            "input.role",
+            (string?)defaultReport["residual_queries"]?[0]?[0]?["input_path"]);
+    }
+
+    [TestMethod]
+    public void Rvm_explanation_settings_reject_invalid_evaluation_mode()
+    {
+        using var vm = new Rvm();
+
+        var exception = Assert.ThrowsException<InvalidOperationException>(() =>
+            vm.SetExplanationSettings(
+                enabled: true,
+                evaluationMode: (EvaluationMode)byte.MaxValue));
+
+        StringAssert.Contains(exception.Message, "invalid eval_mode");
+    }
+
+    [TestMethod]
+    public void Rvm_explanation_settings_reject_embedded_nul_in_unknown_path()
+    {
+        using var vm = new Rvm();
+
+        Assert.ThrowsException<ArgumentException>(() =>
+            vm.SetExplanationSettings(
+                enabled: true,
+                evaluationMode: EvaluationMode.PartialEval,
+                unknowns: new[] { "input\0.role" }));
+    }
+
+    [TestMethod]
+    public void Rvm_partial_eval_rejects_invalid_result_without_consuming_trace()
+    {
+        using var engine = new Engine();
+        engine.AddPolicy("test.rego", SimplePolicy);
+
+        using var program = Program.CompileFromEngine(engine, new[] { "data.test.allow" });
+        using var vm = new Rvm();
+        vm.LoadProgram(program);
+        vm.SetExplanationSettings(
+            enabled: true,
+            assumeUnknownInput: true,
+            evaluationMode: EvaluationMode.PartialEval,
+            unknowns: new[] { "input.role" });
+        vm.SetInputJson("{}");
+        Assert.AreEqual("true", vm.ExecuteEntryPoint("data.test.allow"));
+
+        Assert.ThrowsException<ArgumentException>(() => vm.TakePartialEvalResult("true\0garbage"));
+        Assert.ThrowsException<InvalidOperationException>(() => vm.TakePartialEvalResult("tru"));
+
+        var report = JsonNode.Parse(vm.TakePartialEvalResult("true")!)!;
+        Assert.IsTrue(report["residual_queries"]?.AsArray().Count > 0);
     }
 }
