@@ -1251,6 +1251,87 @@ _always := true
     assert!(condition.get("helper_conditions").is_none());
 }
 
+fn has_truncation_flag(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.get("helper_conditions_truncated")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+                || map.values().any(has_truncation_flag)
+        }
+        serde_json::Value::Array(values) => values.iter().any(has_truncation_flag),
+        _ => false,
+    }
+}
+
+fn nested_helper_policy(levels: usize) -> String {
+    let mut policy = String::from("package bicep\nimport rego.v1\n\n");
+    for level in 1..levels {
+        policy.push_str(&format!(
+            "h{level} if {{\n    h{next}\n    input.deployment.location == \"eastus\"\n}}\n\n",
+            next = level + 1
+        ));
+    }
+    policy.push_str(&format!(
+        "h{levels} if {{\n    contains(input.deployment.resourceGroupName, \"prod\")\n    input.deployment.location == \"eastus\"\n}}\n\n"
+    ));
+    policy.push_str("deny contains msg if {\n    h1\n    msg := \"deep chain\"\n}\n");
+    policy
+}
+
+fn nested_empty_leaf_policy(levels: usize) -> String {
+    let mut policy = String::from("package bicep\nimport rego.v1\n\n");
+    for level in 1..levels {
+        policy.push_str(&format!(
+            "h{level} if {{\n    h{next}\n    input.deployment.location == \"eastus\"\n}}\n\n",
+            next = level + 1
+        ));
+    }
+    policy.push_str(&format!("h{levels} := true\n\n"));
+    policy.push_str("deny contains msg if {\n    h1\n    msg := \"deep chain\"\n}\n");
+    policy
+}
+
+const NESTED_HELPER_INPUT: &str = r#"{
+    "deployment": { "resourceGroupName": "prod-rg", "location": "eastus" }
+}"#;
+
+#[test]
+fn causality_10_deep_helper_chain_reports_truncation() {
+    let report = run_causality_full(
+        &nested_helper_policy(9),
+        NESTED_HELPER_INPUT,
+        "data.bicep.deny",
+    );
+    assert!(
+        has_truncation_flag(&report),
+        "a helper chain beyond the cap must report truncation: {report:#?}"
+    );
+}
+
+#[test]
+fn causality_10_shallow_helper_chain_omits_truncation() {
+    let report = run_causality_full(
+        &nested_helper_policy(2),
+        NESTED_HELPER_INPUT,
+        "data.bicep.deny",
+    );
+    assert!(
+        !has_truncation_flag(&report),
+        "a helper chain within the cap must omit truncation: {report:#?}"
+    );
+
+    let report = run_causality_full(
+        &nested_empty_leaf_policy(9),
+        NESTED_HELPER_INPUT,
+        "data.bicep.deny",
+    );
+    assert!(
+        !has_truncation_flag(&report),
+        "a bodyless helper beyond the cap has no conditions to truncate: {report:#?}"
+    );
+}
+
 // ===========================================================================
 // Causality-9: engine report emission is deterministic.
 // ===========================================================================

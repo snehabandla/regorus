@@ -195,6 +195,9 @@ pub struct ConditionExplanation {
     /// Conditions evaluated inside the helper invoked by this condition.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub helper_conditions: Vec<ConditionExplanation>,
+    /// Whether helper expansion stopped at the configured depth cap.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub helper_conditions_truncated: bool,
 }
 
 const fn is_false(value: &bool) -> bool {
@@ -926,20 +929,17 @@ fn materialize_helper_conditions(
     trace: &EvaluationTrace,
     settings: &ExplanationSettings,
     depth: usize,
-) -> Vec<ConditionExplanation> {
-    if depth >= MAX_HELPER_DEPTH {
-        return Vec::new();
-    }
+) -> (Vec<ConditionExplanation>, bool) {
     let Some((helper_rule_index, _call_pc, _dest_register)) =
         detect_helper_call_at_guard(outer_pc, program)
     else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
     let Some(invocation) = trace.rule_invocations.iter().rev().find(|invocation| {
         invocation.rule_index == helper_rule_index
             && invocation.condition_end_index <= outer_outcome_index
     }) else {
-        return Vec::new();
+        return (Vec::new(), false);
     };
     let inner_outcomes = collect_helper_condition_outcomes(
         helper_rule_index,
@@ -948,15 +948,21 @@ fn materialize_helper_conditions(
         trace,
     );
     if inner_outcomes.is_empty() {
-        return Vec::new();
+        return (Vec::new(), false);
+    }
+    if depth >= MAX_HELPER_DEPTH {
+        return (Vec::new(), true);
     }
     let selected_outcomes = select_condition_outcomes_from_slice(inner_outcomes, settings);
-    materialize_condition_explanations_at_depth(
-        selected_outcomes,
-        program,
-        trace,
-        settings,
-        depth.saturating_add(1),
+    (
+        materialize_condition_explanations_at_depth(
+            selected_outcomes,
+            program,
+            trace,
+            settings,
+            depth.saturating_add(1),
+        ),
+        false,
     )
 }
 
@@ -1202,7 +1208,7 @@ fn materialize_condition_explanations_at_depth(
         let builtin_name = static_info.and_then(|i| i.builtin_name.clone());
         let negated = static_info.is_some_and(|i| i.negated);
         let text = decorate_condition_text(base_text, static_info, left.as_ref());
-        let helper_conditions = materialize_helper_conditions(
+        let (helper_conditions, helper_conditions_truncated) = materialize_helper_conditions(
             pc_usize,
             *outcome_index,
             program,
@@ -1226,6 +1232,7 @@ fn materialize_condition_explanations_at_depth(
             builtin_name,
             negated,
             helper_conditions,
+            helper_conditions_truncated,
         });
     }
 
@@ -2472,6 +2479,7 @@ mod tests {
                 builtin_name: None,
                 negated: false,
                 helper_conditions: alloc::vec::Vec::new(),
+                helper_conditions_truncated: false,
             },
             ConditionExplanation {
                 text: "some item in coll [matched: b]".into(),
@@ -2490,6 +2498,7 @@ mod tests {
                 builtin_name: None,
                 negated: false,
                 helper_conditions: alloc::vec::Vec::new(),
+                helper_conditions_truncated: false,
             },
         ];
 
