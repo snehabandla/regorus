@@ -521,12 +521,13 @@ mod declared_rule_tests {
 }
 
 #[no_mangle]
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "test-hooks"))]
 pub extern "C" fn regorus_engine_test_trigger_panic() -> RegorusResult {
     with_unwind_guard(|| panic!("regorus ffi test panic"))
 }
 
 #[no_mangle]
+#[cfg(feature = "test-hooks")]
 pub extern "C" fn regorus_engine_test_reset_poison() {
     crate::panic_guard::reset_poison();
 }

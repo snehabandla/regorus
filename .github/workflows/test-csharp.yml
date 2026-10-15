@@ -73,7 +73,13 @@ jobs:
             echo "Standard FFI unexpectedly exports explanation APIs."
             exit 1
           fi
-          nm -D bindings/ffi/target-experimental/${{ matrix.runtime.target }}/release/libregorus_experimental_ffi.so | grep -q regorus_rvm_take_causality_report
+          if nm -D bindings/ffi/target/${{ matrix.runtime.target }}/release/libregorus_ffi.so | grep -q regorus_rvm_take_partial_eval_result; then
+            echo "Standard FFI unexpectedly exports partial-evaluation APIs."
+            exit 1
+          fi
+          experimental_library=bindings/ffi/target-experimental/${{ matrix.runtime.target }}/release/libregorus_experimental_ffi.so
+          nm -D "$experimental_library" | grep -q regorus_rvm_take_causality_report
+          nm -D "$experimental_library" | grep -q regorus_rvm_take_partial_eval_result
         
       - name: Upload regorus ffi shared library
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -143,6 +149,48 @@ jobs:
             bindings/csharp/Regorus.Experimental/bin/Release/Microsoft.Regorus.Experimental*.snupkg
           if-no-files-found: error
           retention-days: 1
+
+  test-project-reference-hooks:
+    name: 'Test C# project reference with native test hooks'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/toolchains/rust
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          global-json-file: ./bindings/csharp/global.json
+
+      - name: Fetch dependencies
+        run: cargo fetch --locked
+
+      - name: Build production FFI
+        run: cargo build --locked --release --manifest-path bindings/ffi/Cargo.toml
+
+      - name: Run C# panic-guard tests against test-enabled FFI
+        run: dotnet test bindings/csharp/Regorus.Tests/Regorus.Tests.csproj --configuration Release -p:EnableRegorusTestHooks=true
+
+      - name: Verify native and generated-header test-hook boundaries
+        shell: bash
+        run: |
+          production_library=bindings/ffi/target/release/libregorus_ffi.so
+          test_library=bindings/ffi/target/test-hooks/x86_64-unknown-linux-gnu/release/libregorus_ffi.so
+          if nm -D "$production_library" | grep -q regorus_engine_test_; then
+            echo "Production FFI unexpectedly exports test hooks."
+            exit 1
+          fi
+          nm -D "$test_library" | grep -q regorus_engine_test_trigger_panic
+          nm -D "$test_library" | grep -q regorus_engine_test_reset_poison
+          if printf '#include "regorus.h"\n' | cc -E -P -x c -I bindings/ffi - | grep -q regorus_engine_test_; then
+            echo "Production header unexpectedly exposes test hooks."
+            exit 1
+          fi
+          printf '#include "regorus.h"\n' | cc -E -P -x c -DREGORUS_FFI_TEST_HOOKS -I bindings/ffi - | grep -q regorus_engine_test_trigger_panic
+          printf '#include "regorus.h"\n' | cc -E -P -x c -DREGORUS_FFI_TEST_HOOKS -I bindings/ffi - | grep -q regorus_engine_test_reset_poison
 
   test-nuget:
     name: 'Test Regorus Nuget: (${{ matrix.runtime.target }})'

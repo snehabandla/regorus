@@ -179,6 +179,7 @@ pub(crate) fn is_poisoned() -> bool {
     POISONED.load(Ordering::Acquire)
 }
 
+#[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn reset_poison() {
     POISONED.store(false, Ordering::Release);
 }

@@ -48,6 +48,7 @@ rvm = ["std", "regorus/rvm"]
 rbac = ["regorus/azure-rbac"]
 cache = ["regorus/cache"]
 explanations = ["rvm", "regorus/explanations"]
+test-hooks = ["std"]
 custom_allocator = []
 
 [build-dependencies]
