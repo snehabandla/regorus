@@ -263,6 +263,8 @@ mod tests {
             let guarded_panic = with_unwind_guard(|| {
                 panic!("probe panic containment without replacing the host hook")
             });
+            let guarded_panic_caught = matches!(guarded_panic.status, RegorusStatus::Panic);
+            crate::common::regorus_result_drop(guarded_panic);
             let observed_calls = host_hook_calls.load(Ordering::SeqCst);
             reset_poison();
 
@@ -272,7 +274,7 @@ mod tests {
                 a_succeeded,
                 b_succeeded,
                 probe.is_err(),
-                matches!(guarded_panic.status, RegorusStatus::Panic),
+                guarded_panic_caught,
                 observed_calls,
             )
         }));
