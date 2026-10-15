@@ -102,6 +102,23 @@ fn all_conditions(report: &serde_json::Value) -> Vec<&serde_json::Value> {
     out
 }
 
+fn find_emission<'a>(
+    report: &'a serde_json::Value,
+    rule_name: &str,
+    result: &serde_json::Value,
+) -> Option<&'a serde_json::Value> {
+    report["rules"].as_array()?.iter().find_map(|rule| {
+        (rule["name"] == rule_name)
+            .then_some(rule)
+            .and_then(|rule| {
+                rule["emissions"]
+                    .as_array()?
+                    .iter()
+                    .find(|emission| emission["result"] == *result)
+            })
+    })
+}
+
 fn assert_builtin_condition_shape(
     report: &serde_json::Value,
     text_needle: &str,
@@ -1594,6 +1611,254 @@ fn causality_7_helper_no_empty_unknown_entries() {
     assert!(helpers.iter().all(|condition| {
         !(condition["kind"] == "unknown" && condition["text"].as_str().is_some_and(str::is_empty))
     }));
+}
+
+#[test]
+fn causality_7_nested_helper_does_not_inherit_caller_loop_witness() {
+    let report = run_causality_full(
+        HELPER_SUBSTITUTION_POLICY,
+        HELPER_SUBSTITUTION_INPUT,
+        "data.bicep.deny",
+    );
+    let helpers = helper_conditions_for(&report, "in_resource_group(\"prod\")");
+
+    assert!(
+        helpers
+            .iter()
+            .all(|condition| condition.get("witness").is_none()),
+        "scalar helper inherited an unrelated caller loop witness: {helpers:#?}"
+    );
+}
+
+#[test]
+fn causality_7_multi_definition_helper_skips_ambiguous_substitution() {
+    let report = run_causality_full(
+        r#"
+package multidef
+import rego.v1
+
+h(a, b) if {
+    input.x == a
+}
+
+h(b, a) if {
+    input.y == a
+}
+
+result if {
+    h(1, 2)
+}
+"#,
+        r#"{"x":0,"y":2}"#,
+        "data.multidef.result",
+    );
+    let helpers = helper_conditions_for(&report, "h(1, 2)");
+    let texts = helpers
+        .iter()
+        .filter_map(|condition| condition["text"].as_str())
+        .collect::<Vec<_>>();
+
+    assert!(
+        texts.contains(&"input.x == a") && texts.contains(&"input.y == a"),
+        "multi-definition helper was substituted using one definition's formals: {helpers:#?}"
+    );
+    assert!(
+        !texts.contains(&"input.y == 1"),
+        "second definition used the first definition's parameter mapping: {helpers:#?}"
+    );
+}
+
+#[test]
+fn causality_7_substitution_excludes_callees_fields_and_exponents() {
+    let report = run_causality_full(
+        r#"
+package tokens
+import rego.v1
+
+check(startswith, e3) if {
+    startswith(input.name, startswith)
+    input.limit < 1e3
+    input.value == e3
+}
+
+result if {
+    check("prod", 2)
+}
+"#,
+        r#"{"name":"prod-app","limit":999,"value":2}"#,
+        "data.tokens.result",
+    );
+    let text = helper_conditions_for(&report, "check(\"prod\", 2)")
+        .iter()
+        .filter_map(|condition| condition["text"].as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    assert!(text.contains(r#"startswith(input.name, "prod")"#));
+    assert!(text.contains("input.limit < 1e3"));
+    assert!(text.contains("input.value == 2"));
+    assert!(
+        !text.contains(r#""prod"(input.name"#),
+        "callee token was rewritten as a parameter: {text}"
+    );
+}
+
+#[test]
+fn causality_7_non_immediate_helper_consumer_keeps_predicate() {
+    for condition_mode in [
+        evaluation_trace::ConditionMode::AllContributing,
+        evaluation_trace::ConditionMode::PrimaryOnly,
+    ] {
+        let report = run_causality(
+            r#"
+package consumer
+import rego.v1
+
+inner(n) if {
+    input.a == n
+}
+
+outer(n) if {
+    n > 0
+    inner(2) == true
+}
+
+deny contains "matched" if {
+    outer(1)
+}
+"#,
+            r#"{"a":2}"#,
+            "data.consumer.deny",
+            condition_mode,
+            evaluation_trace::ExplanationDetail::Full,
+        );
+        let emission = find_emission(
+            &report,
+            "data.consumer.deny",
+            &serde_json::Value::String("matched".into()),
+        )
+        .unwrap_or_else(|| panic!("missing partial-set emission: {report:#?}"));
+
+        assert!(
+            emission.to_string().contains("input.a == n"),
+            "nested non-immediate helper predicate was discarded in {condition_mode:?}: {emission:#?}"
+        );
+        assert!(
+            !emission.to_string().contains("input.a == 1"),
+            "outer helper substitution rewrote a nested helper parameter: {emission:#?}"
+        );
+    }
+}
+
+#[test]
+fn causality_7_primary_only_does_not_leak_prior_helper_iteration() {
+    let report = run_causality(
+        r#"
+package iterations
+import rego.v1
+
+bad(r) if {
+    r.a == 1
+    r.b == 2
+}
+
+deny contains r.name if {
+    some r in input.rs
+    not bad(r)
+}
+"#,
+        r#"{"rs":[{"name":"x","a":1,"b":0},{"name":"y","a":0,"b":0}]}"#,
+        "data.iterations.deny",
+        evaluation_trace::ConditionMode::PrimaryOnly,
+        evaluation_trace::ExplanationDetail::Compact,
+    );
+    let emission = find_emission(
+        &report,
+        "data.iterations.deny",
+        &serde_json::Value::String("y".into()),
+    )
+    .unwrap_or_else(|| panic!("missing second loop emission: {report:#?}"));
+
+    assert!(
+        !emission.to_string().contains("r.b == 2"),
+        "second emission leaked a failed predicate from the prior helper invocation: {emission:#?}"
+    );
+}
+
+#[test]
+fn causality_7_nested_immediate_helper_predicate_is_not_duplicated() {
+    let report = run_causality_full(
+        r#"
+package nesteddup
+import rego.v1
+
+g(x) if {
+    x > 0
+}
+
+h(x) if {
+    g(x)
+}
+
+deny contains "matched" if {
+    h(1) == true
+}
+"#,
+        "{}",
+        "data.nesteddup.deny",
+    );
+    let emission = find_emission(
+        &report,
+        "data.nesteddup.deny",
+        &serde_json::Value::String("matched".into()),
+    )
+    .unwrap_or_else(|| panic!("missing nested helper emission: {report:#?}"));
+    let serialized = emission.to_string();
+
+    assert_eq!(
+        serialized.matches(r#""text":"x > 0""#).count(),
+        1,
+        "nested immediate helper predicate appeared both flat and nested: {emission:#?}"
+    );
+}
+
+#[test]
+fn causality_7_successful_helper_ignores_failed_alternative_provenance() {
+    let report = run_causality_full(
+        r#"
+package alternatives
+import rego.v1
+
+helper if {
+    input.a == 1
+}
+
+helper if {
+    input.b == 2
+}
+
+result if {
+    helper
+}
+"#,
+        r#"{"a":0,"b":2}"#,
+        "data.alternatives.result",
+    );
+    let condition = find_condition(&report, "helper")
+        .unwrap_or_else(|| panic!("missing successful helper condition: {report:#?}"));
+
+    assert!(
+        condition["left"].get("provenance").is_none(),
+        "successful helper inherited provenance from a failed alternative: {condition:#?}"
+    );
+    assert!(
+        condition["helper_conditions"]
+            .as_array()
+            .is_some_and(|conditions| conditions
+                .iter()
+                .any(|inner| { inner["text"] == "input.a == 1" && inner["outcome"] == "failure" })),
+        "failed alternative was not present as a regression control: {condition:#?}"
+    );
 }
 
 fn has_truncation_flag(value: &serde_json::Value) -> bool {

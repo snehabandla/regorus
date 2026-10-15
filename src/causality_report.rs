@@ -15,7 +15,7 @@ use serde::Serialize;
 
 use crate::evaluation_trace::{
     AssumptionKind, ConditionMode, ConditionOutcome, EvaluationTrace, ExplanationDetail,
-    ExplanationScope, ExplanationSettings, RuleOutcome, ValueMode,
+    ExplanationScope, ExplanationSettings, RuleInvocation, RuleOutcome, ValueMode,
 };
 use crate::rvm::program::Program;
 use crate::rvm::Instruction;
@@ -834,7 +834,6 @@ fn materialize_rule_emissions(
             conditions: materialize_condition_window(
                 emission.condition_start_index,
                 emission.condition_end_index,
-                emission.rule_index,
                 program,
                 trace,
                 settings,
@@ -903,8 +902,7 @@ fn call_writes_to(instruction: &Instruction, target: u8, program: &Program) -> O
     }
 }
 
-fn collect_helper_condition_outcomes(
-    helper_rule_index: u16,
+fn collect_condition_outcomes_in_window(
     condition_start_index: usize,
     condition_end_index: usize,
     trace: &EvaluationTrace,
@@ -915,11 +913,102 @@ fn collect_helper_condition_outcomes(
         .into_iter()
         .flatten()
         .enumerate()
-        .filter_map(|(offset, outcome)| {
-            (outcome.rule_index == helper_rule_index)
-                .then_some((condition_start_index.saturating_add(offset), outcome))
-        })
+        .map(|(offset, outcome)| (condition_start_index.saturating_add(offset), outcome))
         .collect()
+}
+
+fn lookup_helper_invocation(
+    helper_rule_index: u16,
+    outer_outcome_index: usize,
+    invocations: &[RuleInvocation],
+) -> (Option<&RuleInvocation>, usize) {
+    let mut inspections = 0_usize;
+    let mut low = 0_usize;
+    let mut high = invocations.len();
+    while low < high {
+        inspections = inspections.saturating_add(1);
+        let middle = low.saturating_add(high.saturating_sub(low) / 2);
+        if invocations
+            .get(middle)
+            .is_some_and(|invocation| invocation.condition_end_index <= outer_outcome_index)
+        {
+            low = middle.saturating_add(1);
+        } else {
+            high = middle;
+        }
+    }
+
+    debug_assert!(
+        low.checked_sub(1)
+            .and_then(|index| invocations.get(index))
+            .is_none_or(|invocation| invocation.condition_end_index <= outer_outcome_index)
+            && invocations
+                .get(low)
+                .is_none_or(|invocation| invocation.condition_end_index > outer_outcome_index),
+        "rule invocation condition windows must be ordered"
+    );
+
+    for invocation in invocations.get(..low).unwrap_or(&[]).iter().rev() {
+        inspections = inspections.saturating_add(1);
+        if invocation.rule_index == helper_rule_index {
+            return (Some(invocation), inspections);
+        }
+    }
+
+    (None, inspections)
+}
+
+fn suppress_attached_helper_outcomes<'a>(
+    relevant_outcomes: Vec<(usize, &'a ConditionOutcome)>,
+    attachment_outcomes: &[(usize, &'a ConditionOutcome)],
+    program: &Program,
+    trace: &EvaluationTrace,
+) -> Vec<(usize, &'a ConditionOutcome)> {
+    let mut attached_windows: Vec<(usize, usize)> = attachment_outcomes
+        .iter()
+        .filter_map(|(outcome_index, outcome)| {
+            let pc = usize::try_from(outcome.pc).ok()?;
+            let (helper_rule_index, _, _) = detect_helper_call_at_guard(pc, program)?;
+            lookup_helper_invocation(helper_rule_index, *outcome_index, &trace.rule_invocations)
+                .0
+                .map(|invocation| {
+                    (
+                        invocation.condition_start_index,
+                        invocation.condition_end_index,
+                    )
+                })
+        })
+        .collect();
+    attached_windows.sort_unstable();
+
+    let mut merged_windows: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in attached_windows {
+        if let Some(last) = merged_windows.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
+            }
+        }
+        merged_windows.push((start, end));
+    }
+
+    let mut visible = Vec::with_capacity(relevant_outcomes.len());
+    let mut window_index = 0_usize;
+    for outcome in relevant_outcomes {
+        while merged_windows
+            .get(window_index)
+            .is_some_and(|(_, end)| *end <= outcome.0)
+        {
+            window_index = window_index.saturating_add(1);
+        }
+        let is_attached = merged_windows
+            .get(window_index)
+            .is_some_and(|(start, end)| *start <= outcome.0 && outcome.0 < *end);
+        if !is_attached {
+            visible.push(outcome);
+        }
+    }
+    visible
 }
 
 fn materialize_helper_conditions(
@@ -935,14 +1024,16 @@ fn materialize_helper_conditions(
     else {
         return (Vec::new(), false);
     };
-    let Some(invocation) = trace.rule_invocations.iter().rev().find(|invocation| {
-        invocation.rule_index == helper_rule_index
-            && invocation.condition_end_index <= outer_outcome_index
-    }) else {
+    let Some(invocation) = lookup_helper_invocation(
+        helper_rule_index,
+        outer_outcome_index,
+        &trace.rule_invocations,
+    )
+    .0
+    else {
         return (Vec::new(), false);
     };
-    let inner_outcomes = collect_helper_condition_outcomes(
-        helper_rule_index,
+    let inner_outcomes = collect_condition_outcomes_in_window(
         invocation.condition_start_index,
         invocation.condition_end_index,
         trace,
@@ -954,12 +1045,24 @@ fn materialize_helper_conditions(
         return (Vec::new(), true);
     }
     let selected_outcomes = select_condition_outcomes_from_slice(inner_outcomes, settings);
+    let invocation_outcomes = collect_condition_outcomes_in_window(
+        invocation.condition_start_index,
+        invocation.condition_end_index,
+        trace,
+    );
+    let visible_outcomes =
+        suppress_attached_helper_outcomes(selected_outcomes, &invocation_outcomes, program, trace);
+    let rewrite_scopes = visible_outcomes
+        .iter()
+        .map(|(_, outcome)| outcome.rule_index == helper_rule_index)
+        .collect::<Vec<_>>();
     let mut conditions = materialize_condition_explanations_at_depth(
-        selected_outcomes,
+        visible_outcomes,
         program,
         trace,
         settings,
         depth.saturating_add(1),
+        false,
     );
     let substitutions = extract_helper_arg_substitutions(call_pc, helper_rule_index, program);
     let helper_name = program
@@ -967,8 +1070,10 @@ fn materialize_helper_conditions(
         .get(usize::from(helper_rule_index))
         .and_then(|rule| rule.name.rsplit('.').next())
         .unwrap_or("");
-    for condition in &mut conditions {
-        condition.text = rewrite_helper_body_text(&condition.text, helper_name, &substitutions);
+    for (condition, belongs_to_helper) in conditions.iter_mut().zip(rewrite_scopes) {
+        if belongs_to_helper {
+            condition.text = rewrite_helper_body_text(&condition.text, helper_name, &substitutions);
+        }
     }
     conditions.retain(|condition| !(condition.kind == "unknown" && condition.text.is_empty()));
     (conditions, false)
@@ -993,6 +1098,7 @@ fn extract_helper_arg_substitutions(
     let Some(function_info) = program
         .rule_infos
         .get(usize::from(helper_rule_index))
+        .filter(|rule| rule.definitions.len() == 1)
         .and_then(|rule| rule.function_info.as_ref())
     else {
         return Vec::new();
@@ -1182,8 +1288,20 @@ fn substitute_identifiers(text: &str, substitutions: &[(String, String)]) -> Str
             end = index.saturating_add(next.len_utf8());
         }
         let identifier = &text[start..end];
-        let is_field = text[..start].ends_with('.');
-        if !is_field {
+        let previous = text[..start].chars().next_back();
+        let next = text[end..]
+            .chars()
+            .find(|next_character| !next_character.is_whitespace());
+        let is_reference_component = previous == Some('.') || next == Some('.');
+        let is_callee = next == Some('(');
+        let is_exponent = identifier
+            .chars()
+            .next()
+            .is_some_and(|first_character| first_character == 'e' || first_character == 'E')
+            && previous.is_some_and(|previous_character| {
+                previous_character.is_ascii_digit() || previous_character == '.'
+            });
+        if !is_reference_component && !is_callee && !is_exponent {
             if let Some((_, replacement)) = substitutions
                 .iter()
                 .find(|(parameter, _)| parameter == identifier)
@@ -1208,9 +1326,10 @@ const fn is_identifier_char(character: char) -> bool {
 fn derive_left_provenance_from_helper(
     left: Option<OperandExplanation>,
     helper_conditions: &[ConditionExplanation],
+    helper_failed: bool,
 ) -> Option<OperandExplanation> {
     let existing = left?;
-    if existing.provenance.is_some() {
+    if existing.provenance.is_some() || !helper_failed {
         return Some(existing);
     }
     let provenance = helper_conditions.iter().rev().find_map(|condition| {
@@ -1236,25 +1355,19 @@ fn derive_left_provenance_from_helper(
 fn materialize_condition_window(
     condition_start_index: u32,
     condition_end_index: u32,
-    outer_rule_index: u16,
     program: &Program,
     trace: &EvaluationTrace,
     settings: &ExplanationSettings,
 ) -> Vec<ConditionExplanation> {
-    let relevant_outcomes = select_condition_outcomes_in_window(
-        condition_start_index,
-        condition_end_index,
-        trace,
-        settings,
-    );
-
-    let outer_outcomes = relevant_outcomes
-        .into_iter()
-        .filter(|(_, outcome)| outcome.rule_index == outer_rule_index)
-        .collect();
+    let start_index = usize::try_from(condition_start_index).unwrap_or(usize::MAX);
+    let end_index = usize::try_from(condition_end_index).unwrap_or(usize::MAX);
+    let all_outcomes = collect_condition_outcomes_in_window(start_index, end_index, trace);
+    let relevant_outcomes = select_condition_outcomes_from_slice(all_outcomes.clone(), settings);
+    let visible_outcomes =
+        suppress_attached_helper_outcomes(relevant_outcomes, &all_outcomes, program, trace);
 
     finalize_condition_explanations(
-        materialize_condition_explanations(outer_outcomes, program, trace, settings),
+        materialize_condition_explanations(visible_outcomes, program, trace, settings),
         settings,
         true,
     )
@@ -1401,7 +1514,14 @@ fn materialize_condition_explanations(
     trace: &EvaluationTrace,
     settings: &ExplanationSettings,
 ) -> Vec<ConditionExplanation> {
-    materialize_condition_explanations_at_depth(relevant_outcomes, program, trace, settings, 0)
+    materialize_condition_explanations_at_depth(
+        relevant_outcomes,
+        program,
+        trace,
+        settings,
+        0,
+        true,
+    )
 }
 
 fn materialize_condition_explanations_at_depth(
@@ -1410,6 +1530,7 @@ fn materialize_condition_explanations_at_depth(
     trace: &EvaluationTrace,
     settings: &ExplanationSettings,
     depth: usize,
+    allow_unanchored_loop_fallback: bool,
 ) -> Vec<ConditionExplanation> {
     let mut conditions: Vec<ConditionExplanation> = Vec::new();
 
@@ -1455,7 +1576,8 @@ fn materialize_condition_explanations_at_depth(
             settings,
             depth,
         );
-        let left = derive_left_provenance_from_helper(left, &helper_conditions);
+        let helper_failed = !outcome.assumed && outcome.passed == negated;
+        let left = derive_left_provenance_from_helper(left, &helper_conditions, helper_failed);
         let helper_conditions = finalize_condition_explanations(helper_conditions, settings, false);
 
         conditions.push(ConditionExplanation {
@@ -1479,7 +1601,11 @@ fn materialize_condition_explanations_at_depth(
         .iter()
         .all(|condition| condition.witness.is_none())
     {
-        if let Some(witness) = materialize_fallback_loop_witness(&relevant_outcomes, trace) {
+        if let Some(witness) = materialize_fallback_loop_witness(
+            &relevant_outcomes,
+            trace,
+            allow_unanchored_loop_fallback,
+        ) {
             if let Some(last) = conditions.last_mut() {
                 last.witness = Some(witness);
             }
@@ -1492,6 +1618,7 @@ fn materialize_condition_explanations_at_depth(
 fn materialize_fallback_loop_witness(
     relevant_outcomes: &[(usize, &ConditionOutcome)],
     trace: &EvaluationTrace,
+    allow_unanchored_fallback: bool,
 ) -> Option<LoopWitnessExplanation> {
     let selected_indices: Vec<u32> = relevant_outcomes
         .iter()
@@ -1506,7 +1633,11 @@ fn materialize_fallback_loop_witness(
             stat.anchor_condition_idx
                 .is_some_and(|idx| selected_indices.contains(&idx))
         })
-        .or_else(|| trace.loop_stats.last())?;
+        .or_else(|| {
+            allow_unanchored_fallback
+                .then(|| trace.loop_stats.last())
+                .flatten()
+        })?;
 
     Some(LoopWitnessExplanation {
         total_iterations: stat.total_iterations,
@@ -1581,27 +1712,6 @@ fn select_condition_outcomes<'a>(
         .iter()
         .enumerate()
         .filter(|outcome| outcome.1.pc >= first_pc && outcome.1.pc <= last_pc)
-        .collect();
-
-    select_condition_outcomes_from_slice(outcomes, settings)
-}
-
-fn select_condition_outcomes_in_window<'a>(
-    condition_start_index: u32,
-    condition_end_index: u32,
-    trace: &'a EvaluationTrace,
-    settings: &ExplanationSettings,
-) -> Vec<(usize, &'a ConditionOutcome)> {
-    let start_idx = usize::try_from(condition_start_index).unwrap_or(usize::MAX);
-    let end_idx = usize::try_from(condition_end_index).unwrap_or(usize::MAX);
-
-    let outcomes: Vec<(usize, &ConditionOutcome)> = trace
-        .condition_outcomes
-        .get(start_idx..end_idx)
-        .unwrap_or(&[])
-        .iter()
-        .enumerate()
-        .map(|(offset, outcome)| (start_idx.saturating_add(offset), outcome))
         .collect();
 
     select_condition_outcomes_from_slice(outcomes, settings)
@@ -1774,16 +1884,16 @@ fn format_condition_kind(kind: &crate::static_provenance::ConditionKind) -> Stri
 #[cfg(all(test, feature = "explanations"))]
 #[allow(clippy::indexing_slicing, clippy::unwrap_used)]
 mod tests {
-    use alloc::vec;
+    use alloc::{vec, vec::Vec};
 
     use super::{
-        dedupe_emission_conditions, materialize, materialize_condition_explanations,
-        materialize_conditions, materialize_rule_emissions, ConditionExplanation,
-        OperandExplanation,
+        dedupe_emission_conditions, lookup_helper_invocation, materialize,
+        materialize_condition_explanations, materialize_conditions, materialize_rule_emissions,
+        substitute_identifiers, ConditionExplanation, OperandExplanation,
     };
     use crate::evaluation_trace::{
         AssumptionKind, ConditionMode, EvaluationTrace, ExplanationDetail, ExplanationScope,
-        ExplanationSettings, ValueMode,
+        ExplanationSettings, RuleInvocation, ValueMode,
     };
     use crate::rvm::program::{Program, RuleInfo, RuleType, SourceFile, SpanInfo};
     use crate::static_provenance::{ConditionKind, StaticConditionInfo};
@@ -1812,6 +1922,43 @@ mod tests {
             detail,
             ..settings(condition_mode)
         }
+    }
+
+    #[test]
+    fn helper_invocation_lookup_bounds_repeated_helper_search() {
+        let invocations = (0..1024)
+            .map(|index| RuleInvocation {
+                call_pc: index,
+                dest_register: 0,
+                rule_index: 7,
+                condition_start_index: index,
+                condition_end_index: index.saturating_add(1),
+            })
+            .collect::<Vec<_>>();
+
+        let (invocation, inspections) = lookup_helper_invocation(7, 512, &invocations);
+
+        assert_eq!(invocation.map(|value| value.condition_end_index), Some(512));
+        assert!(
+            inspections <= 12,
+            "eligible-prefix lookup inspected {inspections} entries"
+        );
+    }
+
+    #[test]
+    fn helper_substitution_rewrites_only_variable_occurrences() {
+        let substitutions = vec![
+            ("startswith".into(), "\"prod\"".into()),
+            ("pkg".into(), "\"wrong\"".into()),
+            ("name".into(), "\"storage\"".into()),
+            ("e3".into(), "2".into()),
+        ];
+        let text = "startswith(input.name, startswith) && pkg.check(input.name) && input.limit < 1e3 && name == \"name\"";
+
+        assert_eq!(
+            substitute_identifiers(text, &substitutions),
+            "startswith(input.name, \"prod\") && pkg.check(input.name) && input.limit < 1e3 && \"storage\" == \"name\""
+        );
     }
 
     #[test]
