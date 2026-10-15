@@ -134,6 +134,95 @@ cases:
         environment: "production"
     want_effect: "audit"
 
+  - note: field_tags_numeric_key_bracket
+    policy_rule: |
+      {
+        "if": {
+          "field": "tags['123']",
+          "equals": "production"
+        },
+        "then": { "effect": "audit" }
+      }
+    resource:
+      tags:
+        "123": "production"
+    want_effect: "audit"
+
+  - note: field_tags_numeric_key_double_quoted_bracket
+    policy_rule: |
+      {
+        "if": {
+          "field": "tags[\"123\"]",
+          "equals": "production"
+        },
+        "then": { "effect": "audit" }
+      }
+    resource:
+      tags:
+        "123": "production"
+    want_effect: "audit"
+
+  - note: field_tags_numeric_key_bracket_value_differs
+    policy_rule: |
+      {
+        "if": {
+          "field": "tags['123']",
+          "equals": "production"
+        },
+        "then": { "effect": "audit" }
+      }
+    resource:
+      tags:
+        "123": "development"
+    want_undefined: true
+
+  - note: field_array_numeric_index_still_indexes
+    policy_rule: |
+      {
+        "if": {
+          "field": "properties.ipRules[1].value",
+          "equals": "10.0.0.2"
+        },
+        "then": { "effect": "audit" }
+      }
+    resource:
+      properties:
+        ipRules:
+          - value: "10.0.0.1"
+          - value: "10.0.0.2"
+    want_effect: "audit"
+
+  - note: field_quoted_numeric_key_on_nested_object
+    policy_rule: |
+      {
+        "if": {
+          "field": "properties.config['123']",
+          "equals": "enabled"
+        },
+        "then": { "effect": "audit" }
+      }
+    resource:
+      properties:
+        config:
+          "123": "enabled"
+    want_effect: "audit"
+
+  - note: field_quoted_key_preserves_literal_inner_apostrophes
+    policy_rule: |
+      {
+        "if": {
+          "field": "properties.config[\"'123'\"]",
+          "equals": "development"
+        },
+        "then": { "effect": "audit" }
+      }
+    resource:
+      properties:
+        config:
+          "123": "production"
+          "'123'": "development"
+    want_effect: "audit"
+
   - note: field_tags_bracket_notation
     policy_rule: |
       {
@@ -147,6 +236,48 @@ cases:
       tags:
         environment: "production"
     want_effect: "deny"
+
+  - note: field_tags_double_quoted_bracket_notation
+    policy_rule: |
+      {
+        "if": {
+          "field": "tags[\"environment\"]",
+          "equals": "production"
+        },
+        "then": { "effect": "deny" }
+      }
+    resource:
+      tags:
+        environment: "production"
+    want_effect: "deny"
+
+  - note: field_tags_single_quoted_key_containing_wildcard_text
+    policy_rule: |
+      {
+        "if": {
+          "field": "tags['dept[*]']",
+          "equals": "production"
+        },
+        "then": { "effect": "audit" }
+      }
+    resource:
+      tags:
+        "dept[*]": "production"
+    want_effect: "audit"
+
+  - note: field_tags_double_quoted_key_containing_wildcard_text
+    policy_rule: |
+      {
+        "if": {
+          "field": "tags[\"dept[*]\"]",
+          "equals": "production"
+        },
+        "then": { "effect": "audit" }
+      }
+    resource:
+      tags:
+        "dept[*]": "production"
+    want_effect: "audit"
 
   - note: field_tags_dot_hyphen
     policy_rule: |

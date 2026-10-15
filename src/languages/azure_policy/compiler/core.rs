@@ -70,6 +70,9 @@ pub(super) struct Compiler {
 
     /// When `true`, unknown aliases are silently treated as raw property paths.
     pub(super) alias_fallback_to_raw: bool,
+
+    /// ARM function currently being compiled, used for author-facing errors.
+    pub(super) current_arm_function: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -203,7 +206,12 @@ impl Compiler {
         // coalesce, union).  If >8 args are needed, consider packing into an
         // array or folding/chaining associative calls.
         if args.len() > 8 {
-            bail!(span.error(&format!("builtin call {} exceeds max 8 args", name)));
+            let reported = self.current_arm_function.as_deref().unwrap_or(name);
+            bail!(span.error(&format!(
+                "{}() does not support more than 8 arguments (got {})",
+                reported,
+                args.len()
+            )));
         }
 
         let dest = self.alloc_register()?;
@@ -234,19 +242,28 @@ impl Compiler {
         path: &[&str],
         span: &crate::lexer::Span,
     ) -> Result<u8> {
+        let segments: Vec<super::utils::PathSegment> = path
+            .iter()
+            .map(|segment| super::utils::PathSegment::Key((*segment).to_string()))
+            .collect();
+        self.emit_chained_index_segments(root, &segments, span)
+    }
+
+    pub(super) fn emit_chained_index_segments(
+        &mut self,
+        root: u8,
+        path: &[super::utils::PathSegment],
+        span: &crate::lexer::Span,
+    ) -> Result<u8> {
         let dest = self.alloc_register()?;
 
-        // TODO: Auto-parsing numeric-looking segments as u64 can mis-index
-        // object keys that happen to be digits (e.g. a tag named "123" would
-        // become numeric index 123).  Consider carrying type metadata from
-        // `split_path_without_wildcards` or adding a string-only variant of
-        // this helper for object key lookups like tags.
         let path_components = path
             .iter()
             .map(|segment| {
-                let value = segment
-                    .parse::<u64>()
-                    .map_or_else(|_| Value::from((*segment).to_string()), Value::from);
+                let value = match segment {
+                    super::utils::PathSegment::Key(key) => Value::from(key.clone()),
+                    super::utils::PathSegment::Index(index) => Value::from(*index),
+                };
                 self.add_literal_u16(value).map(LiteralOrRegister::Literal)
             })
             .collect::<Result<Vec<_>>>()?;

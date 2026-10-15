@@ -66,6 +66,10 @@ struct TestCase {
     #[serde(default)]
     pub want_compile_error: Option<bool>,
 
+    /// Substring the compile error message must contain.
+    #[serde(default)]
+    pub want_compile_error_contains: Option<String>,
+
     /// If true, evaluation is expected to produce `Value::Undefined`
     /// (the condition does not match and the policy has no effect).
     #[serde(default)]
@@ -74,6 +78,10 @@ struct TestCase {
     /// If true, the policy_rule is expected to fail parsing.
     #[serde(default)]
     pub want_parse_error: Option<bool>,
+
+    /// Substring the evaluation-time error message must contain.
+    #[serde(default)]
+    pub want_eval_error_contains: Option<String>,
 
     /// Optional API version for the resource (e.g., "2023-01-01").
     /// When set, injected as `input.resource.apiversion` (lowercased to match
@@ -185,6 +193,20 @@ fn should_run_test_case(case_note: &str) -> bool {
     } else {
         true
     }
+}
+
+fn compile_error_message(rendered: &str) -> &str {
+    rendered
+        .rsplit_once("\nerror: ")
+        .map_or(rendered, |(_, message)| message)
+}
+
+#[test]
+fn compile_error_message_excludes_rendered_source() {
+    let rendered = "\n--> test:case:1:1\n  |\n1 | equals('expected text', guid())\n  | ^\nerror: unsupported function";
+
+    assert_eq!(compile_error_message(rendered), "unsupported function");
+    assert!(!compile_error_message(rendered).contains("expected text"));
 }
 
 /// Run all test cases from a YAML file.
@@ -318,7 +340,8 @@ fn yaml_test_impl(file: &str) -> Result<()> {
             }
         };
 
-        let expects_compile_error = case.want_compile_error == Some(true);
+        let expects_compile_error =
+            case.want_compile_error == Some(true) || case.want_compile_error_contains.is_some();
 
         let program = match compile_result {
             Ok(prog) => {
@@ -332,6 +355,25 @@ fn yaml_test_impl(file: &str) -> Result<()> {
             }
             Err(e) => {
                 if expects_compile_error {
+                    if let Some(expected) = &case.want_compile_error_contains {
+                        if expected.is_empty() {
+                            bail!(
+                                "case '{}': want_compile_error_contains must not be empty",
+                                case.note
+                            );
+                        }
+                        let rendered = e.to_string();
+                        let actual = compile_error_message(&rendered);
+                        if !actual.contains(expected.as_str()) {
+                            bail!(
+                                "case '{}': compile error did not contain {:?}; got: {}",
+                                case.note,
+                                expected,
+                                rendered
+                            );
+                        }
+                    }
+
                     println!("passed (expected compile error: {})", e);
                     continue;
                 }
@@ -406,7 +448,40 @@ fn yaml_test_impl(file: &str) -> Result<()> {
             vm.set_host_await_responses(responses);
         }
 
-        let value = vm.execute_entry_point_by_name("main")?;
+        let value = match vm.execute_entry_point_by_name("main") {
+            Ok(value) => {
+                if case.want_eval_error_contains.is_some() {
+                    bail!(
+                        "case '{}': expected an evaluation error but execution succeeded with {}",
+                        case.note,
+                        value
+                    );
+                }
+                value
+            }
+            Err(e) => {
+                let Some(expected) = &case.want_eval_error_contains else {
+                    bail!("case '{}': unexpected evaluation error: {}", case.note, e);
+                };
+                if expected.is_empty() {
+                    bail!(
+                        "case '{}': want_eval_error_contains must not be empty",
+                        case.note
+                    );
+                }
+                let actual = e.to_string();
+                if !actual.contains(expected.as_str()) {
+                    bail!(
+                        "case '{}': evaluation error did not contain {:?}; got: {}",
+                        case.note,
+                        expected,
+                        actual
+                    );
+                }
+                println!("passed (expected evaluation error: {})", e);
+                continue;
+            }
+        };
 
         if case.want_undefined == Some(true) {
             assert_eq!(
