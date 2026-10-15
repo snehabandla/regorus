@@ -273,7 +273,7 @@ public sealed class AssumptionTests
     }
 
     [TestMethod]
-    public void Rvm_partial_eval_rejects_malformed_result_without_consuming_trace()
+    public void Rvm_partial_eval_rejects_invalid_result_without_consuming_trace()
     {
         using var engine = new Engine();
         engine.AddPolicy("test.rego", SimplePolicy);
@@ -289,6 +289,7 @@ public sealed class AssumptionTests
         vm.SetInputJson("{}");
         Assert.AreEqual("true", vm.ExecuteEntryPoint("data.test.allow"));
 
+        Assert.ThrowsException<ArgumentException>(() => vm.TakePartialEvalResult("true\0garbage"));
         Assert.ThrowsException<InvalidOperationException>(() => vm.TakePartialEvalResult("tru"));
 
         var report = JsonNode.Parse(vm.TakePartialEvalResult("true")!)!;

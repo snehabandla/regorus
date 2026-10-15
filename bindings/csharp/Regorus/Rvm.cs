@@ -422,6 +422,7 @@ namespace Regorus
                 });
             }
 
+            Utf8Marshaller.ThrowIfContainsNul(valueJson, nameof(valueJson));
             return Utf8Marshaller.WithUtf8(valueJson, valuePtr =>
             {
                 return UseHandle(vmPtr =>
