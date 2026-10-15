@@ -1861,6 +1861,248 @@ result if {
     );
 }
 
+#[test]
+fn causality_11_shadowed_helper_parameter_is_not_substituted() {
+    let report = run_causality_full(
+        r#"
+package shadowing
+import rego.v1
+
+h(x) if {
+    every x in [1] {
+        x > 0
+    }
+}
+
+result if {
+    h(0)
+}
+"#,
+        "{}",
+        "data.shadowing.result",
+    );
+    let helpers = helper_conditions_for(&report, "h(0)");
+
+    assert!(
+        helpers.iter().any(|condition| condition["text"] == "x > 0"),
+        "shadowed loop variable was replaced by the helper argument: {helpers:#?}"
+    );
+    assert!(
+        helpers.iter().all(|condition| condition["text"] != "0 > 0"),
+        "helper substitution ignored lexical shadowing: {helpers:#?}"
+    );
+
+    let report = run_causality_full(
+        r#"
+package assignmentshadow
+import rego.v1
+
+h(x) if {
+    values := [x |
+        x := 1
+        x > 0
+    ]
+    count(values) > 0
+}
+
+result if {
+    h(0)
+}
+"#,
+        "{}",
+        "data.assignmentshadow.result",
+    );
+    let helpers = helper_conditions_for(&report, "h(0)");
+    assert!(
+        helpers.iter().any(|condition| condition["text"] == "x > 0"),
+        "assignment-shadowed variable was replaced by the helper argument: {helpers:#?}"
+    );
+    assert!(
+        helpers.iter().all(|condition| condition["text"] != "0 > 0"),
+        "helper substitution ignored assignment shadowing: {helpers:#?}"
+    );
+}
+
+#[test]
+fn causality_11_large_numeric_helper_argument_preserves_decimal_text() {
+    let report = run_causality_full(
+        r#"
+package precision
+import rego.v1
+
+h(limit) if {
+    input.value < limit
+}
+
+result if {
+    h(18446744073709551617)
+}
+"#,
+        r#"{"value":1}"#,
+        "data.precision.result",
+    );
+    let helpers = helper_conditions_for(&report, "h(18446744073709551617)");
+
+    assert!(
+        helpers.iter().any(|condition| {
+            condition["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("input.value < 18446744073709551617"))
+        }),
+        "large numeric helper argument lost its exact decimal text: {helpers:#?}"
+    );
+}
+
+#[test]
+fn causality_11_report_marker_inside_string_is_not_parsed_as_suffix() {
+    let report = run_causality_full(
+        r#"
+package marker
+import rego.v1
+
+h(value) if {
+    contains(" [matched: value", value)
+}
+
+result if {
+    h("value")
+}
+"#,
+        "{}",
+        "data.marker.result",
+    );
+    let helpers = helper_conditions_for(&report, "h(\"value\")");
+
+    assert!(
+        helpers
+            .iter()
+            .any(|condition| { condition["text"] == r#"contains(" [matched: value", "value")"# }),
+        "authored marker text prevented helper substitution: {helpers:#?}"
+    );
+}
+
+#[test]
+fn causality_11_standard_dedupe_preserves_distinct_helper_trees() {
+    let report = run_causality(
+        r#"
+package dedupe
+import rego.v1
+
+h(n) if {
+    input.a >= n
+}
+
+deny contains "matched" if { h(1); h(2) }
+"#,
+        r#"{"a":2}"#,
+        "data.dedupe.deny",
+        evaluation_trace::ConditionMode::AllContributing,
+        evaluation_trace::ExplanationDetail::Standard,
+    );
+    let emission = find_emission(
+        &report,
+        "data.dedupe.deny",
+        &serde_json::Value::String("matched".into()),
+    )
+    .unwrap_or_else(|| panic!("missing helper emission: {report:#?}"));
+    let helper_guards = emission["conditions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|condition| {
+            condition["helper_conditions"]
+                .as_array()
+                .is_some_and(|helpers| !helpers.is_empty())
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        helper_guards.len(),
+        2,
+        "standard-mode dedupe collapsed distinct helper evidence: {emission:#?}"
+    );
+    let helper_text = helper_guards
+        .iter()
+        .flat_map(|condition| condition["helper_conditions"].as_array().unwrap())
+        .filter_map(|condition| condition["text"].as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(helper_text.contains("input.a >= 1"));
+    assert!(helper_text.contains("input.a >= 2"));
+}
+
+#[test]
+fn causality_11_standard_dedupe_collapses_identical_helper_trees() {
+    let report = run_causality(
+        r#"
+package identical
+import rego.v1
+
+h(n) if {
+    n > 0
+}
+
+deny contains "matched" if {
+    every item in input.items {
+        h(1)
+    }
+}
+"#,
+        r#"{"items":[1,2,3,4]}"#,
+        "data.identical.deny",
+        evaluation_trace::ConditionMode::AllContributing,
+        evaluation_trace::ExplanationDetail::Standard,
+    );
+    let emission = find_emission(
+        &report,
+        "data.identical.deny",
+        &serde_json::Value::String("matched".into()),
+    )
+    .unwrap_or_else(|| panic!("missing helper emission: {report:#?}"));
+    let helper_guards = emission["conditions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|condition| {
+            condition["helper_conditions"]
+                .as_array()
+                .is_some_and(|helpers| !helpers.is_empty())
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        helper_guards.len(),
+        1,
+        "standard-mode dedupe retained identical helper evidence: {emission:#?}"
+    );
+}
+
+#[test]
+fn causality_11_opaque_negation_reports_original_operand() {
+    for (disabled, expected_outcome) in [(false, "success"), (true, "failure")] {
+        let input = format!(r#"{{"disabled":{disabled}}}"#);
+        let report = run_causality_full(
+            r#"
+package opaque
+import rego.v1
+
+result if {
+    not input.disabled
+}
+"#,
+            &input,
+            "data.opaque.result",
+        );
+        let condition = find_condition(&report, "not input.disabled")
+            .unwrap_or_else(|| panic!("missing opaque negation: {report:#?}"));
+
+        assert_eq!(condition["negated"], true);
+        assert_eq!(condition["outcome"], expected_outcome);
+        assert_eq!(condition["left"]["value"], disabled);
+        assert_eq!(condition["left"]["provenance"], "input.disabled");
+    }
+}
+
 fn has_truncation_flag(value: &serde_json::Value) -> bool {
     match value {
         serde_json::Value::Object(map) => {

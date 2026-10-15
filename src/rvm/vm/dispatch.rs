@@ -240,6 +240,30 @@ impl RegoVM {
     }
 
     #[cfg(feature = "explanations")]
+    fn capture_opaque_negation_operand(&self, guard_register: u8) -> Option<GuardOperandCapture> {
+        let info = self.program.condition_infos.get(self.pc)?.as_ref()?;
+        if !info.negated || info.builtin_name.is_some() || info.operator.is_some() {
+            return None;
+        }
+        let previous_pc = self.pc.checked_sub(1)?;
+        let Instruction::Not { dest, operand } = *self.program.instructions.get(previous_pc)?
+        else {
+            return None;
+        };
+        if dest != guard_register {
+            return None;
+        }
+        Some((
+            self.get_register(operand).ok().cloned(),
+            self.provenance
+                .get(operand)
+                .map(|path| path.as_ref().to_string()),
+            None,
+            None,
+        ))
+    }
+
+    #[cfg(feature = "explanations")]
     fn maybe_assume_guard_condition(&mut self, register: u8, mode: GuardMode) -> bool {
         if !self.explanation_settings.assume_unknown_input {
             return false;
@@ -929,21 +953,24 @@ impl RegoVM {
                 if self.explanation_settings.enabled {
                     let pc = u32::try_from(self.pc).unwrap_or(u32::MAX);
                     let (rule_index, _) = self.current_rule_scope();
-                    let (actual, actual_path, expected, expected_path) =
-                        if let Some(operands) = self.capture_builtin_guard_operands() {
-                            operands
-                        } else if let Some(operands) = self.capture_negated_comparison_operands() {
-                            operands
-                        } else {
-                            (
-                                Some(value),
-                                self.provenance
-                                    .get(register)
-                                    .map(|path| path.as_ref().to_string()),
-                                None,
-                                None,
-                            )
-                        };
+                    let (actual, actual_path, expected, expected_path) = if let Some(operands) =
+                        self.capture_builtin_guard_operands()
+                    {
+                        operands
+                    } else if let Some(operands) = self.capture_negated_comparison_operands() {
+                        operands
+                    } else if let Some(operands) = self.capture_opaque_negation_operand(register) {
+                        operands
+                    } else {
+                        (
+                            Some(value),
+                            self.provenance
+                                .get(register)
+                                .map(|path| path.as_ref().to_string()),
+                            None,
+                            None,
+                        )
+                    };
                     self.trace.record_condition(
                         pc,
                         passed,

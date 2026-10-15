@@ -1065,6 +1065,19 @@ fn materialize_helper_conditions(
         false,
     );
     let substitutions = extract_helper_arg_substitutions(call_pc, helper_rule_index, program);
+    let substitutions = substitutions
+        .into_iter()
+        .filter(|(parameter, _)| {
+            !conditions
+                .iter()
+                .zip(&rewrite_scopes)
+                .any(|(condition, belongs_to_helper)| {
+                    *belongs_to_helper
+                        && (condition.binding_name.as_deref() == Some(parameter)
+                            || condition_text_shadows_parameter(&condition.text, parameter))
+                })
+        })
+        .collect::<Vec<_>>();
     let helper_name = program
         .rule_infos
         .get(usize::from(helper_rule_index))
@@ -1155,9 +1168,8 @@ fn find_literal_load(pc: usize, target_register: u8, program: &Program) -> Optio
 
 fn format_literal_for_substitution(value: &Value) -> Option<String> {
     match value {
-        Value::String(_) | Value::Null | Value::Bool(_) | Value::Number(_) => {
-            value.to_json_str().ok()
-        }
+        Value::Number(number) => Some(alloc::format!("{number:?}")),
+        Value::String(_) | Value::Null | Value::Bool(_) => value.to_json_str().ok(),
         _ => None,
     }
 }
@@ -1181,15 +1193,119 @@ fn rewrite_helper_body_text(
     } else {
         text
     };
-    let suffix_start = [" [matched: ", " [loop: "]
-        .into_iter()
-        .filter_map(|marker| body.rfind(marker))
-        .min()
-        .unwrap_or(body.len());
+    let suffix_start = find_report_suffix(body).unwrap_or(body.len());
     let (expression, suffix) = body.split_at(suffix_start);
     let mut rewritten = substitute_identifiers(expression, substitutions);
     rewritten.push_str(suffix);
     rewritten
+}
+
+fn find_report_suffix(text: &str) -> Option<usize> {
+    const MARKERS: [&str; 2] = [" [matched: ", " [loop: "];
+    let mut quote = None;
+    let mut escaped = false;
+    let mut in_comment = false;
+    for (index, character) in text.char_indices() {
+        if in_comment {
+            if character == '\n' {
+                in_comment = false;
+            }
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if delimiter == '"' && character == '\\' && !escaped {
+                escaped = true;
+                continue;
+            }
+            if character == delimiter && !escaped {
+                quote = None;
+            }
+            escaped = false;
+            continue;
+        }
+        if character == '"' || character == '`' {
+            quote = Some(character);
+            continue;
+        }
+        if character == '#' {
+            in_comment = true;
+            continue;
+        }
+        if MARKERS
+            .iter()
+            .any(|marker| text[index..].starts_with(marker))
+        {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn condition_text_shadows_parameter(text: &str, parameter: &str) -> bool {
+    let identifiers = source_identifiers(text);
+    identifiers.iter().enumerate().any(|(index, identifier)| {
+        if *identifier != "every" && *identifier != "some" {
+            return false;
+        }
+        identifiers
+            .get(index.saturating_add(1)..)
+            .unwrap_or(&[])
+            .iter()
+            .take_while(|candidate| **candidate != "in")
+            .any(|candidate| *candidate == parameter)
+            || identifiers
+                .get(index.saturating_add(1))
+                .is_some_and(|candidate| *candidate == parameter)
+    })
+}
+
+fn source_identifiers(text: &str) -> Vec<&str> {
+    let mut identifiers = Vec::new();
+    let mut characters = text.char_indices().peekable();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut in_comment = false;
+    while let Some((start, character)) = characters.next() {
+        if in_comment {
+            if character == '\n' {
+                in_comment = false;
+            }
+            continue;
+        }
+        if let Some(delimiter) = quote {
+            if delimiter == '"' && character == '\\' && !escaped {
+                escaped = true;
+                continue;
+            }
+            if character == delimiter && !escaped {
+                quote = None;
+            }
+            escaped = false;
+            continue;
+        }
+        if character == '"' || character == '`' {
+            quote = Some(character);
+            continue;
+        }
+        if character == '#' {
+            in_comment = true;
+            continue;
+        }
+        if !is_identifier_start(character) {
+            continue;
+        }
+
+        let mut end = start.saturating_add(character.len_utf8());
+        while let Some(&(index, next)) = characters.peek() {
+            if !is_identifier_char(next) {
+                break;
+            }
+            characters.next();
+            end = index.saturating_add(next.len_utf8());
+        }
+        identifiers.push(&text[start..end]);
+    }
+    identifiers
 }
 
 fn find_rule_body_separator(text: &str) -> Option<usize> {
@@ -1462,14 +1578,7 @@ fn dedupe_emission_conditions(conditions: Vec<ConditionExplanation>) -> Vec<Cond
 
     'outer: for condition in conditions {
         for existing in &deduped {
-            if existing.text == condition.text
-                && existing.outcome == condition.outcome
-                && existing.kind == condition.kind
-                && existing.operator == condition.operator
-                && operands_match(existing.left.as_ref(), condition.left.as_ref())
-                && operands_match(existing.right.as_ref(), condition.right.as_ref())
-                && witnesses_match(existing.witness.as_ref(), condition.witness.as_ref())
-            {
+            if condition_explanations_match(existing, &condition) {
                 continue 'outer;
             }
         }
@@ -1478,6 +1587,26 @@ fn dedupe_emission_conditions(conditions: Vec<ConditionExplanation>) -> Vec<Cond
     }
 
     deduped
+}
+
+fn condition_explanations_match(left: &ConditionExplanation, right: &ConditionExplanation) -> bool {
+    left.text == right.text
+        && left.outcome == right.outcome
+        && left.kind == right.kind
+        && left.operator == right.operator
+        && left.binding_name == right.binding_name
+        && left.builtin_name == right.builtin_name
+        && left.negated == right.negated
+        && left.helper_conditions_truncated == right.helper_conditions_truncated
+        && operands_match(left.left.as_ref(), right.left.as_ref())
+        && operands_match(left.right.as_ref(), right.right.as_ref())
+        && witnesses_match(left.witness.as_ref(), right.witness.as_ref())
+        && left.helper_conditions.len() == right.helper_conditions.len()
+        && left
+            .helper_conditions
+            .iter()
+            .zip(&right.helper_conditions)
+            .all(|(left, right)| condition_explanations_match(left, right))
 }
 
 fn operands_match(left: Option<&OperandExplanation>, right: Option<&OperandExplanation>) -> bool {
