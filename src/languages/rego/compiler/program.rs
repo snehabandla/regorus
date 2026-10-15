@@ -99,6 +99,11 @@ impl<'a> Compiler<'a> {
             };
 
             rule_info.destructuring_blocks = destructuring_blocks;
+            rule_info.definition_spans = self
+                .rule_definition_spans
+                .get(rule_index as usize)
+                .cloned()
+                .unwrap_or_else(|| vec![None; rule_info.definitions.len()]);
             rule_info.else_bodies = self
                 .rule_definition_else_bodies
                 .get(rule_index as usize)

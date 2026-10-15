@@ -469,6 +469,10 @@ impl<'a> Compiler<'a> {
                 self.rule_definitions.push(Vec::new());
             }
 
+            while self.rule_definition_spans.len() <= rule_index as usize {
+                self.rule_definition_spans.push(Vec::new());
+            }
+
             while self.rule_definition_function_params.len() <= rule_index as usize {
                 self.rule_definition_function_params.push(Vec::new());
             }
@@ -491,6 +495,8 @@ impl<'a> Compiler<'a> {
             for (def_idx, rule_ref) in rule_definitions.iter().enumerate() {
                 ::core::convert::identity(def_idx);
                 if let Rule::Spec { head, bodies, span } = rule_ref.as_ref() {
+                    let definition_span = self.source_span_info(span);
+                    self.rule_definition_spans[rule_index as usize].push(Some(definition_span));
                     self.push_scope();
                     self.register_counter = 0;
 

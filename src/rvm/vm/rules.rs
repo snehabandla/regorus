@@ -44,6 +44,10 @@ impl RegoVM {
             self.return_register_window(current_register_window);
             self.registers = restored_registers;
         }
+        #[cfg(feature = "explanations")]
+        if let Some(restored_provenance) = self.provenance_stack.pop() {
+            self.provenance.restore_state(restored_provenance);
+        }
         mem::swap(&mut self.loop_stack, previous_loop_stack);
         mem::swap(&mut self.comprehension_stack, previous_comprehension_stack);
     }
@@ -54,7 +58,7 @@ impl RegoVM {
         rule_info: &RuleInfo,
         function_call_params: Option<&FunctionCallParams>,
         #[cfg(feature = "explanations")] rule_index: u16,
-    ) -> Result<(Value, bool, Option<crate::Rc<str>>)> {
+    ) -> Result<(Value, bool, Option<crate::Rc<str>>, bool)> {
         let mut first_successful_result: Option<Value> = None;
         let mut rule_failed_due_to_inconsistency = false;
         let is_function_call = rule_info.function_info.is_some();
@@ -89,12 +93,31 @@ impl RegoVM {
                     .map(|&arg| self.provenance.get(arg).cloned())
                     .collect()
             });
+        #[cfg(feature = "explanations")]
+        let arg_symbolic: Vec<bool> = function_call_params.map_or_else(Vec::new, |params| {
+            params
+                .arg_registers()
+                .iter()
+                .map(|&arg| self.provenance.is_symbolic_undefined(arg))
+                .collect()
+        });
+        #[cfg(feature = "explanations")]
+        let arg_undefined: Vec<bool> = function_call_params.map_or_else(Vec::new, |params| {
+            params
+                .arg_registers()
+                .iter()
+                .map(|&arg| {
+                    self.get_register(arg)
+                        .is_ok_and(|value| *value == Value::Undefined)
+                })
+                .collect()
+        });
 
         let mut previous_registers = Vec::default();
         mem::swap(&mut previous_registers, &mut self.registers);
 
         #[cfg(feature = "explanations")]
-        let previous_provenance = self.provenance.take_paths();
+        let previous_provenance = self.provenance.take_state();
 
         let mut previous_loop_stack = Vec::default();
         mem::swap(&mut previous_loop_stack, &mut self.loop_stack);
@@ -115,6 +138,11 @@ impl RegoVM {
             for (i, prov) in arg_provenance.into_iter().enumerate() {
                 let callee_reg = u8::try_from(i.saturating_add(1)).unwrap_or(u8::MAX);
                 self.provenance.set_path(callee_reg, prov);
+                if arg_symbolic.get(i).copied().unwrap_or(false) {
+                    self.provenance.mark_symbolic_undefined(callee_reg);
+                } else if arg_undefined.get(i).copied().unwrap_or(false) {
+                    self.provenance.mark_concrete_undefined(callee_reg);
+                }
             }
         }
 
@@ -131,6 +159,12 @@ impl RegoVM {
 
             #[cfg(feature = "explanations")]
             let def_assumptions_start = self.trace.assumptions.len();
+
+            #[cfg(feature = "explanations")]
+            let def_start_emissions = self.trace.emission_outcomes.len();
+
+            #[cfg(feature = "explanations")]
+            let def_start_symbolic_yields = self.trace.symbolic_yields.len();
 
             #[cfg(feature = "explanations")]
             let mut def_succeeded = false;
@@ -282,6 +316,15 @@ impl RegoVM {
                         def_succeeded,
                         None,
                     );
+
+                    self.orphan_assumptions_if_definition_did_not_emit(
+                        rule_index,
+                        def_idx,
+                        rule_info.rule_type.clone(),
+                        def_assumptions_start,
+                        def_start_emissions,
+                        def_start_symbolic_yields,
+                    );
                 }
                 self.pop_conjunction_scope();
             }
@@ -320,6 +363,8 @@ impl RegoVM {
 
         #[cfg(feature = "explanations")]
         let return_provenance = self.provenance.get(result_reg).cloned();
+        #[cfg(feature = "explanations")]
+        let return_symbolic = self.provenance.is_symbolic_undefined(result_reg);
 
         if let Some(restored_registers) = self.register_stack.pop() {
             let mut current_register_window = Vec::default();
@@ -330,23 +375,37 @@ impl RegoVM {
 
             #[cfg(feature = "explanations")]
             if let Some(restored_provenance) = self.provenance_stack.pop() {
-                self.provenance.restore_paths(restored_provenance);
+                self.provenance.restore_state(restored_provenance);
             }
         }
 
         self.loop_stack = previous_loop_stack;
         self.comprehension_stack = previous_comprehension_stack;
 
-        Ok((final_result, rule_failed_due_to_inconsistency, {
-            #[cfg(feature = "explanations")]
+        Ok((
+            final_result,
+            rule_failed_due_to_inconsistency,
             {
-                return_provenance
-            }
-            #[cfg(not(feature = "explanations"))]
+                #[cfg(feature = "explanations")]
+                {
+                    return_provenance
+                }
+                #[cfg(not(feature = "explanations"))]
+                {
+                    None
+                }
+            },
             {
-                None
-            }
-        }))
+                #[cfg(feature = "explanations")]
+                {
+                    return_symbolic
+                }
+                #[cfg(not(feature = "explanations"))]
+                {
+                    false
+                }
+            },
+        ))
     }
 
     pub(super) fn execute_call_rule_common(
@@ -448,8 +507,8 @@ impl RegoVM {
         let assumptions_before = self.trace.assumptions.len();
 
         #[allow(unused)]
-        let (final_result, rule_failed_due_to_inconsistency, return_provenance) = self
-            .execute_rule_definitions_common(
+        let (final_result, rule_failed_due_to_inconsistency, return_provenance, return_symbolic) =
+            self.execute_rule_definitions_common(
                 &rule_definitions,
                 &rule_info,
                 function_call_params,
@@ -491,7 +550,12 @@ impl RegoVM {
 
         self.set_register(dest, result_from_rule.clone())?;
         #[cfg(feature = "explanations")]
-        self.provenance.set_path(dest, return_provenance);
+        {
+            self.provenance.set_path(dest, return_provenance);
+            if return_symbolic {
+                self.provenance.mark_symbolic_undefined(dest);
+            }
+        }
 
         #[cfg(feature = "explanations")]
         if self.explanation_settings.enabled {
@@ -597,8 +661,19 @@ impl RegoVM {
                         available: self.rule_cache.len(),
                     })?;
             if *computed {
-                self.set_register(dest, cached_result.clone())?;
-                return Ok(());
+                #[cfg(feature = "explanations")]
+                if self.explanation_settings.enabled {
+                    // Re-evaluate so PE assumptions and causality dependencies
+                    // are recorded for this call site.
+                } else {
+                    self.set_register(dest, cached_result.clone())?;
+                    return Ok(());
+                }
+                #[cfg(not(feature = "explanations"))]
+                {
+                    self.set_register(dest, cached_result.clone())?;
+                    return Ok(());
+                }
             }
         }
 
@@ -653,9 +728,53 @@ impl RegoVM {
             }
         }
 
+        #[cfg(feature = "explanations")]
+        let arg_provenance: Vec<Option<crate::Rc<str>>> =
+            function_call_params.map_or_else(Vec::new, |params| {
+                params
+                    .arg_registers()
+                    .iter()
+                    .map(|&arg| self.provenance.get(arg).cloned())
+                    .collect()
+            });
+        #[cfg(feature = "explanations")]
+        let arg_symbolic: Vec<bool> = function_call_params.map_or_else(Vec::new, |params| {
+            params
+                .arg_registers()
+                .iter()
+                .map(|&arg| self.provenance.is_symbolic_undefined(arg))
+                .collect()
+        });
+        #[cfg(feature = "explanations")]
+        let arg_undefined: Vec<bool> = function_call_params.map_or_else(Vec::new, |params| {
+            params
+                .arg_registers()
+                .iter()
+                .map(|&arg| {
+                    self.get_register(arg)
+                        .is_ok_and(|value| *value == Value::Undefined)
+                })
+                .collect()
+        });
+
         let mut saved_registers = Vec::default();
         mem::swap(&mut saved_registers, &mut self.registers);
         self.registers = register_window;
+        #[cfg(feature = "explanations")]
+        {
+            let saved_provenance = self.provenance.take_state();
+            self.provenance_stack.push(saved_provenance);
+            self.provenance.resize(self.registers.len());
+            for (index, path) in arg_provenance.into_iter().enumerate() {
+                let callee_reg = u8::try_from(index.saturating_add(1)).unwrap_or(u8::MAX);
+                self.provenance.set_path(callee_reg, path);
+                if arg_symbolic.get(index).copied().unwrap_or(false) {
+                    self.provenance.mark_symbolic_undefined(callee_reg);
+                } else if arg_undefined.get(index).copied().unwrap_or(false) {
+                    self.provenance.mark_concrete_undefined(callee_reg);
+                }
+            }
+        }
 
         let mut saved_loop_stack = Vec::default();
         mem::swap(&mut saved_loop_stack, &mut self.loop_stack);
@@ -701,6 +820,10 @@ impl RegoVM {
             saved_comprehension_stack,
             #[cfg(feature = "explanations")]
             assumptions_at_def_start: 0,
+            #[cfg(feature = "explanations")]
+            emissions_at_def_start: 0,
+            #[cfg(feature = "explanations")]
+            symbolic_yields_at_def_start: 0,
             #[cfg(feature = "explanations")]
             pe_any_def_resolved: false,
             #[cfg(feature = "explanations")]
@@ -794,6 +917,8 @@ impl RegoVM {
                     self.push_conjunction_scope();
                     frame_data.conjunction_scope_active = true;
                     frame_data.assumptions_at_def_start = self.trace.assumptions.len();
+                    frame_data.emissions_at_def_start = self.trace.emission_outcomes.len();
+                    frame_data.symbolic_yields_at_def_start = self.trace.symbolic_yields.len();
                 }
 
                 if let Some(ctx) = self.call_rule_stack.last_mut() {
@@ -877,6 +1002,51 @@ impl RegoVM {
         }
     }
 
+    #[cfg(feature = "explanations")]
+    fn orphan_assumptions_if_definition_did_not_emit(
+        &mut self,
+        rule_index: u16,
+        definition_index: usize,
+        rule_type: RuleType,
+        assumptions_start: usize,
+        emissions_start: usize,
+        symbolic_yields_start: usize,
+    ) {
+        if !matches!(rule_type, RuleType::PartialSet | RuleType::PartialObject) {
+            return;
+        }
+
+        let definition_index = u16::try_from(definition_index).unwrap_or(u16::MAX);
+        let definition_emitted = self
+            .trace
+            .emission_outcomes
+            .get(emissions_start..)
+            .is_some_and(|emissions| {
+                emissions.iter().any(|emission| {
+                    emission.rule_index == rule_index
+                        && emission.definition_index == definition_index
+                })
+            });
+        let definition_yielded_symbolically = self
+            .trace
+            .symbolic_yields
+            .get(symbolic_yields_start..)
+            .is_some_and(|yields| {
+                yields.iter().any(|symbolic_yield| {
+                    symbolic_yield.0 == rule_index && symbolic_yield.1 == definition_index
+                })
+            });
+        if definition_emitted || definition_yielded_symbolically {
+            return;
+        }
+
+        if let Some(recorded) = self.trace.assumptions.get_mut(assumptions_start..) {
+            for assumption in recorded {
+                assumption.orphaned = true;
+            }
+        }
+    }
+
     /// Pop the conjunction scope for the current definition in a suspendable
     /// rule frame, and track PE definitiveness.
     #[cfg(feature = "explanations")]
@@ -901,6 +1071,17 @@ impl RegoVM {
                 def_idx,
                 frame_data.current_def_succeeded,
                 None,
+            );
+        }
+
+        if self.explanation_settings.enabled {
+            self.orphan_assumptions_if_definition_did_not_emit(
+                frame_data.rule_index,
+                frame_data.current_definition_index,
+                frame_data.rule_type.clone(),
+                frame_data.assumptions_at_def_start,
+                frame_data.emissions_at_def_start,
+                frame_data.symbolic_yields_at_def_start,
             );
         }
 
@@ -1037,6 +1218,10 @@ impl RegoVM {
                 .cloned()
                 .unwrap_or(Value::Undefined)
         };
+        #[cfg(feature = "explanations")]
+        let return_provenance = self.provenance.get(result_reg).cloned();
+        #[cfg(feature = "explanations")]
+        let return_symbolic = self.provenance.is_symbolic_undefined(result_reg);
 
         #[cfg(feature = "explanations")]
         if self.explanation_settings.enabled {
@@ -1148,6 +1333,16 @@ impl RegoVM {
         }
 
         self.registers = parent_registers;
+        #[cfg(feature = "explanations")]
+        if let Some(saved_provenance) = self.provenance_stack.pop() {
+            self.provenance.restore_state(saved_provenance);
+            self.provenance
+                .clear_reg(dest_reg, final_value == Value::Undefined);
+            self.provenance.set_path(dest_reg, return_provenance);
+            if return_symbolic && final_value == Value::Undefined {
+                self.provenance.mark_symbolic_undefined(dest_reg);
+            }
+        }
 
         // Underflow here means malformed/poisoned program state; surface as a
         // typed error rather than a debug-only panic so the public load_program

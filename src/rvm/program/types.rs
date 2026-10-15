@@ -86,6 +86,9 @@ pub struct RuleInfo {
     pub rule_type: RuleType,
     /// Definitions
     pub definitions: crate::Rc<Vec<Vec<u32>>>,
+    /// Source span of each rule declaration.
+    #[serde(skip, default)]
+    pub definition_spans: Vec<Option<SpanInfo>>,
     /// Function-specific information (only present for function rules)
     pub function_info: Option<FunctionInfo>,
     /// Index into the program's literal table for default value (only for Complete rules)
@@ -125,6 +128,7 @@ impl RuleInfo {
             name,
             rule_type,
             definitions,
+            definition_spans: alloc::vec![None; num_definitions],
             function_info: None,
             default_literal_index: None,
             result_reg,
@@ -154,6 +158,7 @@ impl RuleInfo {
             name,
             rule_type,
             definitions,
+            definition_spans: alloc::vec![None; num_definitions],
             function_info: Some(FunctionInfo {
                 param_names,
                 num_params,

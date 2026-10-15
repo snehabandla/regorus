@@ -264,11 +264,14 @@ impl<'a> Compiler<'a> {
         }
         self.program.instructions.push(instruction);
 
+        let span_info = self.source_span_info(span);
+        self.spans.push(span_info);
+    }
+
+    pub(super) fn source_span_info(&mut self, span: &Span) -> SpanInfo {
         let source_path = span.source.get_path().to_string();
         let source_index = self.get_or_create_source_index(&source_path);
-
-        self.spans
-            .push(SpanInfo::from_lexer_span(span, source_index));
+        SpanInfo::from_lexer_span(span, source_index)
     }
 
     fn get_or_create_source_index(&mut self, source_path: &str) -> usize {

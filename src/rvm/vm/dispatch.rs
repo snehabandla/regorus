@@ -418,6 +418,9 @@ impl RegoVM {
 
                 if a == &Value::Undefined || b == &Value::Undefined {
                     self.set_register(dest, Value::Undefined)?;
+                    #[cfg(feature = "explanations")]
+                    self.provenance
+                        .set_undefined_origin_from(dest, [left, right]);
                     return Ok(InstructionOutcome::Continue);
                 }
 
@@ -431,6 +434,9 @@ impl RegoVM {
 
                 if a == &Value::Undefined || b == &Value::Undefined {
                     self.set_register(dest, Value::Undefined)?;
+                    #[cfg(feature = "explanations")]
+                    self.provenance
+                        .set_undefined_origin_from(dest, [left, right]);
                     return Ok(InstructionOutcome::Continue);
                 }
 
@@ -444,6 +450,9 @@ impl RegoVM {
 
                 if a == &Value::Undefined || b == &Value::Undefined {
                     self.set_register(dest, Value::Undefined)?;
+                    #[cfg(feature = "explanations")]
+                    self.provenance
+                        .set_undefined_origin_from(dest, [left, right]);
                     return Ok(InstructionOutcome::Continue);
                 }
 
@@ -457,6 +466,9 @@ impl RegoVM {
 
                 if a == &Value::Undefined || b == &Value::Undefined {
                     self.set_register(dest, Value::Undefined)?;
+                    #[cfg(feature = "explanations")]
+                    self.provenance
+                        .set_undefined_origin_from(dest, [left, right]);
                     return Ok(InstructionOutcome::Continue);
                 }
 
@@ -470,6 +482,9 @@ impl RegoVM {
 
                 if a == &Value::Undefined || b == &Value::Undefined {
                     self.set_register(dest, Value::Undefined)?;
+                    #[cfg(feature = "explanations")]
+                    self.provenance
+                        .set_undefined_origin_from(dest, [left, right]);
                     return Ok(InstructionOutcome::Continue);
                 }
 
@@ -980,7 +995,45 @@ impl RegoVM {
                 let mut obj_value = self.take_register(obj)?;
 
                 if let Ok(obj_mut) = obj_value.as_object_mut() {
+                    #[cfg(feature = "explanations")]
+                    let emission = self
+                        .explanation_settings
+                        .enabled
+                        .then(|| self.call_rule_stack.last())
+                        .flatten()
+                        .filter(|ctx| {
+                            ctx.rule_type == crate::rvm::program::RuleType::PartialObject
+                                && obj == ctx.result_reg
+                        })
+                        .map(|ctx| {
+                            (
+                                ctx.rule_index,
+                                u16::try_from(ctx.current_definition_index).unwrap_or(u16::MAX),
+                                u32::try_from(ctx.current_body_condition_start).unwrap_or(u32::MAX),
+                                value_value.clone(),
+                            )
+                        });
+
                     obj_mut.insert(key_value, value_value);
+
+                    #[cfg(feature = "explanations")]
+                    if let Some((
+                        rule_index,
+                        definition_index,
+                        condition_start_index,
+                        emitted_value,
+                    )) = emission
+                    {
+                        let condition_end_index =
+                            u32::try_from(self.trace.condition_outcomes.len()).unwrap_or(u32::MAX);
+                        self.trace.record_emission(
+                            rule_index,
+                            definition_index,
+                            condition_start_index,
+                            condition_end_index,
+                            emitted_value,
+                        );
+                    }
                     self.set_register(obj, obj_value)?;
                 } else {
                     let offending = obj_value.clone();
@@ -1012,6 +1065,25 @@ impl RegoVM {
                     .collect::<core::result::Result<_, _>>()?;
                 let leaf_value = self.get_register(params.value)?.clone();
 
+                #[cfg(feature = "explanations")]
+                let emission = self
+                    .explanation_settings
+                    .enabled
+                    .then(|| self.call_rule_stack.last())
+                    .flatten()
+                    .filter(|ctx| {
+                        ctx.rule_type == crate::rvm::program::RuleType::PartialObject
+                            && params.obj == ctx.result_reg
+                    })
+                    .map(|ctx| {
+                        (
+                            ctx.rule_index,
+                            u16::try_from(ctx.current_definition_index).unwrap_or(u16::MAX),
+                            u32::try_from(ctx.current_body_condition_start).unwrap_or(u32::MAX),
+                            leaf_value.clone(),
+                        )
+                    });
+
                 let mut root = self.take_register(params.obj)?;
                 self.object_deep_set(
                     &mut root,
@@ -1020,6 +1092,21 @@ impl RegoVM {
                     params.multi_value,
                     params.obj,
                 )?;
+
+                #[cfg(feature = "explanations")]
+                if let Some((rule_index, definition_index, condition_start_index, emitted_value)) =
+                    emission
+                {
+                    let condition_end_index =
+                        u32::try_from(self.trace.condition_outcomes.len()).unwrap_or(u32::MAX);
+                    self.trace.record_emission(
+                        rule_index,
+                        definition_index,
+                        condition_start_index,
+                        condition_end_index,
+                        emitted_value,
+                    );
+                }
                 self.set_register(params.obj, root)?;
                 Ok(InstructionOutcome::Continue)
             }
@@ -1054,7 +1141,22 @@ impl RegoVM {
                 }
 
                 if any_undefined {
+                    #[cfg(feature = "explanations")]
+                    let field_registers: Vec<u8> = params
+                        .literal_key_field_pairs()
+                        .iter()
+                        .map(|pair| pair.1)
+                        .chain(
+                            params
+                                .field_pairs()
+                                .iter()
+                                .flat_map(|pair| [pair.0, pair.1]),
+                        )
+                        .collect();
                     self.set_register(params.dest, Value::Undefined)?;
+                    #[cfg(feature = "explanations")]
+                    self.provenance
+                        .set_undefined_origin_from(params.dest, field_registers);
                 } else {
                     let mut obj_value = program
                         .literals
@@ -1123,6 +1225,10 @@ impl RegoVM {
                 self.set_register(dest, result.clone())?;
                 #[cfg(feature = "explanations")]
                 {
+                    if result == Value::Undefined {
+                        self.provenance
+                            .set_undefined_origin_from(dest, [container, key]);
+                    }
                     // When the result is Undefined because the key is unknown
                     // (from input), propagate the key's input provenance to the
                     // dest register so downstream comparisons can fire assumptions.
@@ -1152,9 +1258,12 @@ impl RegoVM {
 
                 if let Some(key_value) = program.literals.get(usize::from(literal_idx)) {
                     let result = container_value[key_value].clone();
-                    self.set_register(dest, result)?;
+                    self.set_register(dest, result.clone())?;
                     #[cfg(feature = "explanations")]
                     {
+                        if result == Value::Undefined {
+                            self.provenance.set_undefined_origin_from(dest, [container]);
+                        }
                         if let Ok(field) = key_value.as_string() {
                             self.provenance
                                 .append_field(dest, container, field.as_ref());
@@ -1236,7 +1345,12 @@ impl RegoVM {
                     }
 
                     if any_undefined {
+                        #[cfg(feature = "explanations")]
+                        let element_registers = params.element_registers().to_vec();
                         self.set_register(params.dest, Value::Undefined)?;
+                        #[cfg(feature = "explanations")]
+                        self.provenance
+                            .set_undefined_origin_from(params.dest, element_registers);
                     } else {
                         let elements: Vec<Value> = params
                             .element_registers()
@@ -1266,6 +1380,28 @@ impl RegoVM {
 
                 // Never add undefined values to a set.
                 if matches!(value_to_add, Value::Undefined) {
+                    #[cfg(feature = "explanations")]
+                    if self.explanation_settings.enabled
+                        && self.explanation_settings.eval_mode
+                            == crate::evaluation_trace::EvaluationMode::PartialEval
+                        && self.provenance.is_symbolic_undefined(value)
+                    {
+                        let symbolic_yield = self.call_rule_stack.last().and_then(|ctx| {
+                            (ctx.rule_type == crate::rvm::program::RuleType::PartialSet
+                                && set == ctx.result_reg)
+                                .then(|| {
+                                    (
+                                        ctx.rule_index,
+                                        u16::try_from(ctx.current_definition_index)
+                                            .unwrap_or(u16::MAX),
+                                    )
+                                })
+                        });
+                        if let Some((rule_index, definition_index)) = symbolic_yield {
+                            self.trace
+                                .record_symbolic_yield(rule_index, definition_index);
+                        }
+                    }
                     return Ok(InstructionOutcome::Continue);
                 }
 
@@ -1739,6 +1875,8 @@ impl RegoVM {
                     .provenance
                     .get(params.root)
                     .map(|path| path.as_ref().to_string());
+                #[cfg(feature = "explanations")]
+                let mut visited_dependency_registers = alloc::vec![params.root];
 
                 for (comp_idx, component) in params.path_components.iter().enumerate() {
                     let _ = comp_idx; // used under #[cfg(feature = "explanations")]
@@ -1753,6 +1891,10 @@ impl RegoVM {
                             .clone(),
                         LiteralOrRegister::Register(reg) => self.get_register(reg)?.clone(),
                     };
+                    #[cfg(feature = "explanations")]
+                    if let LiteralOrRegister::Register(register) = *component {
+                        visited_dependency_registers.push(register);
+                    }
 
                     #[cfg(feature = "explanations")]
                     {
@@ -1818,8 +1960,12 @@ impl RegoVM {
 
                 self.set_register(params.dest, current_value)?;
                 #[cfg(feature = "explanations")]
-                self.provenance
-                    .set_path(params.dest, current_path.map(|path| path.into()));
+                {
+                    self.provenance
+                        .set_undefined_origin_from(params.dest, visited_dependency_registers);
+                    self.provenance
+                        .set_path(params.dest, current_path.map(|path| path.into()));
+                }
                 Ok(InstructionOutcome::Continue)
             }
             VirtualDataDocumentLookup { params_index } => {

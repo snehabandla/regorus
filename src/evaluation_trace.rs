@@ -247,6 +247,12 @@ pub struct Assumption {
     /// an unknown input key (e.g. `data.perms[input.role]`), this captures
     /// the concrete data object so `materialize_pe` can invert the lookup.
     pub data_lookup_context: Option<DataLookupContext>,
+    /// Whether the enclosing partial-rule definition emitted no value.
+    ///
+    /// Partial evaluation omits orphaned assumptions because they cannot
+    /// contribute to an observable result. Causality materialization ignores
+    /// this flag.
+    pub orphaned: bool,
 }
 
 /// Context for inverting a data lookup during partial evaluation.
@@ -296,6 +302,9 @@ pub struct EvaluationTrace {
     pub rule_outcomes: Vec<RuleOutcome>,
     /// Emitted values for partial-set rules.
     pub emission_outcomes: Vec<EmissionOutcome>,
+    /// Symbolic partial-rule yields that reached an emission site without a
+    /// concrete value.
+    pub symbolic_yields: Vec<(u16, u16)>,
     /// Assumptions from unknown input handling.
     pub assumptions: Vec<Assumption>,
     /// Warnings generated during evaluation (e.g. comprehension soundness).
@@ -328,6 +337,7 @@ impl EvaluationTrace {
         self.loop_stats.clear();
         self.rule_outcomes.clear();
         self.emission_outcomes.clear();
+        self.symbolic_yields.clear();
         self.assumptions.clear();
         self.warnings.clear();
         self.next_iteration_id = 0;
@@ -342,6 +352,7 @@ impl EvaluationTrace {
         self.condition_outcomes.is_empty()
             && self.loop_stats.is_empty()
             && self.rule_outcomes.is_empty()
+            && self.symbolic_yields.is_empty()
             && self.assumptions.is_empty()
     }
 
@@ -494,6 +505,12 @@ impl EvaluationTrace {
         });
     }
 
+    /// Record that a partial-rule definition reached its emission site but
+    /// could not produce a concrete value because it depends on unknown input.
+    pub fn record_symbolic_yield(&mut self, rule_index: u16, definition_index: u16) {
+        self.symbolic_yields.push((rule_index, definition_index));
+    }
+
     /// Record an assumption from unknown input handling.
     #[allow(clippy::too_many_arguments)]
     pub fn record_assumption(
@@ -525,6 +542,7 @@ impl EvaluationTrace {
             negation_scope_id,
             owned_negation_scope_id: None,
             data_lookup_context: None,
+            orphaned: false,
         });
     }
 

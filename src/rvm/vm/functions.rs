@@ -74,8 +74,13 @@ impl RegoVM {
         }
 
         if args.iter().any(|a| a == &Value::Undefined) {
+            #[cfg(feature = "explanations")]
+            let arg_registers = params.arg_registers().to_vec();
             self.cached_builtin_args = args;
             self.set_register(params.dest, Value::Undefined)?;
+            #[cfg(feature = "explanations")]
+            self.provenance
+                .set_undefined_origin_from(params.dest, arg_registers);
             self.memory_check()?;
             return Ok(());
         }

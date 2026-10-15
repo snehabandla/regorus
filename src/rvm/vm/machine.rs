@@ -42,9 +42,26 @@ pub(super) enum MemoryBudgetLifecycle {
 
 #[cfg(feature = "explanations")]
 #[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum UndefinedOrigin {
+    #[default]
+    Defined,
+    Concrete,
+    Symbolic,
+}
+
+#[cfg(feature = "explanations")]
+#[derive(Debug, Clone, Default)]
+pub(super) struct RuntimeProvenanceState {
+    paths: Vec<Option<Rc<str>>>,
+    undefined_origins: Vec<UndefinedOrigin>,
+}
+
+#[cfg(feature = "explanations")]
 #[derive(Debug, Clone, Default)]
 pub(super) struct RuntimeProvenanceTracker {
     paths: Vec<Option<Rc<str>>>,
+    undefined_origins: Vec<UndefinedOrigin>,
 }
 
 #[cfg(feature = "explanations")]
@@ -52,12 +69,21 @@ pub(super) struct RuntimeProvenanceTracker {
 impl RuntimeProvenanceTracker {
     pub(super) fn resize(&mut self, len: usize) {
         self.paths.resize(len, None);
+        self.undefined_origins.resize(len, UndefinedOrigin::Defined);
     }
 
-    pub(super) fn clear_reg(&mut self, index: u8) {
+    pub(super) fn clear_reg(&mut self, index: u8, is_undefined: bool) {
         if let Some(slot) = self.paths.get_mut(usize::from(index)) {
             *slot = None;
         }
+        self.set_undefined_origin(
+            index,
+            if is_undefined {
+                UndefinedOrigin::Concrete
+            } else {
+                UndefinedOrigin::Defined
+            },
+        );
     }
 
     pub(super) fn get(&self, index: u8) -> Option<&Rc<str>> {
@@ -70,6 +96,7 @@ impl RuntimeProvenanceTracker {
 
     pub(super) fn copy(&mut self, dest: u8, src: u8) {
         self.set_path(dest, self.get(src).cloned());
+        self.set_undefined_origin(dest, self.undefined_origin(src));
     }
 
     pub(super) fn set_path(&mut self, index: u8, path: Option<Rc<str>>) {
@@ -108,14 +135,84 @@ impl RuntimeProvenanceTracker {
     pub(super) fn copy_first_available(&mut self, dest: u8, first: u8, second: u8) {
         let path = self.get(first).or_else(|| self.get(second)).cloned();
         self.set_path(dest, path);
+        self.set_undefined_origin(
+            dest,
+            Self::combine_undefined_origins([
+                self.undefined_origin(first),
+                self.undefined_origin(second),
+            ]),
+        );
     }
 
-    pub(super) fn take_paths(&mut self) -> Vec<Option<Rc<str>>> {
-        core::mem::take(&mut self.paths)
+    pub(super) fn mark_symbolic_undefined(&mut self, index: u8) {
+        self.set_undefined_origin(index, UndefinedOrigin::Symbolic);
     }
 
-    pub(super) fn restore_paths(&mut self, paths: Vec<Option<Rc<str>>>) {
-        self.paths = paths;
+    pub(super) fn mark_concrete_undefined(&mut self, index: u8) {
+        self.set_undefined_origin(index, UndefinedOrigin::Concrete);
+    }
+
+    pub(super) fn is_symbolic_undefined(&self, index: u8) -> bool {
+        self.undefined_origin(index) == UndefinedOrigin::Symbolic
+    }
+
+    pub(super) fn set_undefined_origin_from<I>(&mut self, dest: u8, registers: I)
+    where
+        I: IntoIterator<Item = u8>,
+    {
+        let origin = Self::combine_undefined_origins(
+            registers
+                .into_iter()
+                .map(|register| self.undefined_origin(register)),
+        );
+        if origin != UndefinedOrigin::Defined {
+            self.set_undefined_origin(dest, origin);
+        }
+    }
+
+    pub(super) fn take_state(&mut self) -> RuntimeProvenanceState {
+        RuntimeProvenanceState {
+            paths: core::mem::take(&mut self.paths),
+            undefined_origins: core::mem::take(&mut self.undefined_origins),
+        }
+    }
+
+    pub(super) fn restore_state(&mut self, state: RuntimeProvenanceState) {
+        self.paths = state.paths;
+        self.undefined_origins = state.undefined_origins;
+    }
+
+    fn undefined_origin(&self, index: u8) -> UndefinedOrigin {
+        self.undefined_origins
+            .get(usize::from(index))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn set_undefined_origin(&mut self, index: u8, origin: UndefinedOrigin) {
+        let index = usize::from(index);
+        if self.undefined_origins.len() <= index {
+            self.undefined_origins
+                .resize(index.saturating_add(1), UndefinedOrigin::Defined);
+        }
+        if let Some(slot) = self.undefined_origins.get_mut(index) {
+            *slot = origin;
+        }
+    }
+
+    fn combine_undefined_origins<I>(origins: I) -> UndefinedOrigin
+    where
+        I: IntoIterator<Item = UndefinedOrigin>,
+    {
+        let mut combined = UndefinedOrigin::Defined;
+        for origin in origins {
+            match origin {
+                UndefinedOrigin::Concrete => return UndefinedOrigin::Concrete,
+                UndefinedOrigin::Symbolic => combined = UndefinedOrigin::Symbolic,
+                UndefinedOrigin::Defined => {}
+            }
+        }
+        combined
     }
 
     fn append_path_component(base: &str, key: &Value) -> String {
@@ -191,7 +288,7 @@ pub struct RegoVM {
 
     /// Saved provenance windows for nested rule/function calls.
     #[cfg(feature = "explanations")]
-    pub(super) provenance_stack: Vec<Vec<Option<Rc<str>>>>,
+    pub(super) provenance_stack: Vec<RuntimeProvenanceState>,
 
     /// Runtime input/data path provenance for each live register.
     #[cfg(feature = "explanations")]
@@ -1053,7 +1150,7 @@ impl RegoVM {
         };
 
         #[cfg(feature = "explanations")]
-        self.provenance.clear_reg(index);
+        self.provenance.clear_reg(index, true);
 
         #[cfg(feature = "explanations")]
         self.clear_register_path(index)?;
@@ -1065,6 +1162,8 @@ impl RegoVM {
     #[allow(dead_code)]
     pub(super) fn set_register(&mut self, index: u8, value: Value) -> Result<()> {
         let register_count = self.registers.len();
+        #[cfg(feature = "explanations")]
+        let is_undefined = matches!(value, Value::Undefined);
 
         {
             let slot = self.registers.get_mut(usize::from(index)).ok_or(
@@ -1078,7 +1177,7 @@ impl RegoVM {
         }
 
         #[cfg(feature = "explanations")]
-        self.provenance.clear_reg(index);
+        self.provenance.clear_reg(index, is_undefined);
 
         #[cfg(feature = "explanations")]
         self.clear_register_path(index)?;

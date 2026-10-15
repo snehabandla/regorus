@@ -126,6 +126,7 @@ pub struct Compiler<'a> {
     rule_index_map: BTreeMap<String, u16>,
     rule_worklist: Vec<WorklistEntry>,
     rule_definitions: Vec<Vec<Vec<u32>>>,
+    rule_definition_spans: Vec<Vec<Option<SpanInfo>>>,
     rule_definition_function_params: Vec<Vec<Option<Vec<String>>>>,
     rule_definition_destructuring_patterns: Vec<Vec<Option<u32>>>,
     /// Per-rule, per-definition marker for bodies introduced by `else`.
@@ -169,6 +170,7 @@ impl<'a> Compiler<'a> {
             rule_index_map: BTreeMap::new(),
             rule_worklist: Vec::new(),
             rule_definitions: Vec::new(),
+            rule_definition_spans: Vec::new(),
             rule_definition_function_params: Vec::new(),
             rule_definition_destructuring_patterns: Vec::new(),
             rule_definition_else_bodies: Vec::new(),

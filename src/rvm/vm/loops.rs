@@ -770,17 +770,21 @@ impl RegoVM {
                                 self.set_register(params.value_reg, Value::Undefined)?;
                             }
 
-                            // Set provenance on the value register so
-                            // downstream Guards can trace back to the
-                            // unknown input collection.
+                            // Set provenance on both phantom registers so
+                            // downstream expressions can retain their
+                            // dependency on the unknown input collection.
                             if let Some(base) = self.provenance.get(params.collection).cloned() {
-                                let element_path = {
+                                let element_path: crate::Rc<str> = {
                                     let mut p = alloc::string::String::from(base.as_ref());
                                     p.push_str("[_]");
                                     crate::Rc::from(p.as_str())
                                 };
                                 self.provenance
+                                    .set_path(params.key_reg, Some(element_path.clone()));
+                                self.provenance
                                     .set_path(params.value_reg, Some(element_path));
+                                self.provenance.mark_symbolic_undefined(params.key_reg);
+                                self.provenance.mark_symbolic_undefined(params.value_reg);
                             }
 
                             let loop_next_pc = params.loop_end.saturating_sub(1);

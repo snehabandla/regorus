@@ -27,6 +27,24 @@ fn run_pe_with_unknowns(
     entrypoint_str: &str,
     unknowns: Option<Vec<String>>,
 ) -> serde_json::Value {
+    run_pe_with_unknowns_and_mode(
+        policy,
+        input_json,
+        data_json,
+        entrypoint_str,
+        unknowns,
+        rvm::vm::ExecutionMode::RunToCompletion,
+    )
+}
+
+fn run_pe_with_unknowns_and_mode(
+    policy: &str,
+    input_json: Option<&str>,
+    data_json: Option<&str>,
+    entrypoint_str: &str,
+    unknowns: Option<Vec<String>>,
+    execution_mode: rvm::vm::ExecutionMode,
+) -> serde_json::Value {
     let mut engine = Engine::new();
     engine
         .add_policy("test.rego".into(), policy.into())
@@ -39,6 +57,7 @@ fn run_pe_with_unknowns(
             .unwrap();
 
     let mut vm = rvm::RegoVM::new_with_policy(compiled);
+    vm.set_execution_mode(execution_mode);
     vm.load_program(program);
     vm.set_explanation_settings(evaluation_trace::ExplanationSettings {
         enabled: true,
@@ -2176,4 +2195,801 @@ allow if { input.resource.public == true }
         0,
         "second def uses known input.resource — result definitive"
     );
+}
+
+#[test]
+fn pe_61_helper_gate_prunes_on_concrete_false_downstream() {
+    let policy = r#"
+package bicep
+import future.keywords
+
+in_resource_group(fragment) if contains(input.deployment.resourceGroupName, fragment)
+
+deny contains msg if {
+    in_resource_group("prod")
+    some _, resource in input.resources
+    resource.type == "Microsoft.Storage/storageAccounts"
+    resource.properties.allowBlobPublicAccess == true
+    msg := "allowBlobPublicAccess must be false in prod-rg"
+}
+"#;
+    let input = r#"{
+        "resources": [{
+            "type": "Microsoft.Storage/storageAccounts",
+            "name": "compliantStorage",
+            "properties": { "allowBlobPublicAccess": false }
+        }]
+    }"#;
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some(input),
+            None,
+            "data.bicep.deny",
+            Some(vec!["input.deployment".into()]),
+            mode,
+        );
+
+        assert!(
+            result["residual_queries"].as_array().unwrap().is_empty(),
+            "helper-gate assumption must be pruned in {mode:?} mode when downstream is concretely false; got {result:#?}"
+        );
+        assert!(result["result"].as_array().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn pe_62_inline_gate_prunes_on_concrete_false_downstream() {
+    let policy = r#"
+package bicep
+import future.keywords
+
+deny contains msg if {
+    contains(input.deployment.resourceGroupName, "prod")
+    some _, resource in input.resources
+    resource.type == "Microsoft.Storage/storageAccounts"
+    resource.properties.allowBlobPublicAccess == true
+    msg := "allowBlobPublicAccess must be false in prod-rg"
+}
+"#;
+    let input = r#"{
+        "resources": [{
+            "type": "Microsoft.Storage/storageAccounts",
+            "name": "compliantStorage",
+            "properties": { "allowBlobPublicAccess": false }
+        }]
+    }"#;
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some(input),
+            None,
+            "data.bicep.deny",
+            Some(vec!["input.deployment".into()]),
+            mode,
+        );
+
+        assert!(
+            result["residual_queries"].as_array().unwrap().is_empty(),
+            "inline-gate assumption must be pruned in {mode:?} mode when downstream is concretely false; got {result:#?}"
+        );
+        assert!(result["result"].as_array().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn pe_63_helper_gate_keeps_when_downstream_symbolic() {
+    let policy = r#"
+package bicep
+import future.keywords
+
+in_resource_group(fragment) if contains(input.deployment.resourceGroupName, fragment)
+
+deny contains msg if {
+    in_resource_group("prod")
+    some _, resource in input.resources
+    resource.type == "Microsoft.Storage/storageAccounts"
+    resource.properties.allowBlobPublicAccess == true
+    msg := "allowBlobPublicAccess must be false in prod-rg"
+}
+"#;
+
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result =
+            run_pe_with_unknowns_and_mode(policy, None, None, "data.bicep.deny", None, mode);
+
+        assert!(
+            !result["residual_queries"].as_array().unwrap().is_empty(),
+            "a symbolic downstream must preserve the helper-gate assumption in {mode:?} mode"
+        );
+    }
+}
+
+#[test]
+fn pe_64_helper_gate_emits_on_noncompliant_resource() {
+    let policy = r#"
+package bicep
+import future.keywords
+
+in_resource_group(fragment) if contains(input.deployment.resourceGroupName, fragment)
+
+deny contains msg if {
+    in_resource_group("prod")
+    some _, resource in input.resources
+    resource.type == "Microsoft.Storage/storageAccounts"
+    resource.properties.allowBlobPublicAccess == true
+    msg := "allowBlobPublicAccess must be false in prod-rg"
+}
+"#;
+    let input = r#"{
+        "resources": [{
+            "type": "Microsoft.Storage/storageAccounts",
+            "name": "openStorage",
+            "properties": { "allowBlobPublicAccess": true }
+        }]
+    }"#;
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some(input),
+            None,
+            "data.bicep.deny",
+            Some(vec!["input.deployment".into()]),
+            mode,
+        );
+
+        let queries = result["residual_queries"].as_array().unwrap();
+        assert!(
+            !queries.is_empty(),
+            "a noncompliant resource must preserve the helper-gate residual in {mode:?} mode"
+        );
+        assert!(result["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some("allowBlobPublicAccess must be false in prod-rg")));
+        assert!(queries.iter().any(|query| {
+            query.as_array().is_some_and(|terms| {
+                terms.iter().any(|term| {
+                    term["input_path"].as_str() == Some("input.deployment.resourceGroupName")
+                })
+            })
+        }));
+    }
+}
+
+fn assert_partial_object_emission_preserves_residual(policy: &str, entrypoint: &str) {
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(policy, None, None, entrypoint, None, mode);
+        let queries = result["residual_queries"].as_array().unwrap();
+        assert!(
+            queries.iter().any(|query| {
+                query.as_array().is_some_and(|terms| {
+                    terms.iter().any(|term| {
+                        term["input_path"].as_str() == Some("input.enabled")
+                    })
+                })
+            }),
+            "an emitting partial object must preserve its symbolic gate in {mode:?} mode; got {result:#?}"
+        );
+    }
+}
+
+#[test]
+fn pe_orphan_single_key_partial_object_preserves_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+items[key] := "v" if {
+    key := "a"
+    input.enabled == true
+}
+"#;
+
+    assert_partial_object_emission_preserves_residual(policy, "data.test.items");
+}
+
+#[test]
+fn pe_orphan_multi_value_partial_object_preserves_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+items[key] contains "v" if {
+    key := "a"
+    input.enabled == true
+}
+"#;
+
+    assert_partial_object_emission_preserves_residual(policy, "data.test.items");
+}
+
+#[test]
+fn pe_orphan_nested_partial_rule_emission_does_not_save_caller_assumptions() {
+    let policy = r#"
+package test
+import rego.v1
+
+helper contains "x" if { true }
+
+deny contains "bad" if {
+    input.gate == true
+    count(helper) > 0
+    input.reject == true
+}
+"#;
+    let input = r#"{"reject": false}"#;
+
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some(input),
+            None,
+            "data.test.deny",
+            Some(vec!["input.gate".into()]),
+            mode,
+        );
+        assert!(
+            result["residual_queries"].as_array().unwrap().is_empty(),
+            "a nested helper emission must not preserve assumptions from a non-emitting caller in {mode:?} mode; got {result:#?}"
+        );
+        assert!(result["result"].as_array().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn pe_review_unknown_collection_symbolic_yield_preserves_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+items contains item if {
+    some item in input.items
+}
+"#;
+
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result =
+            run_pe_with_unknowns_and_mode(policy, None, None, "data.test.items", None, mode);
+        assert!(
+            result["result"].as_array().unwrap().is_empty(),
+            "a phantom unknown iteration must not invent a concrete set member in {mode:?} mode"
+        );
+        assert!(
+            result["residual_queries"].as_array().unwrap().iter().any(|query| {
+                query.as_array().is_some_and(|terms| {
+                    terms.iter().any(|term| {
+                        term["kind"].as_str() == Some("collection_exists")
+                            && term["input_path"].as_str() == Some("input.items")
+                    })
+                })
+            }),
+            "the unknown collection dependency must survive as a residual in {mode:?} mode; got {result:#?}"
+        );
+    }
+}
+
+fn assert_unknown_collection_derived_set_head_preserves_residual(policy: &str, entrypoint: &str) {
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(policy, None, None, entrypoint, None, mode);
+        assert!(
+            result["result"].as_array().unwrap().is_empty(),
+            "a phantom unknown iteration must not invent a concrete set member in {mode:?} mode"
+        );
+        assert!(
+            result["residual_queries"].as_array().unwrap().iter().any(|query| {
+                query.as_array().is_some_and(|terms| {
+                    terms.iter().any(|term| {
+                        term["kind"].as_str() == Some("collection_exists")
+                            && term["input_path"].as_str() == Some("input.items")
+                    })
+                })
+            }),
+            "a derived head must retain the unknown collection dependency in {mode:?} mode; got {result:#?}"
+        );
+    }
+}
+
+#[test]
+fn pe_review_unknown_collection_key_head_preserves_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+keys contains key if {
+    some key, _ in input.items
+}
+"#;
+
+    assert_unknown_collection_derived_set_head_preserves_residual(policy, "data.test.keys");
+}
+
+#[test]
+fn pe_review_unknown_collection_structured_head_preserves_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+items contains [item] if {
+    some item in input.items
+}
+"#;
+
+    assert_unknown_collection_derived_set_head_preserves_residual(policy, "data.test.items");
+}
+
+#[test]
+fn pe_review_unknown_collection_object_head_preserves_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+items contains {"id": item} if {
+    some item in input.items
+}
+"#;
+
+    assert_unknown_collection_derived_set_head_preserves_residual(policy, "data.test.items");
+}
+
+#[test]
+fn pe_review_unknown_collection_builtin_head_preserves_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+names contains lower(item) if {
+    some item in input.items
+}
+"#;
+
+    assert_unknown_collection_derived_set_head_preserves_residual(policy, "data.test.names");
+}
+
+#[test]
+fn pe_review_unknown_collection_field_head_preserves_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+names contains item.name if {
+    some item in input.items
+}
+"#;
+
+    assert_unknown_collection_derived_set_head_preserves_residual(policy, "data.test.names");
+}
+
+#[test]
+fn pe_review_unknown_collection_object_field_head_preserves_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+items contains {"id": item.id} if {
+    some item in input.items
+}
+"#;
+
+    assert_unknown_collection_derived_set_head_preserves_residual(policy, "data.test.items");
+}
+
+#[test]
+fn pe_review_unknown_collection_arithmetic_head_preserves_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+items contains item + 1 if {
+    some item in input.items
+}
+"#;
+
+    assert_unknown_collection_derived_set_head_preserves_residual(policy, "data.test.items");
+}
+
+#[test]
+fn pe_review_unknown_collection_head_survives_helper_call() {
+    let policy = r#"
+package test
+import rego.v1
+
+helper if { true }
+
+items contains item if {
+    some item in input.items
+    helper
+}
+"#;
+
+    assert_unknown_collection_derived_set_head_preserves_residual(policy, "data.test.items");
+}
+
+#[test]
+fn pe_review_unknown_collection_head_survives_identity_function() {
+    let policy = r#"
+package test
+import rego.v1
+
+identity(value) := value
+
+items contains identity(item) if {
+    some item in input.items
+}
+"#;
+
+    assert_unknown_collection_derived_set_head_preserves_residual(policy, "data.test.items");
+}
+
+#[test]
+fn pe_review_concrete_undefined_set_value_still_prunes_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+items contains input.missing if {
+    input.gate == true
+}
+"#;
+
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some("{}"),
+            None,
+            "data.test.items",
+            Some(vec!["input.gate".into()]),
+            mode,
+        );
+        assert!(
+            result["result"].as_array().unwrap().is_empty(),
+            "a concrete missing head value must not invent a set member in {mode:?} mode"
+        );
+        assert!(
+            result["residual_queries"].as_array().unwrap().is_empty(),
+            "a gate cannot make a concretely missing head value emit in {mode:?} mode; got {result:#?}"
+        );
+    }
+}
+
+#[test]
+fn pe_review_unrelated_phantom_loop_still_prunes_concrete_undefined_head() {
+    let policy = r#"
+package test
+import rego.v1
+
+items contains input.missing if {
+    some _ in input.items
+}
+"#;
+
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some("{}"),
+            None,
+            "data.test.items",
+            Some(vec!["input.items".into()]),
+            mode,
+        );
+        assert!(
+            result["result"].as_array().unwrap().is_empty(),
+            "an unrelated phantom loop must not invent a concrete set member in {mode:?} mode"
+        );
+        assert!(
+            result["residual_queries"].as_array().unwrap().is_empty(),
+            "a phantom loop cannot make an unrelated concrete-missing head emit in {mode:?} mode; got {result:#?}"
+        );
+    }
+}
+
+#[test]
+fn pe_review_known_container_missing_field_inside_phantom_loop_prunes_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+items contains input.known.missing if {
+    some _ in input.items
+}
+"#;
+    let input = r#"{"known": {}}"#;
+
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some(input),
+            None,
+            "data.test.items",
+            Some(vec!["input.items".into()]),
+            mode,
+        );
+        assert!(
+            result["residual_queries"].as_array().unwrap().is_empty(),
+            "a known container's missing field cannot be repaired by the unrelated phantom loop in {mode:?} mode; got {result:#?}"
+        );
+    }
+}
+
+#[test]
+fn pe_review_unvisited_symbolic_chained_key_does_not_override_concrete_failure() {
+    let policy = r#"
+package test
+import rego.v1
+
+items contains input.known.missing[item] if {
+    some item in input.items
+}
+"#;
+    let input = r#"{"known": {}}"#;
+
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some(input),
+            None,
+            "data.test.items",
+            Some(vec!["input.items".into()]),
+            mode,
+        );
+        assert!(
+            result["residual_queries"].as_array().unwrap().is_empty(),
+            "an unvisited symbolic key cannot override an earlier concrete lookup failure in {mode:?} mode; got {result:#?}"
+        );
+    }
+}
+
+#[test]
+fn pe_review_identity_function_preserves_concrete_undefined_return() {
+    let policy = r#"
+package test
+import rego.v1
+
+identity(value) := value
+
+items contains identity(input.missing) if {
+    some _ in input.items
+}
+"#;
+
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some("{}"),
+            None,
+            "data.test.items",
+            Some(vec!["input.items".into()]),
+            mode,
+        );
+        assert!(
+            result["residual_queries"].as_array().unwrap().is_empty(),
+            "a function's concrete-undefined return must remain concrete in {mode:?} mode; got {result:#?}"
+        );
+    }
+}
+
+#[test]
+fn pe_review_mixed_defined_and_symbolic_array_head_preserves_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+items contains [input.tag, item] if {
+    some item in input.items
+}
+"#;
+    let input = r#"{"tag": "fixed"}"#;
+
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some(input),
+            None,
+            "data.test.items",
+            Some(vec!["input.items".into()]),
+            mode,
+        );
+        assert!(
+            result["residual_queries"].as_array().unwrap().iter().any(|query| {
+                query.as_array().is_some_and(|terms| {
+                    terms.iter().any(|term| {
+                        term["input_path"].as_str() == Some("input.items")
+                    })
+                })
+            }),
+            "a defined sibling must not hide the symbolic array element in {mode:?} mode; got {result:#?}"
+        );
+    }
+}
+
+#[test]
+fn pe_review_mixed_symbolic_and_concrete_undefined_array_head_prunes_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+items contains [item, input.missing] if {
+    some item in input.items
+}
+"#;
+
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some("{}"),
+            None,
+            "data.test.items",
+            Some(vec!["input.items".into()]),
+            mode,
+        );
+        assert!(
+            result["result"].as_array().unwrap().is_empty(),
+            "a concrete missing sibling prevents every array yield in {mode:?} mode"
+        );
+        assert!(
+            result["residual_queries"].as_array().unwrap().is_empty(),
+            "a concrete missing sibling must dominate symbolic undefinedness in {mode:?} mode; got {result:#?}"
+        );
+    }
+}
+
+#[test]
+fn pe_review_symbolic_and_concrete_undefined_arithmetic_head_prunes_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+items contains item + input.missing if {
+    some item in input.items
+}
+"#;
+
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some("{}"),
+            None,
+            "data.test.items",
+            Some(vec!["input.items".into()]),
+            mode,
+        );
+        assert!(
+            result["residual_queries"].as_array().unwrap().is_empty(),
+            "concrete undefinedness must dominate a symbolic arithmetic operand in {mode:?} mode; got {result:#?}"
+        );
+    }
+}
+
+#[test]
+fn pe_review_symbolic_marker_does_not_change_comparison_residuals() {
+    let policy = r#"
+package test
+import rego.v1
+
+allow if lower(input.u.name) == "foo"
+"#;
+
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some("{}"),
+            None,
+            "data.test.allow",
+            Some(vec!["input.u".into()]),
+            mode,
+        );
+        assert!(
+            result["residual_queries"].as_array().unwrap().is_empty(),
+            "symbolic-yield tracking must not manufacture a structured comparison residual in {mode:?} mode; got {result:#?}"
+        );
+    }
+}
+
+#[test]
+fn pe_review_suspendable_cached_helper_replays_dependency() {
+    let policy = r#"
+package test
+import rego.v1
+
+helper if input.deployment.enabled == true
+
+deny contains "first" if {
+    helper
+    input.first == true
+}
+
+deny contains "second" if {
+    helper
+    input.second == true
+}
+"#;
+    let input = r#"{"first": false, "second": true}"#;
+
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some(input),
+            None,
+            "data.test.deny",
+            Some(vec!["input.deployment".into()]),
+            mode,
+        );
+        assert!(
+            result["result"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.as_str() == Some("second")),
+            "the second definition must emit in {mode:?} mode; got {result:#?}"
+        );
+        assert!(
+            result["residual_queries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|query| {
+                    query.as_array().is_some_and(|terms| {
+                        terms.iter().any(|term| {
+                            term["input_path"].as_str() == Some("input.deployment.enabled")
+                        })
+                    })
+                }),
+            "the cached helper dependency must survive in {mode:?} mode; got {result:#?}"
+        );
+    }
 }

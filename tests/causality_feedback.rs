@@ -9,6 +9,7 @@
 #![cfg(all(feature = "rvm", feature = "explanations"))]
 
 use regorus::*;
+use std::collections::HashSet;
 
 fn run_causality_full(policy: &str, input_json: &str, entrypoint_str: &str) -> serde_json::Value {
     let mut engine = Engine::new();
@@ -539,5 +540,251 @@ deny contains msg if {
     assert!(
         found_location_cond,
         "expected a residual condition referencing input.deployment.location; got: {result:#?}"
+    );
+}
+
+// ===========================================================================
+// PE-5: PE residual conjuncts identify the definition that produced them.
+// ===========================================================================
+#[test]
+fn pe_5_residual_carries_source_rule_start_row_for_multi_definition_rules() {
+    let policy = r#"
+package bicep
+import rego.v1
+
+deny contains msg if {
+    some r in input.resources
+    input.deployment.resourceGroupName == "prod-rg"
+    r.properties.supportsHttpsTrafficOnly == false
+    msg := sprintf("[https] Storage '%s' in prod-rg must enable HTTPS", [r.name])
+}
+
+deny contains msg if {
+    some r in input.resources
+    input.deployment.location == "eastus"
+    r.properties.allowBlobPublicAccess == true
+    msg := sprintf("[blob] Storage '%s' in eastus must not allow public blobs", [r.name])
+}
+"#;
+    let input = r#"{
+        "resources": [{
+            "type": "Microsoft.Storage/storageAccounts",
+            "name": "demopeissue5",
+            "location": "eastus",
+            "properties": {
+                "supportsHttpsTrafficOnly": false,
+                "allowBlobPublicAccess": true
+            }
+        }]
+    }"#;
+
+    let result = run_pe(policy, input, "data.bicep.deny");
+    let queries = result["residual_queries"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing residual_queries; got: {result:#?}"));
+
+    assert!(
+        !queries.is_empty(),
+        "expected at least one residual disjunct; got: {result:#?}"
+    );
+
+    let mut start_rows: HashSet<u64> = HashSet::new();
+    for (i, disjunct) in queries.iter().enumerate() {
+        for (j, cond) in disjunct.as_array().unwrap().iter().enumerate() {
+            let source_rule_start_row = cond
+                .get("source_rule_start_row")
+                .and_then(|value| value.as_u64())
+                .unwrap_or_else(|| {
+                    panic!(
+                        "disjunct {i}, condition {j}: source_rule_start_row missing; got: {cond:#?}"
+                    )
+                });
+            let source_row = cond
+                .get("source_row")
+                .and_then(|value| value.as_u64())
+                .unwrap_or_else(|| {
+                    panic!("disjunct {i}, condition {j}: source_row missing; got: {cond:#?}")
+                });
+            assert!(
+                source_rule_start_row <= source_row,
+                "disjunct {i}, condition {j}: rule-start row {source_rule_start_row} must be at or before condition row {source_row}; got: {cond:#?}"
+            );
+            start_rows.insert(source_rule_start_row);
+        }
+    }
+
+    let expected: HashSet<u64> = [5, 12].into_iter().collect();
+    assert_eq!(
+        start_rows, expected,
+        "expected exactly {{5, 12}} distinct source_rule_start_row values across disjuncts; got {start_rows:?}"
+    );
+}
+
+#[test]
+fn pe_review_source_rule_start_row_uses_declaration_span() {
+    fn start_rows(policy: &str, entrypoint: &str) -> HashSet<u64> {
+        let result = run_pe(policy, "{}", entrypoint);
+        result["residual_queries"]
+            .as_array()
+            .unwrap_or_else(|| panic!("missing residual_queries; got {result:#?}"))
+            .iter()
+            .flat_map(|query| query.as_array().into_iter().flatten())
+            .filter_map(|condition| condition["source_rule_start_row"].as_u64())
+            .collect()
+    }
+
+    fn declaration_rows(policy: &str, entrypoint: &str) -> HashSet<u64> {
+        let mut engine = Engine::new();
+        engine
+            .add_policy("test.rego".into(), policy.into())
+            .unwrap();
+        let entrypoint_rc: Rc<str> = entrypoint.into();
+        let compiled = engine.compile_with_entrypoint(&entrypoint_rc).unwrap();
+        let program = languages::rego::compiler::Compiler::compile_from_policy(
+            &compiled,
+            &[entrypoint_rc.as_ref()],
+        )
+        .unwrap();
+        let serialized_with_spans = program.serialize_binary().unwrap();
+        let mut program_without_spans = program.as_ref().clone();
+        for rule_info in &mut program_without_spans.rule_infos {
+            rule_info.definition_spans.clear();
+        }
+        assert_eq!(
+            serialized_with_spans,
+            program_without_spans.serialize_binary().unwrap(),
+            "declaration-only metadata must not change the versioned binary format"
+        );
+        program
+            .rule_infos
+            .iter()
+            .find(|info| info.name == entrypoint)
+            .unwrap_or_else(|| panic!("missing rule info for {entrypoint}"))
+            .definition_spans
+            .iter()
+            .filter_map(|span| span.as_ref())
+            .map(|span| u64::try_from(span.line).unwrap())
+            .collect()
+    }
+
+    let multiline_head = r#"
+package test
+import rego.v1
+
+allow
+if {
+    input.deployment.enabled == true
+}
+"#;
+    assert_eq!(
+        start_rows(multiline_head, "data.test.allow"),
+        HashSet::from([5]),
+        "multiline rule attribution must use the declaration row"
+    );
+
+    let bodyless = r#"
+package test
+import rego.v1
+
+decision :=
+    input.deployment.value == "expected"
+"#;
+    assert_eq!(
+        declaration_rows(bodyless, "data.test.decision"),
+        HashSet::from([5]),
+        "bodyless rule metadata must preserve the declaration row"
+    );
+}
+
+// ===========================================================================
+// PE-6: canonicalize residual input paths and recursively filter empty
+// negation placeholders.
+// ===========================================================================
+#[test]
+fn pe_6_input_path_strips_iteration_suffix_on_exists_and_condition_holds() {
+    let policy = r#"
+package bicep
+import rego.v1
+
+deny contains msg if {
+    some group in input.deployment.claims.groups
+    group == "security"
+    msg := "security group must not be present"
+}
+"#;
+
+    let report = run_pe(policy, "{}", "data.bicep.deny");
+    let residual_queries = report
+        .get("residual_queries")
+        .and_then(|value| value.as_array())
+        .unwrap_or_else(|| panic!("missing residual_queries; report: {report:#?}"));
+    let mut saw_exists = false;
+    let mut saw_condition_holds = false;
+    for disjunct in residual_queries {
+        for cond in disjunct.as_array().expect("disjunct is array") {
+            let kind = cond
+                .get("kind")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let input_path = cond
+                .get("input_path")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            assert!(
+                !input_path.ends_with("[_]"),
+                "input_path must not carry [_] suffix on kind={kind}; got '{input_path}' in {cond:#?}"
+            );
+            if kind == "exists" {
+                saw_exists = true;
+                assert_eq!(input_path, "input.deployment.claims.groups");
+            }
+            if kind == "condition_holds" {
+                saw_condition_holds = true;
+                assert_eq!(input_path, "input.deployment.claims.groups");
+            }
+        }
+    }
+    assert!(
+        saw_exists,
+        "expected an exists conjunct; report: {report:#?}"
+    );
+    assert!(
+        saw_condition_holds,
+        "expected a condition_holds conjunct; report: {report:#?}"
+    );
+}
+
+#[test]
+fn pe_6_collection_exists_stays_clean() {
+    let policy = r#"
+package bicep
+import rego.v1
+
+deny contains msg if {
+    some group in input.deployment.claims.groups
+    group == "security"
+    msg := "security group must not be present"
+}
+"#;
+
+    let report = run_pe(policy, "{}", "data.bicep.deny");
+    let residual_queries = report["residual_queries"]
+        .as_array()
+        .expect("residual_queries");
+    let mut saw_collection_exists = false;
+    for disjunct in residual_queries {
+        for cond in disjunct.as_array().expect("disjunct is array") {
+            if cond.get("kind").and_then(|value| value.as_str()) == Some("collection_exists") {
+                saw_collection_exists = true;
+                assert_eq!(
+                    cond.get("input_path").and_then(|value| value.as_str()),
+                    Some("input.deployment.claims.groups")
+                );
+            }
+        }
+    }
+    assert!(
+        saw_collection_exists,
+        "expected a collection_exists conjunct; report: {report:#?}"
     );
 }

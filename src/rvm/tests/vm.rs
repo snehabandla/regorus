@@ -424,6 +424,7 @@ mod tests {
                 name: String::from("test_rule"),
                 rule_type,
                 definitions: crate::Rc::new(definitions.clone()),
+                definition_spans: alloc::vec![None; definitions.len()],
                 function_info: None,
                 default_literal_index: rule_info_spec.default_literal_index,
                 result_reg,
