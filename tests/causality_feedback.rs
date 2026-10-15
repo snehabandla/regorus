@@ -620,6 +620,82 @@ deny contains msg if {
     );
 }
 
+#[test]
+fn pe_review_source_rule_start_row_uses_declaration_span() {
+    fn start_rows(policy: &str, entrypoint: &str) -> HashSet<u64> {
+        let result = run_pe(policy, "{}", entrypoint);
+        result["residual_queries"]
+            .as_array()
+            .unwrap_or_else(|| panic!("missing residual_queries; got {result:#?}"))
+            .iter()
+            .flat_map(|query| query.as_array().into_iter().flatten())
+            .filter_map(|condition| condition["source_rule_start_row"].as_u64())
+            .collect()
+    }
+
+    fn declaration_rows(policy: &str, entrypoint: &str) -> HashSet<u64> {
+        let mut engine = Engine::new();
+        engine
+            .add_policy("test.rego".into(), policy.into())
+            .unwrap();
+        let entrypoint_rc: Rc<str> = entrypoint.into();
+        let compiled = engine.compile_with_entrypoint(&entrypoint_rc).unwrap();
+        let program = languages::rego::compiler::Compiler::compile_from_policy(
+            &compiled,
+            &[entrypoint_rc.as_ref()],
+        )
+        .unwrap();
+        let serialized_with_spans = program.serialize_binary().unwrap();
+        let mut program_without_spans = program.as_ref().clone();
+        for rule_info in &mut program_without_spans.rule_infos {
+            rule_info.definition_spans.clear();
+        }
+        assert_eq!(
+            serialized_with_spans,
+            program_without_spans.serialize_binary().unwrap(),
+            "declaration-only metadata must not change the versioned binary format"
+        );
+        program
+            .rule_infos
+            .iter()
+            .find(|info| info.name == entrypoint)
+            .unwrap_or_else(|| panic!("missing rule info for {entrypoint}"))
+            .definition_spans
+            .iter()
+            .filter_map(|span| span.as_ref())
+            .map(|span| u64::try_from(span.line).unwrap())
+            .collect()
+    }
+
+    let multiline_head = r#"
+package test
+import rego.v1
+
+allow
+if {
+    input.deployment.enabled == true
+}
+"#;
+    assert_eq!(
+        start_rows(multiline_head, "data.test.allow"),
+        HashSet::from([5]),
+        "multiline rule attribution must use the declaration row"
+    );
+
+    let bodyless = r#"
+package test
+import rego.v1
+
+decision :=
+    input.deployment.value == "expected"
+"#;
+    assert_eq!(
+        declaration_rows(bodyless, "data.test.decision"),
+        HashSet::from([5]),
+        "bodyless rule metadata must preserve the declaration row"
+    );
+}
+
 // ===========================================================================
 // PE-6: canonicalize residual input paths and recursively filter empty
 // negation placeholders.

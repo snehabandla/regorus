@@ -576,11 +576,19 @@ fn source_attribution(
     let rule_start_row = program
         .rule_infos
         .get(usize::from(a.rule_index))
-        .and_then(|info| info.definitions.get(usize::from(a.definition_index)))
-        .and_then(|body_pcs| body_pcs.first())
-        .and_then(|pc| usize::try_from(*pc).ok())
-        .and_then(|pc| program.instruction_spans.get(pc))
-        .and_then(Option::as_ref)
+        .and_then(|info| {
+            info.definition_spans
+                .get(usize::from(a.definition_index))
+                .and_then(Option::as_ref)
+                .or_else(|| {
+                    info.definitions
+                        .get(usize::from(a.definition_index))
+                        .and_then(|body_pcs| body_pcs.first())
+                        .and_then(|pc| usize::try_from(*pc).ok())
+                        .and_then(|pc| program.instruction_spans.get(pc))
+                        .and_then(Option::as_ref)
+                })
+        })
         .map(|span| u32::try_from(span.line).unwrap_or(u32::MAX));
 
     (rule_name, file, row, col, rule_start_row)

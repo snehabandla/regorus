@@ -86,6 +86,9 @@ pub(super) struct RuleFrameData {
     /// PE mode: emission count when the current definition started.
     #[cfg(feature = "explanations")]
     pub(super) emissions_at_def_start: usize,
+    /// PE mode: symbolic-yield count when the current definition started.
+    #[cfg(feature = "explanations")]
+    pub(super) symbolic_yields_at_def_start: usize,
     /// PE mode: at least one definition succeeded with zero assumptions.
     #[cfg(feature = "explanations")]
     pub(super) pe_any_def_resolved: bool,

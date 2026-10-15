@@ -2455,3 +2455,541 @@ deny contains "bad" if {
         assert!(result["result"].as_array().unwrap().is_empty());
     }
 }
+
+#[test]
+fn pe_review_unknown_collection_symbolic_yield_preserves_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+items contains item if {
+    some item in input.items
+}
+"#;
+
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result =
+            run_pe_with_unknowns_and_mode(policy, None, None, "data.test.items", None, mode);
+        assert!(
+            result["result"].as_array().unwrap().is_empty(),
+            "a phantom unknown iteration must not invent a concrete set member in {mode:?} mode"
+        );
+        assert!(
+            result["residual_queries"].as_array().unwrap().iter().any(|query| {
+                query.as_array().is_some_and(|terms| {
+                    terms.iter().any(|term| {
+                        term["kind"].as_str() == Some("collection_exists")
+                            && term["input_path"].as_str() == Some("input.items")
+                    })
+                })
+            }),
+            "the unknown collection dependency must survive as a residual in {mode:?} mode; got {result:#?}"
+        );
+    }
+}
+
+fn assert_unknown_collection_derived_set_head_preserves_residual(policy: &str, entrypoint: &str) {
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(policy, None, None, entrypoint, None, mode);
+        assert!(
+            result["result"].as_array().unwrap().is_empty(),
+            "a phantom unknown iteration must not invent a concrete set member in {mode:?} mode"
+        );
+        assert!(
+            result["residual_queries"].as_array().unwrap().iter().any(|query| {
+                query.as_array().is_some_and(|terms| {
+                    terms.iter().any(|term| {
+                        term["kind"].as_str() == Some("collection_exists")
+                            && term["input_path"].as_str() == Some("input.items")
+                    })
+                })
+            }),
+            "a derived head must retain the unknown collection dependency in {mode:?} mode; got {result:#?}"
+        );
+    }
+}
+
+#[test]
+fn pe_review_unknown_collection_key_head_preserves_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+keys contains key if {
+    some key, _ in input.items
+}
+"#;
+
+    assert_unknown_collection_derived_set_head_preserves_residual(policy, "data.test.keys");
+}
+
+#[test]
+fn pe_review_unknown_collection_structured_head_preserves_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+items contains [item] if {
+    some item in input.items
+}
+"#;
+
+    assert_unknown_collection_derived_set_head_preserves_residual(policy, "data.test.items");
+}
+
+#[test]
+fn pe_review_unknown_collection_object_head_preserves_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+items contains {"id": item} if {
+    some item in input.items
+}
+"#;
+
+    assert_unknown_collection_derived_set_head_preserves_residual(policy, "data.test.items");
+}
+
+#[test]
+fn pe_review_unknown_collection_builtin_head_preserves_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+names contains lower(item) if {
+    some item in input.items
+}
+"#;
+
+    assert_unknown_collection_derived_set_head_preserves_residual(policy, "data.test.names");
+}
+
+#[test]
+fn pe_review_unknown_collection_field_head_preserves_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+names contains item.name if {
+    some item in input.items
+}
+"#;
+
+    assert_unknown_collection_derived_set_head_preserves_residual(policy, "data.test.names");
+}
+
+#[test]
+fn pe_review_unknown_collection_object_field_head_preserves_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+items contains {"id": item.id} if {
+    some item in input.items
+}
+"#;
+
+    assert_unknown_collection_derived_set_head_preserves_residual(policy, "data.test.items");
+}
+
+#[test]
+fn pe_review_unknown_collection_arithmetic_head_preserves_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+items contains item + 1 if {
+    some item in input.items
+}
+"#;
+
+    assert_unknown_collection_derived_set_head_preserves_residual(policy, "data.test.items");
+}
+
+#[test]
+fn pe_review_unknown_collection_head_survives_helper_call() {
+    let policy = r#"
+package test
+import rego.v1
+
+helper if { true }
+
+items contains item if {
+    some item in input.items
+    helper
+}
+"#;
+
+    assert_unknown_collection_derived_set_head_preserves_residual(policy, "data.test.items");
+}
+
+#[test]
+fn pe_review_unknown_collection_head_survives_identity_function() {
+    let policy = r#"
+package test
+import rego.v1
+
+identity(value) := value
+
+items contains identity(item) if {
+    some item in input.items
+}
+"#;
+
+    assert_unknown_collection_derived_set_head_preserves_residual(policy, "data.test.items");
+}
+
+#[test]
+fn pe_review_concrete_undefined_set_value_still_prunes_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+items contains input.missing if {
+    input.gate == true
+}
+"#;
+
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some("{}"),
+            None,
+            "data.test.items",
+            Some(vec!["input.gate".into()]),
+            mode,
+        );
+        assert!(
+            result["result"].as_array().unwrap().is_empty(),
+            "a concrete missing head value must not invent a set member in {mode:?} mode"
+        );
+        assert!(
+            result["residual_queries"].as_array().unwrap().is_empty(),
+            "a gate cannot make a concretely missing head value emit in {mode:?} mode; got {result:#?}"
+        );
+    }
+}
+
+#[test]
+fn pe_review_unrelated_phantom_loop_still_prunes_concrete_undefined_head() {
+    let policy = r#"
+package test
+import rego.v1
+
+items contains input.missing if {
+    some _ in input.items
+}
+"#;
+
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some("{}"),
+            None,
+            "data.test.items",
+            Some(vec!["input.items".into()]),
+            mode,
+        );
+        assert!(
+            result["result"].as_array().unwrap().is_empty(),
+            "an unrelated phantom loop must not invent a concrete set member in {mode:?} mode"
+        );
+        assert!(
+            result["residual_queries"].as_array().unwrap().is_empty(),
+            "a phantom loop cannot make an unrelated concrete-missing head emit in {mode:?} mode; got {result:#?}"
+        );
+    }
+}
+
+#[test]
+fn pe_review_known_container_missing_field_inside_phantom_loop_prunes_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+items contains input.known.missing if {
+    some _ in input.items
+}
+"#;
+    let input = r#"{"known": {}}"#;
+
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some(input),
+            None,
+            "data.test.items",
+            Some(vec!["input.items".into()]),
+            mode,
+        );
+        assert!(
+            result["residual_queries"].as_array().unwrap().is_empty(),
+            "a known container's missing field cannot be repaired by the unrelated phantom loop in {mode:?} mode; got {result:#?}"
+        );
+    }
+}
+
+#[test]
+fn pe_review_unvisited_symbolic_chained_key_does_not_override_concrete_failure() {
+    let policy = r#"
+package test
+import rego.v1
+
+items contains input.known.missing[item] if {
+    some item in input.items
+}
+"#;
+    let input = r#"{"known": {}}"#;
+
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some(input),
+            None,
+            "data.test.items",
+            Some(vec!["input.items".into()]),
+            mode,
+        );
+        assert!(
+            result["residual_queries"].as_array().unwrap().is_empty(),
+            "an unvisited symbolic key cannot override an earlier concrete lookup failure in {mode:?} mode; got {result:#?}"
+        );
+    }
+}
+
+#[test]
+fn pe_review_identity_function_preserves_concrete_undefined_return() {
+    let policy = r#"
+package test
+import rego.v1
+
+identity(value) := value
+
+items contains identity(input.missing) if {
+    some _ in input.items
+}
+"#;
+
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some("{}"),
+            None,
+            "data.test.items",
+            Some(vec!["input.items".into()]),
+            mode,
+        );
+        assert!(
+            result["residual_queries"].as_array().unwrap().is_empty(),
+            "a function's concrete-undefined return must remain concrete in {mode:?} mode; got {result:#?}"
+        );
+    }
+}
+
+#[test]
+fn pe_review_mixed_defined_and_symbolic_array_head_preserves_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+items contains [input.tag, item] if {
+    some item in input.items
+}
+"#;
+    let input = r#"{"tag": "fixed"}"#;
+
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some(input),
+            None,
+            "data.test.items",
+            Some(vec!["input.items".into()]),
+            mode,
+        );
+        assert!(
+            result["residual_queries"].as_array().unwrap().iter().any(|query| {
+                query.as_array().is_some_and(|terms| {
+                    terms.iter().any(|term| {
+                        term["input_path"].as_str() == Some("input.items")
+                    })
+                })
+            }),
+            "a defined sibling must not hide the symbolic array element in {mode:?} mode; got {result:#?}"
+        );
+    }
+}
+
+#[test]
+fn pe_review_mixed_symbolic_and_concrete_undefined_array_head_prunes_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+items contains [item, input.missing] if {
+    some item in input.items
+}
+"#;
+
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some("{}"),
+            None,
+            "data.test.items",
+            Some(vec!["input.items".into()]),
+            mode,
+        );
+        assert!(
+            result["result"].as_array().unwrap().is_empty(),
+            "a concrete missing sibling prevents every array yield in {mode:?} mode"
+        );
+        assert!(
+            result["residual_queries"].as_array().unwrap().is_empty(),
+            "a concrete missing sibling must dominate symbolic undefinedness in {mode:?} mode; got {result:#?}"
+        );
+    }
+}
+
+#[test]
+fn pe_review_symbolic_and_concrete_undefined_arithmetic_head_prunes_residual() {
+    let policy = r#"
+package test
+import rego.v1
+
+items contains item + input.missing if {
+    some item in input.items
+}
+"#;
+
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some("{}"),
+            None,
+            "data.test.items",
+            Some(vec!["input.items".into()]),
+            mode,
+        );
+        assert!(
+            result["residual_queries"].as_array().unwrap().is_empty(),
+            "concrete undefinedness must dominate a symbolic arithmetic operand in {mode:?} mode; got {result:#?}"
+        );
+    }
+}
+
+#[test]
+fn pe_review_symbolic_marker_does_not_change_comparison_residuals() {
+    let policy = r#"
+package test
+import rego.v1
+
+allow if lower(input.u.name) == "foo"
+"#;
+
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some("{}"),
+            None,
+            "data.test.allow",
+            Some(vec!["input.u".into()]),
+            mode,
+        );
+        assert!(
+            result["residual_queries"].as_array().unwrap().is_empty(),
+            "symbolic-yield tracking must not manufacture a structured comparison residual in {mode:?} mode; got {result:#?}"
+        );
+    }
+}
+
+#[test]
+fn pe_review_suspendable_cached_helper_replays_dependency() {
+    let policy = r#"
+package test
+import rego.v1
+
+helper if input.deployment.enabled == true
+
+deny contains "first" if {
+    helper
+    input.first == true
+}
+
+deny contains "second" if {
+    helper
+    input.second == true
+}
+"#;
+    let input = r#"{"first": false, "second": true}"#;
+
+    for mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let result = run_pe_with_unknowns_and_mode(
+            policy,
+            Some(input),
+            None,
+            "data.test.deny",
+            Some(vec!["input.deployment".into()]),
+            mode,
+        );
+        assert!(
+            result["result"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.as_str() == Some("second")),
+            "the second definition must emit in {mode:?} mode; got {result:#?}"
+        );
+        assert!(
+            result["residual_queries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|query| {
+                    query.as_array().is_some_and(|terms| {
+                        terms.iter().any(|term| {
+                            term["input_path"].as_str() == Some("input.deployment.enabled")
+                        })
+                    })
+                }),
+            "the cached helper dependency must survive in {mode:?} mode; got {result:#?}"
+        );
+    }
+}
