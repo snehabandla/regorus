@@ -11,6 +11,22 @@
 use regorus::*;
 
 fn run_causality_full(policy: &str, input_json: &str, entrypoint_str: &str) -> serde_json::Value {
+    run_causality(
+        policy,
+        input_json,
+        entrypoint_str,
+        evaluation_trace::ConditionMode::AllContributing,
+        evaluation_trace::ExplanationDetail::Full,
+    )
+}
+
+fn run_causality(
+    policy: &str,
+    input_json: &str,
+    entrypoint_str: &str,
+    condition_mode: evaluation_trace::ConditionMode,
+    detail: evaluation_trace::ExplanationDetail,
+) -> serde_json::Value {
     let mut engine = Engine::new();
     engine
         .add_policy("test.rego".into(), policy.into())
@@ -27,9 +43,9 @@ fn run_causality_full(policy: &str, input_json: &str, entrypoint_str: &str) -> s
     vm.set_explanation_settings(evaluation_trace::ExplanationSettings {
         enabled: true,
         value_mode: evaluation_trace::ValueMode::Full,
-        condition_mode: evaluation_trace::ConditionMode::AllContributing,
+        condition_mode,
         scope: evaluation_trace::ExplanationScope::AllEmissions,
-        detail: evaluation_trace::ExplanationDetail::Full,
+        detail,
         emission_index: None,
         emission_value: None,
         assume_unknown_input: false,
@@ -981,6 +997,258 @@ deny contains msg if {
         .unwrap_or_else(|| panic!("missing positive comparison: {report:#?}"));
     assert_eq!(condition["kind"], "comparison");
     assert!(condition.get("negated").is_none());
+}
+
+// ===========================================================================
+// Causality-6: stitch helper-boundary conditions into the outer report.
+// ===========================================================================
+
+const HELPER_BOUNDARY_POLICY: &str = r#"
+package bicep
+import rego.v1
+
+deny contains msg if {
+    some resource in input.resources
+    resource.type == "Microsoft.Network/frontDoors"
+    not _frontdoor_has_waf(resource)
+    msg := "must have WAF"
+}
+
+_frontdoor_has_waf(resource) if {
+    some endpoint in resource.properties.frontendEndpoints
+    endpoint.properties.webApplicationFirewallPolicyLink.id != ""
+}
+"#;
+
+const HELPER_BOUNDARY_INPUT: &str = r#"{
+    "resources": [{
+        "name": "badFrontDoor",
+        "type": "Microsoft.Network/frontDoors",
+        "properties": {
+            "frontendEndpoints": [{ "properties": {} }]
+        }
+    }]
+}"#;
+
+#[test]
+fn causality_6_helper_boundary_left_provenance() {
+    let report = run_causality_full(
+        HELPER_BOUNDARY_POLICY,
+        HELPER_BOUNDARY_INPUT,
+        "data.bicep.deny",
+    );
+    let condition = find_condition(&report, "not _frontdoor_has_waf(resource)")
+        .unwrap_or_else(|| panic!("missing helper boundary condition: {report:#?}"));
+    let provenance = condition["left"]["provenance"].as_str().unwrap_or("");
+    assert!(
+        provenance.starts_with("input.resources")
+            && provenance.contains("webApplicationFirewallPolicyLink"),
+        "outer provenance was not derived from the failed helper condition: {condition:#?}"
+    );
+}
+
+#[test]
+fn causality_6_helper_boundary_conditions_populated() {
+    let report = run_causality_full(
+        HELPER_BOUNDARY_POLICY,
+        HELPER_BOUNDARY_INPUT,
+        "data.bicep.deny",
+    );
+    let condition = find_condition(&report, "not _frontdoor_has_waf(resource)")
+        .unwrap_or_else(|| panic!("missing helper boundary condition: {report:#?}"));
+    let helper_conditions = condition["helper_conditions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("missing helper_conditions: {condition:#?}"));
+    let failed = helper_conditions
+        .iter()
+        .find(|candidate| {
+            candidate["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("webApplicationFirewallPolicyLink"))
+        })
+        .unwrap_or_else(|| panic!("missing failed helper predicate: {helper_conditions:#?}"));
+    assert_eq!(failed["kind"], "comparison");
+    assert_eq!(failed["operator"], "!=");
+    assert_eq!(failed["outcome"], "failure");
+
+    let compact = run_causality(
+        r#"
+package compact
+import rego.v1
+
+result if {
+    not helper
+}
+
+helper if {
+    input.a == 1
+}
+"#,
+        r#"{"a":2}"#,
+        "data.compact.result",
+        evaluation_trace::ConditionMode::AllContributing,
+        evaluation_trace::ExplanationDetail::Compact,
+    );
+    let compact_condition = find_condition(&compact, "not helper")
+        .unwrap_or_else(|| panic!("missing compact helper condition: {compact:#?}"));
+    let compact_helpers = compact_condition["helper_conditions"].as_array().unwrap();
+    assert!(
+        compact_helpers.iter().all(|helper| {
+            helper.get("left").is_none()
+                && helper.get("right").is_none()
+                && helper.get("location").is_none()
+        }),
+        "compact mode leaked full-detail helper fields: {compact_helpers:#?}"
+    );
+}
+
+#[test]
+fn causality_6_helper_conditions_not_duplicated_as_siblings() {
+    let report = run_causality_full(
+        HELPER_BOUNDARY_POLICY,
+        HELPER_BOUNDARY_INPUT,
+        "data.bicep.deny",
+    );
+    let deny_rule = report["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|rule| rule["name"] == "data.bicep.deny")
+        .unwrap();
+    let sibling_count = deny_rule["emissions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|emission| emission["conditions"].as_array().unwrap())
+        .filter(|condition| {
+            condition["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("webApplicationFirewallPolicyLink"))
+        })
+        .count();
+    assert_eq!(sibling_count, 0);
+
+    let report = run_causality_full(
+        r#"
+package t
+import rego.v1
+
+r := h(2)
+
+deny contains "m" if {
+    not h(1)
+}
+
+result := {"r": r, "d": deny}
+
+h(n) := true if {
+    input.a == n
+}
+"#,
+        r#"{"a":5}"#,
+        "data.t.result",
+    );
+    let condition = find_condition(&report, "not h(1)")
+        .unwrap_or_else(|| panic!("missing second helper invocation: {report:#?}"));
+    let helpers = condition["helper_conditions"].as_array().unwrap();
+    assert!(
+        !helpers.iter().any(|helper| helper["left"]["value"] == 2),
+        "helper_conditions crossed invocation boundaries: {helpers:#?}"
+    );
+    assert_eq!(
+        helpers
+            .iter()
+            .filter(|helper| helper["text"] == "input.a == n")
+            .count(),
+        1,
+        "expected exactly one comparison from the current helper invocation: {helpers:#?}"
+    );
+
+    let report = run_causality_full(
+        r#"
+package nested
+import rego.v1
+
+deny contains "m" if {
+    not outer(1)
+}
+
+outer(n) if {
+    input.b == 3
+    input.c == 4
+    inner(n)
+}
+
+inner(n) if {
+    input.a == n
+}
+"#,
+        r#"{"a":5,"b":3,"c":4}"#,
+        "data.nested.deny",
+    );
+    let condition = find_condition(&report, "not outer(1)")
+        .unwrap_or_else(|| panic!("missing nested outer helper: {report:#?}"));
+    let helpers = condition["helper_conditions"].as_array().unwrap();
+    for text in ["input.b == 3", "input.c == 4"] {
+        assert!(
+            helpers.iter().any(|helper| helper["text"] == text),
+            "parent helper condition '{text}' was lost around nested call: {helpers:#?}"
+        );
+    }
+    let nested = helpers
+        .iter()
+        .find(|helper| {
+            helper["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("inner(n)"))
+        })
+        .unwrap_or_else(|| panic!("missing nested helper guard: {helpers:#?}"));
+    assert!(
+        nested["helper_conditions"]
+            .as_array()
+            .is_some_and(|conditions| conditions
+                .iter()
+                .any(|inner| inner["text"] == "input.a == n")),
+        "nested helper conditions were not stitched recursively: {nested:#?}"
+    );
+}
+
+#[test]
+fn causality_6_positive_condition_omits_helper_conditions_key() {
+    let report = run_causality_full(
+        r#"
+package bicep
+import rego.v1
+
+deny contains msg if {
+    some resource in input.resources
+    resource.type == "Microsoft.Storage/storageAccounts"
+    msg := resource.name
+}
+"#,
+        r#"{"resources":[{"type":"Microsoft.Storage/storageAccounts","name":"stg1"}]}"#,
+        "data.bicep.deny",
+    );
+    let condition = find_condition(&report, "resource.type ==").unwrap();
+    assert!(condition.get("helper_conditions").is_none());
+
+    let report = run_causality_full(
+        r#"
+package bicep
+import rego.v1
+
+deny contains "always" if {
+    _always
+}
+
+_always := true
+"#,
+        "{}",
+        "data.bicep.deny",
+    );
+    let condition = find_condition(&report, "_always")
+        .unwrap_or_else(|| panic!("missing empty helper condition: {report:#?}"));
+    assert!(condition.get("helper_conditions").is_none());
 }
 
 // ===========================================================================

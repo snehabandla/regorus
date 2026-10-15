@@ -442,6 +442,8 @@ impl RegoVM {
             current_definition_index: 0,
             current_body_index: 0,
             current_body_condition_start: 0,
+            #[cfg(feature = "explanations")]
+            invocation_condition_start: self.trace.condition_outcomes.len(),
         });
 
         #[cfg(feature = "explanations")]
@@ -480,6 +482,15 @@ impl RegoVM {
                 actual: call_context.rule_index,
                 pc: self.pc,
             });
+        }
+        #[cfg(feature = "explanations")]
+        if self.explanation_settings.enabled {
+            self.trace.record_rule_invocation(
+                call_context.return_pc,
+                call_context.dest_reg,
+                call_context.rule_index,
+                call_context.invocation_condition_start,
+            );
         }
         self.pc = call_context.return_pc;
 
@@ -678,6 +689,8 @@ impl RegoVM {
             current_definition_index: 0,
             current_body_index: 0,
             current_body_condition_start: 0,
+            #[cfg(feature = "explanations")]
+            invocation_condition_start: self.trace.condition_outcomes.len(),
         });
 
         let mut frame_data = RuleFrameData {
@@ -1152,8 +1165,22 @@ impl RegoVM {
         // Underflow here means malformed/poisoned program state; surface as a
         // typed error rather than a debug-only panic so the public load_program
         // contract holds the same in debug and release.
-        if self.call_rule_stack.pop().is_none() {
-            return Err(VmError::CallRuleStackUnderflow { pc: self.pc });
+        let call_context = self
+            .call_rule_stack
+            .pop()
+            .ok_or(VmError::CallRuleStackUnderflow { pc: self.pc })?;
+
+        #[cfg(not(feature = "explanations"))]
+        let _ = &call_context;
+
+        #[cfg(feature = "explanations")]
+        if self.explanation_settings.enabled {
+            self.trace.record_rule_invocation(
+                call_context.return_pc,
+                call_context.dest_reg,
+                call_context.rule_index,
+                call_context.invocation_condition_start,
+            );
         }
 
         self.pc = return_pc;

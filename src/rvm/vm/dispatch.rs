@@ -441,6 +441,7 @@ impl RegoVM {
                 {
                     let pc = u32::try_from(self.pc).unwrap_or(u32::MAX);
                     let passed = !matches!(value, Value::Undefined);
+                    let (rule_index, _) = self.current_rule_scope();
                     self.trace.record_condition(
                         pc,
                         passed,
@@ -451,6 +452,7 @@ impl RegoVM {
                             .map(|path| path.as_ref().to_string()),
                         None,
                         None,
+                        rule_index,
                     );
                 }
                 Ok(InstructionOutcome::Continue)
@@ -878,6 +880,7 @@ impl RegoVM {
                 #[cfg(feature = "explanations")]
                 if self.explanation_settings.enabled {
                     let pc = u32::try_from(self.pc).unwrap_or(u32::MAX);
+                    let (rule_index, _) = self.current_rule_scope();
                     self.trace.record_condition(
                         pc,
                         passed,
@@ -890,6 +893,7 @@ impl RegoVM {
                         self.provenance
                             .get(right)
                             .map(|path| path.as_ref().to_string()),
+                        rule_index,
                     );
                 }
                 self.handle_condition(passed)?;
@@ -924,6 +928,7 @@ impl RegoVM {
                 #[cfg(feature = "explanations")]
                 if self.explanation_settings.enabled {
                     let pc = u32::try_from(self.pc).unwrap_or(u32::MAX);
+                    let (rule_index, _) = self.current_rule_scope();
                     let (actual, actual_path, expected, expected_path) =
                         if let Some(operands) = self.capture_builtin_guard_operands() {
                             operands
@@ -947,6 +952,7 @@ impl RegoVM {
                         actual_path,
                         expected,
                         expected_path,
+                        rule_index,
                     );
                 }
                 self.handle_condition(passed)?;

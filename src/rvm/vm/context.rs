@@ -113,6 +113,8 @@ pub struct CallRuleContext {
     pub current_definition_index: usize,
     pub current_body_index: usize,
     pub current_body_condition_start: usize,
+    #[cfg(feature = "explanations")]
+    pub invocation_condition_start: usize,
 }
 
 /// Context for tracking active comprehensions

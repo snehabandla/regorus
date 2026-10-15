@@ -18,6 +18,7 @@ use crate::evaluation_trace::{
     ExplanationScope, ExplanationSettings, RuleOutcome, ValueMode,
 };
 use crate::rvm::program::Program;
+use crate::rvm::Instruction;
 use crate::static_provenance::{Provenance, ProvenanceRoot};
 use crate::value::Value;
 
@@ -191,6 +192,9 @@ pub struct ConditionExplanation {
     /// Whether this condition's truth is inverted.
     #[serde(default, skip_serializing_if = "is_false")]
     pub negated: bool,
+    /// Conditions evaluated inside the helper invoked by this condition.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub helper_conditions: Vec<ConditionExplanation>,
 }
 
 const fn is_false(value: &bool) -> bool {
@@ -827,6 +831,7 @@ fn materialize_rule_emissions(
             conditions: materialize_condition_window(
                 emission.condition_start_index,
                 emission.condition_end_index,
+                emission.rule_index,
                 program,
                 trace,
                 settings,
@@ -859,9 +864,134 @@ fn materialize_conditions(
     )
 }
 
+const MAX_HELPER_DEPTH: usize = 8;
+
+fn detect_helper_call_at_guard(outer_pc: usize, program: &Program) -> Option<(u16, usize, u8)> {
+    let Instruction::Guard { register, .. } = *program.instructions.get(outer_pc)? else {
+        return None;
+    };
+    let preceding_pc = outer_pc.checked_sub(1)?;
+    let preceding = program.instructions.get(preceding_pc)?;
+    if let Some(rule_index) = call_writes_to(preceding, register, program) {
+        return Some((rule_index, preceding_pc, register));
+    }
+    let Instruction::Not { dest, operand } = *preceding else {
+        return None;
+    };
+    if dest != register {
+        return None;
+    }
+    let call_pc = preceding_pc.checked_sub(1)?;
+    call_writes_to(program.instructions.get(call_pc)?, operand, program)
+        .map(|rule_index| (rule_index, call_pc, operand))
+}
+
+fn call_writes_to(instruction: &Instruction, target: u8, program: &Program) -> Option<u16> {
+    match *instruction {
+        Instruction::CallRule { dest, rule_index } if dest == target => Some(rule_index),
+        Instruction::FunctionCall { params_index } => {
+            let params = program
+                .instruction_data
+                .function_call_params
+                .get(usize::from(params_index))?;
+            (params.dest == target).then_some(params.func_rule_index)
+        }
+        _ => None,
+    }
+}
+
+fn collect_helper_condition_outcomes(
+    helper_rule_index: u16,
+    condition_start_index: usize,
+    condition_end_index: usize,
+    trace: &EvaluationTrace,
+) -> Vec<(usize, &ConditionOutcome)> {
+    trace
+        .condition_outcomes
+        .get(condition_start_index..condition_end_index)
+        .into_iter()
+        .flatten()
+        .enumerate()
+        .filter_map(|(offset, outcome)| {
+            (outcome.rule_index == helper_rule_index)
+                .then_some((condition_start_index.saturating_add(offset), outcome))
+        })
+        .collect()
+}
+
+fn materialize_helper_conditions(
+    outer_pc: usize,
+    outer_outcome_index: usize,
+    program: &Program,
+    trace: &EvaluationTrace,
+    settings: &ExplanationSettings,
+    depth: usize,
+) -> Vec<ConditionExplanation> {
+    if depth >= MAX_HELPER_DEPTH {
+        return Vec::new();
+    }
+    let Some((helper_rule_index, _call_pc, _dest_register)) =
+        detect_helper_call_at_guard(outer_pc, program)
+    else {
+        return Vec::new();
+    };
+    let Some(invocation) = trace.rule_invocations.iter().rev().find(|invocation| {
+        invocation.rule_index == helper_rule_index
+            && invocation.condition_end_index <= outer_outcome_index
+    }) else {
+        return Vec::new();
+    };
+    let inner_outcomes = collect_helper_condition_outcomes(
+        helper_rule_index,
+        invocation.condition_start_index,
+        invocation.condition_end_index,
+        trace,
+    );
+    if inner_outcomes.is_empty() {
+        return Vec::new();
+    }
+    let selected_outcomes = select_condition_outcomes_from_slice(inner_outcomes, settings);
+    materialize_condition_explanations_at_depth(
+        selected_outcomes,
+        program,
+        trace,
+        settings,
+        depth.saturating_add(1),
+    )
+}
+
+fn derive_left_provenance_from_helper(
+    left: Option<OperandExplanation>,
+    helper_conditions: &[ConditionExplanation],
+) -> Option<OperandExplanation> {
+    let existing = left?;
+    if existing.provenance.is_some() {
+        return Some(existing);
+    }
+    let provenance = helper_conditions.iter().rev().find_map(|condition| {
+        (condition.outcome == "failure")
+            .then(|| {
+                condition
+                    .left
+                    .as_ref()
+                    .and_then(|operand| operand.provenance.clone())
+            })
+            .flatten()
+    });
+    match provenance {
+        Some(provenance) => Some(OperandExplanation {
+            value: existing.value,
+            provenance: Some(provenance),
+            redacted: existing.redacted,
+        }),
+        None => Some(existing),
+    }
+}
+
 fn materialize_condition_window(
     condition_start_index: u32,
     condition_end_index: u32,
+    outer_rule_index: u16,
     program: &Program,
     trace: &EvaluationTrace,
     settings: &ExplanationSettings,
@@ -873,8 +1003,13 @@ fn materialize_condition_window(
         settings,
     );
 
+    let outer_outcomes = relevant_outcomes
+        .into_iter()
+        .filter(|(_, outcome)| outcome.rule_index == outer_rule_index)
+        .collect();
+
     finalize_condition_explanations(
-        materialize_condition_explanations(relevant_outcomes, program, trace, settings),
+        materialize_condition_explanations(outer_outcomes, program, trace, settings),
         settings,
         true,
     )
@@ -1021,9 +1156,19 @@ fn materialize_condition_explanations(
     trace: &EvaluationTrace,
     settings: &ExplanationSettings,
 ) -> Vec<ConditionExplanation> {
+    materialize_condition_explanations_at_depth(relevant_outcomes, program, trace, settings, 0)
+}
+
+fn materialize_condition_explanations_at_depth(
+    relevant_outcomes: Vec<(usize, &ConditionOutcome)>,
+    program: &Program,
+    trace: &EvaluationTrace,
+    settings: &ExplanationSettings,
+    depth: usize,
+) -> Vec<ConditionExplanation> {
     let mut conditions: Vec<ConditionExplanation> = Vec::new();
 
-    for (_, outcome) in &relevant_outcomes {
+    for (outcome_index, outcome) in &relevant_outcomes {
         let pc_usize: usize = outcome.pc.try_into().unwrap_or(0);
 
         let static_info = program
@@ -1057,6 +1202,16 @@ fn materialize_condition_explanations(
         let builtin_name = static_info.and_then(|i| i.builtin_name.clone());
         let negated = static_info.is_some_and(|i| i.negated);
         let text = decorate_condition_text(base_text, static_info, left.as_ref());
+        let helper_conditions = materialize_helper_conditions(
+            pc_usize,
+            *outcome_index,
+            program,
+            trace,
+            settings,
+            depth,
+        );
+        let left = derive_left_provenance_from_helper(left, &helper_conditions);
+        let helper_conditions = finalize_condition_explanations(helper_conditions, settings, false);
 
         conditions.push(ConditionExplanation {
             text,
@@ -1070,6 +1225,7 @@ fn materialize_condition_explanations(
             binding_name,
             builtin_name,
             negated,
+            helper_conditions,
         });
     }
 
@@ -1452,9 +1608,9 @@ mod tests {
         ];
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, None, None, None, None);
-        trace.record_condition(1, false, false, None, None, None, None);
-        trace.record_condition(2, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
+        trace.record_condition(1, false, false, None, None, None, None, 0);
+        trace.record_condition(2, true, false, None, None, None, None, 0);
 
         let conditions = materialize_conditions(
             1,
@@ -1504,8 +1660,8 @@ mod tests {
         ];
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, None, None, None, None);
-        trace.record_condition(1, false, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
+        trace.record_condition(1, false, false, None, None, None, None, 0);
 
         let conditions = materialize_conditions(
             1,
@@ -1580,13 +1736,13 @@ mod tests {
         program.rule_infos.push(rule_info.clone());
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, None, None, None, None);
-        trace.record_condition(2, true, false, None, None, None, None);
-        trace.record_condition(3, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
+        trace.record_condition(2, true, false, None, None, None, None, 0);
+        trace.record_condition(3, true, false, None, None, None, None, 0);
         trace.record_emission(0, 0, 0, 3, Value::from("violation a"));
-        trace.record_condition(1, true, false, None, None, None, None);
-        trace.record_condition(2, true, false, None, None, None, None);
-        trace.record_condition(3, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
+        trace.record_condition(2, true, false, None, None, None, None, 0);
+        trace.record_condition(3, true, false, None, None, None, None, 0);
         trace.record_emission(0, 0, 3, 6, Value::from("violation b"));
         trace.record_emission(0, 0, 3, 6, Value::from("violation b"));
 
@@ -1681,13 +1837,13 @@ mod tests {
         program.rule_infos.push(rule_info.clone());
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, None, None, None, None);
-        trace.record_condition(2, true, false, None, None, None, None);
-        trace.record_condition(3, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
+        trace.record_condition(2, true, false, None, None, None, None, 0);
+        trace.record_condition(3, true, false, None, None, None, None, 0);
         trace.record_emission(0, 0, 0, 3, Value::from("violation a"));
-        trace.record_condition(1, true, false, None, None, None, None);
-        trace.record_condition(2, true, false, None, None, None, None);
-        trace.record_condition(3, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
+        trace.record_condition(2, true, false, None, None, None, None, 0);
+        trace.record_condition(3, true, false, None, None, None, None, 0);
         trace.record_emission(0, 0, 3, 6, Value::from("violation b"));
 
         let emissions = materialize_rule_emissions(
@@ -1770,13 +1926,13 @@ mod tests {
         program.rule_infos.push(rule_info.clone());
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, None, None, None, None);
-        trace.record_condition(2, true, false, None, None, None, None);
-        trace.record_condition(3, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
+        trace.record_condition(2, true, false, None, None, None, None, 0);
+        trace.record_condition(3, true, false, None, None, None, None, 0);
         trace.record_emission(0, 0, 0, 3, Value::from("violation a"));
-        trace.record_condition(1, true, false, None, None, None, None);
-        trace.record_condition(2, true, false, None, None, None, None);
-        trace.record_condition(3, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
+        trace.record_condition(2, true, false, None, None, None, None, 0);
+        trace.record_condition(3, true, false, None, None, None, None, 0);
         trace.record_emission(0, 0, 3, 6, Value::from("violation b"));
 
         let emissions = materialize_rule_emissions(
@@ -1845,8 +2001,8 @@ mod tests {
         program.rule_infos.push(rule_info.clone());
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, None, None, None, None);
-        trace.record_condition(2, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
+        trace.record_condition(2, true, false, None, None, None, None, 0);
         trace.record_emission(0, 0, 0, 2, Value::from("violation a"));
 
         let standard = materialize_rule_emissions(
@@ -1924,7 +2080,7 @@ mod tests {
         ];
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
         trace.record_condition(
             2,
             true,
@@ -1933,6 +2089,7 @@ mod tests {
             None,
             None,
             None,
+            0,
         );
         trace.attach_loop_stat_to_last_condition(
             2,
@@ -1941,7 +2098,7 @@ mod tests {
             Some(Value::from(1_u64)),
             Some(Value::from("match-a")),
         );
-        trace.record_condition(3, true, false, None, None, None, None);
+        trace.record_condition(3, true, false, None, None, None, None, 0);
 
         let conditions = materialize_conditions(
             1,
@@ -1991,7 +2148,7 @@ mod tests {
         ];
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, Some(Value::Bool(true)), None, None, None);
+        trace.record_condition(1, true, false, Some(Value::Bool(true)), None, None, None, 0);
         trace.attach_loop_stat_to_last_condition(
             1,
             3,
@@ -2059,7 +2216,7 @@ mod tests {
         program.rule_infos.push(rule_info);
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, None, None, None, None);
+        trace.record_condition(1, true, false, None, None, None, None, 0);
         trace.record_rule_outcome(0, 0, true, Some(Value::from("violation a")));
         trace.record_emission(0, 0, 0, 1, Value::from("violation a"));
         trace.record_assumption(
@@ -2113,7 +2270,7 @@ mod tests {
         ];
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, Some(Value::Bool(true)), None, None, None);
+        trace.record_condition(1, true, false, Some(Value::Bool(true)), None, None, None, 0);
         trace.attach_loop_stat_to_last_condition(
             1,
             3,
@@ -2178,8 +2335,17 @@ mod tests {
         ];
 
         let mut trace = EvaluationTrace::new();
-        trace.record_condition(1, true, false, Some(Value::Bool(true)), None, None, None);
-        trace.record_condition(2, false, false, Some(Value::Bool(false)), None, None, None);
+        trace.record_condition(1, true, false, Some(Value::Bool(true)), None, None, None, 0);
+        trace.record_condition(
+            2,
+            false,
+            false,
+            Some(Value::Bool(false)),
+            None,
+            None,
+            None,
+            0,
+        );
         trace.record_loop(
             2,
             Some(1),
@@ -2270,6 +2436,7 @@ mod tests {
             None,
             None,
             None,
+            0,
         );
 
         let conditions = materialize_condition_explanations(
@@ -2304,6 +2471,7 @@ mod tests {
                 binding_name: None,
                 builtin_name: None,
                 negated: false,
+                helper_conditions: alloc::vec::Vec::new(),
             },
             ConditionExplanation {
                 text: "some item in coll [matched: b]".into(),
@@ -2321,6 +2489,7 @@ mod tests {
                 binding_name: None,
                 builtin_name: None,
                 negated: false,
+                helper_conditions: alloc::vec::Vec::new(),
             },
         ];
 
