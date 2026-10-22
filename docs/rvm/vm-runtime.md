@@ -220,6 +220,22 @@ assertion messages. When an internal invariant fails, the error message includes
 
 ## 8. Operational guidance
 
+With the `explanations` feature enabled, causality reports for bare-reference
+negations such as `not resource.properties.enabled` include the referenced
+operand's concrete `left.provenance`. `left.absent: true` distinguishes an
+undefined reference from a defined `false` value; the field is omitted for
+defined values. `left.value` retains the boolean guard result, not the original
+referenced value. Secret-path redaction still applies to `left.value`; it does
+not hide `absent`, so a report can distinguish a missing sensitive field from a
+defined `false` one. When `assume_unknown_input` is set and the path falls under
+a configured unknown prefix, `absent` is omitted: the value is unknown, not known
+to be missing. Negated rule or function calls (`not flag`, `not f(x)`) are
+not bare references and do not receive these fields. Capture is limited to a
+reference evaluated directly inside the negation (`not r.x`, `not input[k]`); a
+negated local alias (`x := input.a; not x`) receives no reference attribution,
+and an unresolved dynamic key receives no concrete path or absence marker. These
+report fields do not change evaluation results or the VM's register provenance.
+
 - **Instruction budgets**: adjust via `set_max_instructions` when running
   untrusted policies. Inspect `executed_instructions` after completion.
 - **Breakpoints & stepping**: populate `breakpoints` with bytecode PCs (see the
@@ -239,5 +255,4 @@ assertion messages. When an internal invariant fails, the error message includes
   combines nested loops, comprehensions, function calls, and host awaits.
 
 ---
-
 

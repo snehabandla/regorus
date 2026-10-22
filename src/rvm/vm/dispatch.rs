@@ -607,6 +607,75 @@ impl RegoVM {
         None
     }
 
+    /// Explanation-only capture for a bare-reference negation (`not r.x`).
+    ///
+    /// Only operands written by the reference instruction immediately before
+    /// the `Not` qualify. Call results (`not flag`, `not f(x)`) can carry a
+    /// stale operand path from inside the callee, so they are excluded. This
+    /// is infallible by design: report capture must never change evaluation.
+    #[cfg(feature = "explanations")]
+    fn capture_reference_guard(&self, register: u8) -> Option<(String, bool)> {
+        let not_pc = self.pc.checked_sub(1)?;
+        let operand = match self.program.instructions.get(not_pc).copied()? {
+            Instruction::Not { dest, operand } if dest == register => operand,
+            _ => return None,
+        };
+        let producer = self
+            .program
+            .instructions
+            .get(not_pc.checked_sub(1)?)
+            .copied()?;
+        let chained = match producer {
+            Instruction::ChainedIndex { params_index } => Some(
+                self.program
+                    .instruction_data
+                    .get_chained_index_params(params_index)
+                    .filter(|params| params.dest == operand)?,
+            ),
+            Instruction::Index { dest, key, .. } if dest == operand => {
+                // An unresolved key would otherwise render as a fabricated concrete path.
+                if self.get_register(key).ok()? == &Value::Undefined {
+                    return None;
+                }
+                None
+            }
+            Instruction::IndexLiteral { dest, .. }
+            | Instruction::LoadInput { dest }
+            | Instruction::LoadData { dest }
+                if dest == operand =>
+            {
+                None
+            }
+            _ => return None,
+        };
+
+        let runtime_path = self.provenance.get(operand)?;
+        let absent = self.get_register(operand).ok()? == &Value::Undefined;
+        let mut path = runtime_path.as_ref().to_string();
+
+        // Missing parents can truncate runtime provenance before a dynamic key.
+        // Complete only the report path; do not change register provenance or evaluation.
+        if let (true, Some(params)) = (absent, chained) {
+            if let Some(root_path) = self.provenance.get(params.root) {
+                path = root_path.as_ref().to_string();
+                for component in &params.path_components {
+                    let key = match *component {
+                        LiteralOrRegister::Literal(idx) => {
+                            self.program.literals.get(usize::from(idx))?
+                        }
+                        LiteralOrRegister::Register(reg) => self.get_register(reg).ok()?,
+                    };
+                    if key == &Value::Undefined {
+                        return None;
+                    }
+                    path = Self::append_path_component(&path, key);
+                }
+            }
+        }
+
+        Some((path, absent))
+    }
+
     #[cfg(feature = "explanations")]
     fn maybe_assume_guard_condition(&mut self, register: u8, mode: GuardMode) -> bool {
         if !self.explanation_settings.assume_unknown_input {
@@ -1319,21 +1388,30 @@ impl RegoVM {
                     } else {
                         None
                     };
+                    let reference = if builtin_operands.is_none() && comparison_operands.is_none() {
+                        self.capture_reference_guard(register)
+                    } else {
+                        None
+                    };
+                    // An Undefined path the caller declared unknown is not known to be missing.
+                    let reference_absent = reference.as_ref().is_some_and(|&(ref path, absent)| {
+                        absent
+                            && !(self.explanation_settings.assume_unknown_input
+                                && self.explanation_settings.is_unknown_path(path))
+                    });
                     let (actual, actual_path, expected, expected_path) =
-                        if let Some(ops) = builtin_operands {
-                            ops
-                        } else if let Some(ops) = comparison_operands {
-                            ops
-                        } else {
+                        builtin_operands.or(comparison_operands).unwrap_or_else(|| {
                             (
                                 Some(value),
-                                self.provenance
-                                    .get(register)
-                                    .map(|path| path.as_ref().to_string()),
+                                reference.map(|(path, _)| path).or_else(|| {
+                                    self.provenance
+                                        .get(register)
+                                        .map(|path| path.as_ref().to_string())
+                                }),
                                 None,
                                 None,
                             )
-                        };
+                        });
                     let (rule_index, _) = self.current_rule_scope();
                     self.trace.record_condition(
                         pc,
@@ -1345,6 +1423,9 @@ impl RegoVM {
                         expected_path,
                         rule_index,
                     );
+                    if let Some(outcome) = self.trace.condition_outcomes.last_mut() {
+                        outcome.actual_absent = reference_absent;
+                    }
                 }
                 self.handle_condition(passed)?;
                 Ok(InstructionOutcome::Continue)

@@ -149,6 +149,8 @@ pub struct ConditionOutcome {
     pub actual_value_idx: Option<ValueIdx>,
     /// Runtime provenance path for the actual value, if available.
     pub actual_path: Option<String>,
+    /// A negated reference was undefined before its boolean result was computed.
+    pub actual_absent: bool,
     /// Index of the expected (RHS) value in `captured_values`, if captured.
     pub expected_value_idx: Option<ValueIdx>,
     /// Runtime provenance path for the expected value, if available.
@@ -462,6 +464,7 @@ impl EvaluationTrace {
             assumed,
             actual_value_idx: actual_idx,
             actual_path,
+            actual_absent: false,
             expected_value_idx: expected_idx,
             expected_path,
             loop_stat_idx: None,

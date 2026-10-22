@@ -45,6 +45,434 @@ fn run_causality_full(policy: &str, input_json: &str, entrypoint_str: &str) -> s
     serde_json::from_str(&report).unwrap()
 }
 
+fn run_rg1_case(
+    policy: &str,
+    input: &str,
+    settings: evaluation_trace::ExplanationSettings,
+) -> (Value, serde_json::Value) {
+    let mut engine = Engine::new();
+    engine.add_policy("rg1.rego".into(), policy.into()).unwrap();
+    let input = Value::from_json_str(input).unwrap();
+    engine.set_input(input.clone());
+    let interpreted = engine.eval_rule("data.bicep.deny".into()).unwrap();
+    let compiled = engine
+        .compile_with_entrypoint(&Rc::from("data.bicep.deny"))
+        .unwrap();
+    let program =
+        languages::rego::compiler::Compiler::compile_from_policy(&compiled, &["data.bicep.deny"])
+            .unwrap();
+
+    let mut plain = rvm::RegoVM::new_with_policy(compiled.clone());
+    plain.load_program(program.clone());
+    plain.set_input(input.clone());
+    let plain_result = plain
+        .execute_entry_point_by_name("data.bicep.deny")
+        .unwrap();
+    assert_eq!(plain_result, interpreted);
+
+    let mut traced = rvm::RegoVM::new_with_policy(compiled);
+    traced.load_program(program);
+    traced.set_explanation_settings(settings);
+    traced.set_input(input);
+    let result = traced
+        .execute_entry_point_by_name("data.bicep.deny")
+        .unwrap();
+    assert_eq!(result, plain_result);
+    let report = traced.take_causality_report(result.clone()).unwrap();
+    (result, serde_json::from_str(&report).unwrap())
+}
+
+#[test]
+fn rg1_negated_reference_reports_concrete_path_and_absence() {
+    use evaluation_trace::{ConditionMode, ExplanationDetail, ExplanationSettings, ValueMode};
+
+    let policy = r#"
+package bicep
+import rego.v1
+deny contains "missing or false" if {
+    some r in input.resources
+    not r.properties.enabled
+}
+"#;
+    for condition_mode in [ConditionMode::PrimaryOnly, ConditionMode::AllContributing] {
+        for detail in [ExplanationDetail::Standard, ExplanationDetail::Full] {
+            for value_mode in [ValueMode::Full, ValueMode::Redacted] {
+                for (resource, matches, absent) in [
+                    (r#"{"properties":{}}"#, true, true),
+                    (r#"{}"#, true, true),
+                    (r#"{"properties":{"enabled":false}}"#, true, false),
+                    (r#"{"properties":{"enabled":true}}"#, false, false),
+                    (r#"{"properties":{"enabled":null}}"#, false, false),
+                    (r#"{"properties":{"enabled":0}}"#, false, false),
+                    (r#"{"properties":{"enabled":""}}"#, false, false),
+                    (r#"{"properties":{"enabled":[]}}"#, false, false),
+                    (r#"{"properties":{"enabled":{}}}"#, false, false),
+                ] {
+                    let input = format!(r#"{{"resources":{{"app":{resource}}}}}"#);
+                    let (result, report) = run_rg1_case(
+                        policy,
+                        &input,
+                        ExplanationSettings {
+                            enabled: true,
+                            condition_mode,
+                            detail,
+                            value_mode,
+                            ..Default::default()
+                        },
+                    );
+                    let values = result.as_set().unwrap();
+                    assert_eq!(values.len(), usize::from(matches), "{input}: {report:#}");
+                    if !matches {
+                        assert!(report["rules"][0].get("emissions").is_none(), "{report:#}");
+                        continue;
+                    }
+                    let emissions = report["rules"][0]["emissions"].as_array().unwrap();
+                    assert_eq!(emissions.len(), 1, "{report:#}");
+                    assert!(values.contains(&Value::from("missing or false")));
+                    let conditions = emissions[0]["conditions"].as_array().unwrap();
+                    let condition = conditions
+                        .iter()
+                        .find(|c| c["text"] == "not r.properties.enabled")
+                        .unwrap();
+                    assert_eq!(condition["kind"], "truthiness");
+                    assert_eq!(condition["negated"], true);
+                    assert_eq!(condition["outcome"], "success");
+                    assert_eq!(condition["left"]["value"], true);
+                    assert_eq!(
+                        condition["left"]["provenance"], "input.resources.app.properties.enabled",
+                        "{condition:#}"
+                    );
+                    assert_eq!(
+                        condition["left"].get("absent"),
+                        absent.then_some(&serde_json::Value::Bool(true))
+                    );
+                    assert!(condition.get("right").is_none(), "{condition:#}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn rg1_nested_reference_keeps_each_emissions_array_index() {
+    let policy = r#"
+package bicep
+import rego.v1
+deny contains child.name if {
+    some r in input.resources
+    some child in r.properties.children
+    not child.enabled
+}
+"#;
+    let input = r#"{"resources":{"app":{"properties":{"children":[
+        {"name":"valid","enabled":true},
+        {"name":"missing"},
+        {"name":"false","enabled":false}
+    ]}}}}"#;
+    let (result, report) = run_rg1_case(
+        policy,
+        input,
+        evaluation_trace::ExplanationSettings {
+            enabled: true,
+            detail: evaluation_trace::ExplanationDetail::Full,
+            ..Default::default()
+        },
+    );
+    let values = result.as_set().unwrap();
+    assert_eq!(values.len(), 2);
+    assert!(values.contains(&Value::from("missing")));
+    assert!(values.contains(&Value::from("false")));
+    let emissions = report["rules"][0]["emissions"].as_array().unwrap();
+    assert_eq!(emissions.len(), 2);
+    for (name, index, absent) in [("missing", 1, true), ("false", 2, false)] {
+        let emission = emissions.iter().find(|e| e["result"] == name).unwrap();
+        let condition = emission["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["text"] == "not child.enabled")
+            .unwrap();
+        assert_eq!(
+            condition["left"]["provenance"],
+            format!("input.resources.app.properties.children[{index}].enabled"),
+            "{condition:#}"
+        );
+        assert_eq!(
+            condition["left"].get("absent"),
+            absent.then_some(&serde_json::Value::Bool(true))
+        );
+    }
+}
+
+#[test]
+fn rg1_direct_and_dynamic_references_preserve_redaction() {
+    use evaluation_trace::{ExplanationDetail, ExplanationSettings, ValueMode};
+
+    for (expression, input, path, absent) in [
+        ("not input.enabled", r#"{}"#, "input.enabled", true),
+        (
+            "not input.enabled",
+            r#"{"enabled":false}"#,
+            "input.enabled",
+            false,
+        ),
+        (
+            "key := \"enabled\"\nnot input.properties[key]",
+            r#"{"properties":{}}"#,
+            "input.properties.enabled",
+            true,
+        ),
+        (
+            "key := input.key\nnot input.properties[key]",
+            r#"{"key":"enabled"}"#,
+            "input.properties.enabled",
+            true,
+        ),
+        (
+            "key := input.key\nnot input.properties[key]",
+            r#"{"key":"password"}"#,
+            "input.properties.password",
+            true,
+        ),
+        (
+            "not input.resources[0].enabled",
+            r#"{}"#,
+            "input.resources[0].enabled",
+            true,
+        ),
+        (
+            "i := input.i\nnot input.resources[i].enabled",
+            r#"{"i":0}"#,
+            "input.resources[0].enabled",
+            true,
+        ),
+        ("not input.password", r#"{}"#, "input.password", true),
+        (
+            "not input.password",
+            r#"{"password":false}"#,
+            "input.password",
+            false,
+        ),
+    ] {
+        for value_mode in [ValueMode::Full, ValueMode::Redacted] {
+            let policy = format!(
+                "package bicep\nimport rego.v1\ndeny contains \"violation\" if {{\n{expression}\n}}"
+            );
+            let (result, report) = run_rg1_case(
+                &policy,
+                input,
+                ExplanationSettings {
+                    enabled: true,
+                    detail: ExplanationDetail::Full,
+                    value_mode,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(result.as_set().unwrap().len(), 1);
+            let condition = find_condition(&report, "not input.").unwrap();
+            let redacted = value_mode == ValueMode::Redacted && path.ends_with(".password");
+            assert_eq!(condition["left"]["provenance"], path, "{condition:#}");
+            assert_eq!(condition["left"]["redacted"], redacted);
+            assert_eq!(
+                condition["left"]["value"],
+                if redacted {
+                    serde_json::json!("<redacted>")
+                } else {
+                    serde_json::json!(true)
+                }
+            );
+            assert_eq!(
+                condition["left"].get("absent"),
+                absent.then_some(&serde_json::Value::Bool(true))
+            );
+        }
+    }
+}
+
+#[test]
+fn rg1_unknown_input_path_is_not_reported_absent() {
+    let policy = r#"
+package bicep
+import rego.v1
+deny contains "v" if {
+    not input.context.enabled
+}
+"#;
+    for (unknowns, absent) in [
+        (vec!["input.context".to_string()], false),
+        (vec!["input.other".to_string()], true),
+    ] {
+        let (result, report) = run_rg1_case(
+            policy,
+            r#"{}"#,
+            evaluation_trace::ExplanationSettings {
+                enabled: true,
+                detail: evaluation_trace::ExplanationDetail::Full,
+                assume_unknown_input: true,
+                unknowns,
+                ..Default::default()
+            },
+        );
+        assert_eq!(result.as_set().unwrap().len(), 1, "{report:#}");
+        let condition = find_condition(&report, "not input.context.enabled").unwrap();
+        assert_eq!(
+            condition["left"]["provenance"], "input.context.enabled",
+            "{condition:#}"
+        );
+        assert_eq!(
+            condition["left"].get("absent"),
+            absent.then_some(&serde_json::Value::Bool(true)),
+            "{condition:#}"
+        );
+    }
+}
+
+#[test]
+fn rg1_undefined_dynamic_key_does_not_fabricate_absent_path() {
+    let policy = r#"
+package bicep
+import rego.v1
+deny contains "v" if {
+    not input[input.key]
+}
+"#;
+    let (result, report) = run_rg1_case(
+        policy,
+        r#"{"<undefined>": true}"#,
+        evaluation_trace::ExplanationSettings {
+            enabled: true,
+            detail: evaluation_trace::ExplanationDetail::Full,
+            ..Default::default()
+        },
+    );
+    assert_eq!(result.as_set().unwrap().len(), 1, "{report:#}");
+    let condition = find_condition(&report, "not input[input.key]").unwrap();
+    assert!(
+        condition["left"].get("absent").is_none(),
+        "an unresolved key must not produce a concrete absent path: {condition:#}"
+    );
+    assert_ne!(
+        condition["left"]["provenance"], "input[\"<undefined>\"]",
+        "an unresolved key must not name a concrete input path: {condition:#}"
+    );
+
+    // Negative control: the literal key really exists, so the negation fails.
+    let (control, _) = run_rg1_case(
+        "package bicep\nimport rego.v1\ndeny contains \"v\" if {\n    not input[\"<undefined>\"]\n}\n",
+        r#"{"<undefined>": true}"#,
+        evaluation_trace::ExplanationSettings {
+            enabled: true,
+            ..Default::default()
+        },
+    );
+    assert!(control.as_set().unwrap().is_empty());
+}
+
+#[test]
+fn rg1_negated_comparison_keeps_defined_left_operand_present() {
+    let policy = r#"
+package bicep
+import rego.v1
+deny contains "violation" if {
+    not input.enabled == input.missing
+}
+"#;
+    let (result, report) = run_rg1_case(
+        policy,
+        r#"{"enabled":false}"#,
+        evaluation_trace::ExplanationSettings {
+            enabled: true,
+            detail: evaluation_trace::ExplanationDetail::Full,
+            ..Default::default()
+        },
+    );
+    assert_eq!(result.as_set().unwrap().len(), 1);
+    let condition = find_condition(&report, "not input.enabled == input.missing").unwrap();
+    assert_eq!(condition["left"]["provenance"], "input.enabled");
+    assert_eq!(condition["left"]["value"], false);
+    assert!(condition["left"].get("absent").is_none(), "{condition:#}");
+}
+
+#[test]
+fn rg1_negated_rule_or_function_result_is_not_reported_absent() {
+    for (policy, input, text) in [
+        (
+            r#"
+package bicep
+import rego.v1
+flag := input.enabled == input.missing
+deny contains "v" if {
+    not flag
+}
+"#,
+            r#"{"enabled":false}"#,
+            "not flag",
+        ),
+        (
+            r#"
+package bicep
+import rego.v1
+bad(r) := r.enabled == input.expected
+deny contains "v" if {
+    not bad(input.resource)
+}
+"#,
+            r#"{"resource":{"enabled":false}}"#,
+            "not bad(input.resource)",
+        ),
+    ] {
+        let (result, report) = run_rg1_case(
+            policy,
+            input,
+            evaluation_trace::ExplanationSettings {
+                enabled: true,
+                detail: evaluation_trace::ExplanationDetail::Full,
+                ..Default::default()
+            },
+        );
+        assert_eq!(result.as_set().unwrap().len(), 1, "{report:#}");
+        let condition = find_condition(&report, text).unwrap();
+        assert!(
+            condition["left"].get("absent").is_none(),
+            "a call result is not a missing reference: {condition:#}"
+        );
+        assert!(
+            condition["left"].get("provenance").is_none(),
+            "a call result must not inherit a path from inside the callee: {condition:#}"
+        );
+    }
+}
+
+#[test]
+fn rg1_non_reference_negation_does_not_gain_provenance_or_absence() {
+    let policy = r#"
+package bicep
+import rego.v1
+deny contains "short" if {
+    not count(input.values) > 1
+}
+"#;
+    let (result, report) = run_rg1_case(
+        policy,
+        r#"{"values":[]}"#,
+        evaluation_trace::ExplanationSettings {
+            enabled: true,
+            detail: evaluation_trace::ExplanationDetail::Full,
+            ..Default::default()
+        },
+    );
+    assert_eq!(result.as_set().unwrap().len(), 1);
+    let condition = find_condition(&report, "not count(input.values) > 1").unwrap();
+    assert_eq!(condition["negated"], true);
+    for operand in ["left", "right"] {
+        assert!(
+            condition[operand].get("provenance").is_none(),
+            "{condition:#}"
+        );
+        assert!(condition[operand].get("absent").is_none(), "{condition:#}");
+    }
+}
+
 /// Find the first condition whose `text` contains `needle` anywhere in the
 /// report's per-rule per-definition conditions array.
 fn find_condition<'a>(

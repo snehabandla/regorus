@@ -240,6 +240,9 @@ pub struct OperandExplanation {
     /// Data path, e.g. `"input.role"`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provenance: Option<String>,
+    /// A negated reference was undefined, rather than a defined false value.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub absent: bool,
     /// Whether the value was redacted.
     pub redacted: bool,
     /// Fully-qualified Azure Policy alias name this value was compiled from,
@@ -1754,6 +1757,7 @@ fn derive_left_provenance_from_helper(
         Some(prov) => Some(OperandExplanation {
             value: existing.value,
             provenance: Some(prov),
+            absent: existing.absent,
             redacted: existing.redacted,
             source_alias: existing.source_alias,
         }),
@@ -1905,6 +1909,7 @@ fn operands_match(left: Option<&OperandExplanation>, right: Option<&OperandExpla
         (Some(left), Some(right)) => {
             left.value == right.value
                 && left.provenance == right.provenance
+                && left.absent == right.absent
                 && left.redacted == right.redacted
         }
         _ => false,
@@ -2217,6 +2222,7 @@ fn materialize_operands(
                 v
             },
             provenance: left_output_path.clone(),
+            absent: outcome.actual_absent,
             redacted: should_redact,
             source_alias: left_prov
                 .and_then(|p| p.source_alias.as_deref())
@@ -2238,6 +2244,7 @@ fn materialize_operands(
                 v
             },
             provenance: right_output_path.clone(),
+            absent: false,
             redacted: should_redact,
             source_alias: right_prov
                 .and_then(|p| p.source_alias.as_deref())
@@ -3249,6 +3256,26 @@ mod tests {
     }
 
     #[test]
+    fn operand_absence_is_distinct_and_omitted_when_false() {
+        let defined = OperandExplanation {
+            value: Value::Bool(true),
+            provenance: Some("input.enabled".into()),
+            absent: false,
+            redacted: false,
+            source_alias: None,
+        };
+        let mut absent = defined.clone();
+        absent.absent = true;
+        assert!(!super::operands_match(Some(&defined), Some(&absent)));
+        assert!(super::operands_match(Some(&absent), Some(&absent)));
+        assert!(serde_json::to_value(&defined)
+            .unwrap()
+            .get("absent")
+            .is_none());
+        assert_eq!(serde_json::to_value(&absent).unwrap()["absent"], true);
+    }
+
+    #[test]
     fn emission_dedup_keeps_distinct_witness_values() {
         let conditions = vec![
             ConditionExplanation {
@@ -3260,6 +3287,7 @@ mod tests {
                 left: Some(OperandExplanation {
                     value: Value::from("a"),
                     provenance: None,
+                    absent: false,
                     redacted: false,
                     source_alias: None,
                 }),
@@ -3280,6 +3308,7 @@ mod tests {
                 left: Some(OperandExplanation {
                     value: Value::from("b"),
                     provenance: None,
+                    absent: false,
                     redacted: false,
                     source_alias: None,
                 }),

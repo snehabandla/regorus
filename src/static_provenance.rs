@@ -1127,7 +1127,15 @@ fn peek_through_negation(
         }
     }
 
-    None
+    get_provenance(reg_prov, not_operand)
+        .filter(|provenance| provenance.is_input_rooted() || provenance.is_data_rooted())
+        .cloned()
+        .map(|provenance| NegationLookThrough {
+            operator: None,
+            operands: None,
+            inner_provenance: Some(provenance),
+            builtin_name: None,
+        })
 }
 
 /// Result of looking through a `Not` instruction at the source condition.
