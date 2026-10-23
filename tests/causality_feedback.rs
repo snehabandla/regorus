@@ -368,6 +368,790 @@ deny contains "v" if {
     assert!(control.as_set().unwrap().is_empty());
 }
 
+/// Every condition in the report, from both per-emission and per-definition lists.
+fn rg5_conditions<'a>(report: &'a serde_json::Value, text: &str) -> Vec<&'a serde_json::Value> {
+    let mut out = Vec::new();
+    for rule in report["rules"].as_array().into_iter().flatten() {
+        for list in ["emissions", "definitions"] {
+            for entry in rule[list].as_array().into_iter().flatten() {
+                for cond in entry["conditions"].as_array().into_iter().flatten() {
+                    if cond["text"] == text {
+                        out.push(cond);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Like `rg5_conditions`, but matches text that starts with `prefix`
+/// (existence conditions append a `[matched: ...]` decoration).
+fn rg5_conditions_prefix<'a>(
+    report: &'a serde_json::Value,
+    prefix: &str,
+) -> Vec<&'a serde_json::Value> {
+    let mut out = Vec::new();
+    for rule in report["rules"].as_array().into_iter().flatten() {
+        for list in ["emissions", "definitions"] {
+            for entry in rule[list].as_array().into_iter().flatten() {
+                for cond in entry["conditions"].as_array().into_iter().flatten() {
+                    if cond["text"].as_str().is_some_and(|t| t.starts_with(prefix)) {
+                        out.push(cond);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Traced RVM only. Assumption mode intentionally changes results, so the
+/// interpreter/plain parity in `run_rg1_case` does not apply.
+fn rg5_traced_only(
+    policy: &str,
+    input: &str,
+    settings: evaluation_trace::ExplanationSettings,
+) -> serde_json::Value {
+    let mut engine = Engine::new();
+    engine.add_policy("rg5.rego".into(), policy.into()).unwrap();
+    let compiled = engine
+        .compile_with_entrypoint(&Rc::from("data.bicep.deny"))
+        .unwrap();
+    let program =
+        languages::rego::compiler::Compiler::compile_from_policy(&compiled, &["data.bicep.deny"])
+            .unwrap();
+    let mut vm = rvm::RegoVM::new_with_policy(compiled);
+    vm.load_program(program);
+    vm.set_explanation_settings(settings);
+    vm.set_input(Value::from_json_str(input).unwrap());
+    let result = vm.execute_entry_point_by_name("data.bicep.deny").unwrap();
+    serde_json::from_str(&vm.take_causality_report(result).unwrap()).unwrap()
+}
+
+fn rg5_settings(
+    condition_mode: evaluation_trace::ConditionMode,
+) -> evaluation_trace::ExplanationSettings {
+    evaluation_trace::ExplanationSettings {
+        enabled: true,
+        condition_mode,
+        detail: evaluation_trace::ExplanationDetail::Full,
+        value_mode: evaluation_trace::ValueMode::Full,
+        ..Default::default()
+    }
+}
+
+fn rg5_assert_operand(
+    cond: &serde_json::Value,
+    side: &str,
+    value: serde_json::Value,
+    provenance: Option<&str>,
+) {
+    assert_eq!(cond[side]["value"], value, "{side}.value: {cond:#}");
+    assert_eq!(
+        cond[side].get("provenance").and_then(|p| p.as_str()),
+        provenance,
+        "{side}.provenance: {cond:#}"
+    );
+}
+
+#[test]
+fn rg5_positive_comparison_between_two_paths_reports_both_operands() {
+    use evaluation_trace::ConditionMode;
+    let input = r#"{"resources":{"sa":{"name":"sa1","sku":"Standard_LRS","kind":"StorageV2","used":1,"limit":5}}}"#;
+    for (expr, op, left, left_path, right, right_path) in [
+        (
+            "r.sku != r.kind",
+            "!=",
+            serde_json::json!("Standard_LRS"),
+            "input.resources.sa.sku",
+            serde_json::json!("StorageV2"),
+            "input.resources.sa.kind",
+        ),
+        (
+            "r.used < r.limit",
+            "<",
+            serde_json::json!(1),
+            "input.resources.sa.used",
+            serde_json::json!(5),
+            "input.resources.sa.limit",
+        ),
+    ] {
+        let policy = format!(
+            "package bicep\nimport rego.v1\ndeny contains r.name if {{\n    some r in input.resources\n    {expr}\n}}\n"
+        );
+        for mode in [ConditionMode::PrimaryOnly, ConditionMode::AllContributing] {
+            let (result, report) = run_rg1_case(&policy, input, rg5_settings(mode));
+            assert_eq!(result.as_set().unwrap().len(), 1, "{report:#}");
+            let conds = rg5_conditions(&report, expr);
+            assert!(!conds.is_empty(), "missing `{expr}`: {report:#}");
+            for cond in conds {
+                assert_eq!(cond["kind"], "comparison");
+                assert_eq!(cond["operator"], op);
+                assert_eq!(cond["outcome"], "success");
+                assert!(cond.get("negated").is_none());
+                rg5_assert_operand(cond, "left", left.clone(), Some(left_path));
+                rg5_assert_operand(cond, "right", right.clone(), Some(right_path));
+            }
+        }
+    }
+}
+
+#[test]
+fn rg5_literal_operand_keeps_source_order_without_provenance() {
+    let input = r#"{"resources":{"sa":{"name":"sa1","kind":"StorageV2"}}}"#;
+    for (expr, left, left_path, right, right_path) in [
+        (
+            "r.kind == \"StorageV2\"",
+            "StorageV2",
+            Some("input.resources.sa.kind"),
+            "StorageV2",
+            None,
+        ),
+        (
+            "\"StorageV2\" == r.kind",
+            "StorageV2",
+            None,
+            "StorageV2",
+            Some("input.resources.sa.kind"),
+        ),
+    ] {
+        let policy = format!(
+            "package bicep\nimport rego.v1\ndeny contains r.name if {{\n    some r in input.resources\n    {expr}\n}}\n"
+        );
+        let (result, report) = run_rg1_case(
+            &policy,
+            input,
+            rg5_settings(evaluation_trace::ConditionMode::PrimaryOnly),
+        );
+        assert_eq!(result.as_set().unwrap().len(), 1, "{report:#}");
+        let conds = rg5_conditions(&report, expr);
+        assert!(!conds.is_empty(), "missing `{expr}`: {report:#}");
+        for cond in conds {
+            rg5_assert_operand(cond, "left", serde_json::json!(left), left_path);
+            rg5_assert_operand(cond, "right", serde_json::json!(right), right_path);
+        }
+    }
+}
+
+#[test]
+fn rg5_failed_and_undefined_comparisons_report_operands() {
+    let policy = r#"
+package bicep
+import rego.v1
+deny contains r.name if {
+    some r in input.resources
+    r.kind == "StorageV2"
+    r.tier != r.sku
+}
+"#;
+    let input = r#"{"resources":{
+        "sa":{"name":"sa1","kind":"StorageV2","sku":"Standard_LRS"},
+        "kv":{"name":"kv1","kind":"KeyVault"}
+    }}"#;
+    let (result, report) = run_rg1_case(
+        policy,
+        input,
+        rg5_settings(evaluation_trace::ConditionMode::AllContributing),
+    );
+    assert!(result.as_set().unwrap().is_empty(), "{report:#}");
+
+    let kind = rg5_conditions(&report, "r.kind == \"StorageV2\"");
+    let failed = kind
+        .iter()
+        .find(|c| c["outcome"] == "failure")
+        .unwrap_or_else(|| panic!("no failed kind comparison: {report:#}"));
+    rg5_assert_operand(
+        failed,
+        "left",
+        serde_json::json!("KeyVault"),
+        Some("input.resources.kv.kind"),
+    );
+    rg5_assert_operand(failed, "right", serde_json::json!("StorageV2"), None);
+
+    // `sa` reaches the second comparison with `tier` missing: the comparison is Undefined.
+    let tier = rg5_conditions(&report, "r.tier != r.sku");
+    let undefined = tier
+        .iter()
+        .find(|c| c["outcome"] == "failure")
+        .unwrap_or_else(|| panic!("no failed tier comparison: {report:#}"));
+    rg5_assert_operand(
+        undefined,
+        "left",
+        serde_json::json!("<undefined>"),
+        Some("input.resources.sa.tier"),
+    );
+    rg5_assert_operand(
+        undefined,
+        "right",
+        serde_json::json!("Standard_LRS"),
+        Some("input.resources.sa.sku"),
+    );
+}
+
+#[test]
+fn rg5_redacted_mode_redacts_sensitive_comparison_operand() {
+    let policy = r#"
+package bicep
+import rego.v1
+deny contains "weak" if {
+    input.password != "Str0ng!"
+}
+"#;
+    let (result, report) = run_rg1_case(
+        policy,
+        r#"{"password":"hunter2"}"#,
+        evaluation_trace::ExplanationSettings {
+            enabled: true,
+            detail: evaluation_trace::ExplanationDetail::Full,
+            value_mode: evaluation_trace::ValueMode::Redacted,
+            ..Default::default()
+        },
+    );
+    assert_eq!(result.as_set().unwrap().len(), 1);
+    let conds = rg5_conditions(&report, "input.password != \"Str0ng!\"");
+    assert!(!conds.is_empty(), "{report:#}");
+    for cond in conds {
+        assert_eq!(cond["left"]["value"], "<redacted>", "{cond:#}");
+        assert_eq!(cond["left"]["redacted"], true);
+        assert_eq!(cond["left"]["provenance"], "input.password");
+        assert!(
+            !cond.to_string().contains("hunter2"),
+            "secret leaked: {cond:#}"
+        );
+    }
+}
+
+#[test]
+fn rg5b_membership_reports_value_then_collection_for_both_polarities() {
+    use evaluation_trace::ConditionMode;
+    let input =
+        r#"{"allowed":["westus","eastus"],"resources":{"sa":{"name":"sa1","location":"westus"}}}"#;
+    for (expr, negated, matches) in [
+        ("r.location in input.allowed", false, true),
+        ("not r.location in input.allowed", true, false),
+    ] {
+        let policy = format!(
+            "package bicep\nimport rego.v1\ndeny contains r.name if {{\n    some r in input.resources\n    {expr}\n}}\n"
+        );
+        for mode in [ConditionMode::PrimaryOnly, ConditionMode::AllContributing] {
+            let (result, report) = run_rg1_case(&policy, input, rg5_settings(mode));
+            assert_eq!(
+                result.as_set().unwrap().len(),
+                usize::from(matches),
+                "{report:#}"
+            );
+            let conds = rg5_conditions(&report, expr);
+            assert!(!conds.is_empty(), "missing `{expr}`: {report:#}");
+            for cond in conds {
+                assert_eq!(cond["operator"], "in", "{cond:#}");
+                assert_eq!(
+                    cond.get("negated")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    negated
+                );
+                rg5_assert_operand(
+                    cond,
+                    "left",
+                    serde_json::json!("westus"),
+                    Some("input.resources.sa.location"),
+                );
+                rg5_assert_operand(
+                    cond,
+                    "right",
+                    serde_json::json!(["westus", "eastus"]),
+                    Some("input.allowed"),
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn rg5b_membership_with_literal_collection_has_no_collection_path() {
+    let expr = "r.location in {\"westus\", \"eastus\"}";
+    let policy = format!(
+        "package bicep\nimport rego.v1\ndeny contains r.name if {{\n    some r in input.resources\n    {expr}\n}}\n"
+    );
+    let (result, report) = run_rg1_case(
+        &policy,
+        r#"{"resources":{"sa":{"name":"sa1","location":"westus"}}}"#,
+        rg5_settings(evaluation_trace::ConditionMode::PrimaryOnly),
+    );
+    assert_eq!(result.as_set().unwrap().len(), 1, "{report:#}");
+    let conds = rg5_conditions(&report, expr);
+    assert!(!conds.is_empty(), "{report:#}");
+    for cond in conds {
+        assert_eq!(cond["kind"], "comparison", "{cond:#}");
+        assert_eq!(cond["operator"], "in", "{cond:#}");
+        rg5_assert_operand(
+            cond,
+            "left",
+            serde_json::json!("westus"),
+            Some("input.resources.sa.location"),
+        );
+        assert!(
+            cond["right"]["value"].is_array(),
+            "set literal serializes as a collection: {cond:#}"
+        );
+        assert!(cond["right"].get("provenance").is_none(), "{cond:#}");
+    }
+}
+
+#[test]
+fn rg5_redaction_covers_other_operand_and_nested_secrets() {
+    use evaluation_trace::{ExplanationDetail, ExplanationSettings, ValueMode};
+    let redacted = ExplanationSettings {
+        enabled: true,
+        detail: ExplanationDetail::Full,
+        value_mode: ValueMode::Redacted,
+        condition_mode: evaluation_trace::ConditionMode::AllContributing,
+        ..Default::default()
+    };
+    for (body, input, secret) in [
+        // Sensitive left, harmless right that equals / contains the secret.
+        (
+            "input.api_key in input.valid",
+            r#"{"api_key":"K1","valid":["K1","K2"]}"#,
+            "K2",
+        ),
+        (
+            "input.secret_token == input.expected",
+            r#"{"secret_token":"T9","expected":"T9"}"#,
+            "T9",
+        ),
+        // Harmless path whose value nests a secret.
+        (
+            "input.profile != {}",
+            r#"{"profile":{"password":"hunter2","name":"alice"}}"#,
+            "hunter2",
+        ),
+        (
+            "input.items[0] != {}",
+            r#"{"items":[{"name":"a","creds":[{"token":"tok123"}]}]}"#,
+            "tok123",
+        ),
+    ] {
+        let policy =
+            format!("package bicep\nimport rego.v1\ndeny contains \"v\" if {{\n    {body}\n}}\n");
+        let (result, report) = run_rg1_case(&policy, input, redacted.clone());
+        assert_eq!(result.as_set().unwrap().len(), 1, "{body}: {report:#}");
+        let conds = rg5_conditions(&report, body);
+        assert!(!conds.is_empty(), "missing `{body}`: {report:#}");
+        assert!(
+            !report.to_string().contains(secret),
+            "`{secret}` leaked for `{body}`: {report:#}"
+        );
+        for cond in conds {
+            assert!(
+                cond["left"]["redacted"] == true || cond["right"]["redacted"] == true,
+                "a redacted operand should be marked: {cond:#}"
+            );
+        }
+    }
+
+    // Negative control: Full mode keeps every operand verbatim.
+    let (_, full) = run_rg1_case(
+        "package bicep\nimport rego.v1\ndeny contains \"v\" if {\n    input.profile != {}\n}\n",
+        r#"{"profile":{"password":"hunter2","name":"alice"}}"#,
+        rg5_settings(evaluation_trace::ConditionMode::PrimaryOnly),
+    );
+    assert!(full.to_string().contains("hunter2"), "{full:#}");
+    // And a harmless comparison is not over-redacted.
+    let (_, plain) = run_rg1_case(
+        "package bicep\nimport rego.v1\ndeny contains \"v\" if {\n    input.profile.name != \"bob\"\n}\n",
+        r#"{"profile":{"password":"hunter2","name":"alice"}}"#,
+        redacted,
+    );
+    let cond = rg5_conditions(&plain, "input.profile.name != \"bob\"");
+    assert!(!cond.is_empty(), "{plain:#}");
+    assert_eq!(cond[0]["left"]["value"], "alice", "{plain:#}");
+    assert_eq!(cond[0]["right"]["value"], "bob", "{plain:#}");
+}
+
+#[test]
+fn rg5_existence_guard_on_comparison_result_keeps_boolean() {
+    let body = "_ = (input.a != input.b)";
+    let policy =
+        format!("package bicep\nimport rego.v1\ndeny contains \"defined\" if {{\n    {body}\n}}\n");
+    for (input, expected) in [(r#"{"a":1,"b":1}"#, false), (r#"{"a":1,"b":2}"#, true)] {
+        let (result, report) = run_rg1_case(
+            &policy,
+            input,
+            rg5_settings(evaluation_trace::ConditionMode::AllContributing),
+        );
+        assert_eq!(result.as_set().unwrap().len(), 1, "{report:#}");
+        let existence: Vec<_> = rg5_conditions_prefix(&report, body)
+            .into_iter()
+            .filter(|c| c["kind"] == "existence")
+            .collect();
+        assert!(
+            !existence.is_empty(),
+            "no existence guard for `{body}`: {report:#}"
+        );
+        for cond in existence {
+            assert_eq!(cond["left"]["value"], expected, "{cond:#}");
+            assert!(cond.get("right").is_none(), "{cond:#}");
+        }
+    }
+}
+
+#[test]
+fn rg5_membership_against_object_and_assumed_operand() {
+    // Object collection: `in` checks values; the collection is reported whole.
+    let expr = "r.tier in input.tiers";
+    let policy = format!(
+        "package bicep\nimport rego.v1\ndeny contains r.name if {{\n    some r in input.resources\n    {expr}\n}}\n"
+    );
+    let (result, report) = run_rg1_case(
+        &policy,
+        r#"{"tiers":{"a":"gold","b":"silver"},"resources":{"sa":{"name":"sa1","tier":"gold"}}}"#,
+        rg5_settings(evaluation_trace::ConditionMode::PrimaryOnly),
+    );
+    assert_eq!(result.as_set().unwrap().len(), 1, "{report:#}");
+    let conds = rg5_conditions(&report, expr);
+    assert!(!conds.is_empty(), "{report:#}");
+    for cond in conds {
+        rg5_assert_operand(
+            cond,
+            "left",
+            serde_json::json!("gold"),
+            Some("input.resources.sa.tier"),
+        );
+        rg5_assert_operand(
+            cond,
+            "right",
+            serde_json::json!({"a":"gold","b":"silver"}),
+            Some("input.tiers"),
+        );
+    }
+
+    // Assumed comparison: an unknown operand stays Undefined, with the outcome assumed.
+    let body = "input.context.region != \"westus\"";
+    let assumed = rg5_traced_only(
+        &format!("package bicep\nimport rego.v1\ndeny contains \"v\" if {{\n    {body}\n}}\n"),
+        r#"{}"#,
+        evaluation_trace::ExplanationSettings {
+            enabled: true,
+            detail: evaluation_trace::ExplanationDetail::Full,
+            value_mode: evaluation_trace::ValueMode::Full,
+            assume_unknown_input: true,
+            unknowns: vec!["input.context".to_string()],
+            ..Default::default()
+        },
+    );
+    let conds = rg5_conditions(&assumed, body);
+    assert!(!conds.is_empty(), "{assumed:#}");
+    for cond in conds {
+        assert_eq!(cond["outcome"], "assumed", "{cond:#}");
+        rg5_assert_operand(
+            cond,
+            "left",
+            serde_json::json!("<undefined>"),
+            Some("input.context.region"),
+        );
+        rg5_assert_operand(cond, "right", serde_json::json!("westus"), None);
+    }
+}
+
+#[test]
+fn rg5_large_collection_operand_is_truncated_with_length() {
+    let expr = "r.x in input.huge";
+    let policy = format!(
+        "package bicep\nimport rego.v1\ndeny contains r.id if {{\n    some r in input.resources\n    {expr}\n}}\n"
+    );
+    let huge: Vec<u32> = (0..1000).collect();
+    let input = serde_json::json!({
+        "huge": huge,
+        "resources": {"a": {"id": "a", "x": 0}, "b": {"id": "b", "x": 999}}
+    })
+    .to_string();
+    for mode in [
+        evaluation_trace::ValueMode::Full,
+        evaluation_trace::ValueMode::Redacted,
+    ] {
+        let (result, report) = run_rg1_case(
+            &policy,
+            &input,
+            evaluation_trace::ExplanationSettings {
+                enabled: true,
+                detail: evaluation_trace::ExplanationDetail::Full,
+                value_mode: mode,
+                ..Default::default()
+            },
+        );
+        // Evaluation is unaffected: 999 is beyond the reported prefix but still matches.
+        assert_eq!(result.as_set().unwrap().len(), 2, "{report:#}");
+        let conds = rg5_conditions(&report, expr);
+        assert!(!conds.is_empty(), "{report:#}");
+        for cond in conds {
+            let right = &cond["right"];
+            assert_eq!(right["truncated"], true, "{cond:#}");
+            assert_eq!(right["length"], 1000, "{cond:#}");
+            let kept = right["value"].as_array().unwrap();
+            assert!(!kept.is_empty() && kept.len() <= 100, "kept {}", kept.len());
+            assert_eq!(kept[0], 0);
+            assert_eq!(right["provenance"], "input.huge");
+            // The scalar side is never truncated.
+            assert!(cond["left"].get("truncated").is_none(), "{cond:#}");
+            assert!(cond["left"].get("length").is_none(), "{cond:#}");
+        }
+    }
+}
+
+#[test]
+fn rg5_nested_collections_share_one_truncation_budget() {
+    // 20 inner arrays of 20 = 420 nodes; the budget must bound the total, not each level.
+    let body = "input.grid != []";
+    let policy =
+        format!("package bicep\nimport rego.v1\ndeny contains \"v\" if {{\n    {body}\n}}\n");
+    let grid: Vec<Vec<u32>> = (0..20).map(|_| (0..20).collect()).collect();
+    let input = serde_json::json!({ "grid": grid }).to_string();
+    let (result, report) = run_rg1_case(
+        &policy,
+        &input,
+        rg5_settings(evaluation_trace::ConditionMode::PrimaryOnly),
+    );
+    assert_eq!(result.as_set().unwrap().len(), 1, "{report:#}");
+    let conds = rg5_conditions(&report, body);
+    assert!(!conds.is_empty(), "{report:#}");
+    for cond in conds {
+        let left = &cond["left"];
+        assert_eq!(left["truncated"], true, "{cond:#}");
+        assert_eq!(left["length"], 20, "{cond:#}");
+        let total: usize = left["value"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| 1 + row.as_array().map_or(0, Vec::len))
+            .sum();
+        assert!(total <= 100, "kept {total} nodes: {cond:#}");
+        // The empty-array side is small and untouched.
+        assert!(cond["right"].get("truncated").is_none(), "{cond:#}");
+    }
+
+    // Control: a small nested value is reported verbatim.
+    let (_, small) = run_rg1_case(
+        &policy,
+        r#"{"grid":[[1,2],[3]]}"#,
+        rg5_settings(evaluation_trace::ConditionMode::PrimaryOnly),
+    );
+    let cond = rg5_conditions(&small, body);
+    assert!(!cond.is_empty(), "{small:#}");
+    assert_eq!(cond[0]["left"]["value"], serde_json::json!([[1, 2], [3]]));
+    assert!(cond[0]["left"].get("truncated").is_none());
+}
+
+#[test]
+fn rg5_compound_keys_count_toward_truncation_budget() {
+    let huge: Vec<u32> = (0..1000).collect();
+    let input = serde_json::json!({ "huge": huge, "small": [1, 2] }).to_string();
+    for body in ["{input.huge: 1} != {}", "[{input.huge: 1}] != []"] {
+        let policy =
+            format!("package bicep\nimport rego.v1\ndeny contains \"v\" if {{\n    {body}\n}}\n");
+        for mode in [
+            evaluation_trace::ValueMode::Full,
+            evaluation_trace::ValueMode::Redacted,
+        ] {
+            let (result, report) = run_rg1_case(
+                &policy,
+                &input,
+                evaluation_trace::ExplanationSettings {
+                    enabled: true,
+                    detail: evaluation_trace::ExplanationDetail::Full,
+                    value_mode: mode,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(result.as_set().unwrap().len(), 1, "{report:#}");
+            let conds = rg5_conditions(&report, body);
+            assert!(!conds.is_empty(), "{report:#}");
+            for cond in conds {
+                assert_eq!(cond["left"]["truncated"], true, "{body}: {cond:#}");
+                assert_eq!(cond["left"]["length"], 1, "{body}: {cond:#}");
+                assert!(
+                    !cond.to_string().contains("999"),
+                    "{body}: the oversized key was emitted: {cond:#}"
+                );
+            }
+        }
+    }
+
+    // Control: a small compound key fits and is kept whole.
+    let body = "{input.small: 1} != {}";
+    let (_, small) = run_rg1_case(
+        &format!("package bicep\nimport rego.v1\ndeny contains \"v\" if {{\n    {body}\n}}\n"),
+        &input,
+        rg5_settings(evaluation_trace::ConditionMode::PrimaryOnly),
+    );
+    let cond = rg5_conditions(&small, body);
+    assert!(!cond.is_empty(), "{small:#}");
+    assert!(cond[0]["left"].get("truncated").is_none(), "{small:#}");
+    assert_eq!(
+        cond[0]["left"]["value"].as_object().map(|o| o.len()),
+        Some(1)
+    );
+}
+
+#[test]
+fn rg5_redaction_fails_closed_on_compound_object_keys() {
+    let body = "{input.profile: 1} != {}";
+    let policy =
+        format!("package bicep\nimport rego.v1\ndeny contains \"v\" if {{\n    {body}\n}}\n");
+    let redacted = evaluation_trace::ExplanationSettings {
+        enabled: true,
+        detail: evaluation_trace::ExplanationDetail::Full,
+        value_mode: evaluation_trace::ValueMode::Redacted,
+        ..Default::default()
+    };
+    let (result, report) = run_rg1_case(
+        &policy,
+        r#"{"profile":{"password":"hunter2"}}"#,
+        redacted.clone(),
+    );
+    assert_eq!(result.as_set().unwrap().len(), 1, "{report:#}");
+    assert!(!rg5_conditions(&report, body).is_empty(), "{report:#}");
+    assert!(!report.to_string().contains("hunter2"), "{report:#}");
+
+    // Negative control: a harmless compound key is kept.
+    let (_, harmless) = run_rg1_case(&policy, r#"{"profile":{"name":"alice"}}"#, redacted);
+    assert!(harmless.to_string().contains("alice"), "{harmless:#}");
+}
+
+#[test]
+fn rg5_comparison_capture_stops_at_rule_definition_boundary() {
+    // Registers restart per definition: the second definition's guard on
+    // `input.flag` must not pick up the first definition's `a == a`.
+    let policy = r#"
+package bicep
+import rego.v1
+f(a) := a if {
+    a == a
+}
+f(_) if {
+    input.flag
+}
+deny contains "v" if {
+    f(true)
+}
+"#;
+    let (result, report) = run_rg1_case(
+        policy,
+        r#"{"flag":true}"#,
+        rg5_settings(evaluation_trace::ConditionMode::AllContributing),
+    );
+    assert_eq!(result.as_set().unwrap().len(), 1, "{report:#}");
+    let mut seen = 0;
+    for rule in report["rules"].as_array().into_iter().flatten() {
+        for def in rule["definitions"].as_array().into_iter().flatten() {
+            for cond in def["conditions"].as_array().into_iter().flatten() {
+                if cond["text"] == "input.flag" {
+                    seen += 1;
+                    assert_eq!(cond["kind"], "truthiness", "{cond:#}");
+                    assert_eq!(cond["left"]["value"], true, "{cond:#}");
+                    assert!(cond.get("right").is_none(), "{cond:#}");
+                }
+            }
+        }
+    }
+    // The helper's own definitions may not surface as a top-level rule; also
+    // check the whole report never shows the input object as a comparison operand.
+    let text = report.to_string();
+    assert!(
+        seen > 0 || !text.contains(r#""value":{"flag":true}"#),
+        "stale capture of the whole input: {report:#}"
+    );
+    assert!(
+        !text.contains(r#""value":{"flag":true}"#),
+        "stale capture of the whole input: {report:#}"
+    );
+}
+
+#[test]
+fn rg5_comparison_capture_does_not_cross_rule_definitions() {
+    // A later definition's first guard must not pick up an `Eq` emitted at the
+    // end of the previous definition into the same (reused) register number.
+    let policy = r#"
+package bicep
+import rego.v1
+deny contains "eq" if {
+    input.a == 1
+}
+deny contains "truthy" if {
+    input.flag
+}
+"#;
+    let (result, report) = run_rg1_case(
+        policy,
+        r#"{"a":1,"flag":true}"#,
+        rg5_settings(evaluation_trace::ConditionMode::AllContributing),
+    );
+    assert_eq!(result.as_set().unwrap().len(), 2, "{report:#}");
+    let conds = rg5_conditions(&report, "input.flag");
+    assert!(!conds.is_empty(), "{report:#}");
+    for cond in conds {
+        assert_eq!(cond["kind"], "truthiness", "{cond:#}");
+        assert_eq!(cond["left"]["value"], true, "{cond:#}");
+        assert!(cond.get("right").is_none(), "{cond:#}");
+    }
+}
+
+#[test]
+fn rg5_non_comparison_guards_keep_their_shape() {
+    let policy = r#"
+package bicep
+import rego.v1
+deny contains r.name if {
+    some r in input.resources
+    r.enabled
+    startswith(r.name, "sa")
+    not r.kind == "KeyVault"
+}
+"#;
+    let (result, report) = run_rg1_case(
+        policy,
+        r#"{"resources":{"sa":{"name":"sa1","enabled":true,"kind":"StorageV2"}}}"#,
+        rg5_settings(evaluation_trace::ConditionMode::PrimaryOnly),
+    );
+    assert_eq!(result.as_set().unwrap().len(), 1, "{report:#}");
+
+    let truthy = rg5_conditions(&report, "r.enabled");
+    assert!(!truthy.is_empty(), "missing `r.enabled`: {report:#}");
+    for cond in truthy {
+        assert_eq!(cond["kind"], "truthiness");
+        assert_eq!(cond["left"]["value"], true, "{cond:#}");
+        assert!(cond.get("right").is_none(), "{cond:#}");
+    }
+    let builtin = rg5_conditions(&report, "startswith(r.name, \"sa\")");
+    assert!(!builtin.is_empty(), "missing startswith: {report:#}");
+    for cond in builtin {
+        assert_eq!(cond["builtin_name"], "startswith");
+        rg5_assert_operand(
+            cond,
+            "left",
+            serde_json::json!("sa1"),
+            Some("input.resources.sa.name"),
+        );
+        rg5_assert_operand(cond, "right", serde_json::json!("sa"), None);
+    }
+    let negated = rg5_conditions(&report, "not r.kind == \"KeyVault\"");
+    assert!(
+        !negated.is_empty(),
+        "missing negated comparison: {report:#}"
+    );
+    for cond in negated {
+        assert_eq!(cond["negated"], true);
+        rg5_assert_operand(
+            cond,
+            "left",
+            serde_json::json!("StorageV2"),
+            Some("input.resources.sa.kind"),
+        );
+        rg5_assert_operand(cond, "right", serde_json::json!("KeyVault"), None);
+    }
+}
+
 #[test]
 fn rg1_negated_comparison_keeps_defined_left_operand_present() {
     let policy = r#"

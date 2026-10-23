@@ -236,6 +236,35 @@ negated local alias (`x := input.a; not x`) receives no reference attribution,
 and an unresolved dynamic key receives no concrete path or absence marker. These
 report fields do not change evaluation results or the VM's register provenance.
 
+Comparison conditions (`==`, `!=`, `<`, `<=`, `>`, `>=`, `in`), whether positive
+or negated, report the evaluated operands: `left`/`right` carry each operand's
+value and, when it came from input or data, its concrete provenance; a literal
+operand has no provenance. Ordinary comparisons keep source order; membership
+(`x in c`) always reports `left` = the value and `right` = the collection. This
+applies to failed and Undefined comparisons too (an Undefined operand's value is
+`<undefined>`). Only condition guards are captured this way; a definedness guard
+on a comparison result (`_ = (a != b)`) keeps the boolean it checked.
+
+In `Redacted` value mode, two-operand conditions (comparisons, membership and
+string-predicate builtins) are redacted as a pair: if either operand's path is
+sensitive, both values are redacted, because a matching or containing operand can
+reveal the other. Values under sensitive-named object keys nested inside either
+operand are also replaced with `<redacted>`, and the operand is marked
+`redacted: true`. A secret inside a compound (non-string) object key cannot be
+rewritten safely, so the whole enclosing object is redacted. Two-operand
+conditions are identified from the compiled condition, so redaction still
+applies if the trace's value capacity drops one operand.
+
+Operands of two-operand conditions are capped at 100 elements, counted across
+all nesting levels. A larger collection is reported as the prefix that fits, with
+`truncated: true` and `length` set to its original top-level element count; both
+fields are omitted for operands that fit. Truncation happens before redaction, so
+only the emitted prefix is walked. Truncation never affects evaluation: a value
+can match an element beyond the reported prefix.
+
+Backward operand scans (static and runtime) stop at rule-definition boundaries,
+because registers are numbered per definition.
+
 - **Instruction budgets**: adjust via `set_max_instructions` when running
   untrusted policies. Inspect `executed_instructions` after completion.
 - **Breakpoints & stepping**: populate `breakpoints` with bytecode PCs (see the

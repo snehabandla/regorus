@@ -542,38 +542,51 @@ impl RegoVM {
         None
     }
 
-    /// Runtime analog of `peek_through_negation` Case A. When a Guard
-    /// fires on a `Not(inner)` register whose inner was written by a
-    /// comparison opcode (`Eq`/`Ne`/`Lt`/`Le`/`Gt`/`Ge`/`Contains`), surface
-    /// the comparison's operand values so the emitted condition carries
-    /// populated `left`/`right` shapes just like a positive comparison would.
-    /// Mirrors `capture_builtin_guard_operands`.
+    /// Runtime analog of `peek_preceding_comparison` and `peek_through_negation`
+    /// Case A. When a Guard fires on a register written by a comparison opcode
+    /// (`Eq`/`Ne`/`Lt`/`Le`/`Gt`/`Ge`/`Contains`), either directly (`a != b`,
+    /// `x in c`) or through a `Not` (`not a == b`, `not x in c`), surface the
+    /// comparison's operand values so the condition carries `left`/`right`
+    /// operands instead of the boolean guard result. Membership is reported as
+    /// `left` = value, `right` = collection, matching `find_comparison_writing_to`.
+    /// Mirrors `capture_builtin_guard_operands`. Positive capture applies only to
+    /// `GuardMode::Condition`: a `NotUndefined` guard on a comparison result
+    /// (`_ = (a != b)`) checks definedness, not the comparison, so it keeps the
+    /// boolean it checked.
     #[cfg(feature = "explanations")]
-    fn capture_comparison_guard_operands(&self, register: u8) -> Option<GuardOperandCapture> {
-        // Only meaningful when Guard is fed by a `Not` — otherwise the
-        // positive-comparison path (record_runtime_comparison_assumption)
-        // already captured operands via record_condition's own arguments.
+    fn capture_comparison_guard_operands(
+        &self,
+        register: u8,
+        mode: GuardMode,
+    ) -> Option<GuardOperandCapture> {
         if self.pc == 0 {
             return None;
         }
-        let not_operand = match self
+        let (target, scan_from) = match self
             .program
             .instructions
             .get(self.pc.saturating_sub(1))
             .copied()
         {
-            Some(Instruction::Not { dest, operand }) if dest == register => operand,
+            // Skip the Not itself and look for what wrote its operand.
+            Some(Instruction::Not { dest, operand }) if dest == register => {
+                (operand, self.pc.saturating_sub(1))
+            }
+            _ if mode == GuardMode::Condition => (register, self.pc),
             _ => return None,
         };
 
-        // Small lookback window — matches static-side peek_through_negation.
+        // Small lookback window — matches static-side find_comparison_writing_to.
         const LOOKBACK: usize = 8;
         let start = self.pc.saturating_sub(LOOKBACK).max(1);
 
-        let mut cur = self.pc.saturating_sub(1); // skip the Not itself
+        let mut cur = scan_from;
         while cur > start {
             cur = cur.saturating_sub(1);
             let instr = *self.program.instructions.get(cur)?;
+            if crate::static_provenance::is_definition_boundary(&instr) {
+                return None;
+            }
             let (left_reg, right_reg) = match instr {
                 Instruction::Eq { dest, left, right }
                 | Instruction::Ne { dest, left, right }
@@ -581,7 +594,7 @@ impl RegoVM {
                 | Instruction::Le { dest, left, right }
                 | Instruction::Gt { dest, left, right }
                 | Instruction::Ge { dest, left, right }
-                    if dest == not_operand =>
+                    if dest == target =>
                 {
                     (left, right)
                 }
@@ -589,7 +602,7 @@ impl RegoVM {
                     dest,
                     collection,
                     value,
-                } if dest == not_operand => (collection, value),
+                } if dest == target => (value, collection),
                 _ => continue,
             };
             let left_val = self.get_register(left_reg).ok().cloned();
@@ -1384,7 +1397,7 @@ impl RegoVM {
                     // back through the `Not` to the comparison instruction
                     // and capture its operand values.
                     let comparison_operands = if builtin_operands.is_none() {
-                        self.capture_comparison_guard_operands(register)
+                        self.capture_comparison_guard_operands(register, mode)
                     } else {
                         None
                     };

@@ -888,9 +888,24 @@ pub(crate) fn builtin_operand_indices(name: &str) -> Option<(usize, usize)> {
     }
 }
 
+/// Instructions that start or end a rule-definition frame. Registers are
+/// numbered per definition, so a backward operand scan must not cross one of
+/// these: a comparison found beyond it wrote a register of a different frame.
+pub(crate) const fn is_definition_boundary(instr: &Instruction) -> bool {
+    matches!(
+        *instr,
+        Instruction::RuleInit { .. }
+            | Instruction::RuleReturn {}
+            | Instruction::DestructuringSuccess {}
+            | Instruction::Return { .. }
+            | Instruction::Halt {}
+    )
+}
+
 /// Scan backward from `pc` (exclusive) looking for a comparison-like
 /// instruction whose `dest` register matches `target_dest`.  Stops at the
-/// nearest such instruction.  Used both for direct comparisons preceding a
+/// nearest such instruction, or at a rule-definition boundary.  Used both for
+/// direct comparisons preceding a
 /// `Guard`, and (indirectly via [`peek_through_negation`]) for the operand
 /// of a `Not` instruction in `not <comparison>` patterns.
 fn find_comparison_writing_to(
@@ -908,6 +923,9 @@ fn find_comparison_writing_to(
     while cur > start {
         cur = cur.saturating_sub(1);
         let instr = program.instructions.get(cur)?;
+        if is_definition_boundary(instr) {
+            return None;
+        }
         match *instr {
             Instruction::Eq { dest, left, right }
             | Instruction::Ne { dest, left, right }

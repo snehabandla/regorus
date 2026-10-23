@@ -48,15 +48,185 @@ fn should_redact_path(provenance: Option<&Provenance>) -> bool {
     };
     for seg in &prov.segments {
         if let crate::static_provenance::Segment::Field(ref name) = *seg {
-            let lower = str::to_ascii_lowercase(name);
-            for sensitive in SENSITIVE_FIELDS {
-                if lower.contains(sensitive) {
-                    return true;
-                }
+            if is_sensitive_name(name) {
+                return true;
             }
         }
     }
     false
+}
+
+fn is_sensitive_name(name: &str) -> bool {
+    let lower = str::to_ascii_lowercase(name);
+    SENSITIVE_FIELDS
+        .iter()
+        .any(|sensitive| lower.contains(sensitive))
+}
+
+/// Nesting beyond this depth is treated as sensitive rather than walked.
+const MAX_REDACT_DEPTH: usize = 64;
+
+/// Whether `value` holds a sensitive-named object key at any depth, in object
+/// values or in compound (non-string) object keys. Fails closed past the depth cap.
+fn contains_nested_secret(value: &Value, depth: usize) -> bool {
+    if !matches!(*value, Value::Object(_) | Value::Array(_) | Value::Set(_)) {
+        return false;
+    }
+    if depth >= MAX_REDACT_DEPTH {
+        return true;
+    }
+    let next = depth.saturating_add(1);
+    match *value {
+        Value::Object(ref map) => map.iter().any(|(key, item)| {
+            key.as_string().is_ok_and(|k| is_sensitive_name(k))
+                || contains_nested_secret(key, next)
+                || contains_nested_secret(item, next)
+        }),
+        Value::Array(ref items) => items.iter().any(|item| contains_nested_secret(item, next)),
+        Value::Set(ref items) => items.iter().any(|item| contains_nested_secret(item, next)),
+        _ => false,
+    }
+}
+
+/// Replace values under sensitive-named object keys anywhere inside `value`.
+///
+/// Returns `None` when nothing needed redacting, without copying. Path-based
+/// redaction only sees the operand's own path; a harmlessly named object
+/// (`input.profile`) can still nest `password`. A secret inside a compound
+/// object key cannot be rewritten without colliding keys, so the whole
+/// enclosing object is redacted instead.
+fn redact_nested_secrets(value: &Value, depth: usize) -> Option<Value> {
+    if !contains_nested_secret(value, depth) {
+        return None;
+    }
+    if depth >= MAX_REDACT_DEPTH {
+        return Some(Value::from("<redacted>"));
+    }
+    let next = depth.saturating_add(1);
+    let redact_items =
+        |item: &Value| redact_nested_secrets(item, next).unwrap_or_else(|| item.clone());
+    Some(match *value {
+        Value::Object(ref map) => {
+            if map.keys().any(|key| contains_nested_secret(key, next)) {
+                return Some(Value::from("<redacted>"));
+            }
+            let out: alloc::collections::BTreeMap<Value, Value> = map
+                .iter()
+                .map(|(key, item)| {
+                    let replaced = if key.as_string().is_ok_and(|k| is_sensitive_name(k)) {
+                        Value::from("<redacted>")
+                    } else {
+                        redact_items(item)
+                    };
+                    (key.clone(), replaced)
+                })
+                .collect();
+            Value::from(out)
+        }
+        Value::Array(ref items) => Value::from(items.iter().map(redact_items).collect::<Vec<_>>()),
+        Value::Set(ref items) => Value::from(
+            items
+                .iter()
+                .map(redact_items)
+                .collect::<alloc::collections::BTreeSet<_>>(),
+        ),
+        _ => return None,
+    })
+}
+
+/// Element budget for one two-operand condition operand, counted across all
+/// nesting levels so nested collections cannot multiply it.
+const MAX_OPERAND_ELEMENTS: usize = 100;
+
+/// Spend one element of `budget`; `false` once it is exhausted.
+const fn consume_element(budget: &mut usize) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget = budget.saturating_sub(1);
+    true
+}
+
+/// Whether every element of `value`, at every depth, fits in `budget`.
+/// Recursion depth is bounded by the budget itself.
+fn fits_element_budget(value: &Value, budget: &mut usize) -> bool {
+    match *value {
+        Value::Array(ref items) => items
+            .iter()
+            .all(|item| consume_element(budget) && fits_element_budget(item, budget)),
+        Value::Set(ref items) => items
+            .iter()
+            .all(|item| consume_element(budget) && fits_element_budget(item, budget)),
+        Value::Object(ref map) => map.iter().all(|(key, item)| {
+            consume_element(budget)
+                && fits_element_budget(key, budget)
+                && fits_element_budget(item, budget)
+        }),
+        _ => true,
+    }
+}
+
+/// Copy `value`, keeping elements in iteration order until `budget` runs out.
+fn take_within_element_budget(value: &Value, budget: &mut usize) -> Value {
+    match *value {
+        Value::Array(ref items) => {
+            let mut out = Vec::new();
+            for item in items.iter() {
+                if !consume_element(budget) {
+                    break;
+                }
+                out.push(take_within_element_budget(item, budget));
+            }
+            Value::from(out)
+        }
+        Value::Set(ref items) => {
+            let mut out = alloc::collections::BTreeSet::new();
+            for item in items.iter() {
+                if !consume_element(budget) {
+                    break;
+                }
+                out.insert(take_within_element_budget(item, budget));
+            }
+            Value::from(out)
+        }
+        Value::Object(ref map) => {
+            let mut out = alloc::collections::BTreeMap::new();
+            for (key, item) in map.iter() {
+                if !consume_element(budget) {
+                    break;
+                }
+                // Keys are kept whole to preserve identity; stop before an
+                // entry whose compound key would not fit the remaining budget.
+                let mut after_key = *budget;
+                if !fits_element_budget(key, &mut after_key) {
+                    break;
+                }
+                *budget = after_key;
+                out.insert(key.clone(), take_within_element_budget(item, budget));
+            }
+            Value::from(out)
+        }
+        _ => value.clone(),
+    }
+}
+
+/// Cut an oversized collection operand to `MAX_OPERAND_ELEMENTS`.
+///
+/// Returns the kept prefix and the original top-level element count, or `None`
+/// when the operand already fits (the common case, with no copy).
+fn truncate_operand(value: &Value) -> Option<(Value, usize)> {
+    let length = match *value {
+        Value::Array(ref items) => items.len(),
+        Value::Set(ref items) => items.len(),
+        Value::Object(ref map) => map.len(),
+        _ => return None,
+    };
+    let mut probe = MAX_OPERAND_ELEMENTS;
+    if fits_element_budget(value, &mut probe) {
+        return None;
+    }
+    let mut budget = MAX_OPERAND_ELEMENTS;
+    Some((take_within_element_budget(value, &mut budget), length))
 }
 
 fn should_redact_runtime_path(path: Option<&str>) -> bool {
@@ -243,6 +413,13 @@ pub struct OperandExplanation {
     /// A negated reference was undefined, rather than a defined false value.
     #[serde(default, skip_serializing_if = "is_false")]
     pub absent: bool,
+    /// `value` is a prefix of a larger collection, cut to the report's element
+    /// budget (`MAX_OPERAND_ELEMENTS`, counted across nesting).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    /// When `truncated`, the original top-level element count of `value`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub length: Option<usize>,
     /// Whether the value was redacted.
     pub redacted: bool,
     /// Fully-qualified Azure Policy alias name this value was compiled from,
@@ -1758,6 +1935,8 @@ fn derive_left_provenance_from_helper(
             value: existing.value,
             provenance: Some(prov),
             absent: existing.absent,
+            truncated: existing.truncated,
+            length: existing.length,
             redacted: existing.redacted,
             source_alias: existing.source_alias,
         }),
@@ -1910,6 +2089,8 @@ fn operands_match(left: Option<&OperandExplanation>, right: Option<&OperandExpla
             left.value == right.value
                 && left.provenance == right.provenance
                 && left.absent == right.absent
+                && left.truncated == right.truncated
+                && left.length == right.length
                 && left.redacted == right.redacted
         }
         _ => false,
@@ -2208,22 +2389,59 @@ fn materialize_operands(
     let right_output_path =
         operand_provenance_for_output(right_runtime_path, right_prov, outcome, trace);
 
+    let left_sensitive = redact
+        && if left_output_path.is_some() {
+            should_redact_runtime_path(left_output_path.as_deref())
+        } else {
+            should_redact_path(left_prov)
+        };
+    let right_sensitive = redact
+        && if right_output_path.is_some() {
+            should_redact_runtime_path(right_output_path.as_deref())
+        } else {
+            should_redact_path(right_prov)
+        };
+    // In a two-operand condition the operands are related (equal, ordered, or
+    // container/member), so a harmless-looking side can reveal the sensitive
+    // one. Redact both when either is sensitive, and sanitize nested secrets.
+    // The shape comes from static metadata, not capture success: if the trace's
+    // value capacity drops one operand, the survivor must still be sanitized.
+    let paired = (actual.is_some() && expected.is_some())
+        || static_info.is_some_and(|i| i.operator.is_some() || i.builtin_name.is_some());
+    let shared = paired && (left_sensitive || right_sensitive);
+
+    // Two-operand conditions can carry whole collections (`x in c`). Truncate
+    // first so report size and the redaction walk are both bounded; then redact
+    // what will actually be emitted.
+    let prepare_operand = |v: Value, sensitive: bool| -> (Value, bool, bool, Option<usize>) {
+        if sensitive || shared {
+            return (Value::from("<redacted>"), true, false, None);
+        }
+        let (v, length) = if paired {
+            match truncate_operand(&v) {
+                Some((kept, length)) => (kept, Some(length)),
+                None => (v, None),
+            }
+        } else {
+            (v, None)
+        };
+        if redact && paired {
+            if let Some(sanitized) = redact_nested_secrets(&v, 0) {
+                return (sanitized, true, length.is_some(), length);
+            }
+        }
+        (v, false, length.is_some(), length)
+    };
+
     let left = actual.map(|v| {
-        let should_redact = redact
-            && if left_output_path.is_some() {
-                should_redact_runtime_path(left_output_path.as_deref())
-            } else {
-                should_redact_path(left_prov)
-            };
+        let (value, redacted, truncated, length) = prepare_operand(v, left_sensitive);
         OperandExplanation {
-            value: if should_redact {
-                Value::from("<redacted>")
-            } else {
-                v
-            },
+            value,
             provenance: left_output_path.clone(),
             absent: outcome.actual_absent,
-            redacted: should_redact,
+            truncated,
+            length,
+            redacted,
             source_alias: left_prov
                 .and_then(|p| p.source_alias.as_deref())
                 .map(str::to_string),
@@ -2231,21 +2449,14 @@ fn materialize_operands(
     });
 
     let right = expected.map(|v| {
-        let should_redact = redact
-            && if right_output_path.is_some() {
-                should_redact_runtime_path(right_output_path.as_deref())
-            } else {
-                should_redact_path(right_prov)
-            };
+        let (value, redacted, truncated, length) = prepare_operand(v, right_sensitive);
         OperandExplanation {
-            value: if should_redact {
-                Value::from("<redacted>")
-            } else {
-                v
-            },
+            value,
             provenance: right_output_path.clone(),
             absent: false,
-            redacted: should_redact,
+            truncated,
+            length,
+            redacted,
             source_alias: right_prov
                 .and_then(|p| p.source_alias.as_deref())
                 .map(str::to_string),
@@ -3256,11 +3467,113 @@ mod tests {
     }
 
     #[test]
+    fn redact_nested_secrets_walks_containers_and_caps_depth() {
+        use super::{redact_nested_secrets, MAX_REDACT_DEPTH};
+        let parse = |s: &str| Value::from_json_str(s).unwrap();
+
+        // Nothing sensitive: no copy is produced.
+        assert!(redact_nested_secrets(&parse(r#"{"a":[1,{"b":"c"}]}"#), 0).is_none());
+        assert!(redact_nested_secrets(&Value::from("password"), 0).is_none());
+
+        // Sensitive keys at any depth, through arrays.
+        let out = redact_nested_secrets(
+            &parse(r#"{"name":"n","nested":[{"apiKey":"k"},{"ok":1}],"Password":"p"}"#),
+            0,
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            parse(
+                r#"{"name":"n","nested":[{"apiKey":"<redacted>"},{"ok":1}],"Password":"<redacted>"}"#
+            )
+        );
+
+        // Sets are walked too; non-string keys are not treated as names.
+        let mut set = alloc::collections::BTreeSet::new();
+        set.insert(parse(r#"{"token":"t"}"#));
+        let set_out = redact_nested_secrets(&Value::from(set), 0).unwrap();
+        assert!(!alloc::format!("{set_out}").contains("\"t\""), "{set_out}");
+        let mut keyed = alloc::collections::BTreeMap::new();
+        keyed.insert(Value::from(1), Value::from("secret-looking"));
+        assert!(redact_nested_secrets(&Value::from(keyed), 0).is_none());
+
+        // Beyond the depth cap any container fails closed.
+        assert_eq!(
+            redact_nested_secrets(&parse(r#"{"a":1}"#), MAX_REDACT_DEPTH),
+            Some(Value::from("<redacted>"))
+        );
+
+        // A secret inside a compound key fails closed for the whole object.
+        let mut inner = alloc::collections::BTreeMap::new();
+        inner.insert(Value::from("password"), Value::from("hunter2"));
+        let mut compound = alloc::collections::BTreeMap::new();
+        compound.insert(Value::from(inner), Value::from(1));
+        compound.insert(Value::from("ok"), Value::from(2));
+        assert_eq!(
+            redact_nested_secrets(&Value::from(compound), 0),
+            Some(Value::from("<redacted>"))
+        );
+        assert!(redact_nested_secrets(&Value::from(1), MAX_REDACT_DEPTH).is_none());
+    }
+
+    #[test]
+    fn paired_redaction_survives_a_dropped_partner_operand() {
+        use crate::static_provenance::Operator;
+        let comparison = StaticConditionInfo {
+            checked_register: 0,
+            checked_provenance: None,
+            operands: None,
+            text: "input.profile != {}".into(),
+            kind: ConditionKind::Comparison,
+            operator: Some(Operator::Ne),
+            has_input_operand: true,
+            binding_name: None,
+            builtin_name: None,
+            negated: false,
+        };
+        let secret = Value::from_json_str(r#"{"password":"hunter2","name":"n"}"#).unwrap();
+        // Only `actual` is captured, as when the trace's value capacity is exhausted.
+        let mut trace = EvaluationTrace::new();
+        trace.record_condition(
+            1,
+            true,
+            false,
+            Some(secret),
+            Some("input.profile".into()),
+            None,
+            None,
+            0,
+        );
+        let outcome = trace.condition_outcomes.first().unwrap();
+        let (left, right) = super::materialize_operands(
+            outcome,
+            Some(&comparison),
+            &trace,
+            &settings(ConditionMode::PrimaryOnly),
+        );
+        let left = left.unwrap();
+        assert!(right.is_none());
+        assert!(left.redacted);
+        assert!(!alloc::format!("{}", left.value).contains("hunter2"));
+
+        // Control: without static two-operand metadata the operand is untouched.
+        let (single, _) = super::materialize_operands(
+            outcome,
+            None,
+            &trace,
+            &settings(ConditionMode::PrimaryOnly),
+        );
+        assert!(!single.unwrap().redacted);
+    }
+
+    #[test]
     fn operand_absence_is_distinct_and_omitted_when_false() {
         let defined = OperandExplanation {
             value: Value::Bool(true),
             provenance: Some("input.enabled".into()),
             absent: false,
+            truncated: false,
+            length: None,
             redacted: false,
             source_alias: None,
         };
@@ -3288,6 +3601,8 @@ mod tests {
                     value: Value::from("a"),
                     provenance: None,
                     absent: false,
+                    truncated: false,
+                    length: None,
                     redacted: false,
                     source_alias: None,
                 }),
@@ -3309,6 +3624,8 @@ mod tests {
                     value: Value::from("b"),
                     provenance: None,
                     absent: false,
+                    truncated: false,
+                    length: None,
                     redacted: false,
                     source_alias: None,
                 }),
