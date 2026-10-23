@@ -367,6 +367,19 @@ pub struct ConditionExplanation {
     /// shape they had before this field existed.
     #[serde(default, skip_serializing_if = "is_false")]
     pub negated: bool,
+    /// Constructs this condition was evaluated inside, outer to inner:
+    /// `"comprehension"`, `"every"`, `"negation"`. Omitted for rule-level
+    /// conditions. A scoped condition is per-iteration (or inverted) evidence,
+    /// not a condition that decided the rule on its own: in
+    /// `n := count([r | some r in input.resources; ...])` the `r` binding is
+    /// one sample element, not the subject of the result.
+    ///
+    /// Scopes are relative to the rule body that recorded the condition, so
+    /// entries in `helper_conditions` are relative to the helper's body; the
+    /// calling condition's own `scopes` apply to them too. Rego only: Azure
+    /// Policy conditions never carry scopes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<&'static str>,
     /// For truthiness conditions whose backing register was written by a
     /// `CallRule` (i.e. the customer wrote `not _helper(x)` or bare
     /// `_helper(x)` as a guard), this carries the helper's evaluated inner
@@ -2068,6 +2081,7 @@ fn dedupe_emission_conditions(conditions: Vec<ConditionExplanation>) -> Vec<Cond
                 && existing.outcome == condition.outcome
                 && existing.kind == condition.kind
                 && existing.operator == condition.operator
+                && existing.scopes == condition.scopes
                 && operands_match(existing.left.as_ref(), condition.left.as_ref())
                 && operands_match(existing.right.as_ref(), condition.right.as_ref())
                 && witnesses_match(existing.witness.as_ref(), condition.witness.as_ref())
@@ -2185,6 +2199,11 @@ fn materialize_condition_explanations_at_depth(
         // Derive outer `left.provenance` from the last failed helper inner
         // condition when the outer condition doesn't already carry one.
         let left = derive_left_provenance_from_helper(left, &helper_conditions);
+        let scopes = program
+            .condition_scopes
+            .get(pc_usize)
+            .map(|scopes| scopes.iter().map(|scope| scope.as_str()).collect())
+            .unwrap_or_default();
 
         conditions.push(ConditionExplanation {
             text,
@@ -2198,6 +2217,7 @@ fn materialize_condition_explanations_at_depth(
             binding_name,
             builtin_name,
             negated,
+            scopes,
             helper_conditions,
             helper_conditions_truncated,
         });
@@ -3611,6 +3631,7 @@ mod tests {
                 binding_name: None,
                 builtin_name: None,
                 negated: false,
+                scopes: Vec::new(),
                 helper_conditions: Vec::new(),
                 helper_conditions_truncated: false,
             },
@@ -3634,6 +3655,7 @@ mod tests {
                 binding_name: None,
                 builtin_name: None,
                 negated: false,
+                scopes: Vec::new(),
                 helper_conditions: Vec::new(),
                 helper_conditions_truncated: false,
             },

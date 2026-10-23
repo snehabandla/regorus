@@ -1152,6 +1152,268 @@ deny contains r.name if {
     }
 }
 
+/// Every condition in the report (emissions and definitions).
+fn rg2_all(report: &serde_json::Value) -> Vec<&serde_json::Value> {
+    let mut out = Vec::new();
+    for rule in report["rules"].as_array().into_iter().flatten() {
+        for list in ["emissions", "definitions"] {
+            for entry in rule[list].as_array().into_iter().flatten() {
+                out.extend(entry["conditions"].as_array().into_iter().flatten());
+            }
+        }
+    }
+    out
+}
+
+fn rg2_scopes(cond: &serde_json::Value) -> Vec<&str> {
+    cond.get("scopes")
+        .and_then(|s| s.as_array())
+        .map(|s| s.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default()
+}
+
+const RG2_INPUT: &str = r#"{"resources":{"a":{"name":"a","type":"S"},"b":{"name":"b","type":"S"},"c":{"name":"c","type":"K","flag":true}}}"#;
+
+/// Run `policy` and assert each condition's scopes via `expect`, which returns
+/// `None` for conditions it does not classify. Every classified bucket must be hit.
+fn rg2_check(
+    policy: &str,
+    expect: impl Fn(&serde_json::Value) -> Option<(&'static str, Vec<&'static str>)>,
+    buckets: &[&str],
+) {
+    let (_, report) = run_rg1_case(
+        policy,
+        RG2_INPUT,
+        rg5_settings(evaluation_trace::ConditionMode::AllContributing),
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    for cond in rg2_all(&report) {
+        if let Some((bucket, scopes)) = expect(cond) {
+            seen.insert(bucket);
+            assert_eq!(rg2_scopes(cond), scopes, "[{bucket}] {cond:#}");
+        }
+    }
+    for bucket in buckets {
+        assert!(
+            seen.contains(bucket),
+            "bucket `{bucket}` never matched: {report:#}"
+        );
+    }
+}
+
+#[test]
+fn rg2_comprehension_conditions_are_scoped_one_line_and_multi_line() {
+    // One-line form: every inner condition shares the outer line's text, so
+    // only `scopes` (and the binding name) can tell them apart.
+    rg2_check(
+        "package bicep\nimport rego.v1\ndeny contains msg if {\n    storage := [r | some r in input.resources; r.type == \"S\"]\n    count(storage) > 1\n    msg := sprintf(\"%d\", [count(storage)])\n}\n",
+        |c| match (c["location"]["row"].as_u64(), c["binding_name"].as_str()) {
+            (Some(4), Some("storage")) => Some(("result binding", vec![])),
+            (Some(4), _) => Some(("inner", vec!["comprehension"])),
+            (Some(5 | 6), _) => Some(("rule level", vec![])),
+            _ => None,
+        },
+        &["result binding", "inner", "rule level"],
+    );
+    // Multi-line form (proof shape R6): the inner `some` renders as its own line.
+    rg2_check(
+        "package bicep\nimport rego.v1\ndeny contains msg if {\n    storage := [r |\n        some r in input.resources\n        r.type == \"S\"\n    ]\n    count(storage) > 1\n    msg := sprintf(\"%d\", [count(storage)])\n}\n",
+        |c| match c["location"]["row"].as_u64() {
+            Some(5 | 6) => Some(("inner", vec!["comprehension"])),
+            Some(4 | 8 | 9) => Some(("rule level", vec![])),
+            _ => None,
+        },
+        &["inner", "rule level"],
+    );
+}
+
+#[test]
+fn rg2_set_and_object_comprehensions_and_inner_negation() {
+    rg2_check(
+        "package bicep\nimport rego.v1\ndeny contains \"v\" if {\n    names := {r.name | some r in input.resources}\n    m := {r.name: r.type | some r in input.resources}\n    flagged := [r | some r in input.resources; not r.flag]\n    count(names) + count(m) + count(flagged) > 0\n}\n",
+        |c| match (c["location"]["row"].as_u64(), c["binding_name"].as_str()) {
+            (Some(4..=6), Some("names" | "m" | "flagged")) => Some(("result bindings", vec![])),
+            (Some(4..=6), _) => Some(("inner", vec!["comprehension"])),
+            (Some(7), _) => Some(("rule level", vec![])),
+            _ => None,
+        },
+        &["result bindings", "inner", "rule level"],
+    );
+}
+
+#[test]
+fn rg2_every_body_and_nested_comprehension_are_scoped() {
+    rg2_check(
+        "package bicep\nimport rego.v1\ndeny contains \"v\" if {\n    every r in input.resources {\n        r.name != \"\"\n    }\n}\n",
+        |c| match c["location"]["row"].as_u64() {
+            Some(5) => Some(("body", vec!["every"])),
+            Some(4) => Some(("every holds", vec![])),
+            _ => None,
+        },
+        &["body", "every holds"],
+    );
+    rg2_check(
+        "package bicep\nimport rego.v1\ndeny contains \"v\" if {\n    every r in input.resources {\n        names := [n | some n in [r.name]; n != \"\"]\n        count(names) == 1\n    }\n}\n",
+        |c| match (c["location"]["row"].as_u64(), c["binding_name"].as_str()) {
+            (Some(5), Some("names")) => Some(("every-level binding", vec!["every"])),
+            (Some(5), _) => Some(("nested", vec!["every", "comprehension"])),
+            (Some(6), _) => Some(("every-level check", vec!["every"])),
+            (Some(4), _) => Some(("every holds", vec![])),
+            _ => None,
+        },
+        &["every-level binding", "nested", "every-level check", "every holds"],
+    );
+}
+
+#[test]
+fn rg2_comprehension_inside_negation_is_scoped_but_negated_guard_is_not() {
+    rg2_check(
+        "package bicep\nimport rego.v1\ndeny contains \"v\" if {\n    not count([r | some r in input.resources; r.type == \"Z\"]) > 0\n}\n",
+        |c| {
+            let negated_guard = c["kind"] == "comparison" && c["outcome"] == "success";
+            Some(if negated_guard {
+                ("negated guard", vec![])
+            } else {
+                ("inner", vec!["negation", "comprehension"])
+            })
+        },
+        &["negated guard", "inner"],
+    );
+}
+
+#[test]
+fn rg2_standard_dedupe_keeps_same_text_conditions_in_different_scopes() {
+    // On one line, the outer `input.flag` guard and the one inside the
+    // comprehension share text, kind and operands; only the scope differs.
+    let (result, report) = run_rg1_case(
+        "package bicep\nimport rego.v1\ndeny contains \"v\" if { input.flag; xs := [1 | input.flag]; count(xs) == 1 }\n",
+        r#"{"flag":true}"#,
+        evaluation_trace::ExplanationSettings {
+            enabled: true,
+            detail: evaluation_trace::ExplanationDetail::Standard,
+            value_mode: evaluation_trace::ValueMode::Full,
+            ..Default::default()
+        },
+    );
+    assert_eq!(result.as_set().unwrap().len(), 1, "{report:#}");
+    let emission = &report["rules"][0]["emissions"][0]["conditions"];
+    let flag_guards: Vec<Vec<&str>> = emission
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["kind"] == "truthiness" && c["left"]["provenance"] == "input.flag")
+        .map(rg2_scopes)
+        .collect();
+    assert!(
+        flag_guards.contains(&vec![]),
+        "outer guard missing: {report:#}"
+    );
+    assert!(
+        flag_guards.contains(&vec!["comprehension"]),
+        "inner guard merged away: {report:#}"
+    );
+}
+
+#[test]
+fn rg2_helpers_some_in_every_nested_every_and_definitions() {
+    // A helper call inside `every` is scoped; the helper's own body is
+    // analyzed per definition, so its conditions are relative to the helper.
+    let (_, report) = run_rg1_case(
+        "package bicep\nimport rego.v1\nok(r) if {\n    r.type != \"\"\n}\ndeny contains \"v\" if {\n    every r in input.resources {\n        ok(r)\n    }\n}\n",
+        RG2_INPUT,
+        rg5_settings(evaluation_trace::ConditionMode::AllContributing),
+    );
+    let calls: Vec<_> = rg2_all(&report)
+        .into_iter()
+        .filter(|c| c["text"] == "ok(r)")
+        .collect();
+    assert!(!calls.is_empty(), "{report:#}");
+    for call in calls {
+        assert_eq!(rg2_scopes(call), vec!["every"], "{call:#}");
+        let inner = call["helper_conditions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("helper call must expand its body: {call:#}"));
+        assert!(
+            inner.iter().any(|c| c["text"] == "r.type != \"\""),
+            "helper body condition missing: {call:#}"
+        );
+        for inner in inner {
+            assert!(inner.get("scopes").is_none(), "{inner:#}");
+        }
+    }
+
+    // `some` inside `every` emits its own guard, which is inside the body.
+    rg2_check(
+        "package bicep\nimport rego.v1\ndeny contains \"v\" if {\n    every r in input.resources {\n        some t in [r.type]\n        t != \"\"\n    }\n}\n",
+        |c| match c["location"]["row"].as_u64() {
+            Some(5 | 6) => Some(("body", vec!["every"])),
+            Some(4) => Some(("every holds", vec![])),
+            _ => None,
+        },
+        &["body", "every holds"],
+    );
+
+    // Nested `every`: the inner holds-guard is inside the outer body.
+    rg2_check(
+        "package bicep\nimport rego.v1\ndeny contains \"v\" if {\n    every r in input.resources {\n        every c in [r.name] {\n            c != \"\"\n        }\n    }\n}\n",
+        |c| match c["location"]["row"].as_u64() {
+            Some(6) => Some(("inner body", vec!["every", "every"])),
+            Some(5) => Some(("inner holds", vec!["every"])),
+            Some(4) => Some(("outer holds", vec![])),
+            _ => None,
+        },
+        &["inner body", "inner holds", "outer holds"],
+    );
+
+    // A second definition of the same rule starts with a clean scope stack.
+    rg2_check(
+        "package bicep\nimport rego.v1\ndeny contains \"a\" if {\n    xs := [r | some r in input.resources]\n    count(xs) > 0\n}\ndeny contains \"b\" if {\n    some r in input.resources\n    r.type == \"K\"\n}\n",
+        |c| match (c["location"]["row"].as_u64(), c["binding_name"].as_str()) {
+            (Some(4), Some("xs")) => Some(("result binding", vec![])),
+            (Some(4), _) => Some(("first definition inner", vec!["comprehension"])),
+            (Some(9 | 10), _) => Some(("second definition", vec![])),
+            _ => None,
+        },
+        &["result binding", "first definition inner", "second definition"],
+    );
+}
+
+#[test]
+fn rg2_loops_hoisted_out_of_a_negation_keep_their_executed_scope() {
+    // `not xs[_]` hoists the `[_]` loop -- and the comprehension producing
+    // `xs` -- ahead of the negation, so they execute outside `NegationBegin`.
+    // Scopes describe where a condition executes: the comprehension's guard is
+    // `["comprehension"]` (still never rule-level), without `negation`.
+    let body = "not [true | input.flag][_]";
+    let (_, report) = run_rg1_case(
+        &format!("package bicep\nimport rego.v1\ndeny contains \"v\" if {{\n    {body}\n}}\n"),
+        r#"{"flag": true}"#,
+        rg5_settings(evaluation_trace::ConditionMode::AllContributing),
+    );
+    let inner: Vec<_> = rg2_all(&report)
+        .into_iter()
+        .filter(|c| c["text"] == body && c["outcome"] == "success")
+        .collect();
+    assert!(!inner.is_empty(), "{report:#}");
+    for cond in inner {
+        assert_eq!(rg2_scopes(cond), vec!["comprehension"], "{cond:#}");
+    }
+}
+
+#[test]
+fn rg2_rule_level_conditions_carry_no_scopes() {
+    let (_, report) = run_rg1_case(
+        "package bicep\nimport rego.v1\ndeny contains r.name if {\n    some r in input.resources\n    r.type == \"S\"\n    not r.flag\n}\n",
+        RG2_INPUT,
+        rg5_settings(evaluation_trace::ConditionMode::AllContributing),
+    );
+    let all = rg2_all(&report);
+    assert!(all.len() >= 3, "{report:#}");
+    for cond in all {
+        assert!(cond.get("scopes").is_none(), "{cond:#}");
+    }
+}
+
 #[test]
 fn rg1_negated_comparison_keeps_defined_left_operand_present() {
     let policy = r#"

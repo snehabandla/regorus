@@ -274,6 +274,31 @@ fn source_alias_on_a_wildcard_condition() {
 }
 
 #[test]
+fn ap_conditions_carry_no_rego_scopes() {
+    // Rego-only contract: `scopes` marks Rego comprehension/every/not bodies.
+    // Azure Policy has its own condition model (`not`, `count` and `[*]` are
+    // not bracketed the same way), so its conditions must not carry partial
+    // labels -- in particular the `[*]` leaf, the only condition carrying the
+    // alias provenance, must stay decisive for attribution.
+    let report = run_with_aliases(
+        ARRAY_ALIAS_JSON,
+        ARRAY_ALIAS_POLICY,
+        r#"{"type": "Microsoft.Storage/storageAccounts", "properties": {"networkAcls": {"ipRules": [{"value": "10.0.0.1"}]}}}"#,
+    );
+    let leaf = find_condition(&report, "networkacls.iprules");
+    assert!(
+        leaf.get("scopes").is_none(),
+        "the [*] leaf must not be scoped, got: {leaf}"
+    );
+    for cond in report["rules"][0]["definitions"][0]["conditions"]
+        .as_array()
+        .expect("conditions array")
+    {
+        assert!(cond.get("scopes").is_none(), "unexpected scopes: {cond}");
+    }
+}
+
+#[test]
 fn source_alias_is_absent_for_a_non_aliased_condition() {
     // Negative control: a raw `type` selector never goes through alias
     // resolution, so it must not carry a source_alias -- proves the field is

@@ -222,6 +222,8 @@ impl Program {
             #[cfg(feature = "explanations")]
             condition_infos: Vec::new(),
             #[cfg(feature = "explanations")]
+            condition_scopes: Vec::new(),
+            #[cfg(feature = "explanations")]
             register_provenances: Vec::new(),
             #[cfg(feature = "explanations")]
             binding_infos: Vec::new(),

@@ -96,6 +96,13 @@ pub struct Program {
     #[serde(skip, default)]
     pub condition_infos: Vec<Option<StaticConditionInfo>>,
 
+    /// Enclosing constructs (comprehension, `every`, negation), outer to inner,
+    /// for each instruction that records a condition (parallel to `instructions`).
+    /// Empty for rule-level conditions. Computed by static provenance analysis.
+    #[cfg(feature = "explanations")]
+    #[serde(skip, default)]
+    pub condition_scopes: Vec<Vec<crate::static_provenance::ConditionScope>>,
+
     /// Register provenances per rule definition.
     /// Outer index: flat definition index (ordered by rule, then definition within rule).
     /// Inner index: register number.
@@ -170,6 +177,8 @@ impl Program {
             rego_v0: false, // Default to Rego v1
             #[cfg(feature = "explanations")]
             condition_infos: Vec::new(),
+            #[cfg(feature = "explanations")]
+            condition_scopes: Vec::new(),
             #[cfg(feature = "explanations")]
             register_provenances: Vec::new(),
             #[cfg(feature = "explanations")]

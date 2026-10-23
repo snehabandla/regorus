@@ -196,6 +196,98 @@ impl fmt::Display for Provenance {
 // Condition info types
 // ---------------------------------------------------------------------------
 
+/// A construct a condition is evaluated inside, other than the rule body itself.
+///
+/// Conditions inside these constructs are per-iteration or inverted evidence,
+/// not the rule-level conditions that decided an emission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConditionScope {
+    /// An array, set or object comprehension body.
+    Comprehension,
+    /// An `every` quantifier body.
+    Every,
+    /// The expression of a `not`.
+    Negation,
+}
+
+impl ConditionScope {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Comprehension => "comprehension",
+            Self::Every => "every",
+            Self::Negation => "negation",
+        }
+    }
+}
+
+/// Tracks the enclosing construct stack during a linear walk of bytecode.
+///
+/// Comprehensions and `every` bodies are bracketed by an opening instruction
+/// and an end pc recorded in its params; a negation by `NegationBegin` and the
+/// matching `Not`. Nesting is properly bracketed by the compiler.
+#[derive(Default)]
+struct ScopeTracker {
+    stack: Vec<(ConditionScope, Option<usize>)>,
+}
+
+impl ScopeTracker {
+    /// Close scopes that end at or before `pc`, and a negation closed by `Not`.
+    fn enter(&mut self, pc: usize, instr: &Instruction) {
+        while self
+            .stack
+            .last()
+            .is_some_and(|&(_, end)| end.is_some_and(|end| end <= pc))
+        {
+            self.stack.pop();
+        }
+        if matches!(*instr, Instruction::Not { .. })
+            && self
+                .stack
+                .last()
+                .is_some_and(|&(scope, _)| scope == ConditionScope::Negation)
+        {
+            self.stack.pop();
+        }
+    }
+
+    /// Open the scope that `instr` starts, if any.
+    fn leave(&mut self, instr: &Instruction, program: &Program) {
+        match *instr {
+            Instruction::ComprehensionBegin { params_index } => {
+                if let Some(params) = program
+                    .instruction_data
+                    .comprehension_begin_params
+                    .get(usize::from(params_index))
+                {
+                    self.stack.push((
+                        ConditionScope::Comprehension,
+                        Some(usize::from(params.comprehension_end)),
+                    ));
+                }
+            }
+            Instruction::LoopStart { params_index } => {
+                if let Some(params) = program
+                    .instruction_data
+                    .loop_params
+                    .get(usize::from(params_index))
+                    .filter(|params| params.mode == crate::rvm::instructions::LoopMode::Every)
+                {
+                    self.stack
+                        .push((ConditionScope::Every, Some(usize::from(params.loop_end))));
+                }
+            }
+            Instruction::NegationBegin {} => {
+                self.stack.push((ConditionScope::Negation, None));
+            }
+            _ => {}
+        }
+    }
+
+    fn current(&self) -> Vec<ConditionScope> {
+        self.stack.iter().map(|&(scope, _)| scope).collect()
+    }
+}
+
 /// The kind of condition being asserted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConditionKind {
@@ -311,6 +403,8 @@ pub fn analyze(program: &mut Program) {
     let num_instructions = program.instructions.len();
     let mut condition_infos: Vec<Option<StaticConditionInfo>> = Vec::new();
     condition_infos.resize_with(num_instructions, || None);
+    let mut condition_scopes: Vec<Vec<ConditionScope>> = Vec::new();
+    condition_scopes.resize_with(num_instructions, Vec::new);
 
     let mut all_register_provenances: Vec<Vec<Option<Provenance>>> = Vec::new();
 
@@ -324,6 +418,7 @@ pub fn analyze(program: &mut Program) {
             let num_regs = usize::from(rule_info.num_registers);
             let mut reg_provenance: Vec<Option<Provenance>> = Vec::new();
             reg_provenance.resize_with(num_regs, || None);
+            let mut scopes = ScopeTracker::default();
 
             // Determine instruction range for this definition body.
             // The body PCs are the starting PCs of each body block within the definition.
@@ -339,6 +434,7 @@ pub fn analyze(program: &mut Program) {
                     break;
                 };
 
+                scopes.enter(pc, &instr);
                 analyze_instruction(
                     &instr,
                     pc,
@@ -346,6 +442,8 @@ pub fn analyze(program: &mut Program) {
                     &mut condition_infos,
                     program,
                 );
+                record_scopes(pc, &scopes, &condition_infos, &mut condition_scopes);
+                scopes.leave(&instr, program);
 
                 if matches!(instr, Instruction::RuleReturn {}) {
                     break;
@@ -359,6 +457,8 @@ pub fn analyze(program: &mut Program) {
 
     // Azure Policy compiles to a flat `main` entry point with no rule structure,
     // so the loop above never runs. Walk the whole program once instead.
+    // Condition scopes are Rego-only: Azure Policy's `not`, `count` and `[*]`
+    // are not bracketed like Rego constructs, so partial labels would mislead.
     if program.rule_infos.is_empty() {
         let mut reg_provenance: Vec<Option<Provenance>> = Vec::new();
         reg_provenance.resize_with(usize::from(u8::MAX) + 1, || None);
@@ -378,7 +478,22 @@ pub fn analyze(program: &mut Program) {
     }
 
     program.condition_infos = condition_infos;
+    program.condition_scopes = condition_scopes;
     program.register_provenances = all_register_provenances;
+}
+
+/// Attach the enclosing scope stack to the condition recorded at `pc`, if any.
+fn record_scopes(
+    pc: usize,
+    scopes: &ScopeTracker,
+    condition_infos: &[Option<StaticConditionInfo>],
+    condition_scopes: &mut [Vec<ConditionScope>],
+) {
+    if condition_infos.get(pc).is_some_and(Option::is_some) {
+        if let Some(slot) = condition_scopes.get_mut(pc) {
+            *slot = scopes.current();
+        }
+    }
 }
 
 /// Describe an Azure Policy operator in the terms the causality report speaks.

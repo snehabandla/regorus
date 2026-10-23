@@ -265,6 +265,26 @@ can match an element beyond the reported prefix.
 Backward operand scans (static and runtime) stop at rule-definition boundaries,
 because registers are numbered per definition.
 
+Conditions evaluated inside a comprehension body, an `every` body, or the
+expression of a `not` carry `scopes`, the enclosing constructs from outer to inner
+(`"comprehension"`, `"every"`, `"negation"`); rule-level conditions omit the field.
+In `storage := [r | some r in input.resources; r.type == "S"]` the `r` binding and
+the `r.type` check are scoped `["comprehension"]`: they describe one sample
+element, not the subject of the rule. The comprehension's own result binding
+(`storage`), the guard that an `every` holds, and the negated guard of a `not` are
+rule-level. Scopes are derived from the bytecode brackets (`ComprehensionBegin`
+to its end, `LoopStart` in `every` mode to its end, `NegationBegin` to `Not`).
+They are relative to the body that recorded the condition: a helper's
+`helper_conditions` are scoped within the helper, and the calling condition's
+`scopes` apply on top. Scopes describe where a condition executes: a loop that
+the compiler hoists out of a `not` (as in `not [x | ...][_]`) runs before the
+negation, so its conditions do not carry `negation`. Azure Policy conditions carry no `scopes`. Like the other
+static explanation metadata, scopes are computed during compilation and are not
+serialized with a `Program`: a deserialized program reports no `scopes` (and no
+condition text), so recompile before requesting explanations. Only the first body
+of each rule definition is analyzed statically; conditions in later `else` bodies
+carry no static metadata, including scopes.
+
 - **Instruction budgets**: adjust via `set_max_instructions` when running
   untrusted policies. Inspect `executed_instructions` after completion.
 - **Breakpoints & stepping**: populate `breakpoints` with bytecode PCs (see the
