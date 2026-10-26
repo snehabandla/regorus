@@ -85,13 +85,16 @@ mod panic_tests {
         regorus_engine_new,
     };
     use crate::common::{regorus_result_drop, RegorusStatus};
-    use crate::panic_guard::{is_poisoned, reset_poison};
+    use crate::panic_guard::{is_poisoned, reset_poison, FFI_GLOBAL_STATE_TEST_LOCK};
     use alloc::boxed::Box;
     use regorus::Value;
     use std::ffi::{CStr, CString};
 
     #[test]
     fn catches_extension_panics_and_marks_poison() {
+        let _global_state = FFI_GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         reset_poison();
 
         let engine_ptr = regorus_engine_new();
@@ -664,6 +667,7 @@ pub extern "C" fn regorus_engine_set_explanation_settings(
                 assume_unknown_input,
                 eval_mode: regorus::evaluation_trace::EvaluationMode::default(),
                 unknowns: alloc::vec![String::from("input")],
+                max_derivations: 1,
             });
             Ok(())
         }())

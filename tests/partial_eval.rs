@@ -51,6 +51,7 @@ fn run_pe_with_unknowns(
         assume_unknown_input: true,
         eval_mode: evaluation_trace::EvaluationMode::PartialEval,
         unknowns: unknowns.unwrap_or_else(|| vec!["input".into()]),
+        max_derivations: 1,
     });
 
     let input = match input_json {

@@ -1903,6 +1903,7 @@ fn run_pe(policy: &str, input_json: &str, entrypoint_str: &str) -> serde_json::V
         assume_unknown_input: true,
         eval_mode: evaluation_trace::EvaluationMode::PartialEval,
         unknowns: vec!["input.deployment".into()],
+        max_derivations: 1,
     });
 
     let input: Value = serde_json::from_str(input_json).unwrap();
@@ -3621,6 +3622,7 @@ fn run_pe_raw(policy: &str, input_json: &str, entrypoint_str: &str) -> String {
         assume_unknown_input: true,
         eval_mode: evaluation_trace::EvaluationMode::PartialEval,
         unknowns: vec!["input.deployment".into()],
+        max_derivations: 1,
     });
 
     let input: Value = serde_json::from_str(input_json).unwrap();
@@ -3773,4 +3775,788 @@ fn causality_9_report_stable_across_ten_runs() {
             next
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// RG-3: every derivation of a repeated partial-set value (opt-in).
+// ---------------------------------------------------------------------------
+
+const RG3_CONSTANT_POLICY: &str = r#"package bicep
+import rego.v1
+
+deny contains msg if {
+    some r in input.resources
+    r.type == "storage"
+    not r.properties.tls
+    msg := "storage must set tls"
+}
+"#;
+
+const RG3_CONSTANT_INPUT: &str = r#"{"resources": {
+    "a": {"type": "storage", "properties": {}},
+    "b": {"type": "storage", "properties": {"tls": "1.2"}},
+    "c": {"type": "storage", "properties": {}},
+    "d": {"type": "storage", "properties": {}},
+    "e": {"type": "vault", "properties": {}}
+}}"#;
+
+fn rg3_settings(
+    condition_mode: evaluation_trace::ConditionMode,
+    max_derivations: usize,
+) -> evaluation_trace::ExplanationSettings {
+    evaluation_trace::ExplanationSettings {
+        enabled: true,
+        condition_mode,
+        value_mode: evaluation_trace::ValueMode::Full,
+        detail: evaluation_trace::ExplanationDetail::Standard,
+        max_derivations,
+        ..Default::default()
+    }
+}
+
+fn rg3_emissions(report: &serde_json::Value) -> Vec<&serde_json::Value> {
+    let rules = report["rules"].as_array().expect("report must list rules");
+    let deny = rules
+        .iter()
+        .find(|rule| rule["name"] == "data.bicep.deny")
+        .expect("deny rule must be explained");
+    deny["emissions"]
+        .as_array()
+        .expect("deny must have emissions")
+        .iter()
+        .collect()
+}
+
+/// The resource keys named, in order, by the RG-1 provenance of the deciding
+/// `not r.properties.tls` conditions of one derivation.
+fn rg3_subjects(derivation: &serde_json::Value) -> Vec<String> {
+    let conditions = derivation["conditions"]
+        .as_array()
+        .expect("derivation must carry conditions");
+    let mut subjects: Vec<String> = conditions
+        .iter()
+        .filter_map(|condition| condition["left"]["provenance"].as_str())
+        .filter_map(|path| path.strip_prefix("input.resources."))
+        .filter_map(|rest| rest.strip_suffix(".properties.tls"))
+        .map(str::to_string)
+        .collect();
+    subjects.dedup();
+    subjects
+}
+
+/// The single subject of a PrimaryOnly derivation.
+fn rg3_subject(derivation: &serde_json::Value) -> String {
+    let subjects = rg3_subjects(derivation);
+    assert_eq!(
+        subjects.len(),
+        1,
+        "each derivation must name exactly one subject: {derivation:#}"
+    );
+    subjects[0].clone()
+}
+
+fn rg3_derivation_subjects(emission: &serde_json::Value) -> Vec<String> {
+    emission["derivations"]
+        .as_array()
+        .unwrap_or_else(|| panic!("emission must carry derivations: {emission:#}"))
+        .iter()
+        .map(rg3_subject)
+        .collect()
+}
+
+#[test]
+fn rg3_repeated_constant_reports_every_derivation_in_both_condition_modes() {
+    for mode in [
+        evaluation_trace::ConditionMode::PrimaryOnly,
+        evaluation_trace::ConditionMode::AllContributing,
+    ] {
+        let (result, report) = run_rg1_case(
+            RG3_CONSTANT_POLICY,
+            RG3_CONSTANT_INPUT,
+            rg3_settings(mode, 10),
+        );
+        assert_eq!(result.as_set().unwrap().len(), 1);
+        let emissions = rg3_emissions(&report);
+        assert_eq!(emissions.len(), 1, "{mode:?}: one distinct value");
+        let emission = emissions[0];
+        assert_eq!(emission["result"], "storage must set tls");
+        let derivations = emission["derivations"].as_array().unwrap();
+        assert_eq!(derivations.len(), 3, "{mode:?}: {emission:#}");
+        if mode == evaluation_trace::ConditionMode::PrimaryOnly {
+            assert_eq!(
+                rg3_derivation_subjects(emission),
+                ["a", "c", "d"],
+                "every non-compliant resource, in trace order"
+            );
+        } else {
+            // Pre-existing: an AllContributing emission window runs from the
+            // start of the body, so it also holds earlier loop iterations.
+            // The iteration that emitted is the last one in the window.
+            let last: Vec<String> = derivations
+                .iter()
+                .map(|derivation| rg3_subjects(derivation).pop().unwrap())
+                .collect();
+            assert_eq!(last, ["a", "c", "d"]);
+            assert_eq!(rg3_subjects(&derivations[2]), ["a", "b", "c", "d"]);
+        }
+        for derivation in derivations {
+            assert_eq!(derivation["definition_index"], 0);
+        }
+        // The top-level definition is the first derivation's; its conditions
+        // are the default view, which may also carry a loop witness.
+        assert_eq!(emission["definition_index"], 0);
+        let without_witness = |conditions: &serde_json::Value| {
+            let mut conditions = conditions.clone();
+            for condition in conditions.as_array_mut().unwrap() {
+                condition.as_object_mut().unwrap().remove("witness");
+            }
+            conditions
+        };
+        assert_eq!(
+            without_witness(&emission["conditions"]),
+            emission["derivations"][0]["conditions"]
+        );
+        assert!(
+            !emission["derivations"].to_string().contains("\"witness\""),
+            "derivations carry no loop witness: {emission:#}"
+        );
+        assert!(emission.get("derivation_count").is_none(), "{emission:#}");
+        assert!(
+            emission.get("derivations_truncated").is_none(),
+            "{emission:#}"
+        );
+    }
+}
+
+#[test]
+fn rg3_equal_object_results_report_each_derivation() {
+    let policy = RG3_CONSTANT_POLICY.replace(
+        r#"msg := "storage must set tls""#,
+        r#"msg := {"code": "TLS", "severity": 2}"#,
+    );
+    let (_, report) = run_rg1_case(
+        &policy,
+        RG3_CONSTANT_INPUT,
+        rg3_settings(evaluation_trace::ConditionMode::PrimaryOnly, 10),
+    );
+    let emissions = rg3_emissions(&report);
+    assert_eq!(emissions.len(), 1);
+    assert_eq!(emissions[0]["result"]["code"], "TLS");
+    assert_eq!(rg3_derivation_subjects(emissions[0]), ["a", "c", "d"]);
+}
+
+#[test]
+fn rg3_cap_keeps_first_derivations_and_reports_total() {
+    for (max, kept, truncated) in [(2_usize, 2_usize, true), (3, 3, false), (4, 3, false)] {
+        let (_, report) = run_rg1_case(
+            RG3_CONSTANT_POLICY,
+            RG3_CONSTANT_INPUT,
+            rg3_settings(evaluation_trace::ConditionMode::PrimaryOnly, max),
+        );
+        let emission = rg3_emissions(&report)[0];
+        let subjects = rg3_derivation_subjects(emission);
+        assert_eq!(subjects.len(), kept, "max={max}: {emission:#}");
+        assert_eq!(subjects, ["a", "c", "d"][..kept], "max={max}");
+        if truncated {
+            assert_eq!(emission["derivation_count"], 3, "max={max}");
+            assert_eq!(emission["derivations_truncated"], true, "max={max}");
+        } else {
+            assert!(emission.get("derivation_count").is_none(), "max={max}");
+            assert!(emission.get("derivations_truncated").is_none(), "max={max}");
+        }
+    }
+}
+
+#[test]
+fn rg3_default_and_one_and_zero_keep_first_derivation_only() {
+    let default_settings = evaluation_trace::ExplanationSettings {
+        enabled: true,
+        value_mode: evaluation_trace::ValueMode::Full,
+        detail: evaluation_trace::ExplanationDetail::Standard,
+        ..Default::default()
+    };
+    assert_eq!(default_settings.max_derivations, 1);
+    let (_, default_report) =
+        run_rg1_case(RG3_CONSTANT_POLICY, RG3_CONSTANT_INPUT, default_settings);
+    for max in [0_usize, 1] {
+        let (_, report) = run_rg1_case(
+            RG3_CONSTANT_POLICY,
+            RG3_CONSTANT_INPUT,
+            rg3_settings(evaluation_trace::ConditionMode::PrimaryOnly, max),
+        );
+        assert_eq!(report, default_report, "max={max} must equal the default");
+    }
+    let text = default_report.to_string();
+    for field in ["derivations", "derivation_count", "derivations_truncated"] {
+        assert!(
+            !text.contains(field),
+            "default output must not mention {field}"
+        );
+    }
+    let emission = rg3_emissions(&default_report)[0];
+    // Unchanged first-derivation explanation: the first non-compliant resource.
+    let first = rg3_subject(emission);
+    assert_eq!(first, "a");
+}
+
+#[test]
+fn rg3_distinct_values_carry_one_derivation_each() {
+    let policy = RG3_CONSTANT_POLICY
+        .replace("some r in input.resources", "some k, r in input.resources")
+        .replace(
+            r#"msg := "storage must set tls""#,
+            r#"msg := sprintf("%s must set tls", [k])"#,
+        );
+    let (_, report) = run_rg1_case(
+        &policy,
+        RG3_CONSTANT_INPUT,
+        rg3_settings(evaluation_trace::ConditionMode::PrimaryOnly, 10),
+    );
+    let emissions = rg3_emissions(&report);
+    let results: Vec<&serde_json::Value> = emissions.iter().map(|e| &e["result"]).collect();
+    assert_eq!(
+        results,
+        ["a must set tls", "c must set tls", "d must set tls"],
+        "{report:#}"
+    );
+    for (emission, subject) in emissions.iter().zip(["a", "c", "d"]) {
+        assert_eq!(rg3_derivation_subjects(emission), [subject]);
+        assert!(emission.get("derivation_count").is_none());
+    }
+}
+
+#[test]
+fn rg3_two_definitions_of_the_same_value_keep_their_definition_index() {
+    let policy = r#"package bicep
+import rego.v1
+
+deny contains "dup" if {
+    input.a == 1
+}
+
+deny contains "dup" if {
+    input.b == 2
+}
+"#;
+    let (_, report) = run_rg1_case(
+        policy,
+        r#"{"a": 1, "b": 2}"#,
+        rg3_settings(evaluation_trace::ConditionMode::PrimaryOnly, 10),
+    );
+    let emissions = rg3_emissions(&report);
+    assert_eq!(emissions.len(), 1);
+    let derivations = emissions[0]["derivations"].as_array().unwrap();
+    assert_eq!(derivations.len(), 2, "{:#}", emissions[0]);
+    let paths: Vec<(&serde_json::Value, &str)> = derivations
+        .iter()
+        .map(|derivation| {
+            let path = derivation["conditions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find_map(|condition| condition["left"]["provenance"].as_str())
+                .expect("derivation must name its input");
+            (&derivation["definition_index"], path)
+        })
+        .collect();
+    assert_eq!(paths[0], (&serde_json::json!(0), "input.a"));
+    assert_eq!(paths[1], (&serde_json::json!(1), "input.b"));
+}
+
+#[test]
+fn rg3_single_emission_collects_every_derivation_of_the_target_only() {
+    let policy = r#"package bicep
+import rego.v1
+
+deny contains "other" if {
+    input.z == 1
+}
+
+deny contains msg if {
+    some r in input.resources
+    r.type == "storage"
+    not r.properties.tls
+    msg := "storage must set tls"
+}
+"#;
+    let input = r#"{"z": 1, "resources": {
+        "a": {"type": "storage", "properties": {}},
+        "c": {"type": "storage", "properties": {}}
+    }}"#;
+
+    let mut by_index = rg3_settings(evaluation_trace::ConditionMode::PrimaryOnly, 10);
+    by_index.scope = evaluation_trace::ExplanationScope::SingleEmission;
+    by_index.emission_index = Some(1);
+    let (_, report) = run_rg1_case(policy, input, by_index);
+    let emissions = rg3_emissions(&report);
+    assert_eq!(emissions.len(), 1, "{report:#}");
+    assert_eq!(emissions[0]["index"], 1);
+    assert_eq!(emissions[0]["result"], "storage must set tls");
+    assert_eq!(rg3_derivation_subjects(emissions[0]), ["a", "c"]);
+
+    let mut by_value = rg3_settings(evaluation_trace::ConditionMode::PrimaryOnly, 10);
+    by_value.scope = evaluation_trace::ExplanationScope::SingleEmission;
+    by_value.emission_value = Some(Value::from("storage must set tls"));
+    let (_, report) = run_rg1_case(policy, input, by_value);
+    let emissions = rg3_emissions(&report);
+    assert_eq!(emissions.len(), 1, "{report:#}");
+    assert_eq!(rg3_derivation_subjects(emissions[0]), ["a", "c"]);
+
+    let mut other = rg3_settings(evaluation_trace::ConditionMode::PrimaryOnly, 10);
+    other.scope = evaluation_trace::ExplanationScope::SingleEmission;
+    other.emission_index = Some(0);
+    let (_, report) = run_rg1_case(policy, input, other);
+    let emissions = rg3_emissions(&report);
+    assert_eq!(emissions.len(), 1);
+    assert_eq!(emissions[0]["result"], "other");
+    assert_eq!(emissions[0]["derivations"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn rg3_complete_rules_and_rule_summary_are_unaffected() {
+    let policy = r#"package bicep
+import rego.v1
+
+default allow := false
+
+allow if {
+    input.a == 1
+}
+
+deny contains "x" if {
+    some v in input.xs
+    v > 0
+}
+"#;
+    let input = r#"{"a": 1, "xs": [1, 2]}"#;
+    let mut summary = rg3_settings(evaluation_trace::ConditionMode::PrimaryOnly, 10);
+    summary.scope = evaluation_trace::ExplanationScope::RuleSummary;
+    let summary_with = rg5_traced_only(policy, input, summary.clone());
+    summary.max_derivations = 1;
+    let summary_without = rg5_traced_only(policy, input, summary);
+    assert_eq!(summary_with, summary_without);
+    assert!(!summary_with.to_string().contains("derivations"));
+
+    let mut engine = Engine::new();
+    engine.add_policy("rg3.rego".into(), policy.into()).unwrap();
+    let compiled = engine
+        .compile_with_entrypoint(&Rc::from("data.bicep.allow"))
+        .unwrap();
+    let program =
+        languages::rego::compiler::Compiler::compile_from_policy(&compiled, &["data.bicep.allow"])
+            .unwrap();
+    let mut vm = rvm::RegoVM::new_with_policy(compiled);
+    vm.load_program(program);
+    vm.set_explanation_settings(rg3_settings(
+        evaluation_trace::ConditionMode::PrimaryOnly,
+        10,
+    ));
+    vm.set_input(Value::from_json_str(input).unwrap());
+    let result = vm.execute_entry_point_by_name("data.bicep.allow").unwrap();
+    assert_eq!(result, Value::from(true));
+    let report = vm.take_causality_report(result).unwrap();
+    assert!(!report.contains("derivations"), "{report}");
+}
+
+#[test]
+fn rg3_exact_duplicate_derivations_are_dropped_before_counting() {
+    let policy = r#"package bicep
+import rego.v1
+
+deny contains "x" if {
+    some i in [1, 1, 2]
+    i == 1
+    input.flag
+}
+"#;
+    let (_, report) = run_rg1_case(
+        policy,
+        r#"{"flag": true}"#,
+        rg3_settings(evaluation_trace::ConditionMode::PrimaryOnly, 10),
+    );
+    let emission = rg3_emissions(&report)[0];
+    let derivations = emission["derivations"].as_array().unwrap();
+    // The two `i == 1` iterations read the same literal at the same location,
+    // so their derivations are equal and count once. Index 0 and 1 of the
+    // literal array carry no provenance that could tell them apart.
+    assert_eq!(derivations.len(), 1, "{emission:#}");
+    assert!(emission.get("derivation_count").is_none(), "{emission:#}");
+
+    // Three equal `i == 1` derivations and one distinct `i == 2` derivation:
+    // deduplicated there are 2, which fit a cap of 2. Counting before
+    // deduplicating would give 4 and report truncation.
+    let counted = policy
+        .replace("[1, 1, 2]", "[1, 1, 1, 2]")
+        .replace("i == 1", "i >= 1");
+    let (_, capped) = run_rg1_case(
+        &counted,
+        r#"{"flag": true}"#,
+        rg3_settings(evaluation_trace::ConditionMode::PrimaryOnly, 2),
+    );
+    let capped = rg3_emissions(&capped)[0];
+    assert_eq!(
+        capped["derivations"].as_array().unwrap().len(),
+        2,
+        "{capped:#}"
+    );
+    assert!(capped.get("derivations_truncated").is_none(), "{capped:#}");
+    assert!(capped.get("derivation_count").is_none(), "{capped:#}");
+}
+
+#[test]
+fn rg3_compact_detail_keeps_distinct_derivations() {
+    // With `r := input.resources[_]`, Compact keeps only the negation, whose
+    // text carries one loop-wide sample, so every derivation prints alike.
+    let policy =
+        RG3_CONSTANT_POLICY.replace("some r in input.resources", "r := input.resources[_]");
+    let mut settings = rg3_settings(evaluation_trace::ConditionMode::PrimaryOnly, 10);
+    settings.detail = evaluation_trace::ExplanationDetail::Compact;
+    let (_, report) = run_rg1_case(&policy, RG3_CONSTANT_INPUT, settings);
+    let emission = rg3_emissions(&report)[0];
+    let derivations = emission["derivations"].as_array().unwrap();
+    // They are still distinct evidence (resources a, c, d) and are all kept.
+    assert_eq!(derivations.len(), 3, "{emission:#}");
+    assert_eq!(
+        derivations[0], derivations[1],
+        "Compact output must look alike"
+    );
+    // The default view decorates Compact text with the loop witness; the
+    // per-derivation view has no witness to decorate with.
+    assert!(
+        emission["conditions"].to_string().contains("[loop:"),
+        "{emission:#}"
+    );
+    assert!(
+        !emission["derivations"].to_string().contains("[loop:"),
+        "{emission:#}"
+    );
+    assert!(derivations[0]["conditions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|condition| condition.get("left").is_none()));
+    assert!(
+        emission.get("derivations_truncated").is_none(),
+        "{emission:#}"
+    );
+}
+
+#[test]
+fn rg3_redacted_secret_paths_keep_derivations_distinct() {
+    let policy = RG3_CONSTANT_POLICY
+        .replace("r.properties.tls", "r.properties.password")
+        .replace("storage must set tls", "storage must set a password");
+    let mut settings = rg3_settings(evaluation_trace::ConditionMode::PrimaryOnly, 10);
+    settings.value_mode = evaluation_trace::ValueMode::Redacted;
+    let input = RG3_CONSTANT_INPUT.replace(r#""tls": "1.2""#, r#""password": "hunter2""#);
+    let (_, report) = run_rg1_case(&policy, &input, settings);
+    let emission = rg3_emissions(&report)[0];
+    let paths: Vec<&str> = emission["derivations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|derivation| {
+            derivation["conditions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|condition| condition["left"]["provenance"].as_str())
+                .find(|path| path.ends_with(".properties.password"))
+                .expect("derivation must name the password path")
+        })
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            "input.resources.a.properties.password",
+            "input.resources.c.properties.password",
+            "input.resources.d.properties.password"
+        ]
+    );
+}
+
+#[test]
+fn rg3_redacted_derivations_sanitize_secrets_nested_in_unary_operands() {
+    // Only `c`, a middle derivation, nests a secret. The `some r` binding
+    // carries the whole resource as a single operand.
+    let input = r#"{"resources": {
+        "a": {"type": "storage", "properties": {}},
+        "b": {"type": "storage", "properties": {"tls": "1.2"}},
+        "c": {"type": "storage", "properties": {}, "auth": {"password": "hunter2"}},
+        "d": {"type": "storage", "properties": {}}
+    }}"#;
+    for (value_mode, exposed) in [
+        (evaluation_trace::ValueMode::Full, true),
+        (evaluation_trace::ValueMode::Redacted, false),
+    ] {
+        let mut settings = rg3_settings(evaluation_trace::ConditionMode::PrimaryOnly, 10);
+        settings.value_mode = value_mode;
+        let (_, report) = run_rg1_case(RG3_CONSTANT_POLICY, input, settings);
+        let emission = rg3_emissions(&report)[0];
+        assert_eq!(rg3_derivation_subjects(emission), ["a", "c", "d"]);
+        let derivations = emission["derivations"].to_string();
+        assert_eq!(
+            derivations.contains("hunter2"),
+            exposed,
+            "{value_mode:?}: {derivations}"
+        );
+        if !exposed {
+            let binding = emission["derivations"][1]["conditions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|condition| condition["left"]["provenance"] == "input.resources.c")
+                .expect("c's derivation binds the resource");
+            assert_eq!(binding["left"]["redacted"], true);
+            assert_eq!(binding["left"]["value"]["auth"]["password"], "<redacted>");
+            assert_eq!(binding["left"]["value"]["type"], "storage");
+        }
+    }
+}
+
+#[test]
+fn rg3_partial_object_rules_carry_no_derivations() {
+    let policy = r#"package bicep
+import rego.v1
+
+deny[k] := "must set tls" if {
+    some k, r in input.resources
+    not r.properties.tls
+}
+"#;
+    let report = rg5_traced_only(
+        policy,
+        RG3_CONSTANT_INPUT,
+        rg3_settings(evaluation_trace::ConditionMode::PrimaryOnly, 10),
+    );
+    let rule = &report["rules"][0];
+    assert_eq!(rule["type"], "partial_object", "{report:#}");
+    // Only partial-set rules report emissions, so there is nothing to expand.
+    assert_eq!(rule["result"].as_object().map(|m| m.len()), Some(4));
+    assert!(rule.get("emissions").is_none(), "{report:#}");
+    assert!(!report.to_string().contains("derivation"), "{report:#}");
+}
+#[test]
+fn rg3_exhausted_value_capture_marks_derivations_incomplete() {
+    let policy = r#"package bicep
+import rego.v1
+
+deny contains "nonnegative" if {
+    some v in input.xs
+    v >= 0
+}
+"#;
+    // Ten matches, then enough failing comparisons (each capturing operands) to
+    // exhaust the value table, then ten more matches whose emitted values can
+    // no longer be captured.
+    let mut xs = vec!["0"; 10];
+    xs.extend(vec!["-1"; 40_000]);
+    xs.extend(vec!["0"; 10]);
+    let input = format!(r#"{{"xs": [{}]}}"#, xs.join(","));
+    let mut engine = Engine::new();
+    engine.add_policy("rg3.rego".into(), policy.into()).unwrap();
+    let compiled = engine
+        .compile_with_entrypoint(&Rc::from("data.bicep.deny"))
+        .unwrap();
+    let program =
+        languages::rego::compiler::Compiler::compile_from_policy(&compiled, &["data.bicep.deny"])
+            .unwrap();
+    // A cap above the number found shows truncation is reported for the
+    // incomplete trace itself, not just for exceeding the cap.
+    for cap in [5_usize, 100] {
+        let mut vm = rvm::RegoVM::new_with_policy(compiled.clone());
+        vm.load_program(program.clone());
+        vm.set_max_instructions(usize::MAX);
+        vm.set_explanation_settings(rg3_settings(
+            evaluation_trace::ConditionMode::PrimaryOnly,
+            cap,
+        ));
+        vm.set_input(Value::from_json_str(&input).unwrap());
+        let result = vm.execute_entry_point_by_name("data.bicep.deny").unwrap();
+        let report: serde_json::Value =
+            serde_json::from_str(&vm.take_causality_report(result).unwrap()).unwrap();
+        let emission = rg3_emissions(&report)[0];
+        assert_eq!(emission["result"], "nonnegative");
+        // Only the ten derivations recorded before the table filled are found.
+        assert_eq!(emission["derivation_count"], 10, "cap {cap}");
+        assert_eq!(emission["derivations_truncated"], true, "cap {cap}");
+        let kept = emission["derivations"].as_array().unwrap().len();
+        assert_eq!(kept, cap.min(10), "cap {cap}");
+    }
+}
+#[test]
+fn rg3_duplicates_beyond_the_cap_are_counted_once() {
+    let policy = r#"package bicep
+import rego.v1
+
+deny contains "x" if {
+    some i in [1, 2, 1, 3, 3]
+    i >= 1
+    input.flag
+}
+"#;
+    let (_, report) = run_rg1_case(
+        policy,
+        r#"{"flag": true}"#,
+        rg3_settings(evaluation_trace::ConditionMode::PrimaryOnly, 2),
+    );
+    let emission = rg3_emissions(&report)[0];
+    // Distinct derivations: i = 1, 2, 3. The repeated 1 matches a kept entry;
+    // the repeated 3 matches one past the cap.
+    assert_eq!(emission["derivations"].as_array().unwrap().len(), 2);
+    assert_eq!(emission["derivation_count"], 3, "{emission:#}");
+    assert_eq!(emission["derivations_truncated"], true);
+}
+
+#[test]
+fn rg3_unrelated_capture_exhaustion_keeps_deduplication() {
+    let policy = r#"package bicep
+import rego.v1
+
+deny contains "x" if {
+    some i in [1, 1, 2]
+    i == 1
+    input.flag
+}
+
+deny contains "x" if {
+    some n in input.padding
+    n == -1
+}
+"#;
+    let padding = vec!["0"; 40_000].join(",");
+    let input = format!(r#"{{"flag": true, "padding": [{padding}]}}"#);
+    let mut engine = Engine::new();
+    engine.add_policy("rg3.rego".into(), policy.into()).unwrap();
+    let compiled = engine
+        .compile_with_entrypoint(&Rc::from("data.bicep.deny"))
+        .unwrap();
+    let program =
+        languages::rego::compiler::Compiler::compile_from_policy(&compiled, &["data.bicep.deny"])
+            .unwrap();
+    let mut vm = rvm::RegoVM::new_with_policy(compiled);
+    vm.load_program(program);
+    vm.set_max_instructions(usize::MAX);
+    vm.set_explanation_settings(rg3_settings(
+        evaluation_trace::ConditionMode::PrimaryOnly,
+        2,
+    ));
+    vm.set_input(Value::from_json_str(&input).unwrap());
+    let result = vm.execute_entry_point_by_name("data.bicep.deny").unwrap();
+    let report: serde_json::Value =
+        serde_json::from_str(&vm.take_causality_report(result).unwrap()).unwrap();
+    let emission = rg3_emissions(&report)[0];
+    // The second definition fills the value table but never emits, so the
+    // first definition's two equal derivations are still one.
+    assert_eq!(
+        emission["derivations"].as_array().unwrap().len(),
+        1,
+        "{emission:#}"
+    );
+    assert!(
+        emission.get("derivations_truncated").is_none(),
+        "{emission:#}"
+    );
+    assert!(emission.get("derivation_count").is_none(), "{emission:#}");
+}
+
+#[test]
+fn rg3_fingerprint_distinguishes_arrays_from_sets_beyond_the_cap() {
+    let policy = r#"package bicep
+import rego.v1
+
+deny contains "x" if {
+    some i in [0, 1, [2], {2}]
+    i != null
+    input.flag
+}
+"#;
+    let (_, report) = run_rg1_case(
+        policy,
+        r#"{"flag": true}"#,
+        rg3_settings(evaluation_trace::ConditionMode::PrimaryOnly, 2),
+    );
+    let emission = rg3_emissions(&report)[0];
+    // `[2]` and `{2}` serialize to the same JSON but are different values, so
+    // the two derivations past the cap are both counted.
+    assert_eq!(emission["derivation_count"], 4, "{emission:#}");
+    assert_eq!(emission["derivations_truncated"], true);
+    assert_eq!(emission["derivations"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn rg3_fingerprint_counts_large_integers_exactly_and_equal_numbers_once() {
+    // Past a cap of 2: two integers beyond 64 bits that JSON rounds to the same
+    // f64 are distinct; `2` and `2.0` are equal numbers and count once.
+    for (values, expected) in [
+        ("[0, 1, 18446744073709551616, 18446744073709551617]", 4),
+        ("[0, 1, 2, 2.0]", 3),
+    ] {
+        let policy = format!(
+            "package bicep\nimport rego.v1\n\ndeny contains \"x\" if {{\n    some i in {values}\n    i != null\n    input.flag\n}}\n"
+        );
+        let (_, report) = run_rg1_case(
+            &policy,
+            r#"{"flag": true}"#,
+            rg3_settings(evaluation_trace::ConditionMode::PrimaryOnly, 2),
+        );
+        let emission = rg3_emissions(&report)[0];
+        assert_eq!(
+            emission["derivation_count"], expected,
+            "{values}: {emission:#}"
+        );
+        assert_eq!(emission["derivations_truncated"], true, "{values}");
+    }
+}
+
+#[test]
+fn rg3_compact_detail_counts_distinct_derivations_beyond_the_cap() {
+    let policy =
+        RG3_CONSTANT_POLICY.replace("some r in input.resources", "r := input.resources[_]");
+    let input = r#"{"resources": {
+        "a": {"type": "storage", "properties": {}},
+        "c": {"type": "storage", "properties": {}},
+        "d": {"type": "storage", "properties": {}},
+        "f": {"type": "storage", "properties": {}}
+    }}"#;
+    let mut settings = rg3_settings(evaluation_trace::ConditionMode::PrimaryOnly, 2);
+    settings.detail = evaluation_trace::ExplanationDetail::Compact;
+    let (_, report) = run_rg1_case(&policy, input, settings);
+    let emission = rg3_emissions(&report)[0];
+    // The two derivations past the cap print like the kept ones but are
+    // distinct resources, so the fingerprint must use the unstripped view.
+    assert_eq!(emission["derivations"].as_array().unwrap().len(), 2);
+    assert_eq!(emission["derivation_count"], 4, "{emission:#}");
+}
+
+#[test]
+fn rg3_derivations_carry_no_loop_witness_from_inner_loops() {
+    let policy = r#"package bicep
+import rego.v1
+
+deny contains "ports are positive" if {
+    some r in input.resources
+    every p in r.ports {
+        p > 0
+    }
+}
+"#;
+    let input = r#"{"resources": {"a": {"ports": [1, 2]}, "b": {"ports": [3]}}}"#;
+    let (_, report) = run_rg1_case(
+        policy,
+        input,
+        rg3_settings(evaluation_trace::ConditionMode::AllContributing, 10),
+    );
+    let emission = rg3_emissions(&report)[0];
+    // The `every` loop finishes inside each window, so the default view
+    // carries its witness; the derivations do not.
+    assert!(
+        emission["conditions"].to_string().contains("\"witness\""),
+        "{emission:#}"
+    );
+    assert_eq!(emission["derivations"].as_array().unwrap().len(), 2);
+    assert!(
+        !emission["derivations"].to_string().contains("\"witness\""),
+        "{emission:#}"
+    );
 }

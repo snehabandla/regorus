@@ -618,6 +618,15 @@ impl RegoVM {
         self.explanation_settings = settings;
     }
 
+    /// Set [`ExplanationSettings::max_derivations`] on the current settings.
+    ///
+    /// [`set_explanation_settings`](Self::set_explanation_settings) replaces
+    /// every setting, including this one, so call this afterwards.
+    #[cfg(feature = "explanations")]
+    pub const fn set_explanation_max_derivations(&mut self, max_derivations: usize) {
+        self.explanation_settings.max_derivations = max_derivations;
+    }
+
     /// Take the causality report for the most recent evaluation.
     ///
     /// Returns a JSON string. Clears the internal trace.

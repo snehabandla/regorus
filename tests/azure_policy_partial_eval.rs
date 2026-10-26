@@ -162,6 +162,7 @@ fn settings(eval_mode: EvaluationMode, unknowns: Vec<String>) -> ExplanationSett
         assume_unknown_input: true,
         eval_mode,
         unknowns,
+        max_derivations: 1,
     }
 }
 

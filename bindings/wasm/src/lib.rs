@@ -544,6 +544,7 @@ impl Rvm {
                 emission_value: None,
                 eval_mode: mode,
                 unknowns: unknown_paths,
+                max_derivations: 1,
             });
         Ok(())
     }

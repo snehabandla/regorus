@@ -95,6 +95,14 @@ pub struct ExplanationSettings {
     /// Default: `["input"]`. A path is considered unknown if it equals
     /// or is a child of any entry (e.g. `"input"` matches `"input.foo"`).
     pub unknowns: Vec<String>,
+    /// Maximum number of distinct derivations reported per repeated
+    /// partial-set value. A partial-set value can be produced by several
+    /// derivations (for example a constant message emitted once per
+    /// non-compliant resource). With the default `1`, each emission explains
+    /// only its first derivation and the report is unchanged. With a larger
+    /// value, every emission also carries a `derivations` list of up to this
+    /// many distinct derivations in trace order. `0` is treated as `1`.
+    pub max_derivations: usize,
 }
 
 impl Default for ExplanationSettings {
@@ -110,6 +118,7 @@ impl Default for ExplanationSettings {
             assume_unknown_input: false,
             eval_mode: EvaluationMode::default(),
             unknowns: vec![String::from("input")],
+            max_derivations: 1,
         }
     }
 }

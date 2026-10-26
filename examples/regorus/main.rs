@@ -132,6 +132,7 @@ fn build_explanation_settings(
         assume_unknown_input,
         eval_mode: eval_mode_setting,
         unknowns: unknowns_list,
+        max_derivations: 1,
     })
 }
 

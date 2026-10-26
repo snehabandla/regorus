@@ -157,3 +157,8 @@ pub(crate) fn is_poisoned() -> bool {
 pub(crate) fn reset_poison() {
     POISONED.store(false, Ordering::Release);
 }
+
+/// Serializes tests that trip or depend on the process-global poison flag.
+/// A poisoning test makes every concurrent FFI call fail until it resets.
+#[cfg(all(test, feature = "std"))]
+pub(crate) static FFI_GLOBAL_STATE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

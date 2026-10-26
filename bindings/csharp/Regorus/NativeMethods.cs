@@ -223,6 +223,12 @@ namespace Regorus.Internal
         internal static extern RegorusResult regorus_rvm_set_explanation_settings(RegorusRvm* vm, [MarshalAs(UnmanagedType.U1)] bool enabled, byte value_mode, byte condition_mode, byte scope_mode, byte detail_mode, [MarshalAs(UnmanagedType.U1)] bool has_emission_index, uint emission_index, [MarshalAs(UnmanagedType.U1)] bool has_emission_value, byte* emission_value_json, [MarshalAs(UnmanagedType.U1)] bool assume_unknown_input, byte eval_mode, byte** unknowns, UIntPtr unknowns_len);
 
         /// <summary>
+        /// Set the maximum number of distinct derivations reported per repeated partial-set value.
+        /// </summary>
+        [DllImport(LibraryName, EntryPoint = "regorus_rvm_set_explanation_max_derivations", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern RegorusResult regorus_rvm_set_explanation_max_derivations(RegorusRvm* vm, UIntPtr max_derivations);
+
+        /// <summary>
         /// Take the partial-evaluation result from the most recent RVM evaluation as JSON.
         /// </summary>
         [DllImport(LibraryName, EntryPoint = "regorus_rvm_take_partial_eval_result", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]

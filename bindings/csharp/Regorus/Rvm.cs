@@ -289,6 +289,28 @@ namespace Regorus
         }
 
         /// <summary>
+        /// Set the maximum number of distinct derivations reported per repeated partial-set value.
+        /// </summary>
+        /// <remarks>
+        /// The default, 1, explains only the first derivation of each emitted value. With a larger
+        /// value, each emission in the causality report also carries a <c>derivations</c> list (for
+        /// example one entry per resource that produced the same constant message), plus
+        /// <c>derivation_count</c> and <c>derivations_truncated</c> when the list was cut. 0 is
+        /// treated as 1. <see cref="SetExplanationSettings"/> resets this to 1, so call this afterwards.
+        /// Values above the native pointer size are clamped to its maximum. Keep the cap small:
+        /// comparing a derivation against the kept ones is linear in the cap.
+        /// </remarks>
+        public void SetExplanationMaxDerivations(ulong maxDerivations)
+        {
+            var clamped = UIntPtr.Size == 4 ? Math.Min(maxDerivations, uint.MaxValue) : maxDerivations;
+            UseHandle(vmPtr =>
+            {
+                CheckAndDropResult(API.regorus_rvm_set_explanation_max_derivations((RegorusRvm*)vmPtr, new UIntPtr(clamped)));
+                return 0;
+            });
+        }
+
+        /// <summary>
         /// Take the causality report from the most recent evaluation as JSON.
         /// </summary>
         public string? TakeCausalityReport()

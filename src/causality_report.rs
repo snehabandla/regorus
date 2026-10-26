@@ -313,6 +313,35 @@ pub struct EmissionExplanation {
     pub result: Value,
     /// Conditions active when the value was emitted.
     pub conditions: Vec<ConditionExplanation>,
+    /// Every distinct derivation of `result`, in trace order and including the
+    /// first, in the per-derivation view: conditions carry no loop witness,
+    /// and under `Redacted` nested secrets are sanitized in every operand. The
+    /// top-level `definition_index` is the first derivation's; the top-level
+    /// `conditions` are its default view. Present only when
+    /// `ExplanationSettings::max_derivations` is greater than one; holds at
+    /// most that many entries.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub derivations: Vec<DerivationExplanation>,
+    /// Number of distinct derivations found for `result`. Present only with
+    /// `derivations_truncated`. Approximate when the list is incomplete
+    /// (value capture exhausted, or a derivation could not be fingerprinted).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derivation_count: Option<usize>,
+    /// `true` when `derivations` was cut to `max_derivations`, or when the
+    /// list may be incomplete.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub derivations_truncated: bool,
+}
+
+/// One derivation of an emitted partial-set value: the definition that
+/// produced it and the conditions active when it was emitted. Two derivations
+/// are distinct unless both the definition and every condition are equal.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DerivationExplanation {
+    /// Definition that produced this derivation.
+    pub definition_index: u16,
+    /// Conditions active when this derivation emitted the value.
+    pub conditions: Vec<ConditionExplanation>,
 }
 
 /// Explanation for a single rule definition body.
@@ -330,7 +359,7 @@ pub struct DefinitionExplanation {
 }
 
 /// A single condition evaluation.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ConditionExplanation {
     /// Source text of the condition.
     pub text: String,
@@ -405,7 +434,7 @@ const fn is_false(b: &bool) -> bool {
 }
 
 /// Witness summary for a loop-backed condition.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LoopWitnessExplanation {
     pub total_iterations: u32,
     pub success_count: u32,
@@ -416,7 +445,7 @@ pub struct LoopWitnessExplanation {
 }
 
 /// An operand value with optional provenance.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct OperandExplanation {
     /// The runtime value (may be redacted).
     pub value: Value,
@@ -446,7 +475,7 @@ pub struct OperandExplanation {
 }
 
 /// Source location.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SourceLocation {
     pub file: String,
     pub row: usize,
@@ -1558,7 +1587,11 @@ fn materialize_rule_emissions(
                 program,
                 trace,
                 settings,
+                false,
             ),
+            derivations: Vec::new(),
+            derivation_count: None,
+            derivations_truncated: false,
         });
 
         emission_index = emission_index.saturating_add(1);
@@ -1568,9 +1601,233 @@ fn materialize_rule_emissions(
         }
     }
 
+    if settings.max_derivations > 1 {
+        for explanation in &mut emissions {
+            attach_derivations(explanation, rule_idx, program, trace, settings);
+        }
+    }
+
     emissions
 }
 
+/// Fill `explanation.derivations` with every distinct derivation of its value.
+///
+/// The trace records an emission each time a body adds a value to the set,
+/// including values already present, so every derivation is available here.
+/// Derivations use the per-derivation view of their window (no loop witness;
+/// under `Redacted`, nested secrets sanitized in every operand).
+///
+/// Exact duplicates (same definition and equal conditions as presented) add no
+/// evidence and are dropped before counting. Equality is judged on conditions
+/// materialized at `Standard` detail even when the report is `Compact`,
+/// because `Compact` strips the operands that tell derivations apart; values
+/// hidden by redaction, operand truncation or `PrimaryOnly` filtering are not
+/// compared.
+///
+/// Only the first `max_derivations` distinct derivations are kept. Every later
+/// derivation is still materialized, one at a time, to tell whether it is
+/// distinct, and a 128-bit fingerprint is kept for each distinct one, so memory
+/// grows by 16 bytes per distinct derivation past the cap and time grows with
+/// the derivations' window sizes. Exact comparison against kept derivations
+/// is linear in the cap, so a very large cap is quadratic in the number of
+/// derivations.
+///
+/// The list is marked incomplete (`derivations_truncated`, with
+/// `derivation_count` approximate) when an emission of the rule has no
+/// captured value, which happens only once the trace's value capacity is
+/// exhausted, and when a derivation past the cap cannot be fingerprinted.
+fn attach_derivations(
+    explanation: &mut EmissionExplanation,
+    rule_idx: u16,
+    program: &Program,
+    trace: &EvaluationTrace,
+    settings: &ExplanationSettings,
+) {
+    let identity_settings = (settings.detail == ExplanationDetail::Compact).then(|| {
+        let mut identity = settings.clone();
+        identity.detail = ExplanationDetail::Standard;
+        identity
+    });
+    let mut kept: Vec<DerivationExplanation> = Vec::new();
+    let mut kept_identities: Vec<DerivationExplanation> = Vec::new();
+    let mut overflow: alloc::collections::BTreeSet<u128> = alloc::collections::BTreeSet::new();
+    let mut total = 0_usize;
+    let mut incomplete = false;
+
+    for emission in trace
+        .emission_outcomes
+        .iter()
+        .filter(|outcome| outcome.rule_index == rule_idx)
+    {
+        let Some(value) = emission.value_idx.and_then(|idx| trace.get_value(idx)) else {
+            // The value was not captured, so this may be a derivation of it.
+            incomplete = true;
+            continue;
+        };
+        if *value != explanation.result {
+            continue;
+        }
+
+        let window = |window_settings: &ExplanationSettings| DerivationExplanation {
+            definition_index: emission.definition_index,
+            conditions: materialize_condition_window(
+                emission.condition_start_index,
+                emission.condition_end_index,
+                emission.rule_index,
+                program,
+                trace,
+                window_settings,
+                true,
+            ),
+        };
+        let candidate = window(settings);
+        let identity = identity_settings.as_ref().map(window);
+        let key = identity.as_ref().unwrap_or(&candidate);
+
+        let compared = if identity_settings.is_some() {
+            &kept_identities
+        } else {
+            &kept
+        };
+        if compared.contains(key) {
+            continue;
+        }
+        if kept.len() < settings.max_derivations {
+            total = total.saturating_add(1);
+            kept_identities.extend(identity);
+            kept.push(candidate);
+            continue;
+        }
+        match derivation_fingerprint(key) {
+            Some(print) => {
+                if overflow.insert(print) {
+                    total = total.saturating_add(1);
+                }
+            }
+            None => {
+                total = total.saturating_add(1);
+                incomplete = true;
+            }
+        }
+    }
+
+    if incomplete || total > settings.max_derivations {
+        explanation.derivation_count = Some(total);
+        explanation.derivations_truncated = true;
+    }
+    explanation.derivations = kept;
+}
+/// 128-bit FNV-1a fingerprint of a derivation, used only to recognize
+/// duplicates beyond the retained cap.
+///
+/// The derivation's JSON carries its content, but JSON is not an equality
+/// encoding of `Value` (arrays and sets serialize alike, as do number and
+/// string object keys; `Undefined` is rendered as a string; integers beyond
+/// 64 bits are rounded). A type-tag stream over every `Value` in the
+/// derivation, with exact number content, is hashed too, so equal
+/// fingerprints mean equal content and shape. Number content follows
+/// `Number` equality except for integral floats beyond 2^53 compared with big
+/// integers, where `Number` equality itself is lossy, and `-0.0`, which equals
+/// `0` but prints differently (so it can count once more). A remaining hash
+/// collision can at worst undercount `derivation_count`; it never changes
+/// which derivations are reported.
+fn derivation_fingerprint(derivation: &DerivationExplanation) -> Option<u128> {
+    let mut hash = Fnv128::new();
+    hash.write(&serde_json::to_vec(derivation).ok()?);
+    for condition in &derivation.conditions {
+        hash_condition_value_types(&mut hash, condition);
+    }
+    Some(hash.0)
+}
+
+struct Fnv128(u128);
+
+impl Fnv128 {
+    const fn new() -> Self {
+        Self(0x6c62_272e_07bb_0142_62b8_2175_6295_c58d)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+        for byte in bytes {
+            self.0 = (self.0 ^ u128::from(*byte)).wrapping_mul(PRIME);
+        }
+    }
+}
+
+fn hash_condition_value_types(hash: &mut Fnv128, condition: &ConditionExplanation) {
+    for operand in [&condition.left, &condition.right].into_iter().flatten() {
+        hash_value_type(hash, &operand.value);
+    }
+    if let Some(witness) = &condition.witness {
+        for value in [&witness.sample_key, &witness.sample_value]
+            .into_iter()
+            .flatten()
+        {
+            hash_value_type(hash, value);
+        }
+    }
+    hash.write(b"(");
+    for helper in &condition.helper_conditions {
+        hash_condition_value_types(hash, helper);
+    }
+    hash.write(b")");
+}
+
+/// Hash the variant structure of `value`, plus exact number content (the JSON
+/// rounds large integers). Other content is covered by the JSON. The walk is
+/// iterative, so nesting depth neither overflows the stack
+/// nor truncates the structure.
+fn hash_value_type(hash: &mut Fnv128, root: &Value) {
+    enum Step<'a> {
+        Value(&'a Value),
+        Close(&'static [u8]),
+    }
+
+    let mut stack = alloc::vec![Step::Value(root)];
+    while let Some(step) = stack.pop() {
+        let current = match step {
+            Step::Close(tag) => {
+                hash.write(tag);
+                continue;
+            }
+            Step::Value(current) => current,
+        };
+        match current {
+            Value::Null => hash.write(b"n"),
+            Value::Bool(_) => hash.write(b"b"),
+            Value::Number(number) => {
+                // JSON rounds integers beyond 64 bits through f64, so hash the
+                // exact decimal form; equal numbers share it.
+                hash.write(b"#");
+                hash.write(number.format_decimal().as_bytes());
+                hash.write(b";");
+            }
+            Value::String(_) => hash.write(b"s"),
+            Value::Undefined => hash.write(b"u"),
+            Value::Array(items) => {
+                hash.write(b"[");
+                stack.push(Step::Close(b"]"));
+                stack.extend(items.iter().rev().map(Step::Value));
+            }
+            Value::Set(items) => {
+                hash.write(b"<");
+                stack.push(Step::Close(b">"));
+                let items: Vec<&Value> = items.iter().collect();
+                stack.extend(items.into_iter().rev().map(Step::Value));
+            }
+            Value::Object(fields) => {
+                hash.write(b"{");
+                stack.push(Step::Close(b"}"));
+                let fields: Vec<(&Value, &Value)> = fields.iter().collect();
+                for (key, field) in fields.into_iter().rev() {
+                    stack.push(Step::Value(field));
+                    stack.push(Step::Value(key));
+                }
+            }
+        }
+    }
+}
 fn materialize_conditions(
     first_pc: u32,
     last_pc: u32,
@@ -1696,6 +1953,7 @@ fn collect_helper_condition_outcomes(
 /// cap. Detection deliberately runs *before* the cap check so the two empty
 /// cases stay distinguishable: no helper call at all reports `false`, while a
 /// real helper we declined to expand reports `true`.
+#[allow(clippy::too_many_arguments)]
 fn materialize_helper_conditions(
     outer_pc: usize,
     outer_outcome_idx: usize,
@@ -1704,6 +1962,7 @@ fn materialize_helper_conditions(
     trace: &EvaluationTrace,
     settings: &ExplanationSettings,
     depth: usize,
+    per_derivation: bool,
 ) -> (Vec<ConditionExplanation>, bool) {
     let Some(helper_rule_index) = detect_helper_call_at_guard(outer_pc, program) else {
         return (Vec::new(), false);
@@ -1726,6 +1985,7 @@ fn materialize_helper_conditions(
         trace,
         settings,
         depth.saturating_add(1),
+        per_derivation,
     );
 
     // Rewrite each inner condition's `text` to just the helper body
@@ -1957,6 +2217,9 @@ fn derive_left_provenance_from_helper(
     }
 }
 
+/// Materialize the conditions of one emission window. `per_derivation`
+/// selects the view used for `derivations`: no loop witnesses, and nested
+/// secrets sanitized in every operand under `Redacted`.
 fn materialize_condition_window(
     condition_start_index: u32,
     condition_end_index: u32,
@@ -1964,6 +2227,7 @@ fn materialize_condition_window(
     program: &Program,
     trace: &EvaluationTrace,
     settings: &ExplanationSettings,
+    per_derivation: bool,
 ) -> Vec<ConditionExplanation> {
     let relevant_outcomes = select_condition_outcomes_in_window(
         condition_start_index,
@@ -1982,7 +2246,14 @@ fn materialize_condition_window(
         .collect();
 
     finalize_condition_explanations(
-        materialize_condition_explanations(outer_only, program, trace, settings),
+        materialize_condition_explanations_at_depth(
+            outer_only,
+            program,
+            trace,
+            settings,
+            0,
+            per_derivation,
+        ),
         settings,
         true,
     )
@@ -2133,7 +2404,14 @@ fn materialize_condition_explanations(
     trace: &EvaluationTrace,
     settings: &ExplanationSettings,
 ) -> Vec<ConditionExplanation> {
-    materialize_condition_explanations_at_depth(relevant_outcomes, program, trace, settings, 0)
+    materialize_condition_explanations_at_depth(
+        relevant_outcomes,
+        program,
+        trace,
+        settings,
+        0,
+        false,
+    )
 }
 
 /// Recursion-aware variant. Callers that materialize helper inner
@@ -2145,6 +2423,7 @@ fn materialize_condition_explanations_at_depth(
     trace: &EvaluationTrace,
     settings: &ExplanationSettings,
     depth: usize,
+    per_derivation: bool,
 ) -> Vec<ConditionExplanation> {
     let mut conditions: Vec<ConditionExplanation> = Vec::new();
 
@@ -2176,8 +2455,14 @@ fn materialize_condition_explanations_at_depth(
             "failure"
         };
 
-        let (left, right) = materialize_operands(outcome, static_info, trace, settings);
-        let witness = materialize_loop_witness(outcome, trace);
+        let (left, right) =
+            materialize_operands(outcome, static_info, trace, settings, per_derivation);
+        // A loop witness summarizes a whole loop, not one derivation of it.
+        let witness = if per_derivation {
+            None
+        } else {
+            materialize_loop_witness(outcome, trace)
+        };
         let binding_name = static_info.and_then(|i| i.binding_name.clone());
         let builtin_name = static_info.and_then(|i| i.builtin_name.clone());
         let negated = static_info.map(|i| i.negated).unwrap_or(false);
@@ -2194,6 +2479,7 @@ fn materialize_condition_explanations_at_depth(
             trace,
             settings,
             depth,
+            per_derivation,
         );
 
         // Derive outer `left.provenance` from the last failed helper inner
@@ -2223,9 +2509,10 @@ fn materialize_condition_explanations_at_depth(
         });
     }
 
-    if conditions
-        .iter()
-        .all(|condition| condition.witness.is_none())
+    if !per_derivation
+        && conditions
+            .iter()
+            .all(|condition| condition.witness.is_none())
     {
         if let Some(witness) = materialize_fallback_loop_witness(&relevant_outcomes, trace) {
             if let Some(last) = conditions.last_mut() {
@@ -2384,6 +2671,7 @@ fn materialize_operands(
     static_info: Option<&crate::static_provenance::StaticConditionInfo>,
     trace: &EvaluationTrace,
     settings: &ExplanationSettings,
+    per_derivation: bool,
 ) -> (Option<OperandExplanation>, Option<OperandExplanation>) {
     let actual = outcome
         .actual_value_idx
@@ -2445,7 +2733,10 @@ fn materialize_operands(
         } else {
             (v, None)
         };
-        if redact && paired {
+        // Derivations expose iterations the default report never shows, so
+        // they sanitize unary operands (whole-object bindings, existence
+        // guards) as well.
+        if redact && (paired || per_derivation) {
             if let Some(sanitized) = redact_nested_secrets(&v, 0) {
                 return (sanitized, true, length.is_some(), length);
             }
@@ -2588,6 +2879,7 @@ mod tests {
             assume_unknown_input: false,
             eval_mode: crate::evaluation_trace::EvaluationMode::Causality,
             unknowns: vec![alloc::string::String::from("input")],
+            max_derivations: 1,
         }
     }
 
@@ -3570,6 +3862,7 @@ mod tests {
             Some(&comparison),
             &trace,
             &settings(ConditionMode::PrimaryOnly),
+            false,
         );
         let left = left.unwrap();
         assert!(right.is_none());
@@ -3582,6 +3875,7 @@ mod tests {
             None,
             &trace,
             &settings(ConditionMode::PrimaryOnly),
+            false,
         );
         assert!(!single.unwrap().redacted);
     }
@@ -3664,5 +3958,92 @@ mod tests {
         let deduped = dedupe_emission_conditions(conditions);
 
         assert_eq!(deduped.len(), 2);
+    }
+
+    #[test]
+    fn derivation_fingerprint_separates_nested_arrays_and_sets() {
+        use super::{derivation_fingerprint, DerivationExplanation};
+
+        fn two() -> Value {
+            Value::from_json_str("2").unwrap()
+        }
+        fn nest(mut value: Value, depth: usize) -> Value {
+            for _ in 0..depth {
+                let mut array = Value::new_array();
+                array.as_array_mut().unwrap().push(value);
+                value = array;
+            }
+            value
+        }
+        fn array_of_two() -> Value {
+            let mut array = Value::new_array();
+            array.as_array_mut().unwrap().push(two());
+            array
+        }
+        fn set_of_two() -> Value {
+            let mut set = Value::new_set();
+            set.as_set_mut().unwrap().insert(two());
+            set
+        }
+        fn derivation(value: Value) -> DerivationExplanation {
+            DerivationExplanation {
+                definition_index: 0,
+                conditions: vec![ConditionExplanation {
+                    text: "i != null".into(),
+                    outcome: "success".into(),
+                    location: None,
+                    kind: "comparison".into(),
+                    operator: Some("!=".into()),
+                    left: Some(OperandExplanation {
+                        value,
+                        provenance: None,
+                        absent: false,
+                        truncated: false,
+                        length: None,
+                        redacted: false,
+                        source_alias: None,
+                    }),
+                    right: None,
+                    witness: None,
+                    binding_name: None,
+                    builtin_name: None,
+                    negated: false,
+                    scopes: Vec::new(),
+                    helper_conditions: Vec::new(),
+                    helper_conditions_truncated: false,
+                }],
+            }
+        }
+
+        // Equal numbers share a fingerprint whatever their representation.
+        for (left, right) in [("2", "2.0"), ("1e2", "100")] {
+            let left = Value::from_json_str(left).unwrap();
+            let right = Value::from_json_str(right).unwrap();
+            assert_eq!(left, right);
+            assert_eq!(
+                derivation_fingerprint(&derivation(left)),
+                derivation_fingerprint(&derivation(right))
+            );
+        }
+
+        for depth in [0_usize, 64, 300] {
+            let array = derivation(nest(array_of_two(), depth));
+            let set = derivation(nest(set_of_two(), depth));
+            assert_eq!(
+                serde_json::to_vec(&array).unwrap(),
+                serde_json::to_vec(&set).unwrap(),
+                "depth {depth}: JSON alone cannot tell them apart"
+            );
+            assert_ne!(
+                derivation_fingerprint(&array),
+                derivation_fingerprint(&set),
+                "depth {depth}"
+            );
+            assert_eq!(
+                derivation_fingerprint(&array),
+                derivation_fingerprint(&derivation(nest(array_of_two(), depth))),
+                "depth {depth}: equal derivations share a fingerprint"
+            );
+        }
     }
 }

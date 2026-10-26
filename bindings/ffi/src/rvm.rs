@@ -703,7 +703,30 @@ pub extern "C" fn regorus_rvm_set_explanation_settings(
                 assume_unknown_input,
                 eval_mode: em,
                 unknowns: unknown_paths,
+                max_derivations: 1,
             });
+            Ok(())
+        }())
+    })
+}
+
+/// Set the maximum number of distinct derivations reported per repeated
+/// partial-set value (default 1; 0 is treated as 1).
+///
+/// `regorus_rvm_set_explanation_settings` resets this to 1, so call this
+/// afterwards. With a value above 1, each emission in the causality report
+/// carries a `derivations` list.
+#[no_mangle]
+#[cfg(feature = "explanations")]
+pub extern "C" fn regorus_rvm_set_explanation_max_derivations(
+    vm: *mut RegorusRvm,
+    max_derivations: usize,
+) -> RegorusResult {
+    with_unwind_guard(|| {
+        to_regorus_result(|| -> Result<()> {
+            let vm = to_shared_ref(vm as *const RegorusRvm)?;
+            let mut guard = vm.try_write()?;
+            guard.set_explanation_max_derivations(max_derivations);
             Ok(())
         }())
     })
@@ -840,4 +863,143 @@ fn convert_c_modules_to_rust(
     }
 
     Ok(policy_modules)
+}
+
+#[cfg(all(test, feature = "explanations", feature = "std"))]
+mod explanation_max_derivations_tests {
+    use super::*;
+    use crate::common::{regorus_result_drop, RegorusStatus};
+    use crate::panic_guard::FFI_GLOBAL_STATE_TEST_LOCK;
+    use core::ffi::CStr;
+    use std::ffi::CString;
+
+    const POLICY: &str = r#"package bicep
+import rego.v1
+
+deny contains "storage must set tls" if {
+    some r in input.resources
+    not r.tls
+}
+"#;
+
+    const INPUT: &str = r#"{"resources": {"a": {}, "b": {"tls": "1.2"}, "c": {}}}"#;
+
+    fn new_vm() -> *mut RegorusRvm {
+        let mut engine = regorus::Engine::new();
+        engine
+            .add_policy("rg3.rego".into(), POLICY.into())
+            .expect("policy parses");
+        let compiled = engine
+            .compile_with_entrypoint(&"data.bicep.deny".into())
+            .expect("policy compiles");
+        let program = regorus::languages::rego::compiler::Compiler::compile_from_policy(
+            &compiled,
+            &["data.bicep.deny"],
+        )
+        .expect("program compiles");
+        let vm = Box::into_raw(Box::new(RegorusRvm::new(RegoVM::new_with_policy(compiled))));
+        let input = CString::new(INPUT).expect("input has no NUL");
+        // SAFETY: `vm` was just created from a live Box and is dropped by the caller.
+        unsafe {
+            (*vm).try_write().expect("vm is free").load_program(program);
+        }
+        assert_ok(regorus_rvm_set_input(vm, input.as_ptr()));
+        vm
+    }
+
+    fn assert_ok(result: RegorusResult) {
+        assert_eq!(result.status, RegorusStatus::Ok, "expected Ok");
+        regorus_result_drop(result);
+    }
+
+    fn set_settings(vm: *mut RegorusRvm) {
+        assert_ok(regorus_rvm_set_explanation_settings(
+            vm,
+            true,
+            1,
+            0,
+            0,
+            1,
+            false,
+            0,
+            false,
+            core::ptr::null(),
+            false,
+            0,
+            core::ptr::null(),
+            0,
+        ));
+    }
+
+    fn evaluate(vm: *mut RegorusRvm) -> serde_json::Value {
+        let entry = CString::new("data.bicep.deny").expect("entry has no NUL");
+        assert_ok(regorus_rvm_execute_entry_point_by_name(vm, entry.as_ptr()));
+        let report = regorus_rvm_take_causality_report(vm);
+        assert_eq!(report.status, RegorusStatus::Ok);
+        // SAFETY: an Ok string result owns a valid NUL-terminated UTF-8 buffer.
+        let text = unsafe { CStr::from_ptr(report.output) }
+            .to_str()
+            .expect("report is UTF-8")
+            .to_string();
+        regorus_result_drop(report);
+        serde_json::from_str(&text).expect("report is JSON")
+    }
+
+    fn derivation_count(report: &serde_json::Value) -> Option<usize> {
+        report["rules"][0]["emissions"][0]
+            .get("derivations")
+            .map(|derivations| derivations.as_array().expect("array").len())
+    }
+
+    #[test]
+    fn export_enables_derivations_and_settings_reset_it() {
+        let _global_state = FFI_GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let vm = new_vm();
+
+        set_settings(vm);
+        assert_eq!(derivation_count(&evaluate(vm)), None);
+
+        set_settings(vm);
+        assert_ok(regorus_rvm_set_explanation_max_derivations(vm, 5));
+        let report = evaluate(vm);
+        assert_eq!(derivation_count(&report), Some(2), "{report:#}");
+        let subjects: Vec<&str> = report["rules"][0]["emissions"][0]["derivations"]
+            .as_array()
+            .expect("derivations")
+            .iter()
+            .filter_map(|derivation| {
+                derivation["conditions"]
+                    .as_array()?
+                    .iter()
+                    .filter_map(|condition| condition["left"]["provenance"].as_str())
+                    .find(|path| path.ends_with(".tls"))
+            })
+            .collect();
+        assert_eq!(subjects, ["input.resources.a.tls", "input.resources.c.tls"]);
+
+        // `regorus_rvm_set_explanation_settings` replaces every setting.
+        assert_ok(regorus_rvm_set_explanation_max_derivations(vm, 5));
+        set_settings(vm);
+        assert_eq!(derivation_count(&evaluate(vm)), None);
+
+        regorus_rvm_drop(vm);
+    }
+
+    #[test]
+    fn export_rejects_null_vm() {
+        let _global_state = FFI_GLOBAL_STATE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = regorus_rvm_set_explanation_max_derivations(core::ptr::null_mut(), 5);
+        assert_eq!(result.status, RegorusStatus::Error);
+        // SAFETY: an error result owns a valid NUL-terminated message.
+        let message = unsafe { CStr::from_ptr(result.error_message) }
+            .to_str()
+            .expect("message is UTF-8")
+            .to_string();
+        assert!(message.contains("null pointer"), "{message}");
+        regorus_result_drop(result);
+    }
 }

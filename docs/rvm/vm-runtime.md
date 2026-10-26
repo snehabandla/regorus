@@ -285,6 +285,58 @@ condition text), so recompile before requesting explanations. Only the first bod
 of each rule definition is analyzed statically; conditions in later `else` bodies
 carry no static metadata, including scopes.
 
+A partial-set value can be emitted by several derivations, for example a constant
+message produced once per non-compliant resource. By default each emission
+explains only its first derivation. Setting `ExplanationSettings::max_derivations`
+above 1 (or calling `set_explanation_max_derivations` after
+`set_explanation_settings`, which resets it; the C ABI export is
+`regorus_rvm_set_explanation_max_derivations`) adds `derivations` to every
+partial-set emission: up to that many distinct derivations, in trace order and
+including the first, whose definition is the emission's top-level
+`definition_index`:
+
+```json
+{"index": 0, "definition_index": 0, "result": "storage must set tls",
+ "conditions": [...],
+ "derivations": [{"definition_index": 0, "conditions": [...]}, ...],
+ "derivation_count": 3, "derivations_truncated": true}
+```
+
+Derivations use a per-derivation view of their conditions. They carry no loop
+witness, because a witness summarizes a whole loop rather than one derivation,
+and under `Redacted` nested secrets are sanitized in every operand, including
+single-operand conditions such as whole-object bindings. The first derivation
+therefore matches the top-level `conditions` except for those two differences;
+in particular, under `Redacted` the top-level `conditions` (like `definitions`)
+can still show a secret nested in a single-operand value that the derivations
+sanitize.
+
+Two derivations are the same, and counted once, only when their definition and
+every condition, as presented, are equal: values hidden by redaction, operand
+truncation or `PrimaryOnly` filtering are not compared. For `Compact` reports
+equality is judged before the operands are stripped, so derivations that print
+alike can still be distinct. `derivation_count` (the number of distinct
+derivations) and `derivations_truncated` appear only when the list was cut or
+may be incomplete. Every derivation of a repeated value is materialized, one at
+a time, to decide whether it is distinct; beyond the cap only a 128-bit
+fingerprint (16 bytes) is kept for each distinct one, so report time grows with
+the number of derivations and their condition windows even when the list is
+cut. Comparison against kept derivations is linear in the cap, so choose a
+small cap rather than "unlimited". If the trace runs out of value slots, an
+emission whose value was lost may have been a derivation of this value: the
+list is then marked `derivations_truncated` and `derivation_count` is
+approximate, as it is when a derivation past the cap cannot be fingerprinted.
+`SingleEmission` targeting is unchanged and collects every derivation of the
+target value. With `AllContributing`, an emission's window runs from the start
+of the rule body, so a later derivation also lists the conditions of earlier
+loop iterations; the iteration that emitted is the last one in its window, and
+report time grows quadratically in the window size. As with every report field,
+the trace is cleared only when a report is taken, so executing twice before
+taking it explains both executions. `0` is treated as `1`, and the default
+output is unchanged. The setting is honored by the Rust `RegoVM` and `Engine`
+(through `ExplanationSettings`) and exposed by the RVM C ABI and C# bindings; the
+interpreter-engine C ABI/C# bindings and wasm keep the default.
+
 - **Instruction budgets**: adjust via `set_max_instructions` when running
   untrusted policies. Inspect `executed_instructions` after completion.
 - **Breakpoints & stepping**: populate `breakpoints` with bytecode PCs (see the
