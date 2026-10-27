@@ -869,7 +869,6 @@ fn convert_c_modules_to_rust(
 mod explanation_max_derivations_tests {
     use super::*;
     use crate::common::{regorus_result_drop, RegorusStatus};
-    use crate::panic_guard::FFI_GLOBAL_STATE_TEST_LOCK;
     use core::ffi::CStr;
     use std::ffi::CString;
 
@@ -953,9 +952,6 @@ deny contains "storage must set tls" if {
 
     #[test]
     fn export_enables_derivations_and_settings_reset_it() {
-        let _global_state = FFI_GLOBAL_STATE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let vm = new_vm();
 
         set_settings(vm);
@@ -989,9 +985,6 @@ deny contains "storage must set tls" if {
 
     #[test]
     fn export_rejects_null_vm() {
-        let _global_state = FFI_GLOBAL_STATE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = regorus_rvm_set_explanation_max_derivations(core::ptr::null_mut(), 5);
         assert_eq!(result.status, RegorusStatus::Error);
         // SAFETY: an error result owns a valid NUL-terminated message.

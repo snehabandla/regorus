@@ -85,17 +85,19 @@ mod panic_tests {
         regorus_engine_new,
     };
     use crate::common::{regorus_result_drop, RegorusStatus};
-    use crate::panic_guard::{is_poisoned, reset_poison, FFI_GLOBAL_STATE_TEST_LOCK};
+    use crate::panic_guard::{
+        forget_panic_hook_installation, is_poisoned, lock_poison_test_state, reset_poison,
+    };
     use alloc::boxed::Box;
     use regorus::Value;
     use std::ffi::{CStr, CString};
 
     #[test]
     fn catches_extension_panics_and_marks_poison() {
-        let _global_state = FFI_GLOBAL_STATE_TEST_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _poison_test_lock = lock_poison_test_state();
         reset_poison();
+        // Another test may have replaced the process hook; reinstall ours.
+        forget_panic_hook_installation();
 
         let engine_ptr = regorus_engine_new();
         assert!(!engine_ptr.is_null(), "engine allocation must succeed");
@@ -139,6 +141,10 @@ mod panic_tests {
                 message.contains("ffi extension panic"),
                 "panic payload must bubble across guard"
             );
+            assert!(
+                message.contains(&alloc::format!("panicked at {}:", file!())),
+                "panic location must be reported: {message}"
+            );
         }
         regorus_result_drop(panic_result);
         assert!(is_poisoned(), "engine must be marked poisoned after panic");
@@ -166,12 +172,13 @@ mod panic_tests {
 }
 
 #[no_mangle]
-#[cfg(feature = "std")]
+#[cfg(all(feature = "std", feature = "test-hooks"))]
 pub extern "C" fn regorus_engine_test_trigger_panic() -> RegorusResult {
     with_unwind_guard(|| panic!("regorus ffi test panic"))
 }
 
 #[no_mangle]
+#[cfg(feature = "test-hooks")]
 pub extern "C" fn regorus_engine_test_reset_poison() {
     crate::panic_guard::reset_poison();
 }

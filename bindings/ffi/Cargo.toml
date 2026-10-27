@@ -45,13 +45,14 @@ std = ["regorus/std"]
 coverage = ["regorus/coverage"]
 allocator-memory-limits = ["regorus/allocator-memory-limits"]
 contention_checks = ["parking_lot"]
-rvm = ["regorus/rvm"]
+rvm = ["std", "regorus/rvm"]
 rbac = ["regorus/azure-rbac"]
 cache = ["regorus/cache"]
-explanations = ["regorus/explanations"]
+explanations = ["rvm", "regorus/explanations"]
 # Exposes `regorus_rvm_take_causality_report_msgpack` alongside the JSON
 # entrypoint. See the `causality_msgpack` feature in the root Cargo.toml.
-causality_msgpack = ["regorus/causality_msgpack"]
+causality_msgpack = ["explanations", "regorus/causality_msgpack"]
+test-hooks = ["std"]
 custom_allocator = []
 
 [build-dependencies]

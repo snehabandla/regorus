@@ -328,7 +328,7 @@ namespace Regorus
         /// cargo feature; calling this against a default-build native DLL will fail with
         /// EntryPointNotFoundException.
         /// </summary>
-        public byte[]? TakeCausalityReportMsgpack()
+        public byte[]? TakeCausalityReportMsgPack()
         {
             return UseHandle(vmPtr =>
             {

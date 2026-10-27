@@ -233,12 +233,13 @@ pub extern "C" fn regorus_clear_cache() -> RegorusResult {
     RegorusResult::ok_void()
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "std", feature = "allocator-memory-limits"))]
 mod tests {
     use super::{
         optional_u64_to_result, regorus_get_global_memory_limit, regorus_set_global_memory_limit,
     };
     use crate::common::{regorus_result_drop, RegorusDataType, RegorusStatus};
+    use crate::panic_guard::lock_poison_test_state;
 
     #[test]
     fn optional_some_returns_integer() {
@@ -258,6 +259,7 @@ mod tests {
 
     #[test]
     fn ffi_roundtrips_global_limit() {
+        let _test_guard = lock_poison_test_state();
         let limit = 456_u64;
         let result = regorus_set_global_memory_limit(limit, true);
         assert!(matches!(result.status, RegorusStatus::Ok));

@@ -9,6 +9,7 @@ fn main() {
         .with_crate(&crate_dir)
         .with_language(cbindgen::Language::C)
         .with_include_guard("REGORUS_H")
+        .with_define("feature", "test-hooks", "REGORUS_FFI_TEST_HOOKS")
         .generate()
         .expect("Unable to generate bindings")
         .write_to_file("regorus.h");
@@ -17,6 +18,7 @@ fn main() {
         .with_crate(crate_dir)
         .with_language(cbindgen::Language::Cxx)
         .with_include_guard("REGORUS_FFI_HPP")
+        .with_define("feature", "test-hooks", "REGORUS_FFI_TEST_HOOKS")
         .generate()
         .expect("Unable to generate bindings")
         .write_to_file("regorus.ffi.hpp");

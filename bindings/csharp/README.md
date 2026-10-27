@@ -35,6 +35,18 @@ The `cargo xtask` runner provides helpers for local builds:
 2. `cargo xtask nuget` reuses those artefacts to pack the C# library. It defaults to debug builds for the host but accepts `--target`, `--release`, `--artifacts-dir <path>` to reuse existing binaries, and `--enforce-artifacts` to require every officially supported platform.
 3. `cargo xtask test-csharp` ensures a NuGet is available (rebuilding when required or when `--force-nuget` is passed) and then runs `Regorus.Tests`, `TestApp`, and `TargetExampleApp` against it. The command accepts the same build flags as `cargo xtask nuget`.
 
+### Project-reference tests and native test hooks
+
+`dotnet test bindings/csharp/Regorus.Tests/Regorus.Tests.csproj` without `-p:UsePackageReference=true` builds the native library itself, for the managed process architecture, into `bindings/ffi/target/<triple>/<profile>`. That never replaces `bindings/ffi/target/<profile>`, the production library that hosts load by path.
+
+The panic-guard tests need two test-only exports, `regorus_engine_test_trigger_panic` and `regorus_engine_test_reset_poison`. They exist only when the FFI crate is built with `--features test-hooks`; the C header guards them with `REGORUS_FFI_TEST_HOOKS`. Run those tests with:
+
+```shell
+dotnet test bindings/csharp/Regorus.Tests/Regorus.Tests.csproj --configuration Release -p:EnableRegorusTestHooks=true
+```
+
+This builds the test-enabled library into `bindings/ffi/target/test-hooks/<triple>/<profile>` and defines `REGORUS_FFI_TEST_HOOKS` for the test project. A host that runs its own poisoning tests against Regorus (for example `PolicyAnalyzerEnginePoisoningTests` in Bicep) needs the same thing: build with `cargo build --release --features test-hooks --target-dir target/test-hooks` in `bindings/ffi`, make the host load that library, and define `REGORUS_FFI_TEST_HOOKS`. If the host loads the library from a fixed path (Bicep uses `bindings/ffi/target/release`), copy the test-enabled library there only for the test run and rebuild the production library afterwards, because the copy also exports the test hooks. Without the define those tests compile out; with the define and a production library they fail with `EntryPointNotFoundException`.
+
 ## Memory Usage Safeguards
 
 The C# bindings expose allocator-backed memory tracking utilities via the static `Regorus.MemoryLimits` helper. Typical usage:
