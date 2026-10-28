@@ -124,7 +124,12 @@ impl RegoVM {
                     }
                 }
 
-                match self.jump_to(*body_entry_point) {
+                let body_result = self.jump_to(*body_entry_point);
+                #[cfg(feature = "explanations")]
+                if self.explain.enabled {
+                    self.explain_body_end(body_result.is_ok());
+                }
+                match body_result {
                     Ok(_) => {
                         if matches!(rule_info.rule_type, RuleType::Complete) || is_function_call {
                             let current_result = self.get_register(result_reg)?.clone();
@@ -884,7 +889,13 @@ impl RegoVM {
             RuleFramePhase::ExecutingDestructuring => {
                 self.rule_frame_after_destructuring_success(frame_data, &rule_info)
             }
-            RuleFramePhase::ExecutingBody => self.rule_frame_after_success(frame_data, &rule_info),
+            RuleFramePhase::ExecutingBody => {
+                #[cfg(feature = "explanations")]
+                if self.explain.enabled {
+                    self.explain_body_end(true);
+                }
+                self.rule_frame_after_success(frame_data, &rule_info)
+            }
             RuleFramePhase::Initializing | RuleFramePhase::Finalizing => Ok(None),
         }
     }
@@ -894,6 +905,10 @@ impl RegoVM {
         frame_data: &mut RuleFrameData,
     ) -> Result<Option<usize>> {
         let rule_info = self.get_rule_info(frame_data.rule_index)?;
+        #[cfg(feature = "explanations")]
+        if self.explain.enabled && matches!(frame_data.phase, RuleFramePhase::ExecutingBody) {
+            self.explain_body_end(false);
+        }
         self.rule_frame_after_failure(frame_data, &rule_info)
     }
 

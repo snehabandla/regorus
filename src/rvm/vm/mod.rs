@@ -8,6 +8,8 @@ mod dispatch;
 mod errors;
 mod execution;
 mod execution_model;
+#[cfg(feature = "explanations")]
+mod explain_trace;
 mod functions;
 mod loops;
 mod machine;
@@ -19,3 +21,7 @@ pub use context::{CallRuleContext, IterationState, LoopContext};
 pub use errors::{Result, VmError};
 pub use execution_model::{ExecutionMode, ExecutionState, SuspendReason};
 pub use machine::RegoVM;
+#[cfg(feature = "explanations")]
+pub use explain_trace::{
+    ExplainCapture, ExplainOutput, ExplainProtoError, TraceBudget, TraceLimit, TraceTruncation,
+};
