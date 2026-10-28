@@ -347,7 +347,16 @@ impl RegoVM {
             .nth(span.line.saturating_sub(1))
             .and_then(|line| {
                 let start = span.column.saturating_sub(1);
-                line.get(start..(start + span.length).min(line.len()))
+                let mut end = (start + span.length).min(line.len());
+                // String-literal token spans exclude the closing quote.
+                let text = line.get(start..end)?;
+                let next = line.get(end..)?.chars().next();
+                if let Some(q @ ('"' | '`')) = next {
+                    if text.matches(q).count() % 2 == 1 {
+                        end += 1;
+                    }
+                }
+                line.get(start..end)
             })
             .unwrap_or_default()
             .to_string();
