@@ -10,10 +10,11 @@ use crate::value::Object;
 use crate::Value;
 
 use super::super::obj_map::{
-    obj_get, obj_get_mut, obj_insert, set_nested, set_nested_lowercased, set_nested_verbatim,
+    obj_get, obj_get_mut, set_nested_lowercased, set_nested_verbatim,
     ObjMap,
 };
 use super::super::types::PrecomputedRemap;
+use super::super::path::{self, Segment};
 
 /// Describes a field remapping inside each element of a (possibly nested) array.
 pub struct ElementRemap {
@@ -184,28 +185,19 @@ fn remap_deep_field_in_btree(btree: &mut Object, source: &str, target: &str, low
         None => return,
     };
 
-    let segments: Vec<&str> = target.split('.').collect();
-    if segments.is_empty() {
-        return;
+    if let Some(segments) = path::scalar_segments(target) {
+        path::set_object(btree, &segments, val, lowercase);
     }
-    if segments.len() == 1 {
-        if let Some(seg) = segments.first() {
-            btree.insert(Value::String(crate::Rc::from(*seg)), val);
-        }
-        return;
-    }
-    set_nested(btree, &segments, val, lowercase);
 }
 
 /// Read a value at a dotted path from a BTreeMap.
 fn read_dotted_path_btree(btree: &Object, path: &str) -> Option<Value> {
-    let segments: Vec<&str> = path.split('.').collect();
-    let first = segments.first()?;
-    let mut cur: &Value = btree.get(&Value::from(*first))?;
-    for &seg in segments.iter().skip(1) {
-        cur = cur.as_object().ok()?.get(&Value::from(seg))?;
-    }
-    Some(cur.clone())
+    let segments = path::scalar_segments(path)?;
+    let (Segment::Key(first), rest) = segments.split_first()? else {
+        return None;
+    };
+    let value = btree.get(&Value::String(crate::Rc::clone(first)))?;
+    path::get(value, rest, false).cloned()
 }
 
 /// Remap a value from one (possibly nested) dot-separated path to another
@@ -216,16 +208,6 @@ fn remap_deep_field(obj: &mut ObjMap, source: &str, target: &str, lowercase: boo
         None => return,
     };
 
-    let segments: Vec<&str> = target.split('.').collect();
-    if segments.is_empty() {
-        return;
-    }
-    if segments.len() == 1 {
-        if let Some(seg) = segments.first() {
-            obj_insert(obj, seg, val);
-        }
-        return;
-    }
     if lowercase {
         set_nested_lowercased(obj, target, val);
     } else {
@@ -235,11 +217,10 @@ fn remap_deep_field(obj: &mut ObjMap, source: &str, target: &str, lowercase: boo
 
 /// Read a value at a dot-separated path from an ObjMap.
 fn read_dotted_path(obj: &ObjMap, path: &str) -> Option<Value> {
-    let segments: Vec<&str> = path.split('.').collect();
-    let first = segments.first()?;
-    let mut cur: &Value = obj_get(obj, first)?;
-    for &seg in segments.iter().skip(1) {
-        cur = cur.as_object().ok()?.get(&Value::from(seg))?;
-    }
-    Some(cur.clone())
+    let segments = path::scalar_segments(path)?;
+    let (Segment::Key(first), rest) = segments.split_first()? else {
+        return None;
+    };
+    let value = obj_get(obj, first)?;
+    path::get(value, rest, false).cloned()
 }

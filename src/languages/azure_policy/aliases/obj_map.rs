@@ -130,9 +130,15 @@ pub fn value_to_obj_map(value: &Value) -> Option<ObjMap> {
     Some(map)
 }
 
-/// Set a value at a dot-separated path in an [`ObjMap`], creating
+/// Set a value at a dotted or bracket path in an [`ObjMap`], creating
 /// intermediate `Value::Object` nodes as needed.  All keys are lowercased.
 pub fn set_nested_lowercased(result: &mut ObjMap, path: &str, value: Value) {
+    if path.contains('[') {
+        if let Some(segments) = super::path::scalar_segments(path) {
+            super::path::set(result, &segments, value, true);
+        }
+        return;
+    }
     let segments: Vec<&str> = path.split('.').collect();
     if segments.is_empty() {
         return;
@@ -147,9 +153,15 @@ pub fn set_nested_lowercased(result: &mut ObjMap, path: &str, value: Value) {
     set_nested_inner(result, &segments, value, true);
 }
 
-/// Set a value at a dot-separated path in an [`ObjMap`], creating
+/// Set a value at a dotted or bracket path in an [`ObjMap`], creating
 /// intermediate `Value::Object` nodes as needed.  Keys preserve their casing.
 pub fn set_nested_verbatim(result: &mut ObjMap, path: &str, value: Value) {
+    if path.contains('[') {
+        if let Some(segments) = super::path::scalar_segments(path) {
+            super::path::set(result, &segments, value, false);
+        }
+        return;
+    }
     let segments: Vec<&str> = path.split('.').collect();
     if segments.is_empty() {
         return;

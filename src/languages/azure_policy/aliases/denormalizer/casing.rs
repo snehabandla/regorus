@@ -11,6 +11,7 @@ use crate::Value;
 
 use super::super::obj_map::{make_array, make_value, new_map, obj_insert, val_str, ROOT_FIELDS};
 use super::super::types::ResolvedEntry;
+use super::super::path::{self, Segment};
 
 fn insert_default_casing(map: &mut BTreeMap<String, String>) {
     for &field in ROOT_FIELDS {
@@ -49,30 +50,18 @@ pub fn build_casing_map(entries: &BTreeMap<String, ResolvedEntry>) -> BTreeMap<S
     insert_default_casing(&mut map);
 
     for entry in entries.values() {
-        for segment in entry.short_name.split('.') {
-            let clean = segment.replace("[*]", "");
-            if !clean.is_empty() {
-                map.entry(clean.to_ascii_lowercase())
-                    .or_insert_with(|| clean.to_string());
-            }
-        }
-
-        for segment in entry.default_path.split('.') {
-            let clean = segment.replace("[*]", "");
-            if !clean.is_empty() && !clean.eq_ignore_ascii_case("properties") {
-                map.entry(clean.to_ascii_lowercase())
-                    .or_insert_with(|| clean.to_string());
-            }
-        }
-
-        // Also include segments from all version-specific ARM paths so
-        // casing can be restored correctly for versioned aliases.
-        for (_ver, path) in &entry.versioned_paths {
-            for segment in path.split('.') {
-                let clean = segment.replace("[*]", "");
-                if !clean.is_empty() && !clean.eq_ignore_ascii_case("properties") {
-                    map.entry(clean.to_ascii_lowercase())
-                        .or_insert_with(|| clean.to_string());
+        for path in core::iter::once(entry.short_name.as_str())
+            .chain(core::iter::once(entry.default_path.as_str()))
+            .chain(entry.versioned_paths.iter().map(|(_, path)| path.as_str()))
+        {
+            if let Some(parsed) = path::parse(path) {
+                for segment in parsed.segments {
+                    if let Segment::Key(key) = segment {
+                        if !key.eq_ignore_ascii_case("properties") {
+                            map.entry(key.to_ascii_lowercase())
+                                .or_insert_with(|| key.to_string());
+                        }
+                    }
                 }
             }
         }

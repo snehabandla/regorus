@@ -21,6 +21,7 @@
 pub mod denormalizer;
 pub mod normalizer;
 pub(crate) mod obj_map;
+mod path;
 pub mod types;
 
 #[cfg(test)]
@@ -486,8 +487,8 @@ fn compute_aggregates_for_version(
 
         // Select the ARM path for this version (or default).
         let selected_path = entry.select_path(api_version);
-        let short_parts: Vec<&str> = entry.short_name.split("[*].").collect();
-        let arm_raw_parts: Vec<&str> = selected_path.split("[*].").collect();
+        let short_parts = path::wildcard_parts(&entry.short_name);
+        let arm_raw_parts = path::wildcard_parts(selected_path);
 
         if short_parts.len() >= 2 && arm_raw_parts.len() >= 2 {
             if let (Some(short_leaf), Some(arm_leaf_raw)) =
@@ -526,10 +527,7 @@ fn compute_aggregates_for_version(
         }
 
         // Compute array base rename.
-        if let (Some(short_base), Some(arm_base)) = (
-            entry.short_name.split("[*]").next(),
-            selected_path.split("[*]").next(),
-        ) {
+        if let (Some(short_base), Some(arm_base)) = (short_parts.first(), arm_raw_parts.first()) {
             let arm_base_stripped = arm_base.strip_prefix("properties.").unwrap_or(arm_base);
             if !short_base.eq_ignore_ascii_case(arm_base_stripped) {
                 // Normalize direction: (arm_base_lc, short_base_lc)
@@ -576,8 +574,8 @@ fn detect_sub_resource_array(
     sub_resource_arrays: &mut BTreeSet<String>,
 ) {
     // Split short name and default path by `[*].`
-    let short_parts: Vec<&str> = short_name.split("[*].").collect();
-    let path_parts: Vec<&str> = default_path.split("[*].").collect();
+    let short_parts = path::wildcard_parts(short_name);
+    let path_parts = path::wildcard_parts(default_path);
 
     if short_parts.len() < 2 || path_parts.len() < 2 {
         return; // No wildcard — not a sub-resource array alias

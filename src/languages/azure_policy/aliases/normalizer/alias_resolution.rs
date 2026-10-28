@@ -13,6 +13,7 @@ use super::super::obj_map::{
     obj_remove, set_nested_lowercased, ObjMap,
 };
 use super::super::types::ResolvedAliases;
+use super::super::path;
 use super::element_remap::apply_element_remap_precomputed;
 use super::flatten::normalize_value;
 
@@ -42,7 +43,11 @@ pub fn apply_alias_entries(
 
         // Use precomputed segments for all paths (default and versioned).
         let segments = entry.select_path_segments(api_version);
-        let value = navigate_arm_path_segments(raw, segments);
+        let value = if segments.is_empty() {
+            None
+        } else {
+            path::get(raw, segments, false).cloned()
+        };
 
         if let Some(value) = value {
             let value = normalize_value(&value, &entry.short_name, None);
@@ -50,7 +55,7 @@ pub fn apply_alias_entries(
             if is_root_field_collision(&entry.short_name, &entry.default_path) {
                 let target = collision_safe_key(&entry.short_name);
                 set_nested_lowercased(result, &target, value);
-            } else if entry.short_name.contains('.') {
+            } else if entry.short_name.contains(['.', '[']) {
                 set_nested_lowercased(result, &entry.short_name, value);
             } else {
                 obj_insert_rc(result, Rc::clone(&entry.short_name_lc), value);
@@ -82,16 +87,4 @@ pub fn apply_alias_entries(
             }
         }
     }
-}
-
-/// Navigate an ARM path using precomputed segments (avoids per-call split).
-fn navigate_arm_path_segments(value: &Value, segments: &[Rc<str>]) -> Option<Value> {
-    let mut current = value;
-    for segment in segments {
-        current = current
-            .as_object()
-            .ok()?
-            .get(&Value::String(Rc::clone(segment)))?;
-    }
-    Some(current.clone())
 }

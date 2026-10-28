@@ -18,9 +18,10 @@ use crate::Rc;
 
 use super::obj_map::{
     extract_type_field, is_root_field_collision, make_value, new_map, obj_insert,
-    set_nested_verbatim, val_str, ROOT_FIELDS,
+    val_str, ROOT_FIELDS,
 };
 use super::types::ResolvedAliases;
+use super::path::{self, Segment};
 use super::AliasRegistry;
 
 use super::normalizer::{apply_element_remap, ElementRemap};
@@ -131,28 +132,24 @@ pub fn denormalize_with_aliases(
                 lc_key.clone()
             };
 
-            // Fast-path: direct BTreeMap lookup for lowercase keys,
-            // with case-insensitive fallback for mixed-case external input.
-            let nk_val = Value::String(Rc::from(normalized_key.as_str()));
-            let val = obj.get(&nk_val).or_else(|| {
-                obj.iter()
-                    .find(|(k, _)| {
-                        val_str(k).is_some_and(|s| s.eq_ignore_ascii_case(&normalized_key))
-                    })
-                    .map(|(_, v)| v)
-            });
-            let val = match val {
-                Some(v) => v,
-                None => continue,
+            let Some(short_segments) = path::scalar_segments(&normalized_key) else {
+                continue;
+            };
+            let Some(val) = path::get(normalized, &short_segments, true) else {
+                continue;
             };
 
-            let arm_path = entry.select_path(api_version);
+            let arm_segments = entry.select_path_segments(api_version);
             let denorm_val = denormalize_value(val, &casing_map);
+            if arm_segments.is_empty() {
+                continue;
+            }
+            path::remove(&mut properties, &short_segments);
 
-            if let Some(props_path) = arm_path.strip_prefix("properties.") {
-                set_nested_verbatim(&mut properties, props_path, denorm_val);
+            if matches!(arm_segments.first(), Some(Segment::Key(key)) if key.eq_ignore_ascii_case("properties")) {
+                path::set(&mut properties, arm_segments.get(1..).unwrap_or_default(), denorm_val, false);
             } else {
-                set_nested_verbatim(&mut result, arm_path, denorm_val);
+                path::set(&mut result, arm_segments, denorm_val, false);
             }
         }
 
