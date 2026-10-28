@@ -23,6 +23,9 @@ pub mod normalizer;
 pub(crate) mod obj_map;
 pub mod types;
 
+#[cfg(test)]
+mod bracket_tests;
+
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString as _};
 use alloc::vec::Vec;
