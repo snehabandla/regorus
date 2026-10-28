@@ -359,7 +359,8 @@ impl RegoVM {
                     GuardMode::NotUndefined => !matches!(value, Value::Undefined),
                 };
                 #[cfg(feature = "explanations")]
-                if self.explain.enabled {
+                // NotUndefined guards are compiler-generated binding checks.
+                if self.explain.enabled && !matches!(mode, GuardMode::NotUndefined) {
                     self.explain_condition(register, None, passed);
                 }
                 self.handle_condition(passed)?;
