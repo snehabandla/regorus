@@ -103,6 +103,10 @@ impl RegoVM {
         self.pc = 0;
         self.evaluated = Value::new_object();
         self.cache_hits = 0;
+        #[cfg(feature = "explanations")]
+        if self.explain.enabled {
+            self.explain.reset();
+        }
 
         self.execution_state = ExecutionState::Ready;
 

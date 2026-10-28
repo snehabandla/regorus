@@ -336,6 +336,10 @@ impl RegoVM {
                 let a = self.get_register(left)?;
                 let b = self.get_register(right)?;
                 let passed = a != &Value::Undefined && b != &Value::Undefined && a == b;
+                #[cfg(feature = "explanations")]
+                if self.explain.enabled {
+                    self.explain_condition(left, Some(right), passed);
+                }
                 self.handle_condition(passed)?;
                 Ok(InstructionOutcome::Continue)
             }
@@ -354,6 +358,10 @@ impl RegoVM {
                     },
                     GuardMode::NotUndefined => !matches!(value, Value::Undefined),
                 };
+                #[cfg(feature = "explanations")]
+                if self.explain.enabled {
+                    self.explain_condition(register, None, passed);
+                }
                 self.handle_condition(passed)?;
                 Ok(InstructionOutcome::Continue)
             }
@@ -673,6 +681,10 @@ impl RegoVM {
                 Ok(InstructionOutcome::Continue)
             }
             SetAdd { set, value } => {
+                #[cfg(feature = "explanations")]
+                if self.explain.enabled && self.explain.emissions {
+                    self.explain_emission(value);
+                }
                 let value_to_add = self.get_register(value)?.clone();
 
                 // Take ownership so Rc refcount stays at 1 and make_mut is a no-op.
