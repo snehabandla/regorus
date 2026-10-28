@@ -262,12 +262,12 @@ impl RegoVM {
         };
         let (v0, v1) = match operands {
             Some((l, r)) => {
-                let l = self.registers.get(usize::from(l)).cloned().unwrap_or_default();
-                let r = self.registers.get(usize::from(r)).cloned().unwrap_or_default();
+                let l = self.registers.get(usize::from(l)).cloned().unwrap_or(Value::Undefined);
+                let r = self.registers.get(usize::from(r)).cloned().unwrap_or(Value::Undefined);
                 (self.explain.value(&l), self.explain.value(&r))
             }
             None => {
-                let v = self.registers.get(usize::from(left)).cloned().unwrap_or_default();
+                let v = self.registers.get(usize::from(left)).cloned().unwrap_or(Value::Undefined);
                 (self.explain.value(&v), NO_VALUE)
             }
         };
@@ -288,7 +288,7 @@ impl RegoVM {
         if !self.explain.has_room() {
             return;
         }
-        let v = self.registers.get(usize::from(value)).cloned().unwrap_or_default();
+        let v = self.registers.get(usize::from(value)).cloned().unwrap_or(Value::Undefined);
         let v0 = self.explain.value(&v);
         self.explain_push(EventKind::Emission, true, v0, NO_VALUE);
     }
