@@ -452,7 +452,11 @@ impl ResolvedEntry {
             .unwrap_or_default();
         let versioned_path_segments = versioned_paths
             .iter()
-            .map(|(_, p)| super::path::parse(p).map(|path| path.segments).unwrap_or_default())
+            .map(|(_, p)| {
+                super::path::parse(p)
+                    .map(|path| path.segments)
+                    .unwrap_or_default()
+            })
             .collect();
         Self {
             short_name,
@@ -486,7 +490,10 @@ impl ResolvedEntry {
     /// Returns the versioned segments if `api_version` matches, otherwise
     /// the default segments.  This avoids per-call `split('.')` for both
     /// default and versioned scalar alias navigation.
-    pub(crate) fn select_path_segments(&self, api_version: Option<&str>) -> &[super::path::Segment] {
+    pub(crate) fn select_path_segments(
+        &self,
+        api_version: Option<&str>,
+    ) -> &[super::path::Segment] {
         if let Some(ver) = api_version {
             for (i, (v, _)) in self.versioned_paths.iter().enumerate() {
                 if v.eq_ignore_ascii_case(ver) {

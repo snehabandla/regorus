@@ -47,7 +47,12 @@ pub(crate) fn parse(path: &str) -> Option<Path> {
         segments.push(segment);
         pos = end;
         match path.as_bytes().get(pos) {
-            None => return Some(Path { segments, wildcards }),
+            None => {
+                return Some(Path {
+                    segments,
+                    wildcards,
+                })
+            }
             Some(b'.') => {
                 pos = pos.saturating_add(1);
                 if pos == path.len() {
@@ -198,17 +203,21 @@ fn set_value(current: &mut Value, segments: &[Segment], value: Value, lowercase:
         return;
     };
     match (current, segment) {
-        (Value::Object(object), Segment::Key(_)) => set_object(Rc::make_mut(object), segments, value, lowercase),
+        (Value::Object(object), Segment::Key(_)) => {
+            set_object(Rc::make_mut(object), segments, value, lowercase)
+        }
         (Value::Array(array), Segment::Index(index)) => {
             let array = Rc::make_mut(array);
             if *index >= array.len() {
                 let Some(len) = index.checked_add(1) else {
                     return;
                 };
-                if array.try_reserve(len.saturating_sub(array.len())).is_err() {
+                let mut values = array.to_vec();
+                if values.try_reserve(len.saturating_sub(values.len())).is_err() {
                     return;
                 }
-                array.resize(len, Value::Null);
+                values.resize(len, Value::Null);
+                *array = values.into();
             }
             if let Some(child) = array.get_mut(*index) {
                 if matches!(child, Value::Null) {
@@ -217,61 +226,84 @@ fn set_value(current: &mut Value, segments: &[Segment], value: Value, lowercase:
                     }
                 }
 
-                pub(crate) fn set_object(object: &mut Object, segments: &[Segment], value: Value, lowercase: bool) {
-                    let Some((Segment::Key(key), rest)) = segments.split_first() else {
-                        return;
-                    };
-                    let key = Value::String(key_case(key, lowercase));
-                    if let Some(next) = rest.first() {
-                        let child = object.get_or_insert_with(key, || empty_for(next));
-                        set_value(child, rest, value, lowercase);
-                    } else {
-                        object.insert(key, value);
-                    }
-                }
-
-                /// Remove a consumed alias leaf without discarding unrelated siblings.
-                pub(crate) fn remove(map: &mut ObjMap, segments: &[Segment]) {
-                    let Some((Segment::Key(key), rest)) = segments.split_first() else {
-                        return;
-                    };
-                    let Some(actual) = map.keys().find(|candidate| candidate.eq_ignore_ascii_case(key)).cloned() else {
-                        return;
-                    };
-                    if rest.is_empty() || map.get_mut(&actual).is_some_and(|value| remove_value(value, rest)) {
-                        map.remove(&actual);
-                    }
-                }
-
-                fn remove_value(value: &mut Value, segments: &[Segment]) -> bool {
-                    let Some((first, rest)) = segments.split_first() else {
-                        return false;
-                    };
-                    match (value, first) {
-                        (Value::Object(object), Segment::Key(key)) => {
-                            let object = Rc::make_mut(object);
-                            let actual = object.keys().find(|candidate| {
-                                candidate.as_string().is_ok_and(|candidate| candidate.eq_ignore_ascii_case(key))
-                            }).cloned();
-                            if let Some(actual) = actual {
-                                if rest.is_empty() || object.get_mut(&actual).is_some_and(|value| remove_value(value, rest)) {
-                                    object.remove(&actual);
-                                }
-                            }
-                            object.is_empty()
-                        }
-                        (Value::Array(array), Segment::Index(index)) => {
-                            if let Some(value) = Rc::make_mut(array).get_mut(*index) {
-                                if rest.is_empty() || remove_value(value, rest) {
-                                    *value = Value::Null;
-                                }
-                            }
-                            false
-                        }
-                        _ => false,
-                    }
-                }
                 set_value(child, rest, value, lowercase);
+            }
+        }
+
+        pub(crate) fn set_object(
+            object: &mut Object,
+            segments: &[Segment],
+            value: Value,
+            lowercase: bool,
+        ) {
+            let Some((Segment::Key(key), rest)) = segments.split_first() else {
+                return;
+            };
+            let key = Value::String(key_case(key, lowercase));
+            if let Some(next) = rest.first() {
+                let child = object.get_or_insert_with(key, || empty_for(next));
+                set_value(child, rest, value, lowercase);
+            } else {
+                object.insert(key, value);
+            }
+        }
+
+        /// Remove a consumed alias leaf without discarding unrelated siblings.
+        pub(crate) fn remove(map: &mut ObjMap, segments: &[Segment]) {
+            let Some((Segment::Key(key), rest)) = segments.split_first() else {
+                return;
+            };
+            let Some(actual) = map
+                .keys()
+                .find(|candidate| candidate.eq_ignore_ascii_case(key))
+                .cloned()
+            else {
+                return;
+            };
+            if rest.is_empty()
+                || map
+                    .get_mut(&actual)
+                    .is_some_and(|value| remove_value(value, rest))
+            {
+                map.remove(&actual);
+            }
+        }
+
+        fn remove_value(value: &mut Value, segments: &[Segment]) -> bool {
+            let Some((first, rest)) = segments.split_first() else {
+                return false;
+            };
+            match (value, first) {
+                (Value::Object(object), Segment::Key(key)) => {
+                    let object = Rc::make_mut(object);
+                    let actual = object
+                        .keys()
+                        .find(|candidate| {
+                            candidate
+                                .as_string()
+                                .is_ok_and(|candidate| candidate.eq_ignore_ascii_case(key))
+                        })
+                        .cloned();
+                    if let Some(actual) = actual {
+                        if rest.is_empty()
+                            || object
+                                .get_mut(&actual)
+                                .is_some_and(|value| remove_value(value, rest))
+                        {
+                            object.remove(&actual);
+                        }
+                    }
+                    object.is_empty()
+                }
+                (Value::Array(array), Segment::Index(index)) => {
+                    if let Some(value) = Rc::make_mut(array).get_mut(*index) {
+                        if rest.is_empty() || remove_value(value, rest) {
+                            *value = Value::Null;
+                        }
+                    }
+                    false
+                }
+                _ => false,
             }
         }
         _ => {}

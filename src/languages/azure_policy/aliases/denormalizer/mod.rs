@@ -17,11 +17,11 @@ use crate::Value;
 use crate::Rc;
 
 use super::obj_map::{
-    extract_type_field, is_root_field_collision, make_value, new_map, obj_insert,
-    val_str, ROOT_FIELDS,
+    extract_type_field, is_root_field_collision, make_value, new_map, obj_insert, val_str,
+    ROOT_FIELDS,
 };
-use super::types::ResolvedAliases;
 use super::path::{self, Segment};
+use super::types::ResolvedAliases;
 use super::AliasRegistry;
 
 use super::normalizer::{apply_element_remap, ElementRemap};
@@ -146,8 +146,14 @@ pub fn denormalize_with_aliases(
             }
             path::remove(&mut properties, &short_segments);
 
-            if matches!(arm_segments.first(), Some(Segment::Key(key)) if key.eq_ignore_ascii_case("properties")) {
-                path::set(&mut properties, arm_segments.get(1..).unwrap_or_default(), denorm_val, false);
+            if matches!(arm_segments.first(), Some(Segment::Key(key)) if key.eq_ignore_ascii_case("properties"))
+            {
+                path::set(
+                    &mut properties,
+                    arm_segments.get(1..).unwrap_or_default(),
+                    denorm_val,
+                    false,
+                );
             } else {
                 path::set(&mut result, arm_segments, denorm_val, false);
             }

@@ -37,7 +37,9 @@ fn cases() -> Vec<(&'static str, Vec<&'static str>)> {
 }
 
 fn nest(keys: &[&str], value: Json) -> Json {
-    keys.iter().rev().fold(value, |value, key| json!({*key: value}))
+    keys.iter()
+        .rev()
+        .fold(value, |value, key| json!({*key: value}))
 }
 
 fn registry(suffix: &str) -> AliasRegistry {
@@ -119,10 +121,9 @@ fn bracket_alias_normalizer_nonmatch() {
         assert_eq!(lookup(&normalized, &target), Value::Undefined, "{suffix}");
     }
     // Raw ARM navigation remains case-sensitive, even for quoted keys.
-    let raw = Value::from_json_str(
-        r#"{"type":"Test/widgets","properties":{"original":{"aB":42}}}"#,
-    )
-    .unwrap();
+    let raw =
+        Value::from_json_str(r#"{"type":"Test/widgets","properties":{"original":{"aB":42}}}"#)
+            .unwrap();
     let normalized = normalizer::normalize(&raw, Some(&registry("['Ab']")), None);
     assert_eq!(lookup(&normalized, &["renamed", "ab"]), Value::Undefined);
 }
@@ -140,7 +141,11 @@ fn bracket_alias_denormalizer_match() {
             )
             .unwrap();
             let actual = denormalizer::denormalize(&normalized, Some(&registry), version);
-            let source = if version.is_some() { "versioned" } else { "original" };
+            let source = if version.is_some() {
+                "versioned"
+            } else {
+                "original"
+            };
             let mut target = vec!["properties", source];
             target.extend(keys.iter().copied());
             if lookup(&actual, &target) != Value::from(42) {
@@ -155,10 +160,8 @@ fn bracket_alias_denormalizer_match() {
 fn bracket_alias_denormalizer_nonmatch() {
     for (suffix, keys) in cases() {
         let registry = registry(suffix);
-        let normalized = Value::from_json_str(
-            r#"{"type":"Test/widgets","renamed":{"different":42}}"#,
-        )
-        .unwrap();
+        let normalized =
+            Value::from_json_str(r#"{"type":"Test/widgets","renamed":{"different":42}}"#).unwrap();
         let actual = denormalizer::denormalize(&normalized, Some(&registry), None);
         let mut target = vec!["properties", "original"];
         target.extend(keys);
@@ -178,7 +181,12 @@ fn bracket_alias_wildcard_classification() {
         ("renamed['a[*]'][*].leaf", true),
         ("renamed['a[*]'].*", false),
     ] {
-        let entry = ResolvedEntry::new(short.to_string(), "properties.original".to_string(), vec![], None);
+        let entry = ResolvedEntry::new(
+            short.to_string(),
+            "properties.original".to_string(),
+            vec![],
+            None,
+        );
         if entry.is_wildcard != expected {
             failures.push(alloc::format!("{short}: expected {expected}"));
         }

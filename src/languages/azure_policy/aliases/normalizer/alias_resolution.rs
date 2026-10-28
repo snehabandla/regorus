@@ -12,8 +12,8 @@ use super::super::obj_map::{
     collision_safe_key, is_root_field_collision, obj_contains, obj_insert, obj_insert_rc,
     obj_remove, set_nested_lowercased, ObjMap,
 };
-use super::super::types::ResolvedAliases;
 use super::super::path;
+use super::super::types::ResolvedAliases;
 use super::element_remap::apply_element_remap_precomputed;
 use super::flatten::normalize_value;
 

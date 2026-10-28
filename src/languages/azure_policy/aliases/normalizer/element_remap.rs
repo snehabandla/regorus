@@ -10,11 +10,10 @@ use crate::value::Object;
 use crate::Value;
 
 use super::super::obj_map::{
-    obj_get, obj_get_mut, set_nested_lowercased, set_nested_verbatim,
-    ObjMap,
+    obj_get, obj_get_mut, set_nested_lowercased, set_nested_verbatim, ObjMap,
 };
-use super::super::types::PrecomputedRemap;
 use super::super::path::{self, Segment};
+use super::super::types::PrecomputedRemap;
 
 /// Describes a field remapping inside each element of a (possibly nested) array.
 pub struct ElementRemap {

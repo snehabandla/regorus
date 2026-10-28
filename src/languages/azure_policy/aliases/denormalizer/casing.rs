@@ -10,8 +10,8 @@ use alloc::vec::Vec;
 use crate::Value;
 
 use super::super::obj_map::{make_array, make_value, new_map, obj_insert, val_str, ROOT_FIELDS};
-use super::super::types::ResolvedEntry;
 use super::super::path::{self, Segment};
+use super::super::types::ResolvedEntry;
 
 fn insert_default_casing(map: &mut BTreeMap<String, String>) {
     for &field in ROOT_FIELDS {
