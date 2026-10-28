@@ -378,6 +378,91 @@ cases:
         environment: "prod"
     want_effect: "deny"
 
+  - note: field_dotted_tag_path_inside_tag_count
+    policy_rule: |
+      {
+        "if": {
+          "count": {
+            "field": "tags[*]",
+            "where": {
+              "value": "[field('tags.Department.Name')]",
+              "equals": "production"
+            }
+          },
+          "greater": 0
+        },
+        "then": { "effect": "deny" }
+      }
+    resource:
+      tags:
+        "Department.Name": "production"
+        environment: "dev"
+    want_effect: "deny"
+
+  - note: field_dotted_tag_path_inside_tag_count_twin_no_match
+    policy_rule: |
+      {
+        "if": {
+          "count": {
+            "field": "tags[*]",
+            "where": {
+              "value": "[field('tags.Department.Name')]",
+              "equals": "production"
+            }
+          },
+          "greater": 0
+        },
+        "then": { "effect": "deny" }
+      }
+    resource:
+      tags:
+        Department:
+          Name: "production"
+        environment: "dev"
+    want_undefined: true
+
+  - note: field_tag_path_takes_precedence_over_value_count_name
+    policy_rule: |
+      {
+        "if": {
+          "count": {
+            "value": "[createArray('unrelated')]",
+            "name": "tags.env",
+            "where": {
+              "value": "[field('tags.env')]",
+              "equals": "production"
+            }
+          },
+          "equals": 1
+        },
+        "then": { "effect": "deny" }
+      }
+    resource:
+      tags:
+        env: "production"
+    want_effect: "deny"
+
+  - note: field_tag_path_takes_precedence_over_value_count_name_twin_no_match
+    policy_rule: |
+      {
+        "if": {
+          "count": {
+            "value": "[createArray('unrelated')]",
+            "name": "tags.env",
+            "where": {
+              "value": "[field('tags.env')]",
+              "equals": "production"
+            }
+          },
+          "equals": 1
+        },
+        "then": { "effect": "deny" }
+      }
+    resource:
+      tags:
+        env: "staging"
+    want_undefined: true
+
   # =========================================================================
   # Alias field refs inside count resolve to current loop element
   # =========================================================================

@@ -1185,7 +1185,7 @@ cases:
     policy_rule: |
       {
         "if": {
-          "field": "[concat('tags[ ', 'env', ' ]')]",
+          "field": "[concat('tags[ ', '2024', ' ]')]",
           "equals": "production"
         },
         "then": {
@@ -1194,14 +1194,14 @@ cases:
       }
     resource:
       "tags":
-        "env": "production"
+        "2024": "production"
     want_effect: "deny"
 
   - note: dynamic_concat_tags_bracket_padded_unquoted_twin_no_match
     policy_rule: |
       {
         "if": {
-          "field": "[concat('tags[ ', 'env', ' ]')]",
+          "field": "[concat('tags[ ', '2024', ' ]')]",
           "equals": "production"
         },
         "then": {
@@ -1210,7 +1210,40 @@ cases:
       }
     resource:
       "tags":
-        " env ": "production"
+        " 2024 ": "production"
+    want_undefined: true
+
+  - note: dynamic_concat_tags_dotted_key_mixed_case
+    policy_rule: |
+      {
+        "if": {
+          "field": "[concat('tags.', 'DePaRtMeNt.NaMe')]",
+          "equals": "production"
+        },
+        "then": {
+          "effect": "deny"
+        }
+      }
+    resource:
+      tags:
+        "department.name": "production"
+    want_effect: "deny"
+
+  - note: dynamic_concat_tags_dotted_key_mixed_case_twin_no_match
+    policy_rule: |
+      {
+        "if": {
+          "field": "[concat('tags.', 'DePaRtMeNt.NaMe')]",
+          "equals": "production"
+        },
+        "then": {
+          "effect": "deny"
+        }
+      }
+    resource:
+      tags:
+        department:
+          name: "production"
     want_undefined: true
 
   - note: dynamic_concat_tags_bracket_padded_single_quoted
