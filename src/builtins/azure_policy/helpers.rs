@@ -316,7 +316,8 @@ pub fn resolve_path(root: &Value, path: &str) -> Value {
         match tag_field {
             TagField::Key(tag) => return resolve_tag(root, &tag),
             TagField::Empty => return Value::Undefined,
-            TagField::Collection | TagField::Wildcard => {}
+            TagField::Wildcard => return resolve_tag_values(root),
+            TagField::Collection => {}
         }
     }
 
@@ -378,6 +379,21 @@ fn resolve_tag(root: &Value, tag: &str) -> Value {
                 return value.clone();
             }
         }
+    }
+
+    fn resolve_tag_values(root: &Value) -> Value {
+        let tags = resolve_path(root, "tags");
+        #[allow(clippy::pattern_type_mismatch)]
+        let Value::Object(map) = tags
+        else {
+            return Value::Undefined;
+        };
+
+        Value::from(
+            map.iter_sorted()
+                .map(|(_, value)| value.clone())
+                .collect::<Vec<_>>(),
+        )
     }
 
     Value::Undefined

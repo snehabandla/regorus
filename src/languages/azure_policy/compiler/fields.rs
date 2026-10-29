@@ -123,9 +123,10 @@ impl Compiler {
                         ..
                     }) = args.first()
                     {
-                        if first == "tags"
-                            || first.starts_with("tags.")
-                            || first.starts_with("tags[")
+                        let first_lower = first.to_ascii_lowercase();
+                        if first_lower == "tags"
+                            || first_lower.starts_with("tags.")
+                            || first_lower.starts_with("tags[")
                         {
                             self.observed_has_dynamic_fields = true;
                             let path_reg = self.compile_expr(expr)?;
@@ -153,8 +154,10 @@ impl Compiler {
         field_path: &str,
         span: &crate::lexer::Span,
     ) -> Result<u8> {
-        if let Some(TagField::Key(tag)) = classify_tag_field(field_path) {
-            return self.compile_tag_value(&tag, span);
+        match classify_tag_field(field_path) {
+            Some(TagField::Key(tag)) => return self.compile_tag_value(&tag, span),
+            Some(TagField::Empty) => bail!(span.error("empty tag name")),
+            _ => {}
         }
         if let Some(binding) = self.resolve_count_binding(field_path)? {
             return self.compile_from_binding(&binding, field_path, span);

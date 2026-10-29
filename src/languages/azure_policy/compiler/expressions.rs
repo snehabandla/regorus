@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 use anyhow::{anyhow, bail, Result};
 
 use crate::languages::azure_policy::ast::{Expr, ExprLiteral, JsonValue, ValueOrExpr};
+use crate::languages::azure_policy::tag::{classify_tag_field, TagField};
 use crate::rvm::Instruction;
 use crate::Value;
 
@@ -300,7 +301,12 @@ impl Compiler {
                 // property of it) still yields a one-member array; paths with
                 // further `[*]` levels are already collected into an array.
                 // Use the binding resolved in primary-resource scope above.
-                let wrap_single = resolved.contains("[*]")
+                let is_literal_tag = matches!(
+                    classify_tag_field(&resolved),
+                    Some(TagField::Key(_))
+                );
+                let wrap_single = !is_literal_tag
+                    && resolved.contains("[*]")
                     && binding?.is_some_and(|b| Self::binding_selects_single_value(&b, &resolved));
                 let reg = if wrap_single {
                     let arr = self.alloc_register()?;
