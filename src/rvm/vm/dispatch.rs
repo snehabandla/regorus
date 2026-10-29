@@ -36,6 +36,47 @@ impl RegoVM {
         })
     }
 
+    /// Whether sensitive pair-value paths are recorded for this evaluation.
+    #[cfg(feature = "explanations")]
+    pub(super) fn records_sensitive_pairs(&self) -> bool {
+        self.explanation_settings.enabled
+            && self.explanation_settings.value_mode == crate::evaluation_trace::ValueMode::Redacted
+    }
+
+    /// Whether reading `key` from `container` yields the `value` of a
+    /// `{name, value}` pair whose `name` is sensitive.
+    #[cfg(feature = "explanations")]
+    pub(super) fn is_sensitive_pair_value(container: &Value, key: &Value) -> bool {
+        key.as_string().is_ok_and(|key| key.as_ref() == "value")
+            && matches!(*container, Value::Object(ref map)
+                if crate::causality_report::is_sensitive_pair(map))
+    }
+
+    /// Record the provenance of `register` as a sensitive pair value.
+    #[cfg(feature = "explanations")]
+    pub(super) fn record_sensitive_pair_path(&mut self, register: u8) {
+        if let Some(path) = self.provenance.get(register).cloned() {
+            self.trace.record_sensitive_value_path(path.as_ref());
+        }
+    }
+
+    /// Attach the provenance of `register` to the emission just recorded.
+    #[cfg(feature = "explanations")]
+    fn set_last_emission_path(&mut self, register: u8) {
+        let path = self.register_value_path(register);
+        if let Some(last) = self.trace.emission_outcomes.last_mut() {
+            last.value_path = path;
+        }
+    }
+
+    /// Runtime provenance of a register's value, whether or not it is unknown.
+    #[cfg(feature = "explanations")]
+    fn register_value_path(&self, register: u8) -> Option<alloc::string::String> {
+        self.provenance
+            .get(register)
+            .map(|path| String::from(path.as_ref()))
+    }
+
     #[cfg(feature = "explanations")]
     pub(super) fn current_rule_scope(&self) -> (u16, u16) {
         self.call_rule_stack
@@ -165,6 +206,9 @@ impl RegoVM {
                 .ok()
                 .and_then(|value| (!matches!(value, Value::Undefined)).then(|| value.clone()))
         };
+        let assumed_value_path = assumed_value
+            .as_ref()
+            .and_then(|_| self.register_value_path(right));
 
         let static_info = self
             .program
@@ -196,6 +240,7 @@ impl RegoVM {
         );
         if let Some(last) = self.trace.assumptions.last_mut() {
             last.builtin_name = builtin_name;
+            last.assumed_value_path = assumed_value_path;
         }
 
         self.set_register(dest, Value::Bool(true))?;
@@ -339,7 +384,7 @@ impl RegoVM {
         let left_path = self.runtime_path_for_register(left);
         let right_path = self.runtime_path_for_register(right);
 
-        let (input_path, assumed_value) = if let Some(path) = left_path {
+        let (input_path, assumed_value, value_reg) = if let Some(path) = left_path {
             // Only assume if the input-path register is actually undefined.
             // If the value exists but doesn't match, it's a genuine failure.
             match self.get_register(left) {
@@ -350,7 +395,7 @@ impl RegoVM {
                 .get_register(right)
                 .ok()
                 .and_then(|value| (!matches!(value, Value::Undefined)).then(|| value.clone()));
-            (path, value)
+            (path, value, right)
         } else if let Some(path) = right_path {
             match self.get_register(right) {
                 Ok(v) if *v == Value::Undefined => {}
@@ -360,10 +405,13 @@ impl RegoVM {
                 .get_register(left)
                 .ok()
                 .and_then(|value| (!matches!(value, Value::Undefined)).then(|| value.clone()));
-            (path, value)
+            (path, value, left)
         } else {
             return false;
         };
+        let assumed_value_path = assumed_value
+            .as_ref()
+            .and_then(|_| self.register_value_path(value_reg));
 
         let (rule_index, definition_index) = self.current_rule_scope();
         let iteration_index = self.current_loop_iteration_index();
@@ -380,6 +428,9 @@ impl RegoVM {
             self.current_conjunction_id(),
             self.current_call_chain(),
         );
+        if let Some(last) = self.trace.assumptions.last_mut() {
+            last.assumed_value_path = assumed_value_path;
+        }
         // Attach pending data lookup context (from ChainedIndex) if available.
         if let Some(ctx) = self.pending_data_lookup.take() {
             if let Some(last) = self.trace.assumptions.last_mut() {
@@ -434,7 +485,7 @@ impl RegoVM {
         // Tier-aware arg mapping keeps `left = subject, right = value`
         // regardless of source arg order — see `builtin_operand_indices` in
         // static_provenance.
-        let (operator, assumed_value) = self
+        let (operator, assumed_value, assumed_value_path) = self
             .program
             .builtin_info_table
             .get(usize::from(params.builtin_index))
@@ -446,9 +497,12 @@ impl RegoVM {
                     .get_register(value_reg)
                     .ok()
                     .and_then(|v| (!matches!(v, Value::Undefined)).then(|| v.clone()));
-                Some((Some(info.name.clone()), value))
+                let value_path = value
+                    .as_ref()
+                    .and_then(|_| self.register_value_path(value_reg));
+                Some((Some(info.name.clone()), value, value_path))
             })
-            .unwrap_or((None, None));
+            .unwrap_or((None, None, None));
 
         let (rule_index, definition_index) = self.current_rule_scope();
         let iteration_index = self.current_loop_iteration_index();
@@ -465,6 +519,9 @@ impl RegoVM {
             self.current_conjunction_id(),
             self.current_call_chain(),
         );
+        if let Some(last) = self.trace.assumptions.last_mut() {
+            last.assumed_value_path = assumed_value_path;
+        }
         true
     }
 
@@ -1574,13 +1631,16 @@ impl RegoVM {
                     {
                         let condition_end_index =
                             u32::try_from(self.trace.condition_outcomes.len()).unwrap_or(u32::MAX);
+                        let active_iterations = self.active_loop_iterations();
                         self.trace.record_emission(
                             rule_index,
                             definition_index,
                             condition_start_index,
                             condition_end_index,
                             emitted_value,
+                            active_iterations,
                         );
+                        self.set_last_emission_path(value);
                     }
                     self.set_register(obj, obj_value)?;
                 } else {
@@ -1612,6 +1672,23 @@ impl RegoVM {
                     .map(|&k| self.get_register(k).cloned())
                     .collect::<core::result::Result<_, _>>()?;
                 let leaf_value = self.get_register(params.value)?.clone();
+                #[cfg(feature = "explanations")]
+                let leaf_rule = self
+                    .explanation_settings
+                    .enabled
+                    .then(|| self.call_rule_stack.last())
+                    .flatten()
+                    .filter(|ctx| {
+                        ctx.rule_type == crate::rvm::program::RuleType::PartialObject
+                            && params.obj == ctx.result_reg
+                    })
+                    .map(|ctx| ctx.rule_index);
+                #[cfg(feature = "explanations")]
+                if let Some(rule_index) = leaf_rule {
+                    let path = self.register_value_path(params.value);
+                    self.trace
+                        .record_deep_object_leaf(rule_index, leaf_value.clone(), path);
+                }
 
                 let mut root = self.take_register(params.obj)?;
                 self.object_deep_set(
@@ -1721,6 +1798,9 @@ impl RegoVM {
                 let result = container_value[key_value].clone();
                 #[cfg(feature = "explanations")]
                 let key_clone = key_value.clone();
+                #[cfg(feature = "explanations")]
+                let sensitive_pair_value = self.records_sensitive_pairs()
+                    && Self::is_sensitive_pair_value(container_value, key_value);
                 self.set_register(dest, result.clone())?;
                 #[cfg(feature = "explanations")]
                 {
@@ -1741,6 +1821,9 @@ impl RegoVM {
                     } else {
                         self.provenance.append_index(dest, container, &key_clone);
                     }
+                    if sensitive_pair_value {
+                        self.record_sensitive_pair_path(dest);
+                    }
                 }
                 Ok(InstructionOutcome::Continue)
             }
@@ -1753,6 +1836,9 @@ impl RegoVM {
 
                 if let Some(key_value) = program.literals.get(usize::from(literal_idx)) {
                     let result = container_value[key_value].clone();
+                    #[cfg(feature = "explanations")]
+                    let sensitive_pair_value = self.records_sensitive_pairs()
+                        && Self::is_sensitive_pair_value(container_value, key_value);
                     self.set_register(dest, result)?;
                     #[cfg(feature = "explanations")]
                     {
@@ -1761,6 +1847,9 @@ impl RegoVM {
                                 .append_field(dest, container, field.as_ref());
                         } else {
                             self.provenance.append_index(dest, container, key_value);
+                        }
+                        if sensitive_pair_value {
+                            self.record_sensitive_pair_path(dest);
                         }
                     }
                     Ok(InstructionOutcome::Continue)
@@ -1887,13 +1976,16 @@ impl RegoVM {
                                 let condition_start_index =
                                     u32::try_from(ctx.current_body_condition_start)
                                         .unwrap_or(u32::MAX);
+                                let active_iterations = self.active_loop_iterations();
                                 self.trace.record_emission(
                                     ctx.rule_index,
                                     u16::try_from(ctx.current_definition_index).unwrap_or(u16::MAX),
                                     condition_start_index,
                                     condition_end_index,
                                     value_to_add.clone(),
+                                    active_iterations,
                                 );
+                                self.set_last_emission_path(value);
                             }
                         }
                     }
@@ -2445,6 +2537,13 @@ impl RegoVM {
                         current_path = current_path
                             .as_deref()
                             .map(|base| Self::append_path_component(base, &key_value));
+                        if self.records_sensitive_pairs()
+                            && Self::is_sensitive_pair_value(&current_value, &key_value)
+                        {
+                            if let Some(path) = current_path.as_deref() {
+                                self.trace.record_sensitive_value_path(path);
+                            }
+                        }
                     }
 
                     current_value = current_value[&key_value].clone();

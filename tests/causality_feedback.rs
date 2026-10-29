@@ -3902,23 +3902,17 @@ fn rg3_repeated_constant_reports_every_derivation_in_both_condition_modes() {
         for derivation in derivations {
             assert_eq!(derivation["definition_index"], 0);
         }
-        // The top-level definition is the first derivation's; its conditions
-        // are the default view, which may also carry a loop witness.
+        // The top-level fields are exactly the first derivation's.
         assert_eq!(emission["definition_index"], 0);
-        let without_witness = |conditions: &serde_json::Value| {
-            let mut conditions = conditions.clone();
-            for condition in conditions.as_array_mut().unwrap() {
-                condition.as_object_mut().unwrap().remove("witness");
-            }
-            conditions
-        };
         assert_eq!(
-            without_witness(&emission["conditions"]),
+            emission["conditions"],
             emission["derivations"][0]["conditions"]
         );
+        // The `some r` loop is still running when each value is emitted, so
+        // its summary belongs to the definition, not to any emission.
         assert!(
-            !emission["derivations"].to_string().contains("\"witness\""),
-            "derivations carry no loop witness: {emission:#}"
+            !emission.to_string().contains("\"witness\""),
+            "{mode:?}: an unfinished loop must not be reported on an emission: {emission:#}"
         );
         assert!(emission.get("derivation_count").is_none(), "{emission:#}");
         assert!(
@@ -4220,16 +4214,10 @@ fn rg3_compact_detail_keeps_distinct_derivations() {
         derivations[0], derivations[1],
         "Compact output must look alike"
     );
-    // The default view decorates Compact text with the loop witness; the
-    // per-derivation view has no witness to decorate with.
-    assert!(
-        emission["conditions"].to_string().contains("[loop:"),
-        "{emission:#}"
-    );
-    assert!(
-        !emission["derivations"].to_string().contains("[loop:"),
-        "{emission:#}"
-    );
+    // The loop producing these values is unfinished at each emission, so
+    // neither view decorates text with its summary.
+    assert!(!emission.to_string().contains("[loop:"), "{emission:#}");
+    assert_eq!(emission["conditions"], derivations[0]["conditions"]);
     assert!(derivations[0]["conditions"]
         .as_array()
         .unwrap()
@@ -4294,12 +4282,9 @@ fn rg3_redacted_derivations_sanitize_secrets_nested_in_unary_operands() {
         let (_, report) = run_rg1_case(RG3_CONSTANT_POLICY, input, settings);
         let emission = rg3_emissions(&report)[0];
         assert_eq!(rg3_derivation_subjects(emission), ["a", "c", "d"]);
-        let derivations = emission["derivations"].to_string();
-        assert_eq!(
-            derivations.contains("hunter2"),
-            exposed,
-            "{value_mode:?}: {derivations}"
-        );
+        // The whole report, not only the derivations, follows the value mode.
+        let text = report.to_string();
+        assert_eq!(text.contains("hunter2"), exposed, "{value_mode:?}: {text}");
         if !exposed {
             let binding = emission["derivations"][1]["conditions"]
                 .as_array()
@@ -4530,7 +4515,7 @@ fn rg3_compact_detail_counts_distinct_derivations_beyond_the_cap() {
 }
 
 #[test]
-fn rg3_derivations_carry_no_loop_witness_from_inner_loops() {
+fn rg3_derivations_report_their_own_finished_inner_loop() {
     let policy = r#"package bicep
 import rego.v1
 
@@ -4542,21 +4527,1287 @@ deny contains "ports are positive" if {
 }
 "#;
     let input = r#"{"resources": {"a": {"ports": [1, 2]}, "b": {"ports": [3]}}}"#;
+    for mode in [
+        evaluation_trace::ConditionMode::PrimaryOnly,
+        evaluation_trace::ConditionMode::AllContributing,
+    ] {
+        let (_, report) = run_rg1_case(policy, input, rg3_settings(mode, 10));
+        let emission = rg3_emissions(&report)[0];
+        let derivations = emission["derivations"].as_array().unwrap();
+        assert_eq!(derivations.len(), 2, "{mode:?}: {emission:#}");
+        assert_eq!(emission["conditions"], derivations[0]["conditions"]);
+        // Each derivation's `every` loop finished before its value was
+        // emitted, so each carries that loop's own summary, never another
+        // iteration's and never the unfinished outer `some r` loop.
+        let witnesses: Vec<(u64, u64, &serde_json::Value)> = derivations
+            .iter()
+            .map(|derivation| {
+                let found: Vec<&serde_json::Value> = derivation["conditions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|condition| condition.get("witness"))
+                    .collect();
+                assert_eq!(found.len(), 1, "{mode:?}: {derivation:#}");
+                (
+                    found[0]["total_iterations"].as_u64().unwrap(),
+                    found[0]["success_count"].as_u64().unwrap(),
+                    &found[0]["sample_value"],
+                )
+            })
+            .collect();
+        assert_eq!(witnesses[0], (2, 2, &serde_json::json!(1)), "{mode:?}");
+        assert_eq!(witnesses[1], (1, 1, &serde_json::json!(3)), "{mode:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RG-R2: Redacted mode sanitizes every reported value, not only two-operand
+// conditions. RG-W1: a loop witness only describes a loop that finished
+// within what it explains.
+// ---------------------------------------------------------------------------
+
+// The causality demo's "Reason capture without leaking secrets" scenario.
+const RGW_DEMO_POLICY: &str = r#"package demo
+import rego.v1
+
+violations contains msg if {
+    request := input.requests[_]
+    api_token := request.api_token
+    request.path == "/admin"
+    request.user != "admin"
+    msg := sprintf("user %v attempted admin path", [request.user])
+}
+
+violations contains msg if {
+    request := input.requests[_]
+    password := request.password
+    count(password) > 0
+    request.path == "/login"
+    request.user == "guest"
+    msg := "guest login included password"
+}
+"#;
+
+const RGW_DEMO_INPUT: &str = r#"{"requests": [
+    {"user": "alice", "path": "/admin", "api_token": "tok-prod-123", "password": ""},
+    {"user": "guest", "path": "/login", "api_token": "", "password": "guest-password"}
+]}"#;
+
+/// Run `entry` through the interpreter, a plain VM and a traced VM, require
+/// equal results, and return the traced report.
+fn rgw_run(
+    policy: &str,
+    input: &str,
+    entry: &str,
+    settings: evaluation_trace::ExplanationSettings,
+) -> serde_json::Value {
+    let mut engine = Engine::new();
+    engine.add_policy("rgw.rego".into(), policy.into()).unwrap();
+    let input = Value::from_json_str(input).unwrap();
+    engine.set_input(input.clone());
+    let interpreted = engine.eval_rule(entry.into()).unwrap();
+    let compiled = engine.compile_with_entrypoint(&Rc::from(entry)).unwrap();
+    let program =
+        languages::rego::compiler::Compiler::compile_from_policy(&compiled, &[entry]).unwrap();
+    let mut plain = rvm::RegoVM::new_with_policy(compiled.clone());
+    plain.load_program(program.clone());
+    plain.set_input(input.clone());
+    assert_eq!(
+        plain.execute_entry_point_by_name(entry).unwrap(),
+        interpreted
+    );
+    let mut traced = rvm::RegoVM::new_with_policy(compiled);
+    traced.load_program(program);
+    traced.set_explanation_settings(settings);
+    traced.set_input(input);
+    let result = traced.execute_entry_point_by_name(entry).unwrap();
+    assert_eq!(result, interpreted);
+    serde_json::from_str(&traced.take_causality_report(result).unwrap()).unwrap()
+}
+
+fn rgw_settings(
+    condition_mode: evaluation_trace::ConditionMode,
+    detail: evaluation_trace::ExplanationDetail,
+    value_mode: evaluation_trace::ValueMode,
+) -> evaluation_trace::ExplanationSettings {
+    evaluation_trace::ExplanationSettings {
+        enabled: true,
+        condition_mode,
+        detail,
+        value_mode,
+        ..Default::default()
+    }
+}
+
+fn rgw_rule<'a>(report: &'a serde_json::Value, name: &str) -> &'a serde_json::Value {
+    report["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|rule| rule["name"] == name)
+        .unwrap_or_else(|| panic!("rule {name} must be explained: {report:#}"))
+}
+
+/// The witnesses on a condition list, in order.
+fn rgw_witnesses(conditions: &serde_json::Value) -> Vec<&serde_json::Value> {
+    conditions
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|condition| condition.get("witness"))
+        .collect()
+}
+
+const RGW_MODES: [evaluation_trace::ConditionMode; 2] = [
+    evaluation_trace::ConditionMode::PrimaryOnly,
+    evaluation_trace::ConditionMode::AllContributing,
+];
+
+#[test]
+fn rgr2_demo_secret_redaction_scenario_leaks_nothing_under_redacted() {
+    use evaluation_trace::{ExplanationDetail::*, ValueMode};
+    for mode in RGW_MODES {
+        for detail in [Standard, Full, Compact] {
+            let report = rgw_run(
+                RGW_DEMO_POLICY,
+                RGW_DEMO_INPUT,
+                "data.demo.violations",
+                rgw_settings(mode, detail, ValueMode::Redacted),
+            );
+            let text = report.to_string();
+            for secret in ["tok-prod-123", "guest-password"] {
+                assert!(
+                    !text.contains(secret),
+                    "{mode:?}/{detail:?}: {secret} leaked: {report:#}"
+                );
+            }
+            if detail != Compact {
+                // Control: the same evidence in Full value mode shows them.
+                let full = rgw_run(
+                    RGW_DEMO_POLICY,
+                    RGW_DEMO_INPUT,
+                    "data.demo.violations",
+                    rgw_settings(mode, detail, ValueMode::Full),
+                )
+                .to_string();
+                assert!(full.contains("tok-prod-123") && full.contains("guest-password"));
+            }
+        }
+    }
+
+    // The whole-request binding is sanitized in place: secrets replaced,
+    // everything else kept, and the operand marked redacted.
+    let report = rgw_run(
+        RGW_DEMO_POLICY,
+        RGW_DEMO_INPUT,
+        "data.demo.violations",
+        rgw_settings(
+            evaluation_trace::ConditionMode::PrimaryOnly,
+            evaluation_trace::ExplanationDetail::Standard,
+            evaluation_trace::ValueMode::Redacted,
+        ),
+    );
+    let violations = rgw_rule(&report, "data.demo.violations");
+    let alice = violations["emissions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|emission| emission["result"] == "user alice attempted admin path")
+        .expect("alice's violation must be explained");
+    let binding = alice["conditions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|condition| condition["binding_name"] == "request")
+        .expect("the request binding must be reported");
+    assert_eq!(binding["left"]["provenance"], "input.requests[0]");
+    assert_eq!(binding["left"]["redacted"], true);
+    assert_eq!(binding["left"]["value"]["api_token"], "<redacted>");
+    assert_eq!(binding["left"]["value"]["password"], "<redacted>");
+    assert_eq!(binding["left"]["value"]["user"], "alice");
+    assert_eq!(binding["left"]["value"]["path"], "/admin");
+}
+
+#[test]
+fn rgr2_witness_samples_are_redacted_like_operands() {
+    use evaluation_trace::{ConditionMode::PrimaryOnly, ExplanationDetail::Standard, ValueMode};
+    // (policy body, input, Full-mode sample, Redacted sample key, Redacted sample value)
+    let cases = [
+        (
+            "some r in input.requests\n    r.path == \"/admin\"",
+            RGW_DEMO_INPUT,
+            serde_json::json!({"user": "alice", "path": "/admin", "api_token": "tok-prod-123", "password": ""}),
+            serde_json::json!(0),
+            serde_json::json!({"user": "alice", "path": "/admin", "api_token": "<redacted>", "password": "<redacted>"}),
+        ),
+        (
+            // A sensitive collection path hides the element and its key.
+            "some t in input.tokens\n    t != \"\"",
+            r#"{"tokens": ["", "tok-abc"]}"#,
+            serde_json::json!("tok-abc"),
+            serde_json::json!("<redacted>"),
+            serde_json::json!("<redacted>"),
+        ),
+        (
+            // A sensitive object key hides its value; the key is the name.
+            "some k, v in input.config\n    v == \"on\"",
+            r#"{"config": {"password": "on", "mode": "off"}}"#,
+            serde_json::json!("on"),
+            serde_json::json!("password"),
+            serde_json::json!("<redacted>"),
+        ),
+    ];
+    for (body, input, full_sample, redacted_key, redacted_sample) in cases {
+        let policy = format!("package w\nimport rego.v1\n\nallow if {{\n    {body}\n}}\n");
+        let witness_of = |value_mode| {
+            let report = rgw_run(
+                &policy,
+                input,
+                "data.w.allow",
+                rgw_settings(PrimaryOnly, Standard, value_mode),
+            );
+            let rule = rgw_rule(&report, "data.w.allow");
+            let witnesses = rgw_witnesses(&rule["definitions"][0]["conditions"]);
+            assert_eq!(witnesses.len(), 1, "{body}: {report:#}");
+            witnesses[0].clone()
+        };
+        let full = witness_of(ValueMode::Full);
+        assert_eq!(full["sample_value"], full_sample, "{body}");
+        assert!(full.get("redacted").is_none(), "{body}: {full:#}");
+        let redacted = witness_of(ValueMode::Redacted);
+        assert_eq!(redacted["sample_key"], redacted_key, "{body}");
+        assert_eq!(redacted["sample_value"], redacted_sample, "{body}");
+        assert_eq!(redacted["redacted"], true, "{body}");
+        assert_eq!(redacted["total_iterations"], full["total_iterations"]);
+        assert_eq!(redacted["success_count"], full["success_count"]);
+    }
+}
+
+#[test]
+fn rgw1_emissions_carry_no_unfinished_or_foreign_loop_witness() {
+    use evaluation_trace::{ExplanationDetail::*, ValueMode};
+    for mode in RGW_MODES {
+        for detail in [Standard, Full, Compact] {
+            let report = rgw_run(
+                RGW_DEMO_POLICY,
+                RGW_DEMO_INPUT,
+                "data.demo.violations",
+                rgw_settings(mode, detail, ValueMode::Full),
+            );
+            let violations = rgw_rule(&report, "data.demo.violations");
+            for emission in violations["emissions"].as_array().unwrap() {
+                // Each value is emitted inside its definition's loop, before
+                // that loop finishes; no other loop finished inside it.
+                assert!(
+                    rgw_witnesses(&emission["conditions"]).is_empty(),
+                    "{mode:?}/{detail:?}: {emission:#}"
+                );
+                assert!(!emission.to_string().contains("[loop:"), "{emission:#}");
+            }
+            if detail == Compact {
+                continue;
+            }
+            // Each definition reports its own loop: alice (key 0) satisfied
+            // definition 0, guest (key 1) definition 1.
+            let definitions = violations["definitions"].as_array().unwrap();
+            assert_eq!(definitions.len(), 2);
+            for (definition, key) in definitions.iter().zip([0, 1]) {
+                let witnesses = rgw_witnesses(&definition["conditions"]);
+                assert_eq!(witnesses.len(), 1, "{mode:?}/{detail:?}: {definition:#}");
+                assert_eq!(witnesses[0]["total_iterations"], 2);
+                assert_eq!(witnesses[0]["success_count"], 1);
+                assert_eq!(witnesses[0]["sample_key"], key, "{definition:#}");
+            }
+        }
+    }
+}
+
+#[test]
+fn rgw1_outer_loop_summary_stays_on_its_definition() {
     let (_, report) = run_rg1_case(
+        RG3_CONSTANT_POLICY,
+        RG3_CONSTANT_INPUT,
+        rg3_settings(evaluation_trace::ConditionMode::PrimaryOnly, 10),
+    );
+    let deny = rgw_rule(&report, "data.bicep.deny");
+    // No emission or derivation, including the last one, which the loop's
+    // exit would otherwise land in.
+    assert!(
+        !deny["emissions"].to_string().contains("\"witness\""),
+        "{deny:#}"
+    );
+    let witnesses = rgw_witnesses(&deny["definitions"][0]["conditions"]);
+    assert_eq!(witnesses.len(), 1, "{deny:#}");
+    assert_eq!(witnesses[0]["total_iterations"], 5);
+    assert_eq!(witnesses[0]["success_count"], 3);
+}
+
+#[test]
+fn rgw1_head_function_call_does_not_borrow_another_definitions_loop() {
+    let policy = r#"package bicep
+import rego.v1
+
+deny contains message_for(r) if {
+    some r in input.resources
+    r.bad
+}
+
+deny contains "other" if {
+    some s in input.others
+    s.x
+}
+
+message_for(r) := msg if {
+    r.name != ""
+    msg := sprintf("bad %v", [r.name])
+}
+"#;
+    // The matching resource comes last, so the head function's conditions are
+    // the last ones recorded before definition 0's loop exits and no reported
+    // condition anchors that loop.
+    let input = r#"{
+        "resources": [{"name": "b", "bad": false}, {"name": "a", "bad": true}],
+        "others": [{"x": true}, {"x": true}, {"x": true}]
+    }"#;
+    for mode in RGW_MODES {
+        let report = rgw_run(
+            policy,
+            input,
+            "data.bicep.deny",
+            rgw_settings(
+                mode,
+                evaluation_trace::ExplanationDetail::Standard,
+                evaluation_trace::ValueMode::Full,
+            ),
+        );
+        let deny = rgw_rule(&report, "data.bicep.deny");
+        // Definition 0 iterates two resources. If it reports a witness, it
+        // must be its own loop's, never the three-element `others` loop.
+        for witness in rgw_witnesses(&deny["definitions"][0]["conditions"]) {
+            assert_eq!(witness["total_iterations"], 2, "{mode:?}: {deny:#}");
+        }
+        for emission in deny["emissions"].as_array().unwrap() {
+            assert!(
+                rgw_witnesses(&emission["conditions"]).is_empty(),
+                "{emission:#}"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RG-R2 / RG-W1 deep-review round 1: loop ownership, early-failing `every`,
+// keyless `every`, assumptions, ARM secret shapes, helper rule results.
+// ---------------------------------------------------------------------------
+
+fn rgw_full_standard(
+    mode: evaluation_trace::ConditionMode,
+) -> evaluation_trace::ExplanationSettings {
+    rgw_settings(
+        mode,
+        evaluation_trace::ExplanationDetail::Standard,
+        evaluation_trace::ValueMode::Full,
+    )
+}
+
+#[test]
+fn rgw1_empty_inner_loop_does_not_inherit_the_previous_iterations_loop() {
+    let policy = r#"package bicep
+import rego.v1
+
+deny contains r.name if {
+    some r in input.resources
+    every x in r.ports {
+        x > 0
+    }
+}
+"#;
+    let input = r#"{"resources": [{"name": "a", "ports": [1]}, {"name": "b", "ports": []}]}"#;
+    for mode in RGW_MODES {
+        let report = rgw_run(policy, input, "data.bicep.deny", rgw_full_standard(mode));
+        let deny = rgw_rule(&report, "data.bicep.deny");
+        let emission = |name: &str| {
+            deny["emissions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|emission| emission["result"] == name)
+                .unwrap_or_else(|| panic!("{name} must be emitted: {deny:#}"))
+                .clone()
+        };
+        // `a` ran its own `every` to completion before it was emitted.
+        let a = emission("a");
+        let a_witnesses = rgw_witnesses(&a["conditions"]);
+        assert_eq!(a_witnesses.len(), 1, "{mode:?}: {a:#}");
+        assert_eq!(a_witnesses[0]["total_iterations"], 1);
+        assert_eq!(a_witnesses[0]["sample_value"], 1);
+        // `b`'s `every` had nothing to iterate; `a`'s loop is not its evidence.
+        let b = emission("b");
+        assert!(
+            rgw_witnesses(&b["conditions"]).is_empty(),
+            "{mode:?}: {b:#}"
+        );
+    }
+}
+
+#[test]
+fn rgw1_head_function_keeps_its_callers_loop_on_the_caller() {
+    let policy = r#"package bicep
+import rego.v1
+
+deny contains message_for(r) if {
+    some r in input.resources
+    r.bad
+}
+
+message_for(r) := msg if {
+    r.name != ""
+    msg := sprintf("bad %v", [r.name])
+}
+"#;
+    let input = r#"{"resources": [{"name": "b", "bad": false}, {"name": "a", "bad": true}]}"#;
+    for mode in RGW_MODES {
+        let report = rgw_run(policy, input, "data.bicep.deny", rgw_full_standard(mode));
+        // The caller's loop is summarized on the caller's definition, even
+        // though the head function recorded the last condition before it
+        // finished.
+        let deny = rgw_rule(&report, "data.bicep.deny");
+        let witnesses = rgw_witnesses(&deny["definitions"][0]["conditions"]);
+        assert_eq!(witnesses.len(), 1, "{mode:?}: {deny:#}");
+        assert_eq!(witnesses[0]["total_iterations"], 2);
+        assert_eq!(witnesses[0]["success_count"], 1);
+        // The head function ran no loop of its own.
+        for rule in report["rules"].as_array().unwrap() {
+            if rule["name"] == "data.bicep.deny" {
+                continue;
+            }
+            assert!(
+                !rule.to_string().contains("\"witness\""),
+                "{mode:?}: another rule's loop attributed to {}: {rule:#}",
+                rule["name"]
+            );
+        }
+    }
+}
+
+#[test]
+fn rgw1_early_failing_every_counts_the_failing_iteration() {
+    let policy = r#"package bicep
+import rego.v1
+
+all_positive if {
+    every x in input.xs {
+        x > 0
+    }
+}
+"#;
+    for mode in RGW_MODES {
+        let report = rgw_run(
+            policy,
+            r#"{"xs": [1, 0, 5]}"#,
+            "data.bicep.all_positive",
+            rgw_full_standard(mode),
+        );
+        let rule = rgw_rule(&report, "data.bicep.all_positive");
+        let witnesses = rgw_witnesses(&rule["definitions"][0]["conditions"]);
+        assert_eq!(witnesses.len(), 1, "{mode:?}: {rule:#}");
+        // Two iterations ran (1 passed, 0 failed); the third never started.
+        assert_eq!(witnesses[0]["total_iterations"], 2, "{mode:?}");
+        assert_eq!(witnesses[0]["success_count"], 1, "{mode:?}");
+    }
+}
+
+#[test]
+fn rgr2_keyless_every_over_an_object_redacts_by_key() {
+    let policy = r#"package w
+import rego.v1
+
+allow if {
+    every v in input.config {
+        v != ""
+    }
+}
+"#;
+    let input = r#"{"config": {"password": "hunter2"}}"#;
+    let report_for = |value_mode| {
+        rgw_run(
+            policy,
+            input,
+            "data.w.allow",
+            rgw_settings(
+                evaluation_trace::ConditionMode::PrimaryOnly,
+                evaluation_trace::ExplanationDetail::Standard,
+                value_mode,
+            ),
+        )
+    };
+    let full = report_for(evaluation_trace::ValueMode::Full);
+    let full_witness =
+        rgw_witnesses(&rgw_rule(&full, "data.w.allow")["definitions"][0]["conditions"])[0].clone();
+    // The key is bound, so the sample names it.
+    assert_eq!(full_witness["sample_key"], "password", "{full:#}");
+    assert_eq!(full_witness["sample_value"], "hunter2");
+
+    let redacted = report_for(evaluation_trace::ValueMode::Redacted);
+    assert!(!redacted.to_string().contains("hunter2"), "{redacted:#}");
+    let witness =
+        rgw_witnesses(&rgw_rule(&redacted, "data.w.allow")["definitions"][0]["conditions"])[0]
+            .clone();
+    assert_eq!(witness["sample_key"], "password");
+    assert_eq!(witness["sample_value"], "<redacted>");
+}
+
+const RGR2_ASSUMPTION_POLICY: &str = r#"package p
+import rego.v1
+
+deny contains "v" if {
+    input.context.expected == input.password
+}
+"#;
+
+fn rgr2_assumption_settings(
+    value_mode: evaluation_trace::ValueMode,
+    eval_mode: evaluation_trace::EvaluationMode,
+) -> evaluation_trace::ExplanationSettings {
+    evaluation_trace::ExplanationSettings {
+        enabled: true,
+        value_mode,
+        condition_mode: evaluation_trace::ConditionMode::AllContributing,
+        detail: evaluation_trace::ExplanationDetail::Full,
+        assume_unknown_input: true,
+        eval_mode,
+        unknowns: vec!["input.context".into()],
+        ..Default::default()
+    }
+}
+
+fn rgr2_traced(settings: evaluation_trace::ExplanationSettings) -> (Value, rvm::RegoVM) {
+    let mut engine = Engine::new();
+    engine
+        .add_policy("p.rego".into(), RGR2_ASSUMPTION_POLICY.into())
+        .unwrap();
+    let compiled = engine
+        .compile_with_entrypoint(&Rc::from("data.p.deny"))
+        .unwrap();
+    let program =
+        languages::rego::compiler::Compiler::compile_from_policy(&compiled, &["data.p.deny"])
+            .unwrap();
+    let mut vm = rvm::RegoVM::new_with_policy(compiled);
+    vm.load_program(program);
+    vm.set_explanation_settings(settings);
+    vm.set_input(Value::from_json_str(r#"{"password": "hunter2"}"#).unwrap());
+    let result = vm.execute_entry_point_by_name("data.p.deny").unwrap();
+    (result, vm)
+}
+
+#[test]
+fn rgr2_causality_assumptions_are_redacted() {
+    use evaluation_trace::{EvaluationMode::Causality, ValueMode};
+    for (value_mode, expected) in [
+        (ValueMode::Full, serde_json::json!("hunter2")),
+        (ValueMode::Redacted, serde_json::json!("<redacted>")),
+    ] {
+        let (result, mut vm) = rgr2_traced(rgr2_assumption_settings(value_mode, Causality));
+        let report: serde_json::Value =
+            serde_json::from_str(&vm.take_causality_report(result).unwrap()).unwrap();
+        let assumptions = report["assumptions"].as_array().expect("assumptions");
+        assert_eq!(assumptions.len(), 1, "{report:#}");
+        assert_eq!(assumptions[0]["input_path"], "input.context.expected");
+        assert_eq!(assumptions[0]["assumed_value"], expected, "{value_mode:?}");
+        if value_mode == ValueMode::Redacted {
+            assert!(!report.to_string().contains("hunter2"), "{report:#}");
+        }
+    }
+}
+
+#[test]
+fn rgr2_partial_evaluation_residuals_keep_their_values() {
+    // A residual's value is part of the computed answer (the condition the
+    // unknown input must meet), so it is not redacted in any value mode.
+    let (result, mut vm) = rgr2_traced(rgr2_assumption_settings(
+        evaluation_trace::ValueMode::Redacted,
+        evaluation_trace::EvaluationMode::PartialEval,
+    ));
+    let pe: serde_json::Value =
+        serde_json::from_str(&vm.take_partial_eval_result(result).unwrap()).unwrap();
+    let text = pe.to_string();
+    assert!(text.contains("\"value\":\"hunter2\""), "{pe:#}");
+}
+
+#[test]
+fn rgr2_common_arm_secret_shapes_are_redacted() {
+    let policy = r#"package p
+import rego.v1
+
+deny contains r.name if {
+    some r in input.resources
+    r.type == "x"
+}
+"#;
+    let input = r#"{"resources": [{"name": "a", "type": "x", "properties": {
+        "connectionString": "cs-1",
+        "secureValue": "sv-1",
+        "protectedSettings": {"script": "ps-1"},
+        "accountKey": "ak-1",
+        "sharedKey": "sk-1",
+        "passphrase": "pp-1",
+        "pwd": "pw-1",
+        "private-key": "pk-1",
+        "api key": "api-1",
+        "appSettings": [
+            {"name": "DB_PASSWORD", "value": "dbp-1"},
+            {"name": "MODE", "value": "keep-1"}
+        ],
+        "mode": "basic"
+    }}]}"#;
+    let secrets = [
+        "cs-1", "sv-1", "ps-1", "ak-1", "sk-1", "pp-1", "pw-1", "pk-1", "api-1", "dbp-1",
+    ];
+    for mode in RGW_MODES {
+        let full = rgw_run(policy, input, "data.p.deny", rgw_full_standard(mode)).to_string();
+        for secret in secrets.iter().chain(&["keep-1", "basic"]) {
+            assert!(full.contains(secret), "{mode:?}: Full must show {secret}");
+        }
+        let redacted = rgw_run(
+            policy,
+            input,
+            "data.p.deny",
+            rgw_settings(
+                mode,
+                evaluation_trace::ExplanationDetail::Standard,
+                evaluation_trace::ValueMode::Redacted,
+            ),
+        )
+        .to_string();
+        for secret in secrets {
+            assert!(
+                !redacted.contains(secret),
+                "{mode:?}: {secret} leaked: {redacted}"
+            );
+        }
+        // Not secrets: a pair whose name is not sensitive, and plain fields.
+        assert!(redacted.contains("keep-1") && redacted.contains("basic"));
+    }
+}
+
+#[test]
+fn rgr2_helper_rule_results_are_redacted() {
+    let policy = r#"package p
+import rego.v1
+
+admin_token := input.vault.token
+
+settings := input.settings
+
+deny contains "x" if {
+    admin_token != ""
+    settings.mode == "on"
+}
+"#;
+    let input = r#"{"vault": {"token": "tok-1"}, "settings": {"mode": "on", "password": "pw-9"}}"#;
+    let report_for = |value_mode| {
+        rgw_run(
+            policy,
+            input,
+            "data.p.deny",
+            rgw_settings(
+                evaluation_trace::ConditionMode::PrimaryOnly,
+                evaluation_trace::ExplanationDetail::Standard,
+                value_mode,
+            ),
+        )
+    };
+    let full = report_for(evaluation_trace::ValueMode::Full);
+    assert_eq!(rgw_rule(&full, "data.p.admin_token")["result"], "tok-1");
+    assert_eq!(
+        rgw_rule(&full, "data.p.settings")["result"]["password"],
+        "pw-9"
+    );
+
+    let redacted = report_for(evaluation_trace::ValueMode::Redacted);
+    // A helper named like a secret is hidden whole; others are sanitized.
+    assert_eq!(
+        rgw_rule(&redacted, "data.p.admin_token")["result"],
+        "<redacted>"
+    );
+    let settings = &rgw_rule(&redacted, "data.p.settings")["result"];
+    assert_eq!(settings["password"], "<redacted>");
+    assert_eq!(settings["mode"], "on");
+    // The entry point's result is the policy output and is unchanged.
+    assert_eq!(
+        rgw_rule(&redacted, "data.p.deny")["result"],
+        serde_json::json!(["x"])
+    );
+    assert!(!redacted.to_string().contains("tok-1"), "{redacted:#}");
+    assert!(!redacted.to_string().contains("pw-9"), "{redacted:#}");
+}
+
+// ---------------------------------------------------------------------------
+// RG-R2 round 3: provenance-based redaction (pair values, helper results,
+// keys under sensitive collections) in both execution modes.
+// ---------------------------------------------------------------------------
+
+const RGR3_SECRET: &str = "opaque-42";
+
+/// Run `entry` traced in both execution modes and return both reports.
+fn rgr3_reports(
+    policy: &str,
+    input: &str,
+    entry: &str,
+    value_mode: evaluation_trace::ValueMode,
+) -> Vec<serde_json::Value> {
+    rgr3_reports_with(
+        policy,
+        Value::from_json_str(input).unwrap(),
+        entry,
+        value_mode,
+    )
+}
+
+/// `rgr3_reports` for an input JSON cannot express (sets, compound keys).
+fn rgr3_reports_with(
+    policy: &str,
+    input: Value,
+    entry: &str,
+    value_mode: evaluation_trace::ValueMode,
+) -> Vec<serde_json::Value> {
+    let mut engine = Engine::new();
+    engine
+        .add_policy("rgr3.rego".into(), policy.into())
+        .unwrap();
+    engine.set_input(input.clone());
+    let interpreted = engine.eval_rule(entry.into()).unwrap();
+    let compiled = engine.compile_with_entrypoint(&Rc::from(entry)).unwrap();
+    let program =
+        languages::rego::compiler::Compiler::compile_from_policy(&compiled, &[entry]).unwrap();
+    [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ]
+    .into_iter()
+    .map(|execution_mode| {
+        let mut vm = rvm::RegoVM::new_with_policy(compiled.clone());
+        vm.load_program(program.clone());
+        vm.set_execution_mode(execution_mode);
+        vm.set_max_instructions(10_000_000);
+        vm.set_explanation_settings(evaluation_trace::ExplanationSettings {
+            enabled: true,
+            value_mode,
+            condition_mode: evaluation_trace::ConditionMode::AllContributing,
+            detail: evaluation_trace::ExplanationDetail::Full,
+            ..Default::default()
+        });
+        vm.set_input(input.clone());
+        let result = vm.execute_entry_point_by_name(entry).unwrap();
+        assert_eq!(result, interpreted, "{execution_mode:?}");
+        serde_json::from_str(&vm.take_causality_report(result).unwrap()).unwrap()
+    })
+    .collect()
+}
+
+/// Assert Redacted hides `secret` in both modes while Full shows it, and that
+/// `kept` (a non-secret control) survives Redacted.
+fn rgr3_assert_hidden(policy: &str, input: &str, entry: &str, secret: &str, kept: &str) {
+    use evaluation_trace::ValueMode;
+    for report in rgr3_reports(policy, input, entry, ValueMode::Full) {
+        assert!(
+            report.to_string().contains(secret),
+            "Full control: {report:#}"
+        );
+    }
+    for report in rgr3_reports(policy, input, entry, ValueMode::Redacted) {
+        let text = report.to_string();
+        assert!(
+            !text.contains(secret),
+            "Redacted leaks {secret}: {report:#}"
+        );
+        assert!(text.contains(kept), "Redacted lost {kept}: {report:#}");
+    }
+}
+
+#[test]
+fn rgr3_extracted_pair_value_is_redacted() {
+    let input = r#"{"appSettings": [
+        {"name": "DB_PASSWORD", "value": "opaque-42"},
+        {"name": "REGION", "value": "westus-kept"}]}"#;
+    // Comparison on the extracted value, and a builtin over it.
+    for policy in [
+        r#"package p
+import rego.v1
+deny contains s.name if {
+    some s in input.appSettings
+    s.value != ""
+}
+"#,
+        r#"package p
+import rego.v1
+deny contains s.name if {
+    some s in input.appSettings
+    not startswith(s.value, "@Microsoft.KeyVault(")
+}
+"#,
+    ] {
+        rgr3_assert_hidden(policy, input, "data.p.deny", RGR3_SECRET, "westus-kept");
+    }
+}
+
+#[test]
+fn rgr3_pair_value_read_by_a_dynamic_key_or_a_literal_chain_is_redacted() {
+    let input = r#"{"field": "value", "appSettings": [
+        {"name": "DB_PASSWORD", "value": "opaque-42"},
+        {"name": "REGION", "value": "westus-kept"}]}"#;
+    for policy in [
+        // `Index` with a key computed at runtime.
+        r#"package p
+import rego.v1
+deny contains s.name if {
+    some s in input.appSettings
+    s[input.field] != ""
+}
+"#,
+        // `ChainedIndex` through a literal path from `input`.
+        r#"package p
+import rego.v1
+deny contains "db" if {
+    input.appSettings[0].name == "DB_PASSWORD"
+    input.appSettings[0].value != ""
+    input.appSettings[1].value != ""
+}
+"#,
+    ] {
+        rgr3_assert_hidden(policy, input, "data.p.deny", RGR3_SECRET, "westus-kept");
+    }
+}
+
+#[test]
+fn rgr3_pair_value_reached_by_iterating_the_pair_is_redacted() {
+    let policy = r#"package p
+import rego.v1
+deny contains k if {
+    some s in input.appSettings
+    some k, v in s
+    k == "value"
+    v != ""
+}
+"#;
+    let input = r#"{"appSettings": [{"name": "DB_PASSWORD", "value": "opaque-42"}]}"#;
+    rgr3_assert_hidden(policy, input, "data.p.deny", RGR3_SECRET, "DB_PASSWORD");
+}
+
+#[test]
+fn rgr3_helper_result_from_a_sensitive_path_is_redacted() {
+    let policy = r#"package p
+import rego.v1
+candidate := input.password
+location := input.location
+leaked contains input.password if { true }
+deny contains "x" if {
+    candidate != ""
+    location != ""
+    count(leaked) > 0
+}
+"#;
+    let input = r#"{"password": "opaque-42", "location": "westus-kept"}"#;
+    rgr3_assert_hidden(policy, input, "data.p.deny", RGR3_SECRET, "westus-kept");
+}
+
+#[test]
+fn rgr3_keys_under_a_sensitive_collection_are_masked_in_provenance() {
+    let input = r#"{"tokens": {"opaque-42": true}, "regions": {"westus-kept": true}}"#;
+    for policy in [
+        r#"package p
+import rego.v1
+allow if {
+    every v in input.tokens { v == true }
+    every w in input.regions { w == true }
+}
+"#,
+        r#"package p
+import rego.v1
+allow if {
+    some k, v in input.tokens
+    v == true
+    some j, w in input.regions
+    w == true
+}
+"#,
+    ] {
+        rgr3_assert_hidden(policy, input, "data.p.allow", RGR3_SECRET, "westus-kept");
+    }
+}
+
+#[test]
+fn rgr3_rewritten_values_are_marked_redacted() {
+    use evaluation_trace::ValueMode;
+    let policy = r#"package p
+import rego.v1
+candidate := input.password
+password_auth_enabled if input.authMode == "local"
+deny contains "x" if {
+    candidate != ""
+    password_auth_enabled
+}
+"#;
+    // `password_auth_enabled` is a computed boolean: only its name is
+    // sensitive, unlike a value read from a sensitive path.
+    let input = r#"{"password": "opaque-42", "authMode": "local"}"#;
+    for report in rgr3_reports(policy, input, "data.p.deny", ValueMode::Redacted) {
+        let candidate = rgw_rule(&report, "data.p.candidate");
+        assert_eq!(candidate["result"], "<redacted>", "{report:#}");
+        assert_eq!(candidate["redacted"], true, "{report:#}");
+        // A boolean result under a sensitive name is not a secret.
+        let flag = rgw_rule(&report, "data.p.password_auth_enabled");
+        assert_eq!(flag["result"], true, "{report:#}");
+        assert!(flag.get("redacted").is_none(), "{report:#}");
+        assert!(
+            rgw_rule(&report, "data.p.deny").get("redacted").is_none(),
+            "{report:#}"
+        );
+    }
+    for report in rgr3_reports(policy, input, "data.p.deny", ValueMode::Full) {
+        assert!(rgw_rule(&report, "data.p.candidate")
+            .get("redacted")
+            .is_none());
+    }
+}
+
+#[test]
+fn rgr3_redacted_assumptions_are_marked() {
+    use evaluation_trace::{EvaluationMode::Causality, ValueMode};
+    for (value_mode, marked) in [(ValueMode::Full, false), (ValueMode::Redacted, true)] {
+        let (result, mut vm) = rgr2_traced(rgr2_assumption_settings(value_mode, Causality));
+        let report: serde_json::Value =
+            serde_json::from_str(&vm.take_causality_report(result).unwrap()).unwrap();
+        let assumption = &report["assumptions"][0];
+        assert_eq!(
+            assumption.get("redacted").is_some_and(|v| v == true),
+            marked,
+            "{value_mode:?}: {report:#}"
+        );
+    }
+}
+
+#[test]
+fn rgr3_both_execution_modes_report_the_same_provenance() {
+    // Helper rules (called twice, so the second call would hit the rule cache),
+    // a function with an argument, a nested call and a default.
+    let policy = r#"package p
+import rego.v1
+default fallback := "none"
+fallback := input.missing
+region := input.resources[0].location
+is_east(loc) if startswith(loc, "east")
+name_of(r) := n if { n := r.name }
+deny contains n if {
+    some r in input.resources
+    region != ""
+    region != "x"
+    is_east(r.location)
+    n := name_of(r)
+    fallback == "none"
+}
+"#;
+    let input = r#"{"resources": [{"name": "a", "location": "eastus"},
+                                 {"name": "b", "location": "westus"}]}"#;
+    let reports = rgr3_reports(
         policy,
         input,
-        rg3_settings(evaluation_trace::ConditionMode::AllContributing, 10),
+        "data.p.deny",
+        evaluation_trace::ValueMode::Full,
     );
-    let emission = rg3_emissions(&report)[0];
-    // The `every` loop finishes inside each window, so the default view
-    // carries its witness; the derivations do not.
+    assert_eq!(reports.len(), 2);
+    // Suspendable records one definition outcome per (rule, definition) for
+    // the whole trace while run-to-completion records one per call, so helper
+    // `definitions` are compared by provenance only; everything else is equal.
+    let normalized = |report: &serde_json::Value| {
+        let mut report = report.clone();
+        for rule in report["rules"].as_array_mut().unwrap() {
+            if rule["name"] != "data.p.deny" {
+                rule.as_object_mut().unwrap().remove("definitions");
+            }
+        }
+        report
+    };
+    fn provenances(value: &serde_json::Value, out: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, item) in map {
+                    if key == "provenance" {
+                        out.push(item.to_string());
+                    }
+                    provenances(item, out);
+                }
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|i| provenances(i, out)),
+            _ => {}
+        }
+    }
+    let sorted_provenances = |report: &serde_json::Value| {
+        let mut out = Vec::new();
+        provenances(report, &mut out);
+        out.sort();
+        out.dedup();
+        out
+    };
+    assert_eq!(normalized(&reports[0]), normalized(&reports[1]));
+    assert_eq!(
+        sorted_provenances(&reports[0]),
+        sorted_provenances(&reports[1])
+    );
+    // Non-vacuous: helper-derived operands carry their source paths.
     assert!(
-        emission["conditions"].to_string().contains("\"witness\""),
-        "{emission:#}"
+        sorted_provenances(&reports[1]).contains(&"\"input.resources[0].location\"".to_string()),
+        "{:#}",
+        reports[1]
     );
-    assert_eq!(emission["derivations"].as_array().unwrap().len(), 2);
-    assert!(
-        !emission["derivations"].to_string().contains("\"witness\""),
-        "{emission:#}"
+}
+
+#[test]
+fn rgr3_a_run_stopped_inside_a_rule_leaves_no_provenance_behind() {
+    let policy = r#"package p
+import rego.v1
+helper := input.password
+deny contains "x" if {
+    helper != ""
+    count([i | some i in numbers.range(1, 50)]) > 0
+}
+"#;
+    let entry = "data.p.deny";
+    let input = Value::from_json_str(r#"{"password": "opaque-42"}"#).unwrap();
+    let mut engine = Engine::new();
+    engine.add_policy("p.rego".into(), policy.into()).unwrap();
+    let compiled = engine.compile_with_entrypoint(&Rc::from(entry)).unwrap();
+    let program =
+        languages::rego::compiler::Compiler::compile_from_policy(&compiled, &[entry]).unwrap();
+    let settings = evaluation_trace::ExplanationSettings {
+        enabled: true,
+        value_mode: evaluation_trace::ValueMode::Full,
+        condition_mode: evaluation_trace::ConditionMode::AllContributing,
+        detail: evaluation_trace::ExplanationDetail::Full,
+        ..Default::default()
+    };
+    for execution_mode in [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ] {
+        let report_of = |vm: &mut rvm::RegoVM| {
+            let result = vm.execute_entry_point_by_name(entry).unwrap();
+            serde_json::from_str::<serde_json::Value>(&vm.take_causality_report(result).unwrap())
+                .unwrap()
+        };
+        let mut fresh = rvm::RegoVM::new_with_policy(compiled.clone());
+        fresh.load_program(program.clone());
+        fresh.set_execution_mode(execution_mode);
+        fresh.set_explanation_settings(settings.clone());
+        fresh.set_input(input.clone());
+        let expected = report_of(&mut fresh);
+
+        let mut reused = rvm::RegoVM::new_with_policy(compiled.clone());
+        reused.load_program(program.clone());
+        reused.set_execution_mode(execution_mode);
+        reused.set_explanation_settings(settings.clone());
+        reused.set_input(input.clone());
+        reused.set_max_instructions(40);
+        assert!(
+            reused.execute_entry_point_by_name(entry).is_err(),
+            "{execution_mode:?}: the limit must stop the first run"
+        );
+        // Discard the failed run's trace, as a caller must; this test is about
+        // register provenance, which no caller can reset.
+        reused.take_causality_report(Value::Undefined).unwrap();
+        reused.set_max_instructions(1_000_000);
+        reused.set_explanation_settings(settings.clone());
+        assert_eq!(report_of(&mut reused), expected, "{execution_mode:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RG-R2 round 4: displayed values and their sensitivity come from the same
+// evaluation; paths the VM writes are all understood.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rgr4_function_called_twice_keeps_the_sensitive_result_hidden() {
+    let policy = r#"package p
+import rego.v1
+candidate(x) := x if x != "skip"
+allow if {
+    candidate(input.password) != ""
+    candidate(input.public) != ""
+}
+"#;
+    let input = r#"{"password": "opaque-42", "public": "skip"}"#;
+    rgr3_assert_hidden(policy, input, "data.p.allow", RGR3_SECRET, "skip");
+}
+
+#[test]
+fn rgr4_multi_definition_rule_keeps_its_value_provenance() {
+    let policy = r#"package p
+import rego.v1
+candidate := input.password if input.first
+candidate := input.public if input.second
+allow if {
+    candidate != ""
+    input.region != ""
+}
+"#;
+    let input = r#"{"password": "opaque-42", "public": "w", "first": true, "second": false, "region": "westus-kept"}"#;
+    rgr3_assert_hidden(policy, input, "data.p.allow", RGR3_SECRET, "westus-kept");
+}
+
+#[test]
+fn rgr4_pair_under_a_non_identifier_field_is_redacted() {
+    let policy = r#"package p
+import rego.v1
+allow if {
+    s := input["app-settings"]
+    s.value != ""
+    input.region != ""
+}
+"#;
+    let input = r#"{"app-settings": {"name": "DB_PASSWORD", "value": "opaque-42"},
+                    "region": "westus-kept"}"#;
+    rgr3_assert_hidden(policy, input, "data.p.allow", RGR3_SECRET, "westus-kept");
+}
+
+#[test]
+fn rgr4_witness_over_a_pair_object_is_redacted() {
+    let policy = r#"package p
+import rego.v1
+allow if {
+    some k, v in input.setting
+    k == "value"
+    v != ""
+    input.region != ""
+}
+"#;
+    let input = r#"{"setting": {"name": "DB_PASSWORD", "value": "opaque-42"},
+                    "region": "westus-kept"}"#;
+    rgr3_assert_hidden(policy, input, "data.p.allow", RGR3_SECRET, "westus-kept");
+}
+
+#[test]
+fn rgr4_helpers_returning_sensitive_keys_are_redacted() {
+    let policy = r#"package p
+import rego.v1
+candidate := k if {
+    some k, v in input.tokens
+    v == true
+}
+names := {k | some k, _ in input.tokens}
+flags[k] := 1 if some k, _ in input.tokens
+allow if {
+    candidate != ""
+    count(names) > 0
+    count(flags) > 0
+    input.region != ""
+}
+"#;
+    let input = r#"{"tokens": {"opaque-42": true}, "region": "westus-kept"}"#;
+    rgr3_assert_hidden(policy, input, "data.p.allow", RGR3_SECRET, "westus-kept");
+}
+
+#[test]
+fn rgr4_keys_iterated_across_a_pair_path_overflow_stay_hidden() {
+    // 1,024 pair values fill the record exactly; the 1,025th, read inside the
+    // first iteration over `input.cfg.value`, overflows it. The loop's second
+    // key must stay hidden under the overflow rules.
+    let policy = r#"package p
+import rego.v1
+allow if {
+    count([s.value | some s in input.pairs]) > 0
+    some k, v in input.cfg.value
+    input.extra.value != ""
+    k != "a-first"
+    v > 0
+}
+"#;
+    let pairs: Vec<String> = (0..1024)
+        .map(|i| format!(r#"{{"name": "DB_PASSWORD", "value": "v{i}"}}"#))
+        .collect();
+    let input = format!(
+        r#"{{"cfg": {{"value": {{"a-first": 1, "opaque-42": 2}}}},
+             "extra": {{"name": "API_TOKEN", "value": "t"}},
+             "pairs": [{}]}}"#,
+        pairs.join(",")
     );
+    for report in rgr3_reports(
+        policy,
+        &input,
+        "data.p.allow",
+        evaluation_trace::ValueMode::Redacted,
+    ) {
+        assert!(!report.to_string().contains(RGR3_SECRET), "{report:#}");
+    }
+    for report in rgr3_reports(
+        policy,
+        &input,
+        "data.p.allow",
+        evaluation_trace::ValueMode::Full,
+    ) {
+        assert!(report.to_string().contains(RGR3_SECRET), "Full control");
+    }
+}
+
+#[test]
+fn rgr4_multi_value_object_helpers_are_redacted() {
+    // `bag[k] contains v` compiles to `ObjectDeepSet`, which records no
+    // emission; its leaves are recorded separately for redaction.
+    let policy = r#"package p
+import rego.v1
+bag[k] contains input.password if k := "a"
+bag[k] contains input.public if k := "b"
+plain[k] contains input.region if k := "b"
+allow if {
+    count(bag) > 0
+    count(plain) > 0
+}
+"#;
+    // `public` nests the same secret one level down inside the set.
+    let input = r#"{"password": "opaque-42", "public": ["opaque-42"], "region": "westus-kept"}"#;
+    rgr3_assert_hidden(policy, input, "data.p.allow", RGR3_SECRET, "westus-kept");
+    // A head with several keys also writes through `ObjectDeepSet`, nesting
+    // the leaf deeper.
+    let nested = r#"package p
+import rego.v1
+deep[a][b] contains input.password if {
+    a := "x"
+    b := "y"
+}
+allow if {
+    count(deep) > 0
+    input.region != ""
+}
+"#;
+    rgr3_assert_hidden(nested, input, "data.p.allow", RGR3_SECRET, "westus-kept");
+}
+
+#[test]
+fn rgr4_set_elements_at_a_sensitive_path_are_hidden_as_keys() {
+    use evaluation_trace::ValueMode;
+    let policy = r#"package p
+import rego.v1
+allow if {
+    some k, _ in input.apiTokens
+    k != ""
+    input.region != ""
+}
+"#;
+    // `apiTokens` must be a set, which JSON cannot express.
+    let mut input = Value::from_json_str(r#"{"apiTokens": [], "region": "westus-kept"}"#).unwrap();
+    let tokens: std::collections::BTreeSet<Value> =
+        [Value::from(RGR3_SECRET)].into_iter().collect();
+    input
+        .as_object_mut()
+        .unwrap()
+        .insert(Value::from("apiTokens"), Value::from(tokens));
+    for report in rgr3_reports_with(policy, input.clone(), "data.p.allow", ValueMode::Full) {
+        assert!(report.to_string().contains(RGR3_SECRET), "Full control");
+    }
+    for report in rgr3_reports_with(policy, input, "data.p.allow", ValueMode::Redacted) {
+        let text = report.to_string();
+        assert!(!text.contains(RGR3_SECRET), "{report:#}");
+        assert!(text.contains("westus-kept"), "{report:#}");
+    }
 }

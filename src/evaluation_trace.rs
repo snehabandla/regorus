@@ -175,6 +175,7 @@ pub struct ConditionOutcome {
 
 /// Statistics for a completed loop.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct LoopStat {
     /// PC of the `LoopStart` instruction.
     pub pc: u32,
@@ -188,10 +189,25 @@ pub struct LoopStat {
     pub sample_key: Option<ValueIdx>,
     /// Sample successful value (index into `captured_values`).
     pub sample_value: Option<ValueIdx>,
+    /// Runtime provenance of the iterated collection, when known. Witness
+    /// samples are redacted by this path like operands are by theirs.
+    pub collection_path: Option<crate::Rc<str>>,
+    /// Number of partial-set emissions recorded when the loop finished. The
+    /// value at position `i` of `emission_outcomes` was emitted after this
+    /// loop finished exactly when `emissions_before_exit <= i`.
+    pub emissions_before_exit: u32,
+    /// Iteration id of the innermost loop of the same rule frame that was
+    /// running when this loop started; `None` for a loop at body level. An
+    /// emission owns this loop only if this iteration was active when it
+    /// was emitted.
+    pub enclosing_iteration: Option<u32>,
+    /// Runtime provenance of the sample value, when known.
+    pub sample_path: Option<crate::Rc<str>>,
 }
 
 /// Outcome of a rule definition evaluation.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RuleOutcome {
     /// Rule index in `Program::rule_infos`.
     pub rule_index: u16,
@@ -206,10 +222,15 @@ pub struct RuleOutcome {
     /// Materializers use this to surface a per-rule `result` while keeping
     /// per-definition entries distinct.
     pub is_summary: bool,
+    /// Runtime provenance of the result value, when it was read from data
+    /// (set on summary outcomes), so a report can redact a helper's result by
+    /// where it came from.
+    pub result_path: Option<String>,
 }
 
 /// A single emitted result value for a partial-set rule.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EmissionOutcome {
     /// Rule index in `Program::rule_infos`.
     pub rule_index: u16,
@@ -221,10 +242,16 @@ pub struct EmissionOutcome {
     pub condition_end_index: u32,
     /// Index of the emitted value in `captured_values`.
     pub value_idx: Option<ValueIdx>,
+    /// Iteration ids of the loops of the emitting rule frame that were
+    /// running at the emission, outermost first.
+    pub active_iterations: Vec<u32>,
+    /// Runtime provenance of the emitted value, when it was read from data.
+    pub value_path: Option<String>,
 }
 
 /// An assumption recorded when unknown input handling skips an assertion.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Assumption {
     /// What kind of assumption was made.
     pub kind: AssumptionKind,
@@ -245,6 +272,9 @@ pub struct Assumption {
     /// The non-input value that was compared against, e.g. `"admin"`.
     /// `None` for existence checks or when the value is not available.
     pub assumed_value: Option<Value>,
+    /// Runtime provenance of `assumed_value` when it was read from data, so
+    /// a report can redact it by its path like an operand.
+    pub assumed_value_path: Option<String>,
     /// Rule index when the assumption was recorded (PE mode).
     pub rule_index: u16,
     /// Definition index within the rule (PE mode).
@@ -413,7 +443,51 @@ pub struct EvaluationTrace {
     /// `materialize_pe` returns empty residual queries because the result is
     /// fully determined by concrete evaluation.
     pub definitive_result: bool,
+    /// Runtime paths of `value` entries read from `{name, value}` objects whose
+    /// `name` is a sensitive name (recorded only in `ValueMode::Redacted`).
+    /// A value at or under one of these paths is redacted wherever it is
+    /// reported, even after it is taken out of its object.
+    pub sensitive_value_paths: alloc::collections::BTreeSet<String>,
+    /// `sensitive_value_paths` reached its cap; every path ending in a
+    /// `value` segment is then treated as sensitive.
+    pub sensitive_value_paths_overflowed: bool,
+    /// String keys of objects iterated at a sensitive path (recorded only in
+    /// `ValueMode::Redacted`). The keys of a secret collection are secret too,
+    /// but a key has no path of its own, so it is redacted by value.
+    pub sensitive_keys: alloc::collections::BTreeSet<Value>,
+    /// `sensitive_keys` reached its cap; every string operand without a
+    /// runtime path is then treated as sensitive.
+    pub sensitive_keys_overflowed: bool,
+    /// Leaf values written into a partial-object rule's result by a
+    /// multi-key or multi-value head (`ObjectDeepSet`), with where each was
+    /// read from, so a report can redact them like emitted values. Kept apart
+    /// from `emission_outcomes`, which partial evaluation reads.
+    pub deep_object_leaves: Vec<DeepObjectLeaf>,
+    /// Materialization scratch: nested-secret sanitization results for
+    /// collection values, keyed by their shared allocation (see
+    /// `causality_report::redact_nested_secrets_cached`).
+    pub(crate) nested_secret_cache: core::cell::RefCell<NestedSecretCache>,
 }
+
+/// Nested-secret sanitization results by container allocation address. Each
+/// entry holds a clone of its key value, so the address stays allocated (and
+/// cannot be reused by another value) for as long as the entry exists.
+pub(crate) type NestedSecretCache = alloc::collections::BTreeMap<usize, (Value, Option<Value>)>;
+
+/// A leaf value a multi-key or multi-value partial-object head wrote.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct DeepObjectLeaf {
+    /// Rule index in `Program::rule_infos`.
+    pub rule_index: u16,
+    /// Index of the leaf value in `captured_values`.
+    pub value_idx: Option<ValueIdx>,
+    /// Runtime provenance of the leaf value, when it was read from data.
+    pub value_path: Option<String>,
+}
+
+/// Maximum number of recorded sensitive pair-value paths.
+pub const MAX_SENSITIVE_VALUE_PATHS: usize = 1024;
 
 impl EvaluationTrace {
     pub fn new() -> Self {
@@ -434,6 +508,51 @@ impl EvaluationTrace {
         self.next_negation_scope_id = 0;
         self.negation_scope_stack.clear();
         self.definitive_result = false;
+        self.sensitive_value_paths.clear();
+        self.sensitive_value_paths_overflowed = false;
+        self.sensitive_keys.clear();
+        self.sensitive_keys_overflowed = false;
+        self.deep_object_leaves.clear();
+        self.nested_secret_cache.get_mut().clear();
+    }
+
+    /// Record a leaf a multi-key partial-object head wrote.
+    pub fn record_deep_object_leaf(
+        &mut self,
+        rule_index: u16,
+        value: Value,
+        value_path: Option<String>,
+    ) {
+        let value_idx = self.capture_value(value);
+        self.deep_object_leaves.push(DeepObjectLeaf {
+            rule_index,
+            value_idx,
+            value_path,
+        });
+    }
+
+    /// Record `key` as a key of a sensitive collection.
+    pub fn record_sensitive_key(&mut self, key: &Value) {
+        if self.sensitive_keys.contains(key) {
+            return;
+        }
+        if self.sensitive_keys.len() >= MAX_SENSITIVE_VALUE_PATHS {
+            self.sensitive_keys_overflowed = true;
+            return;
+        }
+        self.sensitive_keys.insert(key.clone());
+    }
+
+    /// Record `path` as holding the `value` of a sensitive name/value pair.
+    pub fn record_sensitive_value_path(&mut self, path: &str) {
+        if self.sensitive_value_paths.contains(path) {
+            return;
+        }
+        if self.sensitive_value_paths.len() >= MAX_SENSITIVE_VALUE_PATHS {
+            self.sensitive_value_paths_overflowed = true;
+            return;
+        }
+        self.sensitive_value_paths.insert(String::from(path));
     }
 
     /// Returns true if the trace is empty (nothing recorded).
@@ -497,6 +616,7 @@ impl EvaluationTrace {
             return;
         };
 
+        let emissions_before_exit = self.emissions_recorded();
         self.loop_stats.push(LoopStat {
             pc,
             anchor_condition_idx: self
@@ -508,6 +628,10 @@ impl EvaluationTrace {
             success_count,
             sample_key: key_idx,
             sample_value: val_idx,
+            collection_path: None,
+            emissions_before_exit,
+            enclosing_iteration: None,
+            sample_path: None,
         });
 
         if let Some(outcome) = self.condition_outcomes.last_mut() {
@@ -515,7 +639,11 @@ impl EvaluationTrace {
         }
     }
 
-    /// Record a loop completion.
+    /// Record a loop completion. `collection_path` is the runtime
+    /// provenance of the iterated collection, when known;
+    /// `enclosing_iteration` is the iteration of the innermost loop of the
+    /// same rule frame that was running when this loop started.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_loop(
         &mut self,
         pc: u32,
@@ -524,9 +652,13 @@ impl EvaluationTrace {
         success_count: u32,
         sample_key: Option<Value>,
         sample_value: Option<Value>,
+        collection_path: Option<crate::Rc<str>>,
+        enclosing_iteration: Option<u32>,
+        sample_path: Option<crate::Rc<str>>,
     ) {
         let key_idx = sample_key.and_then(|v| self.capture_value(v));
         let val_idx = sample_value.and_then(|v| self.capture_value(v));
+        let emissions_before_exit = self.emissions_recorded();
         self.loop_stats.push(LoopStat {
             pc,
             anchor_condition_idx,
@@ -534,7 +666,15 @@ impl EvaluationTrace {
             success_count,
             sample_key: key_idx,
             sample_value: val_idx,
+            collection_path,
+            emissions_before_exit,
+            enclosing_iteration,
+            sample_path,
         });
+    }
+
+    fn emissions_recorded(&self) -> u32 {
+        u32::try_from(self.emission_outcomes.len()).unwrap_or(u32::MAX)
     }
 
     /// Record a rule definition outcome.
@@ -552,6 +692,7 @@ impl EvaluationTrace {
             succeeded,
             result_value_idx: result_idx,
             is_summary: false,
+            result_path: None,
         });
     }
 
@@ -574,10 +715,12 @@ impl EvaluationTrace {
             succeeded,
             result_value_idx: result_idx,
             is_summary: true,
+            result_path: None,
         });
     }
 
-    /// Record a partial-set emission and the body-window conditions active at the time.
+    /// Record a partial-set emission, the body-window conditions and the loop
+    /// iterations active at the time.
     pub fn record_emission(
         &mut self,
         rule_index: u16,
@@ -585,6 +728,7 @@ impl EvaluationTrace {
         condition_start_index: u32,
         condition_end_index: u32,
         value: Value,
+        active_iterations: Vec<u32>,
     ) {
         let value_idx = self.capture_value(value);
         self.emission_outcomes.push(EmissionOutcome {
@@ -593,6 +737,8 @@ impl EvaluationTrace {
             condition_start_index,
             condition_end_index,
             value_idx,
+            active_iterations,
+            value_path: None,
         });
     }
 
@@ -622,6 +768,7 @@ impl EvaluationTrace {
             operator,
             builtin_name: None,
             assumed_value,
+            assumed_value_path: None,
             rule_index,
             definition_index,
             iteration_index,

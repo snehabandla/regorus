@@ -196,6 +196,12 @@ pub struct RegoVM {
     #[cfg(feature = "explanations")]
     pub(super) provenance_stack: Vec<Vec<Option<Rc<str>>>>,
 
+    /// Whether the last iterated collection path was sensitive, keyed by the
+    /// path and by the state of the recorded pair paths (count and overflow),
+    /// so a loop's iterations check their shared path once.
+    #[cfg(feature = "explanations")]
+    pub(super) sensitive_collection_cache: Option<(Rc<str>, usize, bool, bool)>,
+
     /// Runtime input/data path provenance for each live register.
     #[cfg(feature = "explanations")]
     pub(super) register_paths: Vec<Option<String>>,
@@ -354,6 +360,8 @@ impl RegoVM {
             provenance: RuntimeProvenanceTracker::default(),
             #[cfg(feature = "explanations")]
             provenance_stack: Vec::new(),
+            #[cfg(feature = "explanations")]
+            sensitive_collection_cache: None,
             #[cfg(feature = "explanations")]
             register_paths: Vec::new(),
             #[cfg(feature = "explanations")]

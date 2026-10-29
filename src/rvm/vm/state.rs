@@ -31,6 +31,15 @@ impl RegoVM {
         self.registers.clear();
         self.registers
             .resize(self.base_register_count, Value::Undefined);
+        // Provenance belongs to the registers: a previous run that stopped
+        // inside a rule call must not leave its paths behind.
+        #[cfg(feature = "explanations")]
+        {
+            self.provenance.take_paths();
+            self.provenance.resize(self.base_register_count);
+            self.provenance_stack.clear();
+            self.sensitive_collection_cache = None;
+        }
 
         // Builtin cache entries only live for a single execution
         self.builtins_cache.clear();
@@ -66,6 +75,11 @@ impl RegoVM {
         debug_assert!(
             self.call_rule_stack.is_empty(),
             "reset_execution_state postcondition: call_rule_stack must be empty"
+        );
+        #[cfg(feature = "explanations")]
+        debug_assert!(
+            self.provenance_stack.is_empty(),
+            "reset_execution_state postcondition: provenance_stack must be empty"
         );
         debug_assert!(
             self.register_stack.is_empty(),

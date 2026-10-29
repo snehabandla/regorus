@@ -80,6 +80,12 @@ pub(super) struct RuleFrameData {
     pub(super) saved_registers: Vec<Value>,
     pub(super) saved_loop_stack: Vec<LoopContext>,
     pub(super) saved_comprehension_stack: Vec<ComprehensionContext>,
+    /// The caller's register provenance, restored when the frame finishes.
+    #[cfg(feature = "explanations")]
+    pub(super) saved_provenance: Vec<Option<crate::Rc<str>>>,
+    /// Provenance of `accumulated_result`, captured with it.
+    #[cfg(feature = "explanations")]
+    pub(super) accumulated_provenance: Option<crate::Rc<str>>,
     /// PE mode: assumption count when the current definition started.
     #[cfg(feature = "explanations")]
     pub(super) assumptions_at_def_start: usize,
@@ -138,6 +144,11 @@ impl ExecutionStack {
 
     pub fn get(&self, index: usize) -> Option<&ExecutionFrame> {
         self.frames.get(index)
+    }
+
+    #[cfg(feature = "explanations")]
+    pub fn iter(&self) -> core::slice::Iter<'_, ExecutionFrame> {
+        self.frames.iter()
     }
 
     pub fn get_mut(&mut self, index: usize) -> Option<&mut ExecutionFrame> {

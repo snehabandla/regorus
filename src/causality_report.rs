@@ -26,20 +26,34 @@ use crate::value::Value;
 // Redaction
 // ---------------------------------------------------------------------------
 
-/// Field names that are redacted when value_mode is Redacted.
+/// Name fragments that mark a field as sensitive when value_mode is Redacted.
+/// Matched against names normalized by `normalize_name`, so `api_key`,
+/// `api-key` and `apiKey` all match `apikey`.
 const SENSITIVE_FIELDS: &[&str] = &[
     "password",
+    "passwd",
+    "pwd",
+    "passphrase",
     "secret",
     "token",
-    "api_key",
     "apikey",
-    "api-key",
     "jwt",
     "credential",
-    "private_key",
     "privatekey",
-    "access_key",
     "accesskey",
+    "connectionstring",
+    "securevalue",
+    "protectedsettings",
+];
+
+/// Key-material names, matched only at the end of a normalized name so that
+/// settings about a key (`allowSharedKeyAccess`) are not mistaken for one.
+const SENSITIVE_KEY_SUFFIXES: &[&str] = &[
+    "accountkey",
+    "sharedkey",
+    "primarykey",
+    "secondarykey",
+    "subscriptionkey",
 ];
 
 fn should_redact_path(provenance: Option<&Provenance>) -> bool {
@@ -56,11 +70,59 @@ fn should_redact_path(provenance: Option<&Provenance>) -> bool {
     false
 }
 
+/// Bytes of `name`, ASCII-lowercased, without the separators `-`, `_` and space.
+fn normalized_name_bytes(name: &str) -> impl Iterator<Item = u8> + '_ {
+    name.bytes()
+        .filter(|b| !matches!(*b, b'-' | b'_' | b' '))
+        .map(|b| b.to_ascii_lowercase())
+}
+
+/// Names up to this many normalized bytes are checked without allocating;
+/// every sensitive fragment is far shorter.
+const INLINE_NAME_BYTES: usize = 64;
+
+/// Whether `name` is sensitive: after normalization it contains a
+/// `SENSITIVE_FIELDS` fragment or ends with a `SENSITIVE_KEY_SUFFIXES` one.
+///
+/// Runs for every object key of every value a `Redacted` report walks, so the
+/// common short name is normalized into a stack buffer rather than a `String`.
 fn is_sensitive_name(name: &str) -> bool {
-    let lower = str::to_ascii_lowercase(name);
-    SENSITIVE_FIELDS
+    let mut inline = [0_u8; INLINE_NAME_BYTES];
+    let mut len = 0_usize;
+    for byte in normalized_name_bytes(name) {
+        let Some(slot) = inline.get_mut(len) else {
+            let heap: Vec<u8> = normalized_name_bytes(name).collect();
+            return is_sensitive_normalized(&heap);
+        };
+        *slot = byte;
+        len = len.saturating_add(1);
+    }
+    is_sensitive_normalized(inline.get(..len).unwrap_or_default())
+}
+
+fn is_sensitive_normalized(name: &[u8]) -> bool {
+    SENSITIVE_FIELDS.iter().any(|fragment| {
+        name.windows(fragment.len())
+            .any(|window| window == fragment.as_bytes())
+    }) || SENSITIVE_KEY_SUFFIXES
         .iter()
-        .any(|sensitive| lower.contains(sensitive))
+        .any(|suffix| name.ends_with(suffix.as_bytes()))
+}
+
+/// Whether `map` is a name/value pair whose `name` is sensitive, as in ARM
+/// `appSettings` or container `env` entries (`{"name": "DB_PASSWORD",
+/// "value": "..."}`); its `value` entry is then sensitive too.
+pub(crate) fn is_sensitive_pair(map: &crate::value::Object) -> bool {
+    map.get(&Value::from("name"))
+        .and_then(|name| name.as_string().ok())
+        .is_some_and(|name| is_sensitive_name(name))
+}
+
+/// Whether an object entry under `key` holds a sensitive value;
+/// `pair_sensitive` is `is_sensitive_pair` of the enclosing object.
+fn is_sensitive_entry(key: &Value, pair_sensitive: bool) -> bool {
+    key.as_string()
+        .is_ok_and(|k| is_sensitive_name(k) || (pair_sensitive && k.as_ref() == "value"))
 }
 
 /// Nesting beyond this depth is treated as sensitive rather than walked.
@@ -77,11 +139,31 @@ fn contains_nested_secret(value: &Value, depth: usize) -> bool {
     }
     let next = depth.saturating_add(1);
     match *value {
-        Value::Object(ref map) => map.iter().any(|(key, item)| {
-            key.as_string().is_ok_and(|k| is_sensitive_name(k))
-                || contains_nested_secret(key, next)
-                || contains_nested_secret(item, next)
-        }),
+        Value::Object(ref map) => {
+            // One pass: a sensitive key, a nested secret, or a name/value pair
+            // whose `name` is sensitive (see `is_sensitive_pair`).
+            let mut sensitive_name_entry = false;
+            let mut has_value_entry = false;
+            for (key, item) in map.iter() {
+                if let Ok(key_name) = key.as_string() {
+                    if is_sensitive_name(key_name) {
+                        return true;
+                    }
+                    match key_name.as_ref() {
+                        "name" => {
+                            sensitive_name_entry =
+                                item.as_string().is_ok_and(|name| is_sensitive_name(name));
+                        }
+                        "value" => has_value_entry = true,
+                        _ => {}
+                    }
+                }
+                if contains_nested_secret(key, next) || contains_nested_secret(item, next) {
+                    return true;
+                }
+            }
+            sensitive_name_entry && has_value_entry
+        }
         Value::Array(ref items) => items.iter().any(|item| contains_nested_secret(item, next)),
         Value::Set(ref items) => items.iter().any(|item| contains_nested_secret(item, next)),
         _ => false,
@@ -110,10 +192,11 @@ fn redact_nested_secrets(value: &Value, depth: usize) -> Option<Value> {
             if map.keys().any(|key| contains_nested_secret(key, next)) {
                 return Some(Value::from("<redacted>"));
             }
+            let pair_sensitive = is_sensitive_pair(map);
             let out: alloc::collections::BTreeMap<Value, Value> = map
                 .iter()
                 .map(|(key, item)| {
-                    let replaced = if key.as_string().is_ok_and(|k| is_sensitive_name(k)) {
+                    let replaced = if is_sensitive_entry(key, pair_sensitive) {
                         Value::from("<redacted>")
                     } else {
                         redact_items(item)
@@ -229,13 +312,273 @@ fn truncate_operand(value: &Value) -> Option<(Value, usize)> {
     Some((take_within_element_budget(value, &mut budget), length))
 }
 
-fn should_redact_runtime_path(path: Option<&str>) -> bool {
-    let Some(path) = path else {
-        return false;
-    };
+/// One segment of a runtime provenance path.
+#[derive(Debug, PartialEq, Eq)]
+struct PathSegment<'a> {
+    /// Byte offset just past the segment in the path text.
+    end: usize,
+    /// The segment's key when it names an object field (the root, `.ident`
+    /// or `["string"]`); `None` for an index or any other bracketed value.
+    /// Borrowed from the path unless a quoted key holds escapes.
+    key: Option<alloc::borrow::Cow<'a, str>>,
+}
 
-    let lower = path.to_ascii_lowercase();
-    SENSITIVE_FIELDS.iter().any(|field| lower.contains(field))
+/// Segments of a runtime provenance path in the grammar the VM writes:
+/// `root(.ident | ["json string"] | [other])*`. Yields `Err(())` once, and
+/// then stops, where the text does not follow it. Does not allocate unless a
+/// quoted key holds escapes.
+struct RuntimePathSegments<'a> {
+    path: &'a str,
+    pos: usize,
+    done: bool,
+}
+
+impl<'a> RuntimePathSegments<'a> {
+    const fn new(path: &'a str) -> Self {
+        Self {
+            path,
+            pos: 0,
+            done: false,
+        }
+    }
+
+    fn next_segment(&mut self) -> Option<PathSegment<'a>> {
+        use alloc::borrow::Cow;
+        let path = self.path;
+        let bytes = path.as_bytes();
+        let is_ident = |b: u8| b == b'_' || b.is_ascii_alphanumeric();
+        let ident_len = |from: usize| {
+            bytes
+                .get(from..)
+                .map_or(0, |rest| rest.iter().take_while(|&&b| is_ident(b)).count())
+        };
+        if self.pos == 0 {
+            let len = ident_len(0);
+            if len == 0 {
+                return None;
+            }
+            self.pos = len;
+            return Some(PathSegment {
+                end: len,
+                key: Some(Cow::Borrowed(path.get(..len)?)),
+            });
+        }
+        match bytes.get(self.pos).copied()? {
+            b'.' => {
+                // `IndexLiteral` writes any string key after a dot, so a field
+                // runs to the next `.` or `[`.
+                let start = self.pos.saturating_add(1);
+                let len = bytes.get(start..).map_or(0, |rest| {
+                    rest.iter().take_while(|&&b| b != b'.' && b != b'[').count()
+                });
+                if len == 0 {
+                    return None;
+                }
+                self.pos = start.saturating_add(len);
+                Some(PathSegment {
+                    end: self.pos,
+                    key: Some(Cow::Borrowed(path.get(start..self.pos)?)),
+                })
+            }
+            b'[' => {
+                let start = self.pos.saturating_add(1);
+                let (close, key) = if bytes.get(start) == Some(&b'"') {
+                    let close = closing_quote(bytes, start.saturating_add(1))?;
+                    let inner = path.get(start.saturating_add(1)..close)?;
+                    let key = if inner.contains('\\') {
+                        Cow::Owned(serde_json::from_str::<String>(path.get(start..=close)?).ok()?)
+                    } else {
+                        Cow::Borrowed(inner)
+                    };
+                    (close.saturating_add(1), Some(key))
+                } else {
+                    let close = closing_bracket(bytes, start)?;
+                    let inner = path.get(start..close)?;
+                    // A number is an index; anything else is a compound key.
+                    let is_index = inner.parse::<f64>().is_ok();
+                    (close, (!is_index).then_some(Cow::Borrowed(inner)))
+                };
+                if bytes.get(close) != Some(&b']') {
+                    return None;
+                }
+                self.pos = close.saturating_add(1);
+                Some(PathSegment { end: self.pos, key })
+            }
+            _ => None,
+        }
+    }
+}
+
+impl<'a> Iterator for RuntimePathSegments<'a> {
+    type Item = Result<PathSegment<'a>, ()>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done || (self.pos > 0 && self.pos >= self.path.len()) {
+            return None;
+        }
+        let segment = self.next_segment();
+        if segment.is_none() {
+            self.done = true;
+        }
+        Some(segment.ok_or(()))
+    }
+}
+
+/// All segments of a runtime path, or `None` when it does not parse.
+fn parse_runtime_path(path: &str) -> Option<Vec<PathSegment<'_>>> {
+    RuntimePathSegments::new(path)
+        .collect::<Result<_, _>>()
+        .ok()
+}
+
+/// Index of the `"` closing a JSON string whose content starts at `from`.
+fn closing_quote(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut escaped = false;
+    for (offset, &b) in bytes.get(from..)?.iter().enumerate() {
+        match b {
+            _ if escaped => escaped = false,
+            b'\\' => escaped = true,
+            b'"' => return Some(from.saturating_add(offset)),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Index of the `]` closing a bracket whose content starts at `from`, skipping
+/// nested brackets, braces and strings (a compound key's display).
+fn closing_bracket(bytes: &[u8], from: usize) -> Option<usize> {
+    let mut depth = 0_usize;
+    let mut pos = from;
+    while let Some(&b) = bytes.get(pos) {
+        match b {
+            b'"' => pos = closing_quote(bytes, pos.saturating_add(1))?,
+            b'[' | b'{' => depth = depth.saturating_add(1),
+            b']' if depth == 0 => return Some(pos),
+            b']' | b'}' => depth = depth.checked_sub(1)?,
+            _ => {}
+        }
+        pos = pos.saturating_add(1);
+    }
+    None
+}
+
+/// Index of the first segment at which a runtime path becomes sensitive: a
+/// sensitive-named key, or the end of a recorded sensitive pair value (see
+/// `EvaluationTrace::sensitive_value_paths`). A path that does not parse is
+/// sensitive at its root if any part of it looks sensitive.
+fn sensitive_segment(path: &str, trace: &EvaluationTrace) -> Option<usize> {
+    let check_pairs = !trace.sensitive_value_paths.is_empty();
+    for (index, segment) in RuntimePathSegments::new(path).enumerate() {
+        let Ok(segment) = segment else {
+            let pair_prefix = trace.sensitive_value_paths.iter().any(|recorded| {
+                path.strip_prefix(recorded.as_str())
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(['.', '[']))
+            });
+            let named = path
+                .split(['.', '[', ']', '"'])
+                .any(|part| !part.is_empty() && is_sensitive_name(part));
+            // Past the record's cap, an unreadable path may hide a pair value.
+            return (pair_prefix || named || trace.sensitive_value_paths_overflowed).then_some(0);
+        };
+        let key_sensitive = segment.key.as_deref().is_some_and(|key| {
+            is_sensitive_name(key) || (trace.sensitive_value_paths_overflowed && key == "value")
+        });
+        let pair_value = check_pairs
+            && path
+                .get(..segment.end)
+                .is_some_and(|prefix| trace.sensitive_value_paths.contains(prefix));
+        if key_sensitive || pair_value {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// Whether `value` is a key of a sensitive collection (see
+/// `EvaluationTrace::sensitive_keys`). `has_path` tells whether the value has
+/// a runtime path of its own, which a key never does.
+fn is_sensitive_key(value: &Value, has_path: bool, trace: &EvaluationTrace) -> bool {
+    matches!(*value, Value::String(_))
+        && (trace.sensitive_keys.contains(value) || (trace.sensitive_keys_overflowed && !has_path))
+}
+
+/// Whether a runtime path reaches sensitive data (see `sensitive_segment`).
+pub(crate) fn should_redact_runtime_path(path: Option<&str>, trace: &EvaluationTrace) -> bool {
+    path.is_some_and(|path| sensitive_segment(path, trace).is_some())
+}
+
+/// Hide the keys a runtime path reveals beneath its first sensitive segment
+/// (the keys of a secret collection are themselves secret): each later field
+/// key becomes `["<redacted>"]`; indices are kept. Returns `None` when nothing
+/// changes. An unparsable sensitive path is hidden whole.
+fn mask_runtime_path(path: &str, trace: &EvaluationTrace) -> Option<String> {
+    mask_runtime_path_from(path, sensitive_segment(path, trace)?)
+}
+
+/// `mask_runtime_path` once the first sensitive segment is known.
+fn mask_runtime_path_from(path: &str, first: usize) -> Option<String> {
+    let Some(segments) = parse_runtime_path(path) else {
+        return Some(String::from("<redacted>"));
+    };
+    let mut start = segments.get(first)?.end;
+    let mut masked = String::from(path.get(..start)?);
+    let mut changed = false;
+    for segment in segments.get(first.saturating_add(1)..)? {
+        if segment.key.is_some() {
+            masked.push_str("[\"<redacted>\"]");
+            changed = true;
+        } else {
+            masked.push_str(path.get(start..segment.end)?);
+        }
+        start = segment.end;
+    }
+    changed.then_some(masked)
+}
+
+/// `redact_nested_secrets(value, 0)`, remembered per collection allocation.
+///
+/// A report shows the same shared collection (a whole resource bound by
+/// `some r in input.resources`) in many conditions; the walk depends only on
+/// the value, so it is done once per allocation for the life of the trace.
+fn redact_nested_secrets_cached(value: &Value, trace: &EvaluationTrace) -> Option<Value> {
+    let address = match *value {
+        Value::Object(ref map) => crate::Rc::as_ptr(map).cast::<u8>().addr(),
+        Value::Array(ref items) => crate::Rc::as_ptr(items).cast::<u8>().addr(),
+        Value::Set(ref items) => crate::Rc::as_ptr(items).cast::<u8>().addr(),
+        _ => return None,
+    };
+    if let Ok(cache) = trace.nested_secret_cache.try_borrow() {
+        if let Some((_, result)) = cache.get(&address) {
+            return result.clone();
+        }
+    }
+    let result = redact_nested_secrets(value, 0);
+    if let Ok(mut cache) = trace.nested_secret_cache.try_borrow_mut() {
+        cache.insert(address, (value.clone(), result.clone()));
+    }
+    result
+}
+
+/// Sanitize a value for a `Redacted` report: the whole value when `sensitive`,
+/// otherwise only secrets nested inside it.
+fn sanitize_value(value: &Value, sensitive: bool, trace: &EvaluationTrace) -> Option<Value> {
+    if sensitive {
+        Some(Value::from("<redacted>"))
+    } else {
+        redact_nested_secrets_cached(value, trace)
+    }
+}
+
+/// Whether `rule_name` is a result the caller queried (an entry point or a
+/// rule under an entry-point package) rather than a helper it did not ask for.
+fn is_output_rule(rule_name: &str, program: &Program) -> bool {
+    program.entry_points.keys().any(|entry| {
+        rule_name == entry
+            || rule_name
+                .strip_prefix(entry.as_str())
+                .is_some_and(|rest| rest.starts_with('.'))
+    })
 }
 
 fn assumed_input_path_for_pc(trace: &EvaluationTrace, pc: u32) -> Option<String> {
@@ -300,6 +643,9 @@ pub struct RuleExplanation {
     pub emissions: Vec<EmissionExplanation>,
     /// Explanations for each definition that was evaluated.
     pub definitions: Vec<DefinitionExplanation>,
+    /// `true` when `result` was rewritten by redaction.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub redacted: bool,
 }
 
 /// Explanation for a single emitted partial-set value.
@@ -314,12 +660,9 @@ pub struct EmissionExplanation {
     /// Conditions active when the value was emitted.
     pub conditions: Vec<ConditionExplanation>,
     /// Every distinct derivation of `result`, in trace order and including the
-    /// first, in the per-derivation view: conditions carry no loop witness,
-    /// and under `Redacted` nested secrets are sanitized in every operand. The
-    /// top-level `definition_index` is the first derivation's; the top-level
-    /// `conditions` are its default view. Present only when
-    /// `ExplanationSettings::max_derivations` is greater than one; holds at
-    /// most that many entries.
+    /// first, whose `definition_index` and `conditions` the top-level fields
+    /// repeat. Present only when `ExplanationSettings::max_derivations` is
+    /// greater than one; holds at most that many entries.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub derivations: Vec<DerivationExplanation>,
     /// Number of distinct derivations found for `result`. Present only with
@@ -331,6 +674,9 @@ pub struct EmissionExplanation {
     /// list may be incomplete.
     #[serde(default, skip_serializing_if = "is_false")]
     pub derivations_truncated: bool,
+    /// `true` when `result` was rewritten by redaction.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub redacted: bool,
 }
 
 /// One derivation of an emitted partial-set value: the definition that
@@ -433,15 +779,31 @@ const fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// Witness summary for a loop-backed condition.
+/// Summary of a completed loop, attached to the last reported condition of
+/// what it helps explain.
+///
+/// A loop is anchored at the last condition its own rule body recorded while
+/// it ran; a loop with no such condition is never summarized. A definition (or
+/// a rule-less program, or a helper body) carries the latest loop anchored
+/// among its reported conditions. An emission or derivation additionally
+/// requires that the loop finished before the value was emitted and that its
+/// enclosing loop iteration, if any, was still running at the emission, so the
+/// loop that produced a value is summarized on its definition, never on the
+/// emission.
 #[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
 pub struct LoopWitnessExplanation {
     pub total_iterations: u32,
     pub success_count: u32,
+    /// Key of the first successful iteration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sample_key: Option<Value>,
+    /// Value of the first successful iteration.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sample_value: Option<Value>,
+    /// Whether redaction changed the sample (`Redacted` value mode).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub redacted: bool,
 }
 
 /// An operand value with optional provenance.
@@ -500,6 +862,9 @@ pub struct AssumptionRecord {
     /// Source location.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub location: Option<SourceLocation>,
+    /// `true` when `assumed_value` was rewritten by redaction.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub redacted: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1365,7 +1730,7 @@ pub fn materialize(
     let assumptions = if settings.detail == ExplanationDetail::Compact {
         Vec::new()
     } else {
-        materialize_assumptions(program, trace)
+        materialize_assumptions(program, trace, settings)
     };
 
     CausalityReport {
@@ -1402,6 +1767,7 @@ fn materialize_ruleless_program(
             location: None,
             conditions,
         }],
+        redacted: false,
     }
 }
 
@@ -1420,6 +1786,9 @@ fn materialize_rules(
             seen_rules.push(outcome.rule_index);
         }
     }
+
+    let helper_sensitivity = (settings.value_mode == ValueMode::Redacted)
+        .then(|| HelperSensitivity::new(program, trace));
 
     for rule_idx in &seen_rules {
         let rule_info = match program.rule_infos.get(usize::from(*rule_idx)) {
@@ -1455,16 +1824,233 @@ fn materialize_rules(
             materialize_definitions(*rule_idx, rule_info, program, trace, settings)
         };
 
+        let (result, redacted, emissions) = match helper_sensitivity
+            .as_ref()
+            .filter(|_| !is_output_rule(&rule_info.name, program))
+        {
+            Some(sensitivity) => redact_helper_results(
+                *rule_idx,
+                &rule_info.name,
+                result,
+                emissions,
+                sensitivity,
+                trace,
+            ),
+            None => (result, false, emissions),
+        };
+
         rules.push(RuleExplanation {
             name: rule_info.name.clone(),
             rule_type: rule_type_str.to_string(),
             result,
             emissions,
             definitions,
+            redacted,
         });
     }
 
     rules
+}
+
+/// Redact the results of a helper rule the caller did not query, like an
+/// operand, and report whether each was rewritten.
+///
+/// A value read from a sensitive path (the rule's recorded result path, or an
+/// emitted value's path) is hidden whole, and so is any element of the rule's
+/// collection result that equals such an emitted value. A value of a
+/// sensitively named rule is hidden whole unless it is a boolean or null,
+/// which describe a setting rather than hold one. Any other value has its
+/// nested secrets sanitized. Runs after derivations are attached, because
+/// derivation matching compares the raw emitted values.
+fn redact_helper_results(
+    rule_idx: u16,
+    rule_name: &str,
+    result: Value,
+    mut emissions: Vec<EmissionExplanation>,
+    sensitivity: &HelperSensitivity<'_>,
+    trace: &EvaluationTrace,
+) -> (Value, bool, Vec<EmissionExplanation>) {
+    let name_sensitive = rule_name.rsplit('.').next().is_some_and(is_sensitive_name);
+    let rule = usize::from(rule_idx);
+    let result_path_sensitive = sensitivity
+        .result_path_sensitive
+        .get(rule)
+        .copied()
+        .unwrap_or(false);
+    let empty = alloc::collections::BTreeSet::new();
+    let sensitive_emissions = sensitivity.sensitive_emissions.get(rule).unwrap_or(&empty);
+
+    let redact = |value: Value, path_sensitive: bool| -> (Value, bool) {
+        if matches!(value, Value::Undefined) {
+            return (value, false);
+        }
+        let whole =
+            path_sensitive || (name_sensitive && !matches!(value, Value::Bool(_) | Value::Null));
+        sanitize_value(&value, whole, trace).map_or((value, false), |sanitized| (sanitized, true))
+    };
+
+    for emission in &mut emissions {
+        let path_sensitive = sensitive_emissions.contains(&&emission.result);
+        let (value, redacted) = redact(
+            core::mem::replace(&mut emission.result, Value::Undefined),
+            path_sensitive,
+        );
+        emission.result = value;
+        emission.redacted = redacted;
+    }
+
+    let (result, hid_elements) = hide_sensitive_elements(result, sensitive_emissions, trace);
+    let result_is_key = is_sensitive_key(&result, false, trace);
+    let (result, redacted) = redact(result, result_path_sensitive || result_is_key);
+    (result, redacted || hid_elements, emissions)
+}
+
+/// Where each rule's results came from, gathered in one pass over the trace:
+/// whether its latest summary result was read from a sensitive path, and the
+/// emitted values that were (or are keys of a sensitive collection).
+struct HelperSensitivity<'a> {
+    result_path_sensitive: Vec<bool>,
+    sensitive_emissions: Vec<alloc::collections::BTreeSet<&'a Value>>,
+}
+
+impl<'a> HelperSensitivity<'a> {
+    fn new(program: &Program, trace: &'a EvaluationTrace) -> Self {
+        let rules = program.rule_infos.len();
+        let helper: Vec<bool> = program
+            .rule_infos
+            .iter()
+            .map(|info| !is_output_rule(&info.name, program))
+            .collect();
+        let is_helper = |rule: u16| helper.get(usize::from(rule)).copied().unwrap_or(false);
+        // Fail closed: a rule's one reported `result` stands for all of its
+        // calls, so any successful call that returned a sensitive value makes
+        // the result sensitive.
+        let mut result_path_sensitive: Vec<bool> = alloc::vec![false; rules];
+        for outcome in trace
+            .rule_outcomes
+            .iter()
+            .filter(|o| o.is_summary && o.succeeded && is_helper(o.rule_index))
+        {
+            if let Some(slot) = result_path_sensitive.get_mut(usize::from(outcome.rule_index)) {
+                if !*slot {
+                    *slot = should_redact_runtime_path(outcome.result_path.as_deref(), trace);
+                }
+            }
+        }
+        let mut sensitive_emissions: Vec<alloc::collections::BTreeSet<&'a Value>> =
+            alloc::vec![alloc::collections::BTreeSet::new(); rules];
+        for emission in trace
+            .emission_outcomes
+            .iter()
+            .filter(|emission| is_helper(emission.rule_index))
+        {
+            let Some(value) = emission.value_idx.and_then(|idx| trace.get_value(idx)) else {
+                continue;
+            };
+            let sensitive = should_redact_runtime_path(emission.value_path.as_deref(), trace)
+                || is_sensitive_key(value, emission.value_path.is_some(), trace);
+            if sensitive {
+                if let Some(slot) = sensitive_emissions.get_mut(usize::from(emission.rule_index)) {
+                    slot.insert(value);
+                }
+            }
+        }
+        for leaf in trace
+            .deep_object_leaves
+            .iter()
+            .filter(|leaf| is_helper(leaf.rule_index))
+        {
+            let Some(value) = leaf.value_idx.and_then(|idx| trace.get_value(idx)) else {
+                continue;
+            };
+            if should_redact_runtime_path(leaf.value_path.as_deref(), trace)
+                || is_sensitive_key(value, leaf.value_path.is_some(), trace)
+            {
+                if let Some(slot) = sensitive_emissions.get_mut(usize::from(leaf.rule_index)) {
+                    slot.insert(value);
+                }
+            }
+        }
+        Self {
+            result_path_sensitive,
+            sensitive_emissions,
+        }
+    }
+}
+
+/// Replace the parts of a helper rule's collection result that equal one of
+/// `hidden`, or that are keys of a sensitive collection, with `"<redacted>"`:
+/// set and array elements, and object entry values at any depth (a multi-key
+/// head nests them). An object keyed by such a key is hidden whole, since keys
+/// cannot be rewritten without colliding.
+fn hide_sensitive_elements(
+    result: Value,
+    hidden: &alloc::collections::BTreeSet<&Value>,
+    trace: &EvaluationTrace,
+) -> (Value, bool) {
+    let check_keys = !trace.sensitive_keys.is_empty() || trace.sensitive_keys_overflowed;
+    if hidden.is_empty() && !check_keys {
+        return (result, false);
+    }
+    let mut changed = false;
+    let rewritten = hide_sensitive_parts(&result, hidden, trace, 0, &mut changed);
+    if changed {
+        (rewritten, true)
+    } else {
+        (result, false)
+    }
+}
+
+fn hide_sensitive_parts(
+    value: &Value,
+    hidden: &alloc::collections::BTreeSet<&Value>,
+    trace: &EvaluationTrace,
+    depth: usize,
+    changed: &mut bool,
+) -> Value {
+    let next = depth.saturating_add(1);
+    // Each part: hidden when sensitive itself, otherwise walked if it is a
+    // collection, at every level.
+    let part = |item: &Value, flag: &mut bool| {
+        if hidden.contains(item) || is_sensitive_key(item, false, trace) {
+            *flag = true;
+            Value::from("<redacted>")
+        } else if matches!(*item, Value::Object(_) | Value::Set(_) | Value::Array(_)) {
+            hide_sensitive_parts(item, hidden, trace, next, flag)
+        } else {
+            item.clone()
+        }
+    };
+    if depth >= MAX_REDACT_DEPTH {
+        *changed = true;
+        return Value::from("<redacted>");
+    }
+    match *value {
+        Value::Set(ref items) => Value::from(
+            items
+                .iter()
+                .map(|item| part(item, changed))
+                .collect::<alloc::collections::BTreeSet<_>>(),
+        ),
+        Value::Array(ref items) => Value::from(
+            items
+                .iter()
+                .map(|item| part(item, changed))
+                .collect::<Vec<_>>(),
+        ),
+        Value::Object(ref map) => {
+            if map.keys().any(|key| is_sensitive_key(key, false, trace)) {
+                *changed = true;
+                return Value::from("<redacted>");
+            }
+            Value::from(
+                map.iter()
+                    .map(|(key, item)| (key.clone(), part(item, changed)))
+                    .collect::<alloc::collections::BTreeMap<_, _>>(),
+            )
+        }
+        _ => value.clone(),
+    }
 }
 
 fn materialize_definitions(
@@ -1545,10 +2131,11 @@ fn materialize_rule_emissions(
     };
     let mut emission_index = 0_usize;
 
-    for emission in trace
+    for (position, emission) in trace
         .emission_outcomes
         .iter()
-        .filter(|outcome| outcome.rule_index == rule_idx)
+        .enumerate()
+        .filter(|(_, outcome)| outcome.rule_index == rule_idx)
     {
         let Some(result) = emission
             .value_idx
@@ -1584,14 +2171,15 @@ fn materialize_rule_emissions(
                 emission.condition_start_index,
                 emission.condition_end_index,
                 emission.rule_index,
+                position,
                 program,
                 trace,
                 settings,
-                false,
             ),
             derivations: Vec::new(),
             derivation_count: None,
             derivations_truncated: false,
+            redacted: false,
         });
 
         emission_index = emission_index.saturating_add(1);
@@ -1614,8 +2202,7 @@ fn materialize_rule_emissions(
 ///
 /// The trace records an emission each time a body adds a value to the set,
 /// including values already present, so every derivation is available here.
-/// Derivations use the per-derivation view of their window (no loop witness;
-/// under `Redacted`, nested secrets sanitized in every operand).
+/// Each derivation is materialized exactly like a top-level emission.
 ///
 /// Exact duplicates (same definition and equal conditions as presented) add no
 /// evidence and are dropped before counting. Equality is judged on conditions
@@ -1654,10 +2241,11 @@ fn attach_derivations(
     let mut total = 0_usize;
     let mut incomplete = false;
 
-    for emission in trace
+    for (position, emission) in trace
         .emission_outcomes
         .iter()
-        .filter(|outcome| outcome.rule_index == rule_idx)
+        .enumerate()
+        .filter(|(_, outcome)| outcome.rule_index == rule_idx)
     {
         let Some(value) = emission.value_idx.and_then(|idx| trace.get_value(idx)) else {
             // The value was not captured, so this may be a derivation of it.
@@ -1674,10 +2262,10 @@ fn attach_derivations(
                 emission.condition_start_index,
                 emission.condition_end_index,
                 emission.rule_index,
+                position,
                 program,
                 trace,
                 window_settings,
-                true,
             ),
         };
         let candidate = window(settings);
@@ -1962,7 +2550,6 @@ fn materialize_helper_conditions(
     trace: &EvaluationTrace,
     settings: &ExplanationSettings,
     depth: usize,
-    per_derivation: bool,
 ) -> (Vec<ConditionExplanation>, bool) {
     let Some(helper_rule_index) = detect_helper_call_at_guard(outer_pc, program) else {
         return (Vec::new(), false);
@@ -1985,7 +2572,7 @@ fn materialize_helper_conditions(
         trace,
         settings,
         depth.saturating_add(1),
-        per_derivation,
+        WitnessScope::Reported,
     );
 
     // Rewrite each inner condition's `text` to just the helper body
@@ -2217,17 +2804,16 @@ fn derive_left_provenance_from_helper(
     }
 }
 
-/// Materialize the conditions of one emission window. `per_derivation`
-/// selects the view used for `derivations`: no loop witnesses, and nested
-/// secrets sanitized in every operand under `Redacted`.
+/// Materialize the conditions of the emission at `emission_position` in
+/// `trace.emission_outcomes`, whose window is the given condition range.
 fn materialize_condition_window(
     condition_start_index: u32,
     condition_end_index: u32,
     outer_rule_index: u16,
+    emission_position: usize,
     program: &Program,
     trace: &EvaluationTrace,
     settings: &ExplanationSettings,
-    per_derivation: bool,
 ) -> Vec<ConditionExplanation> {
     let relevant_outcomes = select_condition_outcomes_in_window(
         condition_start_index,
@@ -2252,7 +2838,7 @@ fn materialize_condition_window(
             trace,
             settings,
             0,
-            per_derivation,
+            WitnessScope::BeforeEmission(emission_position),
         ),
         settings,
         true,
@@ -2393,6 +2979,7 @@ fn witnesses_match(
                 && left.success_count == right.success_count
                 && left.sample_key == right.sample_key
                 && left.sample_value == right.sample_value
+                && left.redacted == right.redacted
         }
         _ => false,
     }
@@ -2410,8 +2997,53 @@ fn materialize_condition_explanations(
         trace,
         settings,
         0,
-        false,
+        WitnessScope::Reported,
     )
+}
+
+/// Which completed loops may be summarized on a list of reported conditions.
+#[derive(Clone, Copy)]
+enum WitnessScope {
+    /// A loop whose anchor (the last condition its own rule recorded while
+    /// it ran) is among the reported ones.
+    Reported,
+    /// Such a loop that also belongs to the emission at this position of
+    /// `trace.emission_outcomes`: it finished before the value was emitted,
+    /// within a loop iteration still active at the emission (or at body
+    /// level).
+    BeforeEmission(usize),
+}
+
+/// Whether `stat` summarizes a loop accountable to `relevant_outcomes`
+/// under `scope`.
+fn witness_eligible(
+    stat: &crate::evaluation_trace::LoopStat,
+    relevant_outcomes: &[(usize, &ConditionOutcome)],
+    trace: &EvaluationTrace,
+    scope: WitnessScope,
+) -> bool {
+    let anchored = stat.anchor_condition_idx.is_some_and(|anchor| {
+        relevant_outcomes
+            .iter()
+            .any(|(index, _)| u32::try_from(*index).is_ok_and(|index| index == anchor))
+    });
+    if !anchored {
+        return false;
+    }
+    match scope {
+        WitnessScope::Reported => true,
+        WitnessScope::BeforeEmission(position) => {
+            let finished_before =
+                usize::try_from(stat.emissions_before_exit).is_ok_and(|count| count <= position);
+            let enclosing_active = stat.enclosing_iteration.is_none_or(|iteration| {
+                trace
+                    .emission_outcomes
+                    .get(position)
+                    .is_some_and(|emission| emission.active_iterations.contains(&iteration))
+            });
+            finished_before && enclosing_active
+        }
+    }
 }
 
 /// Recursion-aware variant. Callers that materialize helper inner
@@ -2423,7 +3055,7 @@ fn materialize_condition_explanations_at_depth(
     trace: &EvaluationTrace,
     settings: &ExplanationSettings,
     depth: usize,
-    per_derivation: bool,
+    witness_scope: WitnessScope,
 ) -> Vec<ConditionExplanation> {
     let mut conditions: Vec<ConditionExplanation> = Vec::new();
 
@@ -2455,14 +3087,12 @@ fn materialize_condition_explanations_at_depth(
             "failure"
         };
 
-        let (left, right) =
-            materialize_operands(outcome, static_info, trace, settings, per_derivation);
-        // A loop witness summarizes a whole loop, not one derivation of it.
-        let witness = if per_derivation {
-            None
-        } else {
-            materialize_loop_witness(outcome, trace)
-        };
+        let (left, right) = materialize_operands(outcome, static_info, trace, settings);
+        let witness = outcome
+            .loop_stat_idx
+            .and_then(|idx| trace.loop_stats.get(usize::from(idx)))
+            .filter(|stat| witness_eligible(stat, &relevant_outcomes, trace, witness_scope))
+            .map(|stat| loop_witness(stat, trace, settings));
         let binding_name = static_info.and_then(|i| i.binding_name.clone());
         let builtin_name = static_info.and_then(|i| i.builtin_name.clone());
         let negated = static_info.map(|i| i.negated).unwrap_or(false);
@@ -2479,7 +3109,6 @@ fn materialize_condition_explanations_at_depth(
             trace,
             settings,
             depth,
-            per_derivation,
         );
 
         // Derive outer `left.provenance` from the last failed helper inner
@@ -2509,12 +3138,13 @@ fn materialize_condition_explanations_at_depth(
         });
     }
 
-    if !per_derivation
-        && conditions
-            .iter()
-            .all(|condition| condition.witness.is_none())
+    if conditions
+        .iter()
+        .all(|condition| condition.witness.is_none())
     {
-        if let Some(witness) = materialize_fallback_loop_witness(&relevant_outcomes, trace) {
+        if let Some(witness) =
+            materialize_reported_loop_witness(&relevant_outcomes, trace, settings, witness_scope)
+        {
             if let Some(last) = conditions.last_mut() {
                 last.witness = Some(witness);
             }
@@ -2524,61 +3154,80 @@ fn materialize_condition_explanations_at_depth(
     conditions
 }
 
-fn materialize_fallback_loop_witness(
+/// The latest completed loop accountable to `relevant_outcomes` under `scope`.
+/// There is no fallback: a loop that no reported condition anchors (or that
+/// was still running when the value was emitted) is not summarized here.
+fn materialize_reported_loop_witness(
     relevant_outcomes: &[(usize, &ConditionOutcome)],
     trace: &EvaluationTrace,
+    settings: &ExplanationSettings,
+    scope: WitnessScope,
 ) -> Option<LoopWitnessExplanation> {
-    let selected_indices: Vec<u32> = relevant_outcomes
-        .iter()
-        .filter_map(|(index, _)| u32::try_from(*index).ok())
-        .collect();
-
     let stat = trace
         .loop_stats
         .iter()
         .rev()
-        .find(|stat| {
-            stat.anchor_condition_idx
-                .is_some_and(|idx| selected_indices.contains(&idx))
-        })
-        .or_else(|| trace.loop_stats.last())?;
+        .find(|stat| witness_eligible(stat, relevant_outcomes, trace, scope))?;
 
-    Some(LoopWitnessExplanation {
-        total_iterations: stat.total_iterations,
-        success_count: stat.success_count,
-        sample_key: stat
-            .sample_key
-            .and_then(|idx| trace.get_value(idx))
-            .cloned(),
-        sample_value: stat
-            .sample_value
-            .and_then(|idx| trace.get_value(idx))
-            .cloned(),
-    })
+    Some(loop_witness(stat, trace, settings))
 }
 
-fn materialize_loop_witness(
-    outcome: &ConditionOutcome,
+/// Materialize a loop summary, redacting its sample like an operand under
+/// `Redacted`: a sensitive collection path hides the key and the value, a
+/// sensitive-named key hides the value, and nested secrets are sanitized.
+fn loop_witness(
+    stat: &crate::evaluation_trace::LoopStat,
     trace: &EvaluationTrace,
-) -> Option<LoopWitnessExplanation> {
-    let stat = outcome
-        .loop_stat_idx
-        .and_then(|idx| trace.loop_stats.get(usize::from(idx)))?;
+    settings: &ExplanationSettings,
+) -> LoopWitnessExplanation {
+    let mut sample_key = stat
+        .sample_key
+        .and_then(|idx| trace.get_value(idx))
+        .cloned();
+    let mut sample_value = stat
+        .sample_value
+        .and_then(|idx| trace.get_value(idx))
+        .cloned();
+    let mut redacted = false;
 
-    Some(LoopWitnessExplanation {
+    if settings.value_mode == ValueMode::Redacted {
+        let path_sensitive = should_redact_runtime_path(stat.collection_path.as_deref(), trace);
+        let sample_path_sensitive = should_redact_runtime_path(stat.sample_path.as_deref(), trace);
+        let key_sensitive = sample_key
+            .as_ref()
+            .and_then(|key| key.as_string().ok())
+            .is_some_and(|key| is_sensitive_name(key));
+        let recorded_key = sample_key
+            .as_ref()
+            .is_some_and(|key| is_sensitive_key(key, false, trace));
+        let recorded_value = sample_value
+            .as_ref()
+            .is_some_and(|value| is_sensitive_key(value, stat.sample_path.is_some(), trace));
+        let mut hide = |slot: &mut Option<Value>, whole: bool| {
+            let Some(value) = slot.as_ref() else {
+                return;
+            };
+            let replacement = sanitize_value(value, whole, trace);
+            if let Some(replacement) = replacement {
+                *slot = Some(replacement);
+                redacted = true;
+            }
+        };
+        hide(&mut sample_key, path_sensitive || recorded_key);
+        hide(
+            &mut sample_value,
+            path_sensitive || sample_path_sensitive || key_sensitive || recorded_value,
+        );
+    }
+
+    LoopWitnessExplanation {
         total_iterations: stat.total_iterations,
         success_count: stat.success_count,
-        sample_key: stat
-            .sample_key
-            .and_then(|idx| trace.get_value(idx))
-            .cloned(),
-        sample_value: stat
-            .sample_value
-            .and_then(|idx| trace.get_value(idx))
-            .cloned(),
-    })
+        sample_key,
+        sample_value,
+        redacted,
+    }
 }
-
 fn decorate_condition_text(
     base_text: String,
     static_info: Option<&crate::static_provenance::StaticConditionInfo>,
@@ -2671,7 +3320,6 @@ fn materialize_operands(
     static_info: Option<&crate::static_provenance::StaticConditionInfo>,
     trace: &EvaluationTrace,
     settings: &ExplanationSettings,
-    per_derivation: bool,
 ) -> (Option<OperandExplanation>, Option<OperandExplanation>) {
     let actual = outcome
         .actual_value_idx
@@ -2697,18 +3345,35 @@ fn materialize_operands(
     let right_output_path =
         operand_provenance_for_output(right_runtime_path, right_prov, outcome, trace);
 
+    // The first sensitive segment of each output path, found once and used
+    // both to redact the value and to mask the keys beneath it.
+    let first_sensitive = |path: Option<&String>| {
+        path.filter(|_| redact)
+            .and_then(|path| sensitive_segment(path, trace))
+    };
+    let left_first = first_sensitive(left_output_path.as_ref());
+    let right_first = first_sensitive(right_output_path.as_ref());
     let left_sensitive = redact
         && if left_output_path.is_some() {
-            should_redact_runtime_path(left_output_path.as_deref())
+            left_first.is_some()
         } else {
             should_redact_path(left_prov)
         };
     let right_sensitive = redact
         && if right_output_path.is_some() {
-            should_redact_runtime_path(right_output_path.as_deref())
+            right_first.is_some()
         } else {
             should_redact_path(right_prov)
         };
+    // Keys beneath a sensitive segment of a runtime path are secret too.
+    let mask = |path: Option<String>, first: Option<usize>, runtime: bool| match (path, first) {
+        (Some(path), Some(first)) if runtime => {
+            Some(mask_runtime_path_from(&path, first).unwrap_or(path))
+        }
+        (path, _) => path,
+    };
+    let left_output_path = mask(left_output_path, left_first, left_runtime_path.is_some());
+    let right_output_path = mask(right_output_path, right_first, right_runtime_path.is_some());
     // In a two-operand condition the operands are related (equal, ordered, or
     // container/member), so a harmless-looking side can reveal the sensitive
     // one. Redact both when either is sensitive, and sanitize nested secrets.
@@ -2716,11 +3381,21 @@ fn materialize_operands(
     // value capacity drops one operand, the survivor must still be sanitized.
     let paired = (actual.is_some() && expected.is_some())
         || static_info.is_some_and(|i| i.operator.is_some() || i.builtin_name.is_some());
-    let shared = paired && (left_sensitive || right_sensitive);
 
     // Two-operand conditions can carry whole collections (`x in c`). Truncate
     // first so report size and the redaction walk are both bounded; then redact
     // what will actually be emitted.
+    let left_sensitive = left_sensitive
+        || (redact
+            && actual
+                .as_ref()
+                .is_some_and(|v| is_sensitive_key(v, left_runtime_path.is_some(), trace)));
+    let right_sensitive = right_sensitive
+        || (redact
+            && expected
+                .as_ref()
+                .is_some_and(|v| is_sensitive_key(v, right_runtime_path.is_some(), trace)));
+    let shared = paired && (left_sensitive || right_sensitive);
     let prepare_operand = |v: Value, sensitive: bool| -> (Value, bool, bool, Option<usize>) {
         if sensitive || shared {
             return (Value::from("<redacted>"), true, false, None);
@@ -2733,11 +3408,11 @@ fn materialize_operands(
         } else {
             (v, None)
         };
-        // Derivations expose iterations the default report never shows, so
-        // they sanitize unary operands (whole-object bindings, existence
-        // guards) as well.
-        if redact && (paired || per_derivation) {
-            if let Some(sanitized) = redact_nested_secrets(&v, 0) {
+        // Every reported value is sanitized, including single operands
+        // (whole-object bindings, existence guards) that carry a nested secret
+        // under a harmless path.
+        if redact {
+            if let Some(sanitized) = redact_nested_secrets_cached(&v, trace) {
                 return (sanitized, true, length.is_some(), length);
             }
         }
@@ -2777,7 +3452,14 @@ fn materialize_operands(
     (left, right)
 }
 
-fn materialize_assumptions(program: &Program, trace: &EvaluationTrace) -> Vec<AssumptionRecord> {
+/// Under `Redacted`, an assumed value is hidden whole when either the assumed
+/// input path or the value's own provenance is sensitive, and otherwise has
+/// its nested secrets sanitized, like the operands of a condition.
+fn materialize_assumptions(
+    program: &Program,
+    trace: &EvaluationTrace,
+    settings: &ExplanationSettings,
+) -> Vec<AssumptionRecord> {
     trace
         .assumptions
         .iter()
@@ -2790,12 +3472,38 @@ fn materialize_assumptions(program: &Program, trace: &EvaluationTrace) -> Vec<As
                 AssumptionKind::CollectionExists => "collection_exists",
                 AssumptionKind::NegationHolds => "negation_holds",
             };
+            let redact = settings.value_mode == ValueMode::Redacted;
+            let mut redacted = false;
+            let assumed_value = a.assumed_value.as_ref().map(|value| {
+                if !redact {
+                    return value.clone();
+                }
+                let sensitive = should_redact_runtime_path(Some(&a.input_path), trace)
+                    || should_redact_runtime_path(a.assumed_value_path.as_deref(), trace)
+                    || is_sensitive_key(value, a.assumed_value_path.is_some(), trace);
+                let sanitized = sanitize_value(value, sensitive, trace);
+                redacted = sanitized.is_some();
+                sanitized.unwrap_or_else(|| value.clone())
+            });
+            let masked_path = redact
+                .then(|| mask_runtime_path(&a.input_path, trace))
+                .flatten();
+            // The condition text can quote the path (`collection at <path>
+            // exists`), so it is masked the same way.
+            let assumed_holds = match masked_path {
+                Some(ref masked) if !a.input_path.is_empty() => {
+                    a.condition_text.replace(a.input_path.as_str(), masked)
+                }
+                _ => a.condition_text.clone(),
+            };
+            let input_path = masked_path.unwrap_or_else(|| a.input_path.clone());
             AssumptionRecord {
                 kind: kind_str.to_string(),
-                input_path: a.input_path.clone(),
-                assumed_holds: a.condition_text.clone(),
+                input_path,
+                redacted,
+                assumed_holds,
                 operator: a.operator.clone(),
-                assumed_value: a.assumed_value.clone(),
+                assumed_value,
                 location,
             }
         })
@@ -3064,12 +3772,12 @@ mod tests {
         trace.record_condition(1, true, false, None, None, None, None, 0);
         trace.record_condition(2, true, false, None, None, None, None, 0);
         trace.record_condition(3, true, false, None, None, None, None, 0);
-        trace.record_emission(0, 0, 0, 3, Value::from("violation a"));
+        trace.record_emission(0, 0, 0, 3, Value::from("violation a"), Vec::new());
         trace.record_condition(1, true, false, None, None, None, None, 0);
         trace.record_condition(2, true, false, None, None, None, None, 0);
         trace.record_condition(3, true, false, None, None, None, None, 0);
-        trace.record_emission(0, 0, 3, 6, Value::from("violation b"));
-        trace.record_emission(0, 0, 3, 6, Value::from("violation b"));
+        trace.record_emission(0, 0, 3, 6, Value::from("violation b"), Vec::new());
+        trace.record_emission(0, 0, 3, 6, Value::from("violation b"), Vec::new());
 
         let emissions = materialize_rule_emissions(
             0,
@@ -3165,11 +3873,11 @@ mod tests {
         trace.record_condition(1, true, false, None, None, None, None, 0);
         trace.record_condition(2, true, false, None, None, None, None, 0);
         trace.record_condition(3, true, false, None, None, None, None, 0);
-        trace.record_emission(0, 0, 0, 3, Value::from("violation a"));
+        trace.record_emission(0, 0, 0, 3, Value::from("violation a"), Vec::new());
         trace.record_condition(1, true, false, None, None, None, None, 0);
         trace.record_condition(2, true, false, None, None, None, None, 0);
         trace.record_condition(3, true, false, None, None, None, None, 0);
-        trace.record_emission(0, 0, 3, 6, Value::from("violation b"));
+        trace.record_emission(0, 0, 3, 6, Value::from("violation b"), Vec::new());
 
         let emissions = materialize_rule_emissions(
             0,
@@ -3254,11 +3962,11 @@ mod tests {
         trace.record_condition(1, true, false, None, None, None, None, 0);
         trace.record_condition(2, true, false, None, None, None, None, 0);
         trace.record_condition(3, true, false, None, None, None, None, 0);
-        trace.record_emission(0, 0, 0, 3, Value::from("violation a"));
+        trace.record_emission(0, 0, 0, 3, Value::from("violation a"), Vec::new());
         trace.record_condition(1, true, false, None, None, None, None, 0);
         trace.record_condition(2, true, false, None, None, None, None, 0);
         trace.record_condition(3, true, false, None, None, None, None, 0);
-        trace.record_emission(0, 0, 3, 6, Value::from("violation b"));
+        trace.record_emission(0, 0, 3, 6, Value::from("violation b"), Vec::new());
 
         let emissions = materialize_rule_emissions(
             0,
@@ -3328,7 +4036,7 @@ mod tests {
         let mut trace = EvaluationTrace::new();
         trace.record_condition(1, true, false, None, None, None, None, 0);
         trace.record_condition(2, true, false, None, None, None, None, 0);
-        trace.record_emission(0, 0, 0, 2, Value::from("violation a"));
+        trace.record_emission(0, 0, 0, 2, Value::from("violation a"), Vec::new());
 
         let standard = materialize_rule_emissions(
             0,
@@ -3543,7 +4251,7 @@ mod tests {
         let mut trace = EvaluationTrace::new();
         trace.record_condition(1, true, false, None, None, None, None, 0);
         trace.record_rule_outcome(0, 0, true, Some(Value::from("violation a")));
-        trace.record_emission(0, 0, 0, 1, Value::from("violation a"));
+        trace.record_emission(0, 0, 0, 1, Value::from("violation a"), Vec::new());
         trace.record_assumption(
             AssumptionKind::ConditionHolds,
             "input.foo".into(),
@@ -3622,6 +4330,53 @@ mod tests {
     }
 
     #[test]
+    fn condition_loop_witness_obeys_the_emission_scope() {
+        use super::{materialize_condition_explanations_at_depth, WitnessScope};
+        let mut program = Program::new();
+        program.sources.push(SourceFile::new(
+            "test.rego".into(),
+            "every item in input.list { item > 0 }\n".into(),
+        ));
+        program.instruction_spans = vec![None, Some(SpanInfo::new(0, 1, 1, 34))];
+        program.condition_infos = vec![
+            None,
+            Some(StaticConditionInfo {
+                checked_register: 0,
+                checked_provenance: None,
+                operands: None,
+                text: "every item in input.list { item > 0 }".into(),
+                kind: ConditionKind::Truthiness,
+                operator: None,
+                has_input_operand: false,
+                binding_name: None,
+                builtin_name: None,
+                negated: false,
+            }),
+        ];
+
+        // The value is emitted before the loop on its condition finishes.
+        let mut trace = EvaluationTrace::new();
+        trace.record_condition(1, true, false, Some(Value::Bool(true)), None, None, None, 0);
+        trace.record_emission(0, 0, 0, 1, Value::from("v"), Vec::new());
+        trace.attach_loop_stat_to_last_condition(1, 3, 2, None, None);
+
+        let witness_in = |scope| {
+            materialize_condition_explanations_at_depth(
+                trace.condition_outcomes.iter().enumerate().collect(),
+                &program,
+                &trace,
+                &settings(ConditionMode::PrimaryOnly),
+                0,
+                scope,
+            )[0]
+            .witness
+            .clone()
+        };
+        assert!(witness_in(WitnessScope::Reported).is_some());
+        assert_eq!(witness_in(WitnessScope::BeforeEmission(0)), None);
+    }
+
+    #[test]
     fn fallback_loop_witness_attaches_to_last_selected_condition() {
         let mut program = Program::new();
         program
@@ -3679,6 +4434,9 @@ mod tests {
             1,
             Some(Value::from(1_u64)),
             Some(Value::from(2_u64)),
+            None,
+            None,
+            None,
         );
 
         let conditions = materialize_conditions(
@@ -3712,7 +4470,7 @@ mod tests {
 
         let mut trace = EvaluationTrace::new();
         trace.record_rule_outcome(0, 0, true, Some(Value::from("violation a")));
-        trace.record_emission(0, 0, 0, 0, Value::from("violation a"));
+        trace.record_emission(0, 0, 0, 0, Value::from("violation a"), Vec::new());
 
         let report = materialize(
             &program,
@@ -3776,6 +4534,354 @@ mod tests {
             conditions.first().map(|condition| condition.text.as_str()),
             Some("some item in coll [matched: \"match-a\"]")
         );
+    }
+
+    #[test]
+    fn sensitive_names_match_after_normalization_and_only_real_fragments() {
+        use super::is_sensitive_name;
+        for name in [
+            "password",
+            "adminPassword",
+            "DB_PASSWORD",
+            "api-key",
+            "apiKey",
+            "API_KEY",
+            "clientSecret",
+            "sasToken",
+            "privateKey",
+            "private_key",
+            "connectionString",
+            "secureValue",
+            "protectedSettings",
+            "storageAccountKey",
+            "primary_key",
+            "Ocp-Apim-Subscription-Key",
+            "pwd",
+            "pass phrase",
+        ] {
+            assert!(is_sensitive_name(name), "{name} should be sensitive");
+        }
+        // Names longer than the inline buffer take the allocating path.
+        let long_prefix = "x".repeat(super::INLINE_NAME_BYTES + 6);
+        assert!(is_sensitive_name(&alloc::format!("{long_prefix}Password")));
+        assert!(is_sensitive_name(&alloc::format!(
+            "{long_prefix}_storage_account_key"
+        )));
+        assert!(!is_sensitive_name(&alloc::format!("{long_prefix}Location")));
+        for name in [
+            "name",
+            "location",
+            "keyVaultId",
+            "publicKey",
+            "sku",
+            "accessTier",
+            "displayName",
+            "value",
+            "allowSharedKeyAccess",
+            "primaryKeyType",
+        ] {
+            assert!(!is_sensitive_name(name), "{name} should not be sensitive");
+        }
+    }
+
+    #[test]
+    fn runtime_paths_are_checked_one_segment_at_a_time() {
+        use super::should_redact_runtime_path;
+        let trace = EvaluationTrace::new();
+        let sensitive = |path: &str| should_redact_runtime_path(Some(path), &trace);
+        assert!(sensitive("input.resource.properties.adminPassword"));
+        assert!(sensitive("input.settings[\"connection-string\"][0]"));
+        assert!(sensitive("input.api_key"));
+        // A key-material suffix ends a segment, not necessarily the path.
+        assert!(sensitive("input.accounts[0].primaryKey.value"));
+        assert!(!sensitive("input.access.key"));
+        assert!(!sensitive("input.resource.name"));
+        // A quoted key is one segment even when it holds separators.
+        assert!(!sensitive("input.x[\"pass.word\"]"));
+        assert!(sensitive("input.x[\"a].password\"]"));
+        assert!(!should_redact_runtime_path(None, &trace));
+    }
+
+    #[test]
+    fn runtime_path_parser_follows_the_vm_grammar() {
+        use super::parse_runtime_path;
+        let keys = |path: &str| {
+            parse_runtime_path(path).map(|segments| {
+                segments
+                    .into_iter()
+                    .map(|segment| {
+                        segment
+                            .key
+                            .map_or_else(|| "#".into(), |key| key.into_owned())
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let owned = |items: &[&str]| {
+            Some(
+                items
+                    .iter()
+                    .map(|s| alloc::string::String::from(*s))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(keys("input"), owned(&["input"]));
+        assert_eq!(keys("input.a[0].b"), owned(&["input", "a", "#", "b"]));
+        assert_eq!(
+            keys("input.x[\"a.b\"][\"q\\\"]\"]"),
+            owned(&["input", "x", "a.b", "q\"]"])
+        );
+        assert_eq!(
+            keys("input.x[{\"k\": [1]}]"),
+            owned(&["input", "x", "{\"k\": [1]}"])
+        );
+        // `IndexLiteral` writes any string key after a dot; numbers are indices.
+        assert_eq!(
+            keys("input.app-settings[-1.5]"),
+            owned(&["input", "app-settings", "#"])
+        );
+        for malformed in [
+            "",
+            ".a",
+            "input.",
+            "input[",
+            "input[\"a\"",
+            "input..a",
+            "input[1",
+        ] {
+            assert_eq!(keys(malformed), None, "{malformed:?}");
+        }
+    }
+
+    #[test]
+    fn keys_beneath_a_sensitive_segment_are_masked() {
+        use super::mask_runtime_path;
+        let trace = EvaluationTrace::new();
+        assert_eq!(
+            mask_runtime_path("input.tokens[\"opaque-42\"]", &trace).as_deref(),
+            Some("input.tokens[\"<redacted>\"]")
+        );
+        assert_eq!(
+            mask_runtime_path("input.secrets.prod[3].key", &trace).as_deref(),
+            Some("input.secrets[\"<redacted>\"][3][\"<redacted>\"]")
+        );
+        // Nothing beneath the sensitive segment, or nothing sensitive.
+        assert_eq!(
+            mask_runtime_path("input.properties.adminPassword", &trace),
+            None
+        );
+        assert_eq!(mask_runtime_path("input.regions[\"westus\"]", &trace), None);
+        // An unparsable sensitive path is hidden whole.
+        assert_eq!(
+            mask_runtime_path("input.token[", &trace).as_deref(),
+            Some("<redacted>")
+        );
+    }
+
+    #[test]
+    fn paths_the_vm_writes_for_non_identifier_fields_are_understood() {
+        use super::{mask_runtime_path, should_redact_runtime_path};
+        let mut trace = EvaluationTrace::new();
+        // `IndexLiteral` writes `.field` for any string key.
+        assert!(should_redact_runtime_path(Some("input.my-secret"), &trace));
+        assert!(!should_redact_runtime_path(
+            Some("input.app-settings.value"),
+            &trace
+        ));
+        trace.record_sensitive_value_path("input.app-settings.value");
+        assert!(should_redact_runtime_path(
+            Some("input.app-settings.value"),
+            &trace
+        ));
+        // A path that still fails to parse keeps its recorded pair prefix.
+        trace.record_sensitive_value_path("input.odd.value");
+        assert!(should_redact_runtime_path(
+            Some("input.odd.value[\"unterminated"),
+            &trace
+        ));
+        assert!(!should_redact_runtime_path(
+            Some("input.odd.valueX[\"unterminated"),
+            &trace
+        ));
+        // Once the record overflows, an unparsable path fails closed.
+        let mut overflowed = EvaluationTrace::new();
+        overflowed.sensitive_value_paths_overflowed = true;
+        assert!(should_redact_runtime_path(
+            Some("input.odd[.value"),
+            &overflowed
+        ));
+        // A field holding `[` makes `IndexLiteral` write a path the parser
+        // cannot read before the recorded prefix ends.
+        trace.record_sensitive_value_path("input.we[ird.value");
+        assert!(should_redact_runtime_path(
+            Some("input.we[ird.value"),
+            &trace
+        ));
+        assert!(!should_redact_runtime_path(
+            Some("input.we[ird.valueX"),
+            &trace
+        ));
+        // Compound keys beneath a sensitive segment are masked like string keys.
+        let fresh = EvaluationTrace::new();
+        assert_eq!(
+            mask_runtime_path("input.tokens[[\"opaque-42\"]][0]", &fresh).as_deref(),
+            Some("input.tokens[\"<redacted>\"][0]")
+        );
+    }
+
+    #[test]
+    fn assumption_text_masks_the_path_it_quotes() {
+        use super::materialize_assumptions;
+        let program = Program::new();
+        let mut trace = EvaluationTrace::new();
+        let path = "input.tokens[\"opaque-42\"].items";
+        trace.record_assumption(
+            AssumptionKind::CollectionExists,
+            path.into(),
+            alloc::format!("collection at {path} exists"),
+            0,
+            None,
+            None,
+            0,
+            0,
+            None,
+            0,
+            Vec::new(),
+        );
+        let redacted = ExplanationSettings {
+            value_mode: ValueMode::Redacted,
+            ..settings(ConditionMode::PrimaryOnly)
+        };
+        let records = materialize_assumptions(&program, &trace, &redacted);
+        assert_eq!(
+            records[0].input_path,
+            "input.tokens[\"<redacted>\"][\"<redacted>\"]"
+        );
+        assert_eq!(
+            records[0].assumed_holds,
+            "collection at input.tokens[\"<redacted>\"][\"<redacted>\"] exists"
+        );
+        let full = ExplanationSettings {
+            value_mode: ValueMode::Full,
+            ..settings(ConditionMode::PrimaryOnly)
+        };
+        let full_records = materialize_assumptions(&program, &trace, &full);
+        assert_eq!(
+            full_records[0].assumed_holds,
+            alloc::format!("collection at {path} exists")
+        );
+    }
+
+    #[test]
+    fn recorded_pair_values_are_sensitive_and_overflow_fails_closed() {
+        use super::should_redact_runtime_path;
+        let mut trace = EvaluationTrace::new();
+        let pair = "input.appSettings[0].value";
+        assert!(!should_redact_runtime_path(Some(pair), &trace));
+        trace.record_sensitive_value_path(pair);
+        assert!(should_redact_runtime_path(Some(pair), &trace));
+        assert!(should_redact_runtime_path(
+            Some("input.appSettings[0].value.inner"),
+            &trace
+        ));
+        assert!(!should_redact_runtime_path(
+            Some("input.appSettings[1].value"),
+            &trace
+        ));
+        assert!(!should_redact_runtime_path(
+            Some("input.appSettings[0].valueX"),
+            &trace
+        ));
+
+        for i in 0..crate::evaluation_trace::MAX_SENSITIVE_VALUE_PATHS {
+            trace.record_sensitive_value_path(&alloc::format!("input.p{i}.value"));
+        }
+        assert!(trace.sensitive_value_paths_overflowed);
+        assert_eq!(
+            trace.sensitive_value_paths.len(),
+            crate::evaluation_trace::MAX_SENSITIVE_VALUE_PATHS
+        );
+        assert!(should_redact_runtime_path(
+            Some("input.appSettings[9].value"),
+            &trace
+        ));
+        assert!(!should_redact_runtime_path(
+            Some("input.appSettings[9].name"),
+            &trace
+        ));
+    }
+
+    #[test]
+    fn name_value_pairs_redact_the_value_of_a_sensitive_name() {
+        use super::redact_nested_secrets;
+        let parse = |s: &str| Value::from_json_str(s).unwrap();
+        let settings = parse(
+            r#"[{"name": "DB_PASSWORD", "value": "hunter2"},
+                {"name": "REGION", "value": "westus"}]"#,
+        );
+        assert_eq!(
+            redact_nested_secrets(&settings, 0),
+            Some(parse(
+                r#"[{"name": "DB_PASSWORD", "value": "<redacted>"},
+                    {"name": "REGION", "value": "westus"}]"#
+            ))
+        );
+        let harmless = parse(r#"[{"name": "REGION", "value": "westus"}]"#);
+        assert_eq!(redact_nested_secrets(&harmless, 0), None);
+        // Detection alone (no other secret in the value) must see the pair.
+        assert!(super::contains_nested_secret(
+            &parse(r#"{"name": "apiKey", "value": "k"}"#),
+            0
+        ));
+        assert!(!super::contains_nested_secret(
+            &parse(r#"{"name": "apiKey", "kind": "k"}"#),
+            0
+        ));
+    }
+
+    #[test]
+    fn witnesses_match_distinguishes_redaction() {
+        use super::{witnesses_match, LoopWitnessExplanation};
+        let witness = |redacted| LoopWitnessExplanation {
+            total_iterations: 2,
+            success_count: 1,
+            sample_key: Some(Value::from("k")),
+            sample_value: Some(Value::from("<redacted>")),
+            redacted,
+        };
+        assert!(witnesses_match(Some(&witness(true)), Some(&witness(true))));
+        assert!(!witnesses_match(
+            Some(&witness(true)),
+            Some(&witness(false))
+        ));
+        assert!(witnesses_match(None, None));
+        assert!(!witnesses_match(Some(&witness(false)), None));
+    }
+
+    #[test]
+    fn nested_secret_cache_is_keyed_by_allocation_only() {
+        use super::redact_nested_secrets_cached;
+        let parse = |s: &str| Value::from_json_str(s).unwrap();
+        let trace = EvaluationTrace::new();
+        let secret = parse(r#"{"name": "a", "password": "p"}"#);
+        let harmless = parse(r#"{"name": "a", "region": "w"}"#);
+        let hidden = Some(parse(r#"{"name": "a", "password": "<redacted>"}"#));
+        assert_eq!(redact_nested_secrets_cached(&secret, &trace), hidden);
+        // A shared clone is the same allocation and hits the cache.
+        assert_eq!(
+            redact_nested_secrets_cached(&secret.clone(), &trace),
+            hidden
+        );
+        assert_eq!(trace.nested_secret_cache.borrow().len(), 1);
+        // A different allocation is walked on its own.
+        assert_eq!(redact_nested_secrets_cached(&harmless, &trace), None);
+        assert_eq!(trace.nested_secret_cache.borrow().len(), 2);
+        // Scalars are never cached.
+        assert_eq!(
+            redact_nested_secrets_cached(&Value::from("p"), &trace),
+            None
+        );
+        assert_eq!(trace.nested_secret_cache.borrow().len(), 2);
     }
 
     #[test]
@@ -3862,22 +4968,30 @@ mod tests {
             Some(&comparison),
             &trace,
             &settings(ConditionMode::PrimaryOnly),
-            false,
         );
         let left = left.unwrap();
         assert!(right.is_none());
         assert!(left.redacted);
         assert!(!alloc::format!("{}", left.value).contains("hunter2"));
 
-        // Control: without static two-operand metadata the operand is untouched.
+        // A single operand is sanitized the same way (RG-R2).
         let (single, _) = super::materialize_operands(
             outcome,
             None,
             &trace,
             &settings(ConditionMode::PrimaryOnly),
-            false,
         );
-        assert!(!single.unwrap().redacted);
+        let single = single.unwrap();
+        assert!(single.redacted);
+        assert!(!alloc::format!("{}", single.value).contains("hunter2"));
+
+        // Control: Full value mode leaves it untouched.
+        let mut full = settings(ConditionMode::PrimaryOnly);
+        full.value_mode = ValueMode::Full;
+        let (unredacted, _) = super::materialize_operands(outcome, None, &trace, &full);
+        let unredacted = unredacted.unwrap();
+        assert!(!unredacted.redacted);
+        assert!(alloc::format!("{}", unredacted.value).contains("hunter2"));
     }
 
     #[test]

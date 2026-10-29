@@ -55,6 +55,10 @@ impl RegoVM {
         #[cfg(feature = "explanations")] rule_index: u16,
     ) -> Result<(Value, bool, Option<crate::Rc<str>>)> {
         let mut first_successful_result: Option<Value> = None;
+        // The provenance of the value in `first_successful_result`, captured
+        // with it: a later definition may overwrite the result register.
+        #[cfg(feature = "explanations")]
+        let mut first_successful_provenance: Option<crate::Rc<str>> = None;
         let mut rule_failed_due_to_inconsistency = false;
         let is_function_call = rule_info.function_info.is_some();
         let result_reg = rule_info.result_reg;
@@ -189,6 +193,11 @@ impl RegoVM {
                                     }
                                 } else {
                                     first_successful_result = Some(current_result.clone());
+                                    #[cfg(feature = "explanations")]
+                                    {
+                                        first_successful_provenance =
+                                            self.provenance.get(result_reg).cloned();
+                                    }
                                     // In PE mode, do NOT short-circuit — explore
                                     // all definitions to produce complete disjuncts.
                                     #[cfg(feature = "explanations")]
@@ -348,6 +357,8 @@ impl RegoVM {
             }
         }
 
+        #[cfg(feature = "explanations")]
+        let has_successful_result = first_successful_result.is_some();
         let final_result = if rule_failed_due_to_inconsistency {
             Value::Undefined
         } else if let Some(successful_result) = first_successful_result {
@@ -357,7 +368,13 @@ impl RegoVM {
         };
 
         #[cfg(feature = "explanations")]
-        let return_provenance = self.provenance.get(result_reg).cloned();
+        let return_provenance = if rule_failed_due_to_inconsistency {
+            None
+        } else if has_successful_result {
+            first_successful_provenance
+        } else {
+            self.provenance.get(result_reg).cloned()
+        };
 
         if let Some(restored_registers) = self.register_stack.pop() {
             let mut current_register_window = Vec::default();
@@ -533,6 +550,10 @@ impl RegoVM {
 
         self.set_register(dest, result_from_rule.clone())?;
         #[cfg(feature = "explanations")]
+        let result_path = return_provenance
+            .as_ref()
+            .map(|path| alloc::string::String::from(path.as_ref()));
+        #[cfg(feature = "explanations")]
         self.provenance.set_path(dest, return_provenance);
 
         #[cfg(feature = "explanations")]
@@ -540,6 +561,9 @@ impl RegoVM {
             let succeeded = result_from_rule != Value::Undefined;
             self.trace
                 .record_rule_summary(rule_index, succeeded, Some(result_from_rule.clone()));
+            if let Some(last) = self.trace.rule_outcomes.last_mut() {
+                last.result_path = result_path;
+            }
             // Track assumption-dependent depth so negation handling can detect it.
             if succeeded && result_is_assumption_dependent {
                 self.assumption_dependent_depth = self.assumption_dependent_depth.saturating_add(1);
@@ -644,7 +668,13 @@ impl RegoVM {
                         pc: self.pc,
                         available: self.rule_cache.len(),
                     })?;
-            if *computed {
+            // Like run-to-completion, re-evaluate when explanations are enabled
+            // so the call records its conditions and result provenance.
+            #[cfg(feature = "explanations")]
+            let use_cache = *computed && !self.explanation_settings.enabled;
+            #[cfg(not(feature = "explanations"))]
+            let use_cache = *computed;
+            if use_cache {
                 self.set_register(dest, cached_result.clone())?;
                 return Ok(());
             }
@@ -701,6 +731,28 @@ impl RegoVM {
             }
         }
 
+        // Give the callee its own provenance window, as run-to-completion does:
+        // arguments keep their paths, and the caller's paths are restored when
+        // the frame finishes.
+        #[cfg(feature = "explanations")]
+        let saved_provenance = {
+            let arg_provenance: Vec<Option<crate::Rc<str>>> =
+                function_call_params.map_or_else(Vec::new, |params| {
+                    params
+                        .arg_registers()
+                        .iter()
+                        .map(|&arg| self.provenance.get(arg).cloned())
+                        .collect()
+                });
+            let saved = self.provenance.take_paths();
+            self.provenance.resize(register_window.len());
+            for (i, prov) in arg_provenance.into_iter().enumerate() {
+                let callee_reg = u8::try_from(i.saturating_add(1)).unwrap_or(u8::MAX);
+                self.provenance.set_path(callee_reg, prov);
+            }
+            saved
+        };
+
         let mut saved_registers = Vec::default();
         mem::swap(&mut saved_registers, &mut self.registers);
         self.registers = register_window;
@@ -751,6 +803,10 @@ impl RegoVM {
             saved_registers,
             saved_loop_stack,
             saved_comprehension_stack,
+            #[cfg(feature = "explanations")]
+            saved_provenance,
+            #[cfg(feature = "explanations")]
+            accumulated_provenance: None,
             #[cfg(feature = "explanations")]
             assumptions_at_def_start: 0,
             #[cfg(feature = "explanations")]
@@ -1012,6 +1068,11 @@ impl RegoVM {
                     }
                 } else {
                     frame_data.accumulated_result = Some(current_result);
+                    #[cfg(feature = "explanations")]
+                    {
+                        frame_data.accumulated_provenance =
+                            self.provenance.get(frame_data.result_reg).cloned();
+                    }
                     // In PE mode, do NOT short-circuit — explore all definitions.
                     #[cfg(feature = "explanations")]
                     let is_pe = self.explanation_settings.eval_mode
@@ -1069,6 +1130,10 @@ impl RegoVM {
             saved_registers,
             saved_loop_stack,
             saved_comprehension_stack,
+            #[cfg(feature = "explanations")]
+            saved_provenance,
+            #[cfg(feature = "explanations")]
+            accumulated_provenance,
             ..
         } = frame_data;
 
@@ -1084,6 +1149,8 @@ impl RegoVM {
             })?
             .clone();
 
+        #[cfg(feature = "explanations")]
+        let has_accumulated_result = accumulated_result.is_some();
         let result_from_rule = if rule_failed_due_to_inconsistency {
             Value::Undefined
         } else if let Some(value) = accumulated_result {
@@ -1096,11 +1163,26 @@ impl RegoVM {
         };
 
         #[cfg(feature = "explanations")]
+        let return_provenance = if rule_failed_due_to_inconsistency {
+            None
+        } else if has_accumulated_result {
+            accumulated_provenance
+        } else {
+            self.provenance.get(result_reg).cloned()
+        };
+        #[cfg(feature = "explanations")]
         if self.explanation_settings.enabled {
             let succeeded = result_from_rule != Value::Undefined;
             self.trace
                 .record_rule_summary(rule_index, succeeded, Some(result_from_rule.clone()));
+            if let Some(last) = self.trace.rule_outcomes.last_mut() {
+                last.result_path = return_provenance
+                    .as_ref()
+                    .map(|path| alloc::string::String::from(path.as_ref()));
+            }
         }
+        #[cfg(feature = "explanations")]
+        self.provenance.restore_paths(saved_provenance);
 
         let mut current_window = Vec::default();
         mem::swap(&mut current_window, &mut self.registers);
@@ -1210,6 +1292,16 @@ impl RegoVM {
         }
 
         self.registers = parent_registers;
+        // The result keeps the callee's path unless a default replaced it.
+        #[cfg(feature = "explanations")]
+        self.provenance.set_path(
+            dest_reg,
+            if final_value == result_from_rule {
+                return_provenance
+            } else {
+                None
+            },
+        );
 
         // Underflow here means malformed/poisoned program state; surface as a
         // typed error rather than a debug-only panic so the public load_program

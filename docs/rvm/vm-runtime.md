@@ -81,8 +81,13 @@ fields to responsibilities.
 - Each frame tracks its own `pc` and `FrameKind` (`Main`, `Rule`, `Loop`,
   `Comprehension`).
 - `RuleFrameData` carries scheduling cursors, register window sizing, and saved
-  copies of the caller's registers and stacks so finalisation can restore the
-  original context.
+  copies of the caller's registers, stacks and (with `explanations`) register
+  provenance so finalisation can restore the original context; the result
+  reaches the caller with the provenance of the definition that produced it,
+  as in run-to-completion.
+- With explanations enabled, a rule whose result is cached is evaluated again
+  on each call, as in run-to-completion, so the call records its conditions and
+  provenance. A `HostAwait` inside such a rule therefore suspends on every call.
 - Suspension: `InstructionOutcome::Suspend` records a `SuspendReason` (host
   await, breakpoint, step) and stores the last result snapshot. Host code calls
   `resume(resume_value)` to continue.
@@ -245,15 +250,95 @@ applies to failed and Undefined comparisons too (an Undefined operand's value is
 `<undefined>`). Only condition guards are captured this way; a definedness guard
 on a comparison result (`_ = (a != b)`) keeps the boolean it checked.
 
-In `Redacted` value mode, two-operand conditions (comparisons, membership and
-string-predicate builtins) are redacted as a pair: if either operand's path is
-sensitive, both values are redacted, because a matching or containing operand can
-reveal the other. Values under sensitive-named object keys nested inside either
-operand are also replaced with `<redacted>`, and the operand is marked
-`redacted: true`. A secret inside a compound (non-string) object key cannot be
-rewritten safely, so the whole enclosing object is redacted. Two-operand
-conditions are identified from the compiled condition, so redaction still
-applies if the trace's value capacity drops one operand.
+In `Redacted` value mode (the default), the report applies the same rules to
+every value it takes from evaluation: condition operands of any kind, loop
+witness samples, the values embedded in condition text (`[matched: …]`,
+`[loop: … sample: …]`), the `assumed_value` of causality `assumptions`, and the
+results of helper rules. Redaction is best-effort defense in depth, not a
+secrecy guarantee: it decides from where a value was read (its runtime path)
+and from names, and a value computed from a secret by a builtin (`lower`,
+`sprintf`, `object.get`), a comprehension, `walk` or collection construction
+carries no path, so only the nested-name check below applies to it. A
+comparison or other result that copies an operand's path inherits that path's
+sensitivity. Tracking sensitivity through computation is a separate feature
+(RG-R3). A value whose runtime path has a sensitive-named
+segment is replaced with `<redacted>`, and so is a value at or under the path of
+a sensitive pair's `value` (below); the keys a runtime path shows beneath its
+first sensitive segment are themselves hidden, as `["<redacted>"]` (numeric
+indices are kept; compound keys are hidden), because the keys of a secret collection are secret too. Values under sensitive-named object keys nested
+anywhere inside a value are replaced with `<redacted>`, and the value is marked
+`redacted: true`; a secret inside a compound (non-string) object key cannot be
+rewritten safely, so the whole enclosing object is redacted. In an object whose
+`name` entry is a sensitive name (`{"name": "DB_PASSWORD", "value": …}`, as in
+ARM `appSettings` or container `env`), the `value` entry is sensitive too: while
+the object is shown whole, and also once the policy reads the `value` on its own
+(`s.value`, or iterating the object), because the VM records the path it was read
+from. The VM also records the string keys of objects (and the string elements of
+sets) it iterates at a sensitive path, and a reported top-level string equal to
+one of them is hidden, since a key has no path of its own; strings nested inside
+a reported value are checked by name only. Both records are kept only in `Redacted` mode and hold up to 1,024 entries
+each. Past the pair-path cap, every path with a `value` segment and every path
+the report cannot parse is treated as sensitive; past the key cap, every string
+operand without a runtime path is. The path text of a causality assumption
+(`assumed_holds`) is masked like its `input_path`.
+Two-operand conditions (comparisons, membership and string-predicate builtins)
+are also redacted as a pair: if either operand's path is sensitive, both values
+are redacted, because a matching or containing operand can reveal the other. They
+are identified from the compiled condition, so pairing still applies if the
+trace's value capacity drops one operand. A loop witness sample is redacted by
+its loop's collection path (a sensitive path hides the key and the value) and by
+its key (a sensitive-named key hides the value), and by the path the sampled
+value was read from (a sensitive pair's `value` is hidden); a key or value equal
+to a recorded key of a sensitive collection is hidden too. A loop over a
+computed collection has no path, so only these by-name and by-value checks apply. An
+assumed value is hidden when the assumed input path or the value's own path is
+sensitive. A helper rule is one the caller did not query: neither an entry point
+nor a rule under an entry-point package. Its `result` and emission `result`s are
+hidden whole when they were read from a sensitive path (the VM records where a
+rule's result and each emitted value came from, keeping each value with the
+provenance of the definition that produced it). Because one reported `result`
+stands for every call of a function, it is hidden when any successful call
+returned a value from a sensitive path. Elements of a collection result that
+equal a sensitive emitted value or a recorded key are hidden, at any depth for
+partial-object results (a multi-value head, `h[k] contains v`, nests them), and
+an object result keyed by a recorded key is hidden whole. When only the rule's name is
+sensitive, its value is hidden whole unless it is a boolean or null, which
+describe a setting rather than hold one. Otherwise nested secrets are sanitized.
+A rewritten rule `result`, emission `result` or `assumed_value` is marked
+`redacted: true`.
+
+Redaction is best effort: it recognizes sensitive names, not secret-looking
+values. Names are compared after lowercasing and dropping `-`, `_` and spaces,
+and match when they contain one of `password`, `passwd`, `pwd`, `passphrase`,
+`secret`, `token`, `apikey`, `jwt`, `credential`, `privatekey`, `accesskey`,
+`connectionstring`, `securevalue` or `protectedsettings`, or when they end with
+`accountkey`, `sharedkey`, `primarykey`, `secondarykey` or `subscriptionkey` (so
+`storageAccountKey` matches but the setting `allowSharedKeyAccess` does not); a
+path is checked one segment at a time. Policy outputs (`query_result` and the `result` values of
+queried rules and their emissions) are what the policy author chose to return and
+are not redacted, so a policy that returns a whole resource returns its secrets
+too. Partial-evaluation residuals are not redacted either: a residual value is
+part of the computed answer. Use `Full` only where the report is as trusted as
+the input.
+
+A condition carries a loop `witness` (iteration count, success count and the
+first successful key and value; the key is the element's key or index even for
+an `every` that declares no key variable, and the element carries a runtime path) only for a completed loop that is accountable to
+what the condition list explains. A loop is anchored at the last condition its
+own rule body recorded while the loop ran, never at a condition of a rule or
+function it called or one recorded before it started; a loop that recorded no
+condition of its own has no anchor and is never summarized. A definition (or a
+rule-less program, or a helper body) carries the latest loop anchored among its
+reported conditions. An emission or derivation additionally requires that the
+loop finished before the value was emitted and, for a loop nested in another
+loop, that its enclosing iteration was still running at the emission; so the loop
+that produced a value is summarized on its definition, never on the emission, and
+an inner loop finished in an earlier iteration of the outer loop is not
+summarized on a later iteration's emission. A loop that completes inside one
+derivation (for example an `every` over the current resource's ports) is
+summarized there. An `every` that fails early counts the failing iteration. In
+`Compact` detail a partial-set rule with emissions, and every rule in
+`RuleSummary` scope, omits its definitions and so carries no loop summary.
 
 Operands of two-operand conditions are capped at 100 elements, counted across
 all nesting levels. A larger collection is reported as the prefix that fits, with
@@ -302,14 +387,9 @@ including the first, whose definition is the emission's top-level
  "derivation_count": 3, "derivations_truncated": true}
 ```
 
-Derivations use a per-derivation view of their conditions. They carry no loop
-witness, because a witness summarizes a whole loop rather than one derivation,
-and under `Redacted` nested secrets are sanitized in every operand, including
-single-operand conditions such as whole-object bindings. The first derivation
-therefore matches the top-level `conditions` except for those two differences;
-in particular, under `Redacted` the top-level `conditions` (like `definitions`)
-can still show a secret nested in a single-operand value that the derivations
-sanitize.
+The first derivation's `conditions` equal the emission's top-level
+`conditions`, and each derivation carries only the loop witnesses that finished
+within it.
 
 Two derivations are the same, and counted once, only when their definition and
 every condition, as presented, are equal: values hidden by redaction, operand

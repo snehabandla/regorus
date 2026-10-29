@@ -125,16 +125,13 @@ impl<'a> Compiler<'a> {
         let value_var_name = value.text().to_string();
         let key_var_name = key.as_ref().map(|k| k.text().to_string());
 
-        let actual_key_reg = if key_var_name.is_none() || key_var_name.as_deref() == Some("_") {
-            value_reg
-        } else {
-            key_reg
-        };
-
+        // The key register is bound even when the policy names no key, as for
+        // `some … in`, so the iterated key (and with it the element's
+        // provenance path) is known to explanations.
         let loop_params_index = self.program.add_loop_params(LoopStartParams {
             mode: LoopMode::Every,
             collection: collection_reg,
-            key_reg: actual_key_reg,
+            key_reg,
             value_reg,
             result_reg,
             body_start: 0,

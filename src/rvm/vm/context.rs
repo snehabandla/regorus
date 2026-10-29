@@ -28,12 +28,57 @@ pub struct LoopContext {
     /// Sample value from the first successful iteration (for causality witness).
     #[cfg(feature = "explanations")]
     pub sample_value: Option<Value>,
+    /// Runtime provenance of `sample_value`.
+    #[cfg(feature = "explanations")]
+    pub sample_path: Option<crate::Rc<str>>,
     /// Runtime provenance path for the collection being iterated.
     #[cfg(feature = "explanations")]
     pub collection_provenance: Option<crate::Rc<str>>,
     /// Current iteration index (0-based) for PE mode disjunct grouping.
     #[cfg(feature = "explanations")]
     pub iteration_index: u32,
+    /// Number of condition outcomes recorded when the loop started; the
+    /// loop's own conditions are recorded at or after this index.
+    #[cfg(feature = "explanations")]
+    pub conditions_at_start: usize,
+    /// Current iteration of the innermost loop (of the same rule frame) that
+    /// was running when this loop started; `None` at rule level.
+    #[cfg(feature = "explanations")]
+    pub enclosing_iteration: Option<u32>,
+}
+
+/// What the evaluation trace records about a loop when it finishes.
+#[cfg(feature = "explanations")]
+#[derive(Debug, Clone)]
+pub struct LoopTraceSummary {
+    pub total_iterations: usize,
+    pub success_count: usize,
+    pub sample_key: Option<Value>,
+    pub sample_value: Option<Value>,
+    pub sample_path: Option<crate::Rc<str>>,
+    pub collection_provenance: Option<crate::Rc<str>>,
+    pub conditions_at_start: usize,
+    pub enclosing_iteration: Option<u32>,
+}
+
+#[cfg(feature = "explanations")]
+impl LoopContext {
+    /// Summary for a loop finishing now. `failing_iteration` counts an
+    /// iteration that exits the loop before `LoopNext` could count it.
+    pub fn trace_summary(&self, failing_iteration: bool) -> LoopTraceSummary {
+        LoopTraceSummary {
+            total_iterations: self
+                .total_iterations
+                .saturating_add(usize::from(failing_iteration)),
+            success_count: self.success_count,
+            sample_key: self.sample_key.clone(),
+            sample_value: self.sample_value.clone(),
+            sample_path: self.sample_path.clone(),
+            collection_provenance: self.collection_provenance.clone(),
+            conditions_at_start: self.conditions_at_start,
+            enclosing_iteration: self.enclosing_iteration,
+        }
+    }
 }
 
 /// Iterator state for different collection types.
