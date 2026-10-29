@@ -221,16 +221,21 @@ fn bracket_alias_true_wildcard_with_quoted_leaf() {
         ("[outer]['a[b]']", vec!["outer", "a[b]"]),
     ] {
         let mut registry = AliasRegistry::new();
-        registry.load_from_json(&json!([{
-            "namespace": "Test",
-            "resourceTypes": [{
-                "resourceType": "widgets",
-                "aliases": [{
-                    "name": alloc::format!("Test/widgets/items[*].renamed{suffix}"),
-                    "defaultPath": alloc::format!("properties.items[*].original{suffix}")
-                }]
-            }]
-        }]).to_string()).unwrap();
+        registry
+            .load_from_json(
+                &json!([{
+                    "namespace": "Test",
+                    "resourceTypes": [{
+                        "resourceType": "widgets",
+                        "aliases": [{
+                            "name": alloc::format!("Test/widgets/items[*].renamed{suffix}"),
+                            "defaultPath": alloc::format!("properties.items[*].original{suffix}")
+                        }]
+                    }]
+                }])
+                .to_string(),
+            )
+            .unwrap();
         let raw = Value::from(json!({
             "type": "Test/widgets",
             "properties": {"items": [
@@ -244,11 +249,23 @@ fn bracket_alias_true_wildcard_with_quoted_leaf() {
         let lowercase: Vec<_> = keys.iter().map(|key| key.to_ascii_lowercase()).collect();
         let mut target = vec!["renamed"];
         target.extend(lowercase.iter().map(|key| key.as_str()));
-        assert_eq!(lookup(items.get(0).unwrap(), &target), Value::from(42), "{suffix}");
-        assert_eq!(lookup(items.get(1).unwrap(), &target), Value::Undefined, "{suffix}");
+        assert_eq!(
+            lookup(items.get(0).unwrap(), &target),
+            Value::from(42),
+            "{suffix}"
+        );
+        assert_eq!(
+            lookup(items.get(1).unwrap(), &target),
+            Value::Undefined,
+            "{suffix}"
+        );
         let mut source = vec!["original"];
         source.extend(lowercase.iter().map(|key| key.as_str()));
-        assert_eq!(lookup(items.get(0).unwrap(), &source), Value::Undefined, "{suffix}");
+        assert_eq!(
+            lookup(items.get(0).unwrap(), &source),
+            Value::Undefined,
+            "{suffix}"
+        );
 
         let normalized = Value::from(json!({
             "type": "Test/widgets",
@@ -262,9 +279,21 @@ fn bracket_alias_true_wildcard_with_quoted_leaf() {
         let items = items.as_array().unwrap();
         let mut source = vec!["original"];
         source.extend(keys);
-        assert_eq!(lookup(items.get(0).unwrap(), &source), Value::from(42), "{suffix}");
-        assert_eq!(lookup(items.get(1).unwrap(), &source), Value::Undefined, "{suffix}");
-        assert_eq!(lookup(items.get(0).unwrap(), &target), Value::Undefined, "{suffix}");
+        assert_eq!(
+            lookup(items.get(0).unwrap(), &source),
+            Value::from(42),
+            "{suffix}"
+        );
+        assert_eq!(
+            lookup(items.get(1).unwrap(), &source),
+            Value::Undefined,
+            "{suffix}"
+        );
+        assert_eq!(
+            lookup(items.get(0).unwrap(), &target),
+            Value::Undefined,
+            "{suffix}"
+        );
     }
 }
 
@@ -275,17 +304,23 @@ fn bracket_alias_array_indices_are_not_quoted_keys() {
         (json!([{"leaf": 42}]), Value::from(42)),
         (json!({"0": {"leaf": 42}}), Value::Undefined),
     ] {
+        let input = Value::from(json!({"type": "Test/widgets", "renamed": value}));
         let raw = Value::from(json!({"type": "Test/widgets", "properties": {"original": value}}));
         let normalized = normalizer::normalize(&raw, Some(&registry), None);
         let value = lookup(&normalized, &["renamed"]);
-        let actual = value.as_array().ok().and_then(|array| array.get(0))
+        let actual = value
+            .as_array()
+            .ok()
+            .and_then(|array| array.get(0))
             .map_or(Value::Undefined, |value| lookup(value, &["leaf"]));
         assert_eq!(actual, expected);
 
-        let input = Value::from(json!({"type": "Test/widgets", "renamed": value}));
         let arm = registry.denormalize(&input, None);
         let value = lookup(&arm, &["properties", "original"]);
-        let actual = value.as_array().ok().and_then(|array| array.get(0))
+        let actual = value
+            .as_array()
+            .ok()
+            .and_then(|array| array.get(0))
             .map_or(Value::Undefined, |value| lookup(value, &["leaf"]));
         assert_eq!(actual, expected);
     }
@@ -295,11 +330,20 @@ fn bracket_alias_array_indices_are_not_quoted_keys() {
 fn bracket_alias_malformed_paths_do_not_project_whole_resources() {
     for suffix in ["[]", "['']", "[ab", "['ab'].", "[ab]junk"] {
         let registry = registry(suffix);
-        let raw = Value::from(json!({"type": "Test/widgets", "properties": {"original": {"ab": 42}}}));
+        let raw =
+            Value::from(json!({"type": "Test/widgets", "properties": {"original": {"ab": 42}}}));
         let normalized = normalizer::normalize(&raw, Some(&registry), None);
-        assert_eq!(lookup(&normalized, &["renamed"]), Value::Undefined, "{suffix}");
+        assert_eq!(
+            lookup(&normalized, &["renamed"]),
+            Value::Undefined,
+            "{suffix}"
+        );
         let input = Value::from(json!({"type": "Test/widgets", "renamed": {"ab": 42}}));
         let arm = registry.denormalize(&input, None);
-        assert_eq!(lookup(&arm, &["properties", "original"]), Value::Undefined, "{suffix}");
+        assert_eq!(
+            lookup(&arm, &["properties", "original"]),
+            Value::Undefined,
+            "{suffix}"
+        );
     }
 }

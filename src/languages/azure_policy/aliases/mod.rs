@@ -504,7 +504,11 @@ fn compute_aggregates_for_version(
                         .map(|(_, init)| init)
                         .unwrap_or_default()
                         .iter()
-                        .map(|part| path::key_segments(part).map(|keys| keys.iter().map(|key| key.to_ascii_lowercase()).collect()))
+                        .map(|part| {
+                            path::key_segments(part).map(|keys| {
+                                keys.iter().map(|key| key.to_ascii_lowercase()).collect()
+                            })
+                        })
                         .collect();
                     let Some(array_chain) = array_chain else {
                         continue;

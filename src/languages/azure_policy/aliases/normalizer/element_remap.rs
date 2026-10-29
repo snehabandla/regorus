@@ -179,7 +179,7 @@ fn remap_at_depth_in_btree(
 
 /// Remap a value between dotted paths directly in a BTreeMap.
 fn remap_deep_field_in_btree(btree: &mut Object, source: &str, target: &str, lowercase: bool) {
-    let val = match read_dotted_path_btree(btree, source) {
+    let val = match read_dotted_path_btree(btree, source, !lowercase) {
         Some(v) => v,
         None => return,
     };
@@ -190,19 +190,24 @@ fn remap_deep_field_in_btree(btree: &mut Object, source: &str, target: &str, low
 }
 
 /// Read a value at a dotted path from a BTreeMap.
-fn read_dotted_path_btree(btree: &Object, path: &str) -> Option<Value> {
+fn read_dotted_path_btree(btree: &Object, path: &str, case_insensitive: bool) -> Option<Value> {
     let segments = path::scalar_segments(path)?;
     let (Segment::Key(first), rest) = segments.split_first()? else {
         return None;
     };
-    let value = btree.get(&Value::String(crate::Rc::clone(first)))?;
-    path::get(value, rest, false).cloned()
+    let value = btree.get(&Value::String(crate::Rc::clone(first))).or_else(|| {
+        btree.iter().find_map(|(key, value)| {
+            (case_insensitive && key.as_string().is_ok_and(|key| key.eq_ignore_ascii_case(first)))
+                .then_some(value)
+        })
+    })?;
+    path::get(value, rest, case_insensitive).cloned()
 }
 
 /// Remap a value from one (possibly nested) dot-separated path to another
 /// in an ObjMap.  Used only at the top level when `depth >= array_chain.len()`.
 fn remap_deep_field(obj: &mut ObjMap, source: &str, target: &str, lowercase: bool) {
-    let val = match read_dotted_path(obj, source) {
+    let val = match read_dotted_path(obj, source, !lowercase) {
         Some(v) => v,
         None => return,
     };
@@ -215,11 +220,15 @@ fn remap_deep_field(obj: &mut ObjMap, source: &str, target: &str, lowercase: boo
 }
 
 /// Read a value at a dot-separated path from an ObjMap.
-fn read_dotted_path(obj: &ObjMap, path: &str) -> Option<Value> {
+fn read_dotted_path(obj: &ObjMap, path: &str, case_insensitive: bool) -> Option<Value> {
     let segments = path::scalar_segments(path)?;
     let (Segment::Key(first), rest) = segments.split_first()? else {
         return None;
     };
-    let value = obj_get(obj, first)?;
-    path::get(value, rest, false).cloned()
+    let value = obj_get(obj, first).or_else(|| {
+        obj.iter().find_map(|(key, value)| {
+            (case_insensitive && key.eq_ignore_ascii_case(first)).then_some(value)
+        })
+    })?;
+    path::get(value, rest, case_insensitive).cloned()
 }

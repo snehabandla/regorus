@@ -116,13 +116,16 @@ pub(crate) fn scalar_segments(path: &str) -> Option<Vec<Segment>> {
 }
 
 pub(crate) fn key_segments(path: &str) -> Option<Vec<Rc<str>>> {
-    scalar_segments(path)?.into_iter().map(|segment| {
-        if let Segment::Key(key) = segment {
-            Some(key)
-        } else {
-            None
-        }
-    }).collect()
+    scalar_segments(path)?
+        .into_iter()
+        .map(|segment| {
+            if let Segment::Key(key) = segment {
+                Some(key)
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Split only at actual wildcards, leaving quoted `[*]` untouched.
@@ -275,20 +278,35 @@ pub(crate) fn remove(map: &mut ObjMap, segments: &[Segment]) {
     if rest.is_empty()
         || map
             .get_mut(&actual)
-            .is_some_and(|value| remove_value(value, rest))
+            .is_some_and(|value| remove_value(value, rest, true))
     {
         map.remove(&actual);
     }
 }
 
-fn remove_value(value: &mut Value, segments: &[Segment]) -> bool {
+fn remove_value(value: &mut Value, segments: &[Segment], prune: bool) -> bool {
     let Some((first, rest)) = segments.split_first() else {
         return false;
     };
     match (value, first) {
-        (Value::Object(object), Segment::Key(key)) => {
-            let object = Rc::make_mut(object);
-            let actual = object
+        (Value::Object(object), Segment::Key(_)) => remove_object(Rc::make_mut(object), segments, prune),
+        (Value::Array(array), Segment::Index(index)) => {
+            if let Some(value) = Rc::make_mut(array).get_mut(*index) {
+                if rest.is_empty() || remove_value(value, rest, prune) {
+                    *value = Value::Null;
+                }
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn remove_object(object: &mut Object, segments: &[Segment], prune: bool) -> bool {
+    let Some((Segment::Key(key), rest)) = segments.split_first() else {
+        return false;
+    };
+    let actual = object
                 .keys()
                 .find(|candidate| {
                     candidate
@@ -300,21 +318,10 @@ fn remove_value(value: &mut Value, segments: &[Segment]) -> bool {
                 if rest.is_empty()
                     || object
                         .get_mut(&actual)
-                        .is_some_and(|value| remove_value(value, rest))
+                        .is_some_and(|value| remove_value(value, rest, prune))
                 {
                     object.remove(&actual);
                 }
             }
-            object.is_empty()
-        }
-        (Value::Array(array), Segment::Index(index)) => {
-            if let Some(value) = Rc::make_mut(array).get_mut(*index) {
-                if rest.is_empty() || remove_value(value, rest) {
-                    *value = Value::Null;
-                }
-            }
-            false
-        }
-        _ => false,
-    }
+    prune && object.is_empty()
 }

@@ -316,10 +316,13 @@ pub fn remove_element_field(obj: &mut ObjMap, array_chain: &[Vec<String>], field
 
 fn remove_field_at_depth(obj: &mut ObjMap, array_chain: &[Vec<String>], depth: usize, field: &str) {
     let Some(nav) = array_chain.get(depth) else {
-        let Some(keys) = super::path::key_segments(field) else {
+        if field.contains('[') {
+            if let Some(segments) = super::path::scalar_segments(field) {
+                super::path::remove(obj, &segments);
+            }
             return;
-        };
-        let segments: Vec<&str> = keys.iter().map(|key| key.as_ref()).collect();
+        }
+        let segments: Vec<&str> = field.split('.').collect();
         if segments.len() == 1 {
             if let Some(&seg) = segments.first() {
                 obj_remove(obj, seg);
@@ -376,10 +379,13 @@ fn remove_field_at_depth_obj(
     field: &str,
 ) {
     let Some(nav) = array_chain.get(depth) else {
-        let Some(keys) = super::path::key_segments(field) else {
+        if field.contains('[') {
+            if let Some(segments) = super::path::scalar_segments(field) {
+                super::path::remove_object(obj, &segments, false);
+            }
             return;
-        };
-        let segments: Vec<&str> = keys.iter().map(|key| key.as_ref()).collect();
+        }
+        let segments: Vec<&str> = field.split('.').collect();
         if segments.len() == 1 {
             if let Some(&seg) = segments.first() {
                 obj.remove(&Value::from(seg));
