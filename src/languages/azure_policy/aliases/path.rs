@@ -11,18 +11,18 @@ use crate::{value::Object, Rc, Value};
 use super::obj_map::{make_array, make_value, new_map, ObjMap};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Segment {
+pub enum Segment {
     Key(Rc<str>),
     Index(usize),
     Wildcard,
 }
 
-pub(crate) struct Path {
+pub struct Path {
     pub segments: Vec<Segment>,
     wildcards: Vec<(usize, usize)>,
 }
 
-pub(crate) fn parse(path: &str) -> Option<Path> {
+pub fn parse(path: &str) -> Option<Path> {
     let mut segments = Vec::new();
     let mut wildcards = Vec::new();
     let mut pos = 0_usize;
@@ -110,12 +110,12 @@ fn bracket(path: &str, open: usize) -> Option<(Segment, usize)> {
     Some((segment, body_start.saturating_add(close).saturating_add(1)))
 }
 
-pub(crate) fn scalar_segments(path: &str) -> Option<Vec<Segment>> {
+pub fn scalar_segments(path: &str) -> Option<Vec<Segment>> {
     let parsed = parse(path)?;
     parsed.wildcards.is_empty().then_some(parsed.segments)
 }
 
-pub(crate) fn key_segments(path: &str) -> Option<Vec<Rc<str>>> {
+pub fn key_segments(path: &str) -> Option<Vec<Rc<str>>> {
     scalar_segments(path)?
         .into_iter()
         .map(|segment| {
@@ -129,7 +129,7 @@ pub(crate) fn key_segments(path: &str) -> Option<Vec<Rc<str>>> {
 }
 
 /// Split only at actual wildcards, leaving quoted `[*]` untouched.
-pub(crate) fn wildcard_parts(path: &str) -> Vec<&str> {
+pub fn wildcard_parts(path: &str) -> Vec<&str> {
     let Some(parsed) = parse(path) else {
         return alloc::vec![path];
     };
@@ -151,7 +151,7 @@ pub(crate) fn wildcard_parts(path: &str) -> Vec<&str> {
     parts
 }
 
-pub(crate) fn get<'a>(
+pub fn get<'a>(
     mut value: &'a Value,
     segments: &[Segment],
     case_insensitive: bool,
@@ -163,12 +163,12 @@ pub(crate) fn get<'a>(
                 object.get(&Value::String(Rc::clone(key))).or_else(|| {
                     case_insensitive
                         .then(|| {
-                            object.iter().find_map(|(candidate, value)| {
+                            object.iter().find_map(|(candidate, child)| {
                                 candidate
                                     .as_string()
                                     .ok()
                                     .filter(|s| s.eq_ignore_ascii_case(key))
-                                    .map(|_| value)
+                                    .map(|_| child)
                             })
                         })
                         .flatten()
@@ -197,7 +197,7 @@ fn key_case(key: &Rc<str>, lowercase: bool) -> Rc<str> {
     }
 }
 
-pub(crate) fn set(map: &mut ObjMap, segments: &[Segment], value: Value, lowercase: bool) {
+pub fn set(map: &mut ObjMap, segments: &[Segment], value: Value, lowercase: bool) {
     let Some((Segment::Key(key), rest)) = segments.split_first() else {
         return;
     };
@@ -217,7 +217,7 @@ fn set_value(current: &mut Value, segments: &[Segment], value: Value, lowercase:
     };
     match (current, segment) {
         (Value::Object(object), Segment::Key(_)) => {
-            set_object(Rc::make_mut(object), segments, value, lowercase)
+            set_object(Rc::make_mut(object), segments, value, lowercase);
         }
         (Value::Array(array), Segment::Index(index)) => {
             let array = Rc::make_mut(array);
@@ -250,7 +250,7 @@ fn set_value(current: &mut Value, segments: &[Segment], value: Value, lowercase:
     }
 }
 
-pub(crate) fn set_object(object: &mut Object, segments: &[Segment], value: Value, lowercase: bool) {
+pub fn set_object(object: &mut Object, segments: &[Segment], value: Value, lowercase: bool) {
     let Some((Segment::Key(key), rest)) = segments.split_first() else {
         return;
     };
@@ -264,7 +264,7 @@ pub(crate) fn set_object(object: &mut Object, segments: &[Segment], value: Value
 }
 
 /// Remove a consumed alias leaf without discarding unrelated siblings.
-pub(crate) fn remove(map: &mut ObjMap, segments: &[Segment]) {
+pub fn remove(map: &mut ObjMap, segments: &[Segment]) {
     let Some((Segment::Key(key), rest)) = segments.split_first() else {
         return;
     };
@@ -293,9 +293,9 @@ fn remove_value(value: &mut Value, segments: &[Segment], prune: bool) -> bool {
             remove_object(Rc::make_mut(object), segments, prune)
         }
         (Value::Array(array), Segment::Index(index)) => {
-            if let Some(value) = Rc::make_mut(array).get_mut(*index) {
-                if rest.is_empty() || remove_value(value, rest, prune) {
-                    *value = Value::Null;
+            if let Some(child) = Rc::make_mut(array).get_mut(*index) {
+                if rest.is_empty() || remove_value(child, rest, prune) {
+                    *child = Value::Null;
                 }
             }
             false
@@ -304,7 +304,7 @@ fn remove_value(value: &mut Value, segments: &[Segment], prune: bool) -> bool {
     }
 }
 
-pub(crate) fn remove_object(object: &mut Object, segments: &[Segment], prune: bool) -> bool {
+pub fn remove_object(object: &mut Object, segments: &[Segment], prune: bool) -> bool {
     let Some((Segment::Key(key), rest)) = segments.split_first() else {
         return false;
     };
