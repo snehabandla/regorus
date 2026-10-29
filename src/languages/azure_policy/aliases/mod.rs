@@ -499,13 +499,16 @@ fn compute_aggregates_for_version(
                     .unwrap_or(arm_leaf_raw);
 
                 if !short_leaf.eq_ignore_ascii_case(arm_leaf) {
-                    let array_chain: Vec<Vec<String>> = short_parts
+                    let array_chain: Option<Vec<Vec<String>>> = short_parts
                         .split_last()
                         .map(|(_, init)| init)
                         .unwrap_or_default()
                         .iter()
-                        .map(|part| part.split('.').map(|s| s.to_ascii_lowercase()).collect())
+                        .map(|part| path::key_segments(part).map(|keys| keys.iter().map(|key| key.to_ascii_lowercase()).collect()))
                         .collect();
+                    let Some(array_chain) = array_chain else {
+                        continue;
+                    };
 
                     let source_lc = arm_leaf.to_ascii_lowercase();
                     let target_lc = short_leaf.to_ascii_lowercase();
@@ -519,7 +522,7 @@ fn compute_aggregates_for_version(
                     reverse_element_remaps.push(PrecomputedReverseRemap {
                         array_chain: array_chain.clone(),
                         source_field: target_lc.clone(),
-                        target_field: source_lc,
+                        target_field: arm_leaf.to_string(),
                         cleanup_field: target_lc,
                     });
                 }

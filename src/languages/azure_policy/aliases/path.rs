@@ -115,6 +115,16 @@ pub(crate) fn scalar_segments(path: &str) -> Option<Vec<Segment>> {
     parsed.wildcards.is_empty().then_some(parsed.segments)
 }
 
+pub(crate) fn key_segments(path: &str) -> Option<Vec<Rc<str>>> {
+    scalar_segments(path)?.into_iter().map(|segment| {
+        if let Segment::Key(key) = segment {
+            Some(key)
+        } else {
+            None
+        }
+    }).collect()
+}
+
 /// Split only at actual wildcards, leaving quoted `[*]` untouched.
 pub(crate) fn wildcard_parts(path: &str) -> Vec<&str> {
     let Some(parsed) = parse(path) else {

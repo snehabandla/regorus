@@ -185,15 +185,7 @@ pub fn denormalize_with_aliases(
                 let remap = ElementRemap {
                     array_chain: rev.array_chain.clone(),
                     source_field: rev.source_field.clone(),
-                    target_field: if rev.target_field.contains('.') {
-                        rev.target_field
-                            .split('.')
-                            .map(|segment| restore_casing(segment, &casing_map))
-                            .collect::<alloc::vec::Vec<_>>()
-                            .join(".")
-                    } else {
-                        restore_casing(&rev.target_field, &casing_map)
-                    },
+                    target_field: rev.target_field.clone(),
                 };
                 apply_element_remap(&mut properties, &remap, false);
                 remove_element_field(&mut properties, &rev.array_chain, &rev.cleanup_field);
