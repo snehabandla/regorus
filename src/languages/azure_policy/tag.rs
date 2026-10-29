@@ -24,9 +24,9 @@ pub(crate) fn classify_tag_field(text: &str) -> Option<TagField> {
 
     match lower.as_str() {
         "tags" => Some(TagField::Collection),
-        _ if lower.starts_with("tags.") => {
-            Some(TagField::Key(text.get("tags.".len()..).unwrap_or_default().into()))
-        }
+        _ if lower.starts_with("tags.") => Some(TagField::Key(
+            text.get("tags.".len()..).unwrap_or_default().into(),
+        )),
         _ if lower.starts_with("tags[") && text.ends_with(']') => {
             let tag = text
                 .get("tags[".len()..text.len().saturating_sub(1))

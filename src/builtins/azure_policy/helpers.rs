@@ -367,7 +367,8 @@ pub fn resolve_path(root: &Value, path: &str) -> Value {
 fn resolve_tag(root: &Value, tag: &str) -> Value {
     let tags = resolve_path(root, "tags");
     #[allow(clippy::pattern_type_mismatch)]
-    let Value::Object(map) = tags else {
+    let Value::Object(map) = tags
+    else {
         return Value::Undefined;
     };
 

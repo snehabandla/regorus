@@ -66,9 +66,7 @@ impl Compiler {
                 self.record_field_kind("apiVersion");
                 self.compile_resource_path_value("apiVersion", span)?
             }
-            FieldKind::Tag(tag) => {
-                self.compile_tag_value(tag, span)?
-            }
+            FieldKind::Tag(tag) => self.compile_tag_value(tag, span)?,
             FieldKind::Alias(path) => {
                 self.record_alias(path);
                 let short = self.resolve_alias_path(path, span)?;
@@ -175,11 +173,7 @@ impl Compiler {
             self.emit_chained_index_literal_path(override_reg, &["tags", &tag_lower], span)
         } else {
             let input_reg = self.load_input(span)?;
-            self.emit_chained_index_literal_path(
-                input_reg,
-                &["resource", "tags", &tag_lower],
-                span,
-            )
+            self.emit_chained_index_literal_path(input_reg, &["resource", "tags", &tag_lower], span)
         }
     }
 
