@@ -5,6 +5,7 @@
 
 use super::{denormalizer, normalizer, path, AliasRegistry};
 use crate::Value;
+use alloc::string::ToString as _;
 use alloc::vec;
 use serde_json::{json, Value as Json};
 
