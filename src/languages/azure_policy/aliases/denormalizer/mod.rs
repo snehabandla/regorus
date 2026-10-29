@@ -147,7 +147,11 @@ pub fn denormalize_with_aliases(
             let denorm_val = denormalize_value(val, &casing_map);
             let target = path::without_properties(arm_segments);
             let target_properties = target.len() != arm_segments.len();
-            let destination = if target_properties { &properties } else { &result };
+            let destination = if target_properties {
+                &properties
+            } else {
+                &result
+            };
             if target.is_empty() || !path::can_set(destination, target) {
                 continue;
             }
@@ -156,11 +160,16 @@ pub fn denormalize_with_aliases(
                 if let Some(stripped) = first.strip_prefix("_p_") {
                     *first = Rc::from(stripped);
                     source_properties = Some(true);
-                } else if !ROOT_FIELDS.iter().any(|field| field.eq_ignore_ascii_case(first)) {
+                } else if !ROOT_FIELDS
+                    .iter()
+                    .any(|field| field.eq_ignore_ascii_case(first))
+                {
                     source_properties = Some(!is_data_plane);
                 }
             }
-            if source_properties == Some(target_properties) && path::equivalent(&short_segments, target) {
+            if source_properties == Some(target_properties)
+                && path::equivalent(&short_segments, target)
+            {
                 source_properties = None;
             }
             writes.push(ScalarWrite {
@@ -180,12 +189,23 @@ pub fn denormalize_with_aliases(
             let mut next_result = result.clone();
             for write in writes.iter().filter(|write| write.active) {
                 if let Some(source_properties) = write.source_properties {
-                    path::remove(if source_properties { &mut next_properties } else { &mut next_result }, &write.short);
+                    path::remove(
+                        if source_properties {
+                            &mut next_properties
+                        } else {
+                            &mut next_result
+                        },
+                        &write.short,
+                    );
                 }
             }
             let mut failed = false;
             for write in writes.iter_mut().filter(|write| write.active) {
-                let destination = if write.target_properties { &mut next_properties } else { &mut next_result };
+                let destination = if write.target_properties {
+                    &mut next_properties
+                } else {
+                    &mut next_result
+                };
                 if path::can_set(destination, &write.arm) {
                     path::set(destination, &write.arm, write.value.clone(), false);
                 } else {

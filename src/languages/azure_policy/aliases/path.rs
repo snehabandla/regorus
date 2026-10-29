@@ -4,8 +4,8 @@
 //! Alias-local path grammar. Quotes have no escapes and close only before
 //! optional whitespace and `]`; delimiters inside quoted keys are literal.
 
-use alloc::vec::Vec;
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use crate::{value::Object, Rc, Value};
 
@@ -124,14 +124,19 @@ pub fn scalar_segments(path: &str) -> Option<Vec<Segment>> {
 }
 
 pub fn equivalent(left: &[Segment], right: &[Segment]) -> bool {
-    left.len() == right.len() && left.iter().zip(right).all(|(left, right)| match (left, right) {
-        (Segment::Key(left), Segment::Key(right)) => left.eq_ignore_ascii_case(right),
-        _ => left == right,
-    })
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| match (left, right) {
+                (Segment::Key(left), Segment::Key(right)) => left.eq_ignore_ascii_case(right),
+                _ => left == right,
+            })
 }
 
 pub fn without_properties(segments: &[Segment]) -> &[Segment] {
-    if matches!(segments.first(), Some(Segment::Key(key)) if key.eq_ignore_ascii_case("properties")) {
+    if matches!(segments.first(), Some(Segment::Key(key)) if key.eq_ignore_ascii_case("properties"))
+    {
         segments.get(1..).unwrap_or_default()
     } else {
         segments
@@ -150,8 +155,13 @@ pub fn render(segments: &[Segment]) -> String {
                     result.push_str(key);
                 } else {
                     let quote = if key.match_indices('\'').any(|(offset, _)| {
-                        key.get(offset.saturating_add(1)..).is_some_and(|tail| tail.trim_start().starts_with(']'))
-                    }) { '"' } else { '\'' };
+                        key.get(offset.saturating_add(1)..)
+                            .is_some_and(|tail| tail.trim_start().starts_with(']'))
+                    }) {
+                        '"'
+                    } else {
+                        '\''
+                    };
                     result.push('[');
                     result.push(quote);
                     result.push_str(key);
@@ -223,7 +233,9 @@ pub fn get_map<'a>(map: &'a ObjMap, segments: &[Segment]) -> Option<&'a Value> {
     let (Segment::Key(first), rest) = segments.split_first()? else {
         return None;
     };
-    let value = map.iter().find_map(|(key, value)| key.eq_ignore_ascii_case(first).then_some(value))?;
+    let value = map
+        .iter()
+        .find_map(|(key, value)| key.eq_ignore_ascii_case(first).then_some(value))?;
     get(value, rest, true)
 }
 
@@ -260,8 +272,11 @@ pub fn set(map: &mut ObjMap, segments: &[Segment], value: Value, lowercase: bool
     let Some((Segment::Key(key), rest)) = segments.split_first() else {
         return;
     };
-    let key = map.keys().find(|candidate| candidate.eq_ignore_ascii_case(key))
-        .cloned().unwrap_or_else(|| key_case(key, lowercase));
+    let key = map
+        .keys()
+        .find(|candidate| candidate.eq_ignore_ascii_case(key))
+        .cloned()
+        .unwrap_or_else(|| key_case(key, lowercase));
     if let Some(next) = rest.first() {
         let child = map.entry(key).or_insert_with(|| empty_for(next));
         set_value(child, rest, value, lowercase);
@@ -320,8 +335,14 @@ pub fn set_object(object: &mut Object, segments: &[Segment], value: Value, lower
     let Some((Segment::Key(key), rest)) = segments.split_first() else {
         return;
     };
-    let key = object.keys().find(|candidate| candidate.as_string()
-        .is_ok_and(|candidate| candidate.eq_ignore_ascii_case(key))).cloned()
+    let key = object
+        .keys()
+        .find(|candidate| {
+            candidate
+                .as_string()
+                .is_ok_and(|candidate| candidate.eq_ignore_ascii_case(key))
+        })
+        .cloned()
         .unwrap_or_else(|| Value::String(key_case(key, lowercase)));
     if let Some(next) = rest.first() {
         let child = object.get_or_insert_with(key, || empty_for(next));
@@ -394,7 +415,6 @@ pub fn remove_object(object: &mut Object, segments: &[Segment], prune: bool) -> 
         {
             object.remove(&actual);
         }
-
     }
     prune && object.is_empty()
 }
@@ -404,7 +424,9 @@ pub fn can_set(map: &ObjMap, segments: &[Segment]) -> bool {
     let Some((Segment::Key(key), rest)) = segments.split_first() else {
         return false;
     };
-    let existing = map.iter().find_map(|(candidate, child)| candidate.eq_ignore_ascii_case(key).then_some(child));
+    let existing = map
+        .iter()
+        .find_map(|(candidate, child)| candidate.eq_ignore_ascii_case(key).then_some(child));
     can_set_value(existing, rest)
 }
 
@@ -417,11 +439,17 @@ fn can_set_value(current: Option<&Value>, segments: &[Segment]) -> bool {
         (_, Segment::Index(index)) if *index > MAX_INDEX => false,
         (None, _) | (Some(Value::Null), _) => can_set_value(None, rest),
         (Some(Value::Object(object)), Segment::Key(key)) => {
-            let child = object.iter().find_map(|(candidate, child)| candidate.as_string()
-                .is_ok_and(|candidate| candidate.eq_ignore_ascii_case(key)).then_some(child));
+            let child = object.iter().find_map(|(candidate, child)| {
+                candidate
+                    .as_string()
+                    .is_ok_and(|candidate| candidate.eq_ignore_ascii_case(key))
+                    .then_some(child)
+            });
             can_set_value(child, rest)
         }
-        (Some(Value::Array(array)), Segment::Index(index)) => can_set_value(array.get(*index), rest),
+        (Some(Value::Array(array)), Segment::Index(index)) => {
+            can_set_value(array.get(*index), rest)
+        }
         _ => false,
     }
 }

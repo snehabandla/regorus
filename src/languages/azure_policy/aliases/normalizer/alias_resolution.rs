@@ -9,8 +9,7 @@ use crate::Value;
 
 use super::super::obj_map::remove_element_field;
 use super::super::obj_map::{
-    collision_safe_key, is_root_field_collision, obj_insert_rc,
-    set_nested_lowercased, ObjMap,
+    collision_safe_key, is_root_field_collision, obj_insert_rc, set_nested_lowercased, ObjMap,
 };
 use super::super::path;
 use super::super::types::ResolvedAliases;

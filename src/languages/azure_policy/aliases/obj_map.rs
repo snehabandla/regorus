@@ -289,9 +289,7 @@ pub fn is_root_field_collision(short_name: &str, default_path: &str) -> bool {
     let [super::path::Segment::Key(short)] = short.as_slice() else {
         return false;
     };
-    ROOT_FIELDS
-        .iter()
-        .any(|f| f.eq_ignore_ascii_case(short))
+    ROOT_FIELDS.iter().any(|f| f.eq_ignore_ascii_case(short))
         && super::path::without_properties(&arm).len() < arm.len()
         && arm.len() > 1
 }

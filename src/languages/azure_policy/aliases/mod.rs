@@ -500,40 +500,54 @@ fn compute_aggregates_for_version(
         let Some(arm_path) = path::parse(selected_path) else {
             continue;
         };
-        let short_parts: Vec<_> = short_path.segments.split(|segment| *segment == path::Segment::Wildcard).collect();
-        let arm_parts: Vec<_> = arm_path.segments.split(|segment| *segment == path::Segment::Wildcard).collect();
+        let short_parts: Vec<_> = short_path
+            .segments
+            .split(|segment| *segment == path::Segment::Wildcard)
+            .collect();
+        let arm_parts: Vec<_> = arm_path
+            .segments
+            .split(|segment| *segment == path::Segment::Wildcard)
+            .collect();
 
         if short_parts.len() >= 2 && arm_parts.len() >= 2 {
             if let (Some(short_leaf), Some(arm_leaf_raw)) = (short_parts.last(), arm_parts.last()) {
                 let arm_leaf = path::without_properties(arm_leaf_raw);
-                if !short_leaf.is_empty() && !arm_leaf.is_empty() && !path::equivalent(short_leaf, arm_leaf) {
+                if !short_leaf.is_empty()
+                    && !arm_leaf.is_empty()
+                    && !path::equivalent(short_leaf, arm_leaf)
+                {
                     let array_chain: Option<Vec<Vec<String>>> = short_parts
-                        .get(..short_parts.len().saturating_sub(1)).unwrap_or_default()
-                        .iter().map(|part| {
+                        .get(..short_parts.len().saturating_sub(1))
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|part| {
                             if part.is_empty() {
                                 return None;
                             }
-                            part.iter().map(|segment| match segment {
-                                path::Segment::Key(key) => Some(key.to_ascii_lowercase()),
-                                _ => None,
-                            }).collect()
-                        }).collect();
+                            part.iter()
+                                .map(|segment| match segment {
+                                    path::Segment::Key(key) => Some(key.to_ascii_lowercase()),
+                                    _ => None,
+                                })
+                                .collect()
+                        })
+                        .collect();
                     if let Some(array_chain) = array_chain {
-                    let arm_leaf = path::render(arm_leaf);
-                    let source_lc = arm_leaf.to_ascii_lowercase();
-                    let target_lc = path::render(short_leaf).to_ascii_lowercase();
-                    element_remaps.push(PrecomputedRemap {
-                        array_chain: array_chain.clone(),
-                        source_field: source_lc.clone(),
-                        target_field: target_lc.clone(),
-                    });
+                        let arm_leaf = path::render(arm_leaf);
+                        let source_lc = arm_leaf.to_ascii_lowercase();
+                        let target_lc = path::render(short_leaf).to_ascii_lowercase();
+                        element_remaps.push(PrecomputedRemap {
+                            array_chain: array_chain.clone(),
+                            source_field: source_lc.clone(),
+                            target_field: target_lc.clone(),
+                        });
 
-                    reverse_element_remaps.push(PrecomputedReverseRemap {
-                        array_chain: array_chain.clone(),
-                        source_field: target_lc.clone(),
-                        target_field: arm_leaf,
-                        cleanup_field: target_lc,
-                    });
+                        reverse_element_remaps.push(PrecomputedReverseRemap {
+                            array_chain: array_chain.clone(),
+                            source_field: target_lc.clone(),
+                            target_field: arm_leaf,
+                            cleanup_field: target_lc,
+                        });
                     }
                 }
             }
@@ -542,7 +556,10 @@ fn compute_aggregates_for_version(
         // Compute array base rename.
         if let (Some(short_base), Some(arm_base)) = (short_parts.first(), arm_parts.first()) {
             let arm_base_stripped = path::without_properties(arm_base);
-            if !short_base.is_empty() && !arm_base_stripped.is_empty() && !path::equivalent(short_base, arm_base_stripped) {
+            if !short_base.is_empty()
+                && !arm_base_stripped.is_empty()
+                && !path::equivalent(short_base, arm_base_stripped)
+            {
                 let short_base = path::render(short_base);
                 let arm_base_stripped = path::render(arm_base_stripped);
                 // Normalize direction: (arm_base_lc, short_base_lc)
@@ -555,10 +572,7 @@ fn compute_aggregates_for_version(
                 }
 
                 // Denormalize direction: (short_base_lc, arm_base)
-                let denorm_pair = (
-                    short_base.to_ascii_lowercase(),
-                    arm_base_stripped,
-                );
+                let denorm_pair = (short_base.to_ascii_lowercase(), arm_base_stripped);
                 if seen_denorm.insert(denorm_pair.clone()) {
                     renames_denorm.push(denorm_pair);
                 }
