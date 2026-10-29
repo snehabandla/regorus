@@ -305,7 +305,8 @@ fn bracket_alias_array_indices_are_not_quoted_keys() {
         (json!({"0": {"leaf": 42}}), Value::Undefined),
     ] {
         let input = Value::from(json!({"type": "Test/widgets", "renamed": input_value}));
-        let raw = Value::from(json!({"type": "Test/widgets", "properties": {"original": input_value}}));
+        let raw =
+            Value::from(json!({"type": "Test/widgets", "properties": {"original": input_value}}));
         let normalized = normalizer::normalize(&raw, Some(&registry), None);
         let normalized_value = lookup(&normalized, &["renamed"]);
         let actual = normalized_value
