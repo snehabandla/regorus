@@ -378,7 +378,7 @@ cases:
         environment: "prod"
     want_effect: "deny"
 
-  - note: value_count_dynamic_dotted_tag_path
+  - note: value_count_dynamic_bracket_tag_with_closing_bracket
     policy_rule: |
       {
         "if": {
@@ -396,13 +396,13 @@ cases:
       }
     parameters:
       requiredTags:
-        - "Department.Name"
+        - "Department]Name"
     resource:
       tags:
-        "department.name": "production"
+        "department]name": "production"
     want_effect: "deny"
 
-  - note: value_count_dynamic_dotted_tag_path_twin_no_match
+  - note: value_count_dynamic_bracket_tag_closing_bracket_twin_no_match
     policy_rule: |
       {
         "if": {
@@ -420,11 +420,53 @@ cases:
       }
     parameters:
       requiredTags:
-        - "Department.Name"
+        - "Department]Name"
     resource:
       tags:
-        Department:
-          Name: "production"
+        department:
+          name: "production"
+    want_undefined: true
+
+  - note: value_count_tag_star_name_matches_literal_tag
+    policy_rule: |
+      {
+        "if": {
+          "count": {
+            "value": "[createArray('unrelated')]",
+            "name": "tags.a[*]",
+            "where": {
+              "value": "[field('tags.a[*]')]",
+              "equals": "production"
+            }
+          },
+          "equals": 1
+        },
+        "then": { "effect": "deny" }
+      }
+    resource:
+      tags:
+        "a[*]": "production"
+    want_effect: "deny"
+
+  - note: value_count_tag_star_name_twin_no_match
+    policy_rule: |
+      {
+        "if": {
+          "count": {
+            "value": "[createArray('unrelated')]",
+            "name": "tags.a[*]",
+            "where": {
+              "value": "[field('tags.a[*]')]",
+              "equals": "production"
+            }
+          },
+          "equals": 1
+        },
+        "then": { "effect": "deny" }
+      }
+    resource:
+      tags:
+        "a[*]": "staging"
     want_undefined: true
 
   - note: field_tag_path_takes_precedence_over_value_count_name

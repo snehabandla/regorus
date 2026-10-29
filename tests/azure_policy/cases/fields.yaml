@@ -279,6 +279,11 @@ cases:
         environment: "production"
     want_effect: "deny"
 
+  - note: field_tags_empty_dotted_name_rejected
+    policy_rule: |
+      {"if":{"field":"tags.","exists":true},"then":{"effect":"deny"}}
+    want_parse_error_contains: "empty tag name"
+
   - note: field_tags_double_quoted_bracket_notation
     policy_rule: |
       {
@@ -1197,6 +1202,34 @@ cases:
         "2024": "production"
     want_effect: "deny"
 
+  - note: dynamic_concat_tags_bracket_padded_env_unquoted
+    policy_rule: |
+      {
+        "if": {
+          "field": "[concat('tags[ ', 'env', ' ]')]",
+          "equals": "production"
+        },
+        "then": { "effect": "deny" }
+      }
+    resource:
+      tags:
+        env: "production"
+    want_effect: "deny"
+
+  - note: dynamic_concat_tags_bracket_padded_env_unquoted_twin_no_match
+    policy_rule: |
+      {
+        "if": {
+          "field": "[concat('tags[ ', 'env', ' ]')]",
+          "equals": "production"
+        },
+        "then": { "effect": "deny" }
+      }
+    resource:
+      tags:
+        " env ": "production"
+    want_undefined: true
+
   - note: dynamic_concat_tags_bracket_padded_unquoted_twin_no_match
     policy_rule: |
       {
@@ -1244,6 +1277,117 @@ cases:
       tags:
         department:
           name: "production"
+    want_undefined: true
+
+  - note: dynamic_concat_tags_prefix_case_insensitive
+    policy_rule: |
+      {
+        "if": {
+          "field": "[concat('Tags.', 'Env')]",
+          "equals": "production"
+        },
+        "then": { "effect": "deny" }
+      }
+    resource:
+      tags:
+        env: "production"
+    want_effect: "deny"
+
+  - note: field_function_empty_dotted_tag_is_compile_error
+    policy_rule: |
+      {
+        "if": {
+          "value": "[field('tags.')]",
+          "equals": "production"
+        },
+        "then": { "effect": "deny" }
+      }
+    want_compile_error: true
+    want_compile_error_contains: "empty tag name"
+
+  - note: dynamic_concat_empty_dotted_tag_is_undefined
+    policy_rule: |
+      {
+        "if": {
+          "field": "[concat('tags.', '')]",
+          "exists": true
+        },
+        "then": { "effect": "deny" }
+      }
+    resource:
+      tags:
+        env: "production"
+    want_undefined: true
+
+  - note: field_function_dotted_tag_uses_flat_key
+    policy_rule: |
+      {
+        "if": {
+          "value": "[field('tags.Department.Name')]",
+          "equals": "production"
+        },
+        "then": { "effect": "deny" }
+      }
+    resource:
+      tags:
+        "department.name": "production"
+    want_effect: "deny"
+
+  - note: field_function_dotted_tag_rejects_nested_key
+    policy_rule: |
+      {
+        "if": {
+          "value": "[field('tags.Department.Name')]",
+          "equals": "production"
+        },
+        "then": { "effect": "deny" }
+      }
+    resource:
+      tags:
+        department:
+          name: "production"
+    want_undefined: true
+
+  - note: field_function_bracket_tag_precedes_matching_count_name
+    policy_rule: |
+      {
+        "if": {
+          "count": {
+            "value": "[createArray('unrelated')]",
+            "name": "tags[Department.Name]",
+            "where": {
+              "value": "[field('tags[Department.Name]')]",
+              "equals": "production"
+            }
+          },
+          "equals": 1
+        },
+        "then": { "effect": "deny" }
+      }
+    resource:
+      tags:
+        "department.name": "production"
+    want_effect: "deny"
+
+  - note: field_function_bracket_tag_count_name_twin_no_match
+    policy_rule: |
+      {
+        "if": {
+          "count": {
+            "value": "[createArray('unrelated')]",
+            "name": "tags[Department.Name]",
+            "where": {
+              "value": "[field('tags[Department.Name]')]",
+              "equals": "production"
+            }
+          },
+          "equals": 1
+        },
+        "then": { "effect": "deny" }
+      }
+    resource:
+      tags:
+        "department.name": "staging"
     want_undefined: true
 
   - note: dynamic_concat_tags_bracket_padded_single_quoted

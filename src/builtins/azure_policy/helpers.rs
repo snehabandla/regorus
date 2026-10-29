@@ -500,4 +500,17 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn resolve_path_tags_wildcard_collects_values() {
+        let resource = Value::from_json_str(r#"{"tags":{"owner":"ops","env":"production"}}"#)
+            .expect("valid resource");
+        assert_eq!(
+            resolve_path(&resource, "tags[*]"),
+            Value::from(vec![
+                Value::from("production"),
+                Value::from("ops"),
+            ])
+        );
+    }
 }
