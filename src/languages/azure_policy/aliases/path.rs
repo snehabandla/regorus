@@ -289,7 +289,9 @@ fn remove_value(value: &mut Value, segments: &[Segment], prune: bool) -> bool {
         return false;
     };
     match (value, first) {
-        (Value::Object(object), Segment::Key(_)) => remove_object(Rc::make_mut(object), segments, prune),
+        (Value::Object(object), Segment::Key(_)) => {
+            remove_object(Rc::make_mut(object), segments, prune)
+        }
         (Value::Array(array), Segment::Index(index)) => {
             if let Some(value) = Rc::make_mut(array).get_mut(*index) {
                 if rest.is_empty() || remove_value(value, rest, prune) {
@@ -307,21 +309,21 @@ pub(crate) fn remove_object(object: &mut Object, segments: &[Segment], prune: bo
         return false;
     };
     let actual = object
-                .keys()
-                .find(|candidate| {
-                    candidate
-                        .as_string()
-                        .is_ok_and(|candidate| candidate.eq_ignore_ascii_case(key))
-                })
-                .cloned();
-            if let Some(actual) = actual {
-                if rest.is_empty()
-                    || object
-                        .get_mut(&actual)
-                        .is_some_and(|value| remove_value(value, rest, prune))
-                {
-                    object.remove(&actual);
-                }
-            }
+        .keys()
+        .find(|candidate| {
+            candidate
+                .as_string()
+                .is_ok_and(|candidate| candidate.eq_ignore_ascii_case(key))
+        })
+        .cloned();
+    if let Some(actual) = actual {
+        if rest.is_empty()
+            || object
+                .get_mut(&actual)
+                .is_some_and(|value| remove_value(value, rest, prune))
+        {
+            object.remove(&actual);
+        }
+    }
     prune && object.is_empty()
 }

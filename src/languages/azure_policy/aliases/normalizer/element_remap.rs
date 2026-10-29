@@ -195,12 +195,17 @@ fn read_dotted_path_btree(btree: &Object, path: &str, case_insensitive: bool) ->
     let (Segment::Key(first), rest) = segments.split_first()? else {
         return None;
     };
-    let value = btree.get(&Value::String(crate::Rc::clone(first))).or_else(|| {
-        btree.iter().find_map(|(key, value)| {
-            (case_insensitive && key.as_string().is_ok_and(|key| key.eq_ignore_ascii_case(first)))
+    let value = btree
+        .get(&Value::String(crate::Rc::clone(first)))
+        .or_else(|| {
+            btree.iter().find_map(|(key, value)| {
+                (case_insensitive
+                    && key
+                        .as_string()
+                        .is_ok_and(|key| key.eq_ignore_ascii_case(first)))
                 .then_some(value)
-        })
-    })?;
+            })
+        })?;
     path::get(value, rest, case_insensitive).cloned()
 }
 

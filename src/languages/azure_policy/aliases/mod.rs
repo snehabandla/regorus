@@ -17,6 +17,11 @@
 //! alias short names are direct paths. This means the compiler and VM never
 //! need to know about aliases — the normalizer handles the translation once
 //! before evaluation.
+//!
+//! Alias and ARM paths accept dotted fields and bracket subscripts, including
+//! quoted keys containing dots, brackets or literal `[*]`. Quotes have no
+//! escapes and close only before optional whitespace and `]`. Only an unquoted
+//! `[*]` is an array wildcard; unquoted numeric subscripts are array indices.
 
 pub mod denormalizer;
 pub mod normalizer;

@@ -488,7 +488,7 @@ impl ResolvedEntry {
     /// Select pre-tokenized path segments for a given API version.
     ///
     /// Returns the versioned segments if `api_version` matches, otherwise
-    /// the default segments.  This avoids per-call `split('.')` for both
+    /// the default segments. This avoids per-call path parsing for both
     /// default and versioned scalar alias navigation.
     pub(crate) fn select_path_segments(
         &self,
