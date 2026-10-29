@@ -17,7 +17,7 @@
 )]
 
 use crate::languages::azure_policy::strings;
-use crate::languages::azure_policy::tag::{classify_tag_field, TagField};
+use crate::languages::azure_policy::tag::{classify_tag_field, normalize_bracket_tag, TagField};
 use crate::value::Value;
 
 use alloc::string::{String, ToString as _};
@@ -383,19 +383,6 @@ fn resolve_tag(root: &Value, tag: &str) -> Value {
     Value::Undefined
 }
 
-fn bracket_key(contents: &str) -> &str {
-    let trimmed = contents.trim();
-    trimmed
-        .strip_prefix('\'')
-        .and_then(|inner| inner.strip_suffix('\''))
-        .or_else(|| {
-            trimmed
-                .strip_prefix('"')
-                .and_then(|inner| inner.strip_suffix('"'))
-        })
-        .unwrap_or(trimmed)
-}
-
 fn tokenize_path(path: &str) -> Option<Vec<String>> {
     let mut segments = Vec::new();
     let mut token = String::new();
@@ -419,7 +406,7 @@ fn tokenize_path(path: &str) -> Option<Vec<String>> {
             }
             ']' => {
                 in_bracket = false;
-                let cleaned = bracket_key(&bracket);
+                let cleaned = normalize_bracket_tag(&bracket).name;
                 if cleaned.is_empty() {
                     return None;
                 }

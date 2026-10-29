@@ -13,6 +13,23 @@ pub enum TagField {
     Empty,
 }
 
+pub struct BracketTag<'a> {
+    pub name: &'a str,
+    pub quoted: bool,
+}
+
+pub fn normalize_bracket_tag(contents: &str) -> BracketTag<'_> {
+    let trimmed = contents.trim();
+    if let Some(name) = strip_matching_outer_quotes(trimmed) {
+        BracketTag { name, quoted: true }
+    } else {
+        BracketTag {
+            name: trimmed,
+            quoted: false,
+        }
+    }
+}
+
 /// Classify a field path that may name the tag collection or one tag.
 ///
 /// Bracket names are trimmed using Unicode whitespace rules and have one
@@ -28,16 +45,15 @@ pub fn classify_tag_field(text: &str) -> Option<TagField> {
             text.get("tags.".len()..).unwrap_or_default().into(),
         )),
         _ if lower.starts_with("tags[") && text.ends_with(']') => {
-            let tag = text
+            let contents = text
                 .get("tags[".len()..text.len().saturating_sub(1))
-                .unwrap_or_default()
-                .trim();
-            let quoted = strip_matching_outer_quotes(tag);
-            let tag = quoted.unwrap_or(tag);
+                .unwrap_or_default();
+            let bracket_tag = normalize_bracket_tag(contents);
+            let tag = bracket_tag.name;
 
             if tag.is_empty() {
                 Some(TagField::Empty)
-            } else if quoted.is_some() {
+            } else if bracket_tag.quoted {
                 Some(TagField::Key(tag.into()))
             } else if text.contains("[*]") {
                 Some(TagField::Wildcard)
