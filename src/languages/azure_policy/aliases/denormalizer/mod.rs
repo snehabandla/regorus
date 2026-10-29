@@ -131,7 +131,7 @@ pub fn denormalize_with_aliases(
 
             let normalized_key = if is_root_field_collision(&entry.short_name, &entry.default_path)
             {
-                alloc::format!("_p_{}", entry.short_name.to_ascii_lowercase())
+                super::obj_map::collision_safe_key(&entry.short_name)
             } else {
                 lc_key.clone()
             };
@@ -147,12 +147,7 @@ pub fn denormalize_with_aliases(
             let denorm_val = denormalize_value(val, &casing_map);
             let target = path::without_properties(arm_segments);
             let target_properties = target.len() != arm_segments.len();
-            let destination = if target_properties {
-                &properties
-            } else {
-                &result
-            };
-            if target.is_empty() || !path::can_set(destination, target) {
+            if target.is_empty() {
                 continue;
             }
             let mut source_properties = None;

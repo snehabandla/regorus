@@ -22,6 +22,7 @@
 //! quoted keys containing dots, brackets or literal `[*]`. Quotes have no
 //! escapes and close only before optional whitespace and `]`. Only an unquoted
 //! `[*]` is an array wildcard; unquoted numeric subscripts are array indices.
+//! Catalog indices above 4095 are rejected to bound sparse array padding.
 
 pub mod denormalizer;
 pub mod normalizer;

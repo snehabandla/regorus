@@ -110,7 +110,8 @@ fn review_equivalent_wildcard_leaves_do_not_self_remap_r1_3() {
 
 #[test]
 fn review_bracket_properties_root_collision_r1_4() {
-    let registry = registry("Test/widgets", &[("name", "properties['name']")]);
+    for short in ["name", "['name']"] {
+    let registry = registry("Test/widgets", &[(short, "properties['name']")]);
     for (props, expected) in [
         (
             json!({"name": "property"}),
@@ -125,6 +126,7 @@ fn review_bracket_properties_root_collision_r1_4() {
         let normalized = normalizer::normalize(&raw, Some(&registry), None);
         assert_eq!(normalized, Value::from(expected));
         assert_eq!(registry.denormalize(&normalized, None), raw);
+    }
     }
 }
 
@@ -165,6 +167,15 @@ fn review_unsuccessful_writes_preserve_short_value_r1_6() {
             json!({"alias": {"x": 1}, "target": {}})
         ),
         Value::from(json!({"properties": {"target": {"x": 1}}}))
+    );
+    assert_eq!(
+        denorm(&[("a", "properties.a.x")], json!({"a": 1})),
+        Value::from(json!({"properties": {"a": {"x": 1}}}))
+    );
+    assert_eq!(
+        denorm(&[("a", "properties.target"), ("b.x", "properties.target.x")],
+            json!({"a": 1, "b": {"x": 2, "sibling": 3}})),
+        Value::from(json!({"properties": {"target": 1, "b": {"x": 2, "sibling": 3}}}))
     );
 }
 
@@ -251,11 +262,26 @@ fn review_index_padding_is_bounded_r1_12() {
     assert!(path::scalar_segments("a[1000000000]").is_none());
     assert!(path::scalar_segments("a[99999999999999999999999999999]").is_none());
     assert!(path::scalar_segments("a[2]").is_some());
+    let segments = vec![path::Segment::Key(crate::Rc::from("a")), path::Segment::Index(1000000000)];
+    let mut map = super::obj_map::new_map();
+    assert!(!path::can_set(&map, &segments));
+    path::set(&mut map, &segments, Value::from(1), false);
+    assert_eq!(super::obj_map::make_value(map), Value::from(json!({})));
 }
 
 #[test]
 fn review_round_trips_r1_t() {
     for (resource_type, aliases, raw_json) in [
+        (
+            "Test/widgets",
+            vec![("renamed['Mixed.Key']", "properties.original['Mixed.Key']")],
+            json!({"type": "Test/widgets", "properties": {"original": {"Mixed.Key": 1, "sibling": 2}}}),
+        ),
+        (
+            "Test/widgets",
+            vec![("renamed[2].leaf", "properties.original[2].leaf")],
+            json!({"type": "Test/widgets", "properties": {"original": [null, null, {"leaf": 1, "sibling": 2}]}}),
+        ),
         (
             "Test/widgets",
             vec![("renamed['a.b']", "properties.original['a.b']")],
