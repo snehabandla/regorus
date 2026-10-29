@@ -230,7 +230,11 @@ fn set_value(current: &mut Value, segments: &[Segment], value: Value, lowercase:
             }
         }
 
-        pub(crate) fn set_object(
+        _ => {}
+    }
+}
+
+pub(crate) fn set_object(
             object: &mut Object,
             segments: &[Segment],
             value: Value,
@@ -304,8 +308,5 @@ fn set_value(current: &mut Value, segments: &[Segment], value: Value, lowercase:
                     false
                 }
                 _ => false,
-            }
-        }
-        _ => {}
     }
 }
