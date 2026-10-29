@@ -395,32 +395,33 @@ pub fn remove_object(object: &mut Object, segments: &[Segment], prune: bool) -> 
             object.remove(&actual);
         }
 
-        /// Check shape compatibility before consuming the normalized source path.
-        pub fn can_set(map: &ObjMap, segments: &[Segment]) -> bool {
-            let Some((Segment::Key(key), rest)) = segments.split_first() else {
-                return false;
-            };
-            let existing = map.iter().find_map(|(candidate, child)| candidate.eq_ignore_ascii_case(key).then_some(child));
-            can_set_value(existing, rest)
-        }
-
-        fn can_set_value(current: Option<&Value>, segments: &[Segment]) -> bool {
-            let Some((segment, rest)) = segments.split_first() else {
-                return true;
-            };
-            match (current, segment) {
-                (_, Segment::Wildcard) => false,
-                (_, Segment::Index(index)) if *index > MAX_INDEX => false,
-                (None, _) | (Some(Value::Null), _) => can_set_value(None, rest),
-                (Some(Value::Object(object)), Segment::Key(key)) => {
-                    let child = object.iter().find_map(|(candidate, child)| candidate.as_string()
-                        .is_ok_and(|candidate| candidate.eq_ignore_ascii_case(key)).then_some(child));
-                    can_set_value(child, rest)
-                }
-                (Some(Value::Array(array)), Segment::Index(index)) => can_set_value(array.get(*index), rest),
-                _ => false,
-            }
-        }
     }
     prune && object.is_empty()
+}
+
+/// Check shape compatibility before consuming the normalized source path.
+pub fn can_set(map: &ObjMap, segments: &[Segment]) -> bool {
+    let Some((Segment::Key(key), rest)) = segments.split_first() else {
+        return false;
+    };
+    let existing = map.iter().find_map(|(candidate, child)| candidate.eq_ignore_ascii_case(key).then_some(child));
+    can_set_value(existing, rest)
+}
+
+fn can_set_value(current: Option<&Value>, segments: &[Segment]) -> bool {
+    let Some((segment, rest)) = segments.split_first() else {
+        return true;
+    };
+    match (current, segment) {
+        (_, Segment::Wildcard) => false,
+        (_, Segment::Index(index)) if *index > MAX_INDEX => false,
+        (None, _) | (Some(Value::Null), _) => can_set_value(None, rest),
+        (Some(Value::Object(object)), Segment::Key(key)) => {
+            let child = object.iter().find_map(|(candidate, child)| candidate.as_string()
+                .is_ok_and(|candidate| candidate.eq_ignore_ascii_case(key)).then_some(child));
+            can_set_value(child, rest)
+        }
+        (Some(Value::Array(array)), Segment::Index(index)) => can_set_value(array.get(*index), rest),
+        _ => false,
+    }
 }
