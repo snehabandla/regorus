@@ -130,9 +130,15 @@ pub fn value_to_obj_map(value: &Value) -> Option<ObjMap> {
     Some(map)
 }
 
-/// Set a value at a dot-separated path in an [`ObjMap`], creating
+/// Set a value at a dotted or bracket path in an [`ObjMap`], creating
 /// intermediate `Value::Object` nodes as needed.  All keys are lowercased.
 pub fn set_nested_lowercased(result: &mut ObjMap, path: &str, value: Value) {
+    if path.contains('[') {
+        if let Some(segments) = super::path::scalar_segments(path) {
+            super::path::set(result, &segments, value, true);
+        }
+        return;
+    }
     let segments: Vec<&str> = path.split('.').collect();
     if segments.is_empty() {
         return;
@@ -147,9 +153,15 @@ pub fn set_nested_lowercased(result: &mut ObjMap, path: &str, value: Value) {
     set_nested_inner(result, &segments, value, true);
 }
 
-/// Set a value at a dot-separated path in an [`ObjMap`], creating
+/// Set a value at a dotted or bracket path in an [`ObjMap`], creating
 /// intermediate `Value::Object` nodes as needed.  Keys preserve their casing.
 pub fn set_nested_verbatim(result: &mut ObjMap, path: &str, value: Value) {
+    if path.contains('[') {
+        if let Some(segments) = super::path::scalar_segments(path) {
+            super::path::set(result, &segments, value, false);
+        }
+        return;
+    }
     let segments: Vec<&str> = path.split('.').collect();
     if segments.is_empty() {
         return;
@@ -304,6 +316,12 @@ pub fn remove_element_field(obj: &mut ObjMap, array_chain: &[Vec<String>], field
 
 fn remove_field_at_depth(obj: &mut ObjMap, array_chain: &[Vec<String>], depth: usize, field: &str) {
     let Some(nav) = array_chain.get(depth) else {
+        if field.contains('[') {
+            if let Some(segments) = super::path::scalar_segments(field) {
+                super::path::remove(obj, &segments);
+            }
+            return;
+        }
         let segments: Vec<&str> = field.split('.').collect();
         if segments.len() == 1 {
             if let Some(&seg) = segments.first() {
@@ -361,6 +379,12 @@ fn remove_field_at_depth_obj(
     field: &str,
 ) {
     let Some(nav) = array_chain.get(depth) else {
+        if field.contains('[') {
+            if let Some(segments) = super::path::scalar_segments(field) {
+                super::path::remove_object(obj, &segments, false);
+            }
+            return;
+        }
         let segments: Vec<&str> = field.split('.').collect();
         if segments.len() == 1 {
             if let Some(&seg) = segments.first() {
