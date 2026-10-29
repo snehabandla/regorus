@@ -523,10 +523,7 @@ mod tests {
             .expect("valid resource");
         assert_eq!(
             resolve_path(&resource, "tags[*]"),
-            Value::from(vec![
-                Value::from("production"),
-                Value::from("ops"),
-            ])
+            Value::from(vec![Value::from("production"), Value::from("ops"),])
         );
     }
 }
