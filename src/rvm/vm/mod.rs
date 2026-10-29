@@ -20,8 +20,9 @@ mod virtual_data;
 pub use context::{CallRuleContext, IterationState, LoopContext};
 pub use errors::{Result, VmError};
 pub use execution_model::{ExecutionMode, ExecutionState, SuspendReason};
-pub use machine::RegoVM;
 #[cfg(feature = "explanations")]
 pub use explain_trace::{
-    ExplainCapture, ExplainOutput, ExplainProtoError, TraceBudget, TraceLimit, TraceTruncation,
+    ExplainCapture, ExplainDetail, ExplainOutput, ExplainProtoError, IterationRow, SiteStatic,
+    TraceBudget, TraceLimit, TraceTruncation,
 };
+pub use machine::RegoVM;

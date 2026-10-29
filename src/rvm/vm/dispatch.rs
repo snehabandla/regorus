@@ -64,10 +64,16 @@ impl RegoVM {
             }
             LoadData { dest } => {
                 self.set_register(dest, self.data.clone())?;
+                if self.explain.paths {
+                    self.explain_path_root(dest, true);
+                }
                 Ok(InstructionOutcome::Continue)
             }
             LoadInput { dest } => {
                 self.set_register(dest, self.input.clone())?;
+                if self.explain.paths {
+                    self.explain_path_root(dest, false);
+                }
                 Ok(InstructionOutcome::Continue)
             }
             LoadContext { dest } => {
@@ -80,7 +86,11 @@ impl RegoVM {
             }
             Move { dest, src } => {
                 let value = self.get_register(src)?.clone();
+                let path = self.explain_reg_path(src);
                 self.set_register(dest, value)?;
+                if path != u32::MAX {
+                    self.explain_path_copy(dest, path);
+                }
                 Ok(InstructionOutcome::Continue)
             }
             other => self.execute_arithmetic_instruction(program, other),
@@ -569,7 +579,12 @@ impl RegoVM {
                 let key_value = self.get_register(key)?;
                 let container_value = self.get_register(container)?;
                 let result = container_value[key_value].clone();
+                let parent = self.explain_reg_path(container);
+                let key_value = (parent != u32::MAX).then(|| key_value.clone());
                 self.set_register(dest, result)?;
+                if let Some(key_value) = key_value {
+                    self.explain_path_child(dest, parent, &key_value);
+                }
                 Ok(InstructionOutcome::Continue)
             }
             IndexLiteral {
@@ -581,7 +596,11 @@ impl RegoVM {
 
                 if let Some(key_value) = program.literals.get(usize::from(literal_idx)) {
                     let result = container_value[key_value].clone();
+                    let parent = self.explain_reg_path(container);
                     self.set_register(dest, result)?;
+                    if parent != u32::MAX {
+                        self.explain_path_child(dest, parent, key_value);
+                    }
                     Ok(InstructionOutcome::Continue)
                 } else {
                     Err(VmError::LiteralIndexOutOfBounds {
@@ -806,6 +825,9 @@ impl RegoVM {
                     body_start: loop_params.body_start,
                     loop_end: loop_params.loop_end,
                 };
+                if self.explain.paths {
+                    self.explain_loop_collection(params.collection, params.value_reg);
+                }
                 self.execute_loop_start(&mode, params)?;
                 Ok(InstructionOutcome::Continue)
             }
@@ -1132,6 +1154,7 @@ impl RegoVM {
                     })?;
 
                 let mut current_value = self.get_register(params.root)?.clone();
+                let root_path = self.explain_reg_path(params.root);
 
                 for component in &params.path_components {
                     let key_value = match *component {
@@ -1153,7 +1176,15 @@ impl RegoVM {
                     }
                 }
 
+                let path = if root_path != u32::MAX {
+                    self.explain_chain_path(params_index, root_path)
+                } else {
+                    u32::MAX
+                };
                 self.set_register(params.dest, current_value)?;
+                if path != u32::MAX {
+                    self.explain_path_copy(params.dest, path);
+                }
                 Ok(InstructionOutcome::Continue)
             }
             VirtualDataDocumentLookup { params_index } => {
@@ -1170,6 +1201,9 @@ impl RegoVM {
                         available: program.instruction_data.comprehension_begin_params.len(),
                     })?
                     .clone();
+                if self.explain.paths {
+                    self.explain_loop_collection(params.collection_reg, params.value_reg);
+                }
                 self.execute_comprehension_begin(&params)?;
                 Ok(InstructionOutcome::Continue)
             }

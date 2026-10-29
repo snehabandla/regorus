@@ -43,6 +43,9 @@ impl RegoVM {
             let mut current_register_window = Vec::default();
             mem::swap(&mut current_register_window, &mut self.registers);
             self.return_register_window(current_register_window);
+            if self.explain.paths {
+                self.explain_pop_frame();
+            }
             self.registers = restored_registers;
         }
         mem::swap(&mut self.loop_stack, previous_loop_stack);
@@ -94,6 +97,9 @@ impl RegoVM {
 
         self.register_stack.push(previous_registers);
         self.registers = register_window;
+        if self.explain.paths {
+            self.explain_push_frame(function_call_params.map_or(&[][..], |p| p.arg_registers()));
+        }
 
         'outer: for (def_idx, definition_bodies) in rule_definitions.iter().enumerate() {
             for (body_entry_point_idx, body_entry_point) in definition_bodies.iter().enumerate() {
@@ -105,6 +111,9 @@ impl RegoVM {
                 self.registers
                     .resize(num_retained_registers, Value::Undefined);
                 self.registers.resize(num_registers, Value::Undefined);
+                if self.explain.paths {
+                    self.explain_body_start(num_retained_registers);
+                }
 
                 if let Some(destructuring_entry_point) =
                     rule_info.destructuring_blocks.get(def_idx).and_then(|x| *x)
@@ -200,6 +209,9 @@ impl RegoVM {
             let mut current_register_window = Vec::default();
             mem::swap(&mut current_register_window, &mut self.registers);
             self.return_register_window(current_register_window);
+            if self.explain.paths {
+                self.explain_pop_frame();
+            }
 
             self.registers = restored_registers;
         }
