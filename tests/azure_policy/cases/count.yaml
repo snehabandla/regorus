@@ -395,7 +395,7 @@ cases:
       }
     resource:
       tags:
-        "Department.Name": "production"
+        "department.name": "production"
         environment: "dev"
     want_effect: "deny"
 
