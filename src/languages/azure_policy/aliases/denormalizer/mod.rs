@@ -17,10 +17,9 @@ use crate::Value;
 use crate::Rc;
 
 use super::obj_map::{
-    extract_type_field, is_root_field_collision, make_value, new_map, obj_insert, val_str,
-    ROOT_FIELDS,
+    extract_type_field, is_root_field_collision, make_value, new_map, obj_insert,
+    set_nested_verbatim, val_str, ROOT_FIELDS,
 };
-use super::path::{self, Segment};
 use super::types::ResolvedAliases;
 use super::AliasRegistry;
 
@@ -132,30 +131,28 @@ pub fn denormalize_with_aliases(
                 lc_key.clone()
             };
 
-            let Some(short_segments) = path::scalar_segments(&normalized_key) else {
-                continue;
-            };
-            let Some(val) = path::get(normalized, &short_segments, true) else {
-                continue;
+            // Fast-path: direct BTreeMap lookup for lowercase keys,
+            // with case-insensitive fallback for mixed-case external input.
+            let nk_val = Value::String(Rc::from(normalized_key.as_str()));
+            let val = obj.get(&nk_val).or_else(|| {
+                obj.iter()
+                    .find(|(k, _)| {
+                        val_str(k).is_some_and(|s| s.eq_ignore_ascii_case(&normalized_key))
+                    })
+                    .map(|(_, v)| v)
+            });
+            let val = match val {
+                Some(v) => v,
+                None => continue,
             };
 
-            let arm_segments = entry.select_path_segments(api_version);
+            let arm_path = entry.select_path(api_version);
             let denorm_val = denormalize_value(val, &casing_map);
-            if arm_segments.is_empty() {
-                continue;
-            }
-            path::remove(&mut properties, &short_segments);
 
-            if matches!(arm_segments.first(), Some(Segment::Key(key)) if key.eq_ignore_ascii_case("properties"))
-            {
-                path::set(
-                    &mut properties,
-                    arm_segments.get(1..).unwrap_or_default(),
-                    denorm_val,
-                    false,
-                );
+            if let Some(props_path) = arm_path.strip_prefix("properties.") {
+                set_nested_verbatim(&mut properties, props_path, denorm_val);
             } else {
-                path::set(&mut result, arm_segments, denorm_val, false);
+                set_nested_verbatim(&mut result, arm_path, denorm_val);
             }
         }
 
@@ -185,7 +182,15 @@ pub fn denormalize_with_aliases(
                 let remap = ElementRemap {
                     array_chain: rev.array_chain.clone(),
                     source_field: rev.source_field.clone(),
-                    target_field: rev.target_field.clone(),
+                    target_field: if rev.target_field.contains('.') {
+                        rev.target_field
+                            .split('.')
+                            .map(|segment| restore_casing(segment, &casing_map))
+                            .collect::<alloc::vec::Vec<_>>()
+                            .join(".")
+                    } else {
+                        restore_casing(&rev.target_field, &casing_map)
+                    },
                 };
                 apply_element_remap(&mut properties, &remap, false);
                 remove_element_field(&mut properties, &rev.array_chain, &rev.cleanup_field);

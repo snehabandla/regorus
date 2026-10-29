@@ -421,15 +421,15 @@ pub struct ResolvedEntry {
     pub metadata: Option<AliasPathMetadata>,
 
     // ── Precomputed fields (derived at registry-load time) ──────────────
-    /// Whether `short_name` contains an unquoted `[*]` array segment.
+    /// Whether `short_name` contains `[*]` (i.e., this is a wildcard/array alias).
     pub is_wildcard: bool,
     /// Pre-lowercased short name as `Rc<str>` for allocation-free common-case inserts.
     pub(crate) short_name_lc: Rc<str>,
-    /// Precomputed bracket-aware segments for fast ARM path navigation.
-    pub(crate) default_path_segments: Vec<super::path::Segment>,
+    /// Precomputed `default_path.split('.').collect()` for fast ARM path navigation.
+    pub(crate) default_path_segments: Vec<Rc<str>>,
     /// Precomputed path segments for each versioned path, in the same order
     /// as `versioned_paths`.
-    pub(crate) versioned_path_segments: Vec<Vec<super::path::Segment>>,
+    pub(crate) versioned_path_segments: Vec<Vec<Rc<str>>>,
 }
 
 impl ResolvedEntry {
@@ -440,23 +440,16 @@ impl ResolvedEntry {
         versioned_paths: Vec<(String, String)>,
         metadata: Option<AliasPathMetadata>,
     ) -> Self {
-        let is_wildcard = super::path::parse(&short_name)
-            .is_some_and(|path| path.segments.contains(&super::path::Segment::Wildcard));
+        let is_wildcard = short_name.contains("[*]");
         let short_name_lc = if short_name.bytes().all(|b| !b.is_ascii_uppercase()) {
             Rc::from(short_name.as_str())
         } else {
             Rc::from(short_name.to_ascii_lowercase())
         };
-        let default_path_segments = super::path::parse(&default_path)
-            .map(|path| path.segments)
-            .unwrap_or_default();
+        let default_path_segments = default_path.split('.').map(Rc::from).collect();
         let versioned_path_segments = versioned_paths
             .iter()
-            .map(|(_, p)| {
-                super::path::parse(p)
-                    .map(|path| path.segments)
-                    .unwrap_or_default()
-            })
+            .map(|(_, p)| p.split('.').map(Rc::from).collect())
             .collect();
         Self {
             short_name,
@@ -488,12 +481,9 @@ impl ResolvedEntry {
     /// Select pre-tokenized path segments for a given API version.
     ///
     /// Returns the versioned segments if `api_version` matches, otherwise
-    /// the default segments. This avoids per-call path parsing for both
+    /// the default segments.  This avoids per-call `split('.')` for both
     /// default and versioned scalar alias navigation.
-    pub(crate) fn select_path_segments(
-        &self,
-        api_version: Option<&str>,
-    ) -> &[super::path::Segment] {
+    pub(crate) fn select_path_segments(&self, api_version: Option<&str>) -> &[Rc<str>] {
         if let Some(ver) = api_version {
             for (i, (v, _)) in self.versioned_paths.iter().enumerate() {
                 if v.eq_ignore_ascii_case(ver) {
