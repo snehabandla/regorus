@@ -4,6 +4,7 @@
 //! Alias-local path grammar. Quotes have no escapes and close only before
 //! optional whitespace and `]`; delimiters inside quoted keys are literal.
 
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::{value::Object, Rc, Value};
@@ -16,6 +17,9 @@ pub enum Segment {
     Index(usize),
     Wildcard,
 }
+
+/// Bound sparse catalog writes to at most 4096 array elements.
+pub const MAX_INDEX: usize = 4095;
 
 pub struct Path {
     pub segments: Vec<Segment>,
@@ -103,7 +107,11 @@ fn bracket(path: &str, open: usize) -> Option<(Segment, usize)> {
     let segment = if raw == "*" {
         Segment::Wildcard
     } else if key.bytes().all(|byte| byte.is_ascii_digit()) {
-        Segment::Index(key.parse().unwrap_or(usize::MAX))
+        let index = key.parse().ok()?;
+        if index > MAX_INDEX {
+            return None;
+        }
+        Segment::Index(index)
     } else {
         Segment::Key(Rc::from(key))
     };
@@ -115,17 +123,57 @@ pub fn scalar_segments(path: &str) -> Option<Vec<Segment>> {
     parsed.wildcards.is_empty().then_some(parsed.segments)
 }
 
-pub fn key_segments(path: &str) -> Option<Vec<Rc<str>>> {
-    scalar_segments(path)?
-        .into_iter()
-        .map(|segment| {
-            if let Segment::Key(key) = segment {
-                Some(key)
-            } else {
-                None
+pub fn equivalent(left: &[Segment], right: &[Segment]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| match (left, right) {
+                (Segment::Key(left), Segment::Key(right)) => left.eq_ignore_ascii_case(right),
+                _ => left == right,
+            })
+}
+
+pub fn without_properties(segments: &[Segment]) -> &[Segment] {
+    if matches!(segments.first(), Some(Segment::Key(key)) if key.eq_ignore_ascii_case("properties"))
+    {
+        segments.get(1..).unwrap_or_default()
+    } else {
+        segments
+    }
+}
+
+pub fn render(segments: &[Segment]) -> String {
+    let mut result = String::new();
+    for segment in segments {
+        match segment {
+            Segment::Key(key) => {
+                if !key.contains(['.', '[', ']', '\'', '"']) && key.trim() == key.as_ref() {
+                    if !result.is_empty() {
+                        result.push('.');
+                    }
+                    result.push_str(key);
+                } else {
+                    let quote = if key.match_indices('\'').any(|(offset, _)| {
+                        key.get(offset.saturating_add(1)..)
+                            .is_some_and(|tail| tail.trim_start().starts_with(']'))
+                    }) {
+                        '"'
+                    } else {
+                        '\''
+                    };
+                    result.push('[');
+                    result.push(quote);
+                    result.push_str(key);
+                    result.push(quote);
+                    result.push(']');
+                }
             }
-        })
-        .collect()
+            Segment::Index(index) => result.push_str(&alloc::format!("[{index}]")),
+            Segment::Wildcard => result.push_str("[*]"),
+        }
+    }
+    result
 }
 
 /// Split only at actual wildcards, leaving quoted `[*]` untouched.
@@ -181,6 +229,29 @@ pub fn get<'a>(
     Some(value)
 }
 
+pub fn get_map<'a>(map: &'a ObjMap, segments: &[Segment]) -> Option<&'a Value> {
+    let (Segment::Key(first), rest) = segments.split_first()? else {
+        return None;
+    };
+    let value = map
+        .iter()
+        .find_map(|(key, value)| key.eq_ignore_ascii_case(first).then_some(value))?;
+    get(value, rest, true)
+}
+
+pub fn rename(map: &mut ObjMap, source: &str, target: &str, lowercase: bool) {
+    let (Some(source), Some(target)) = (scalar_segments(source), scalar_segments(target)) else {
+        return;
+    };
+    if equivalent(&source, &target) || get_map(map, &target).is_some() || !can_set(map, &target) {
+        return;
+    }
+    if let Some(value) = get_map(map, &source).cloned() {
+        remove(map, &source);
+        set(map, &target, value, lowercase);
+    }
+}
+
 fn empty_for(segment: &Segment) -> Value {
     if matches!(segment, Segment::Index(_)) {
         make_array(Vec::new())
@@ -198,10 +269,20 @@ fn key_case(key: &Rc<str>, lowercase: bool) -> Rc<str> {
 }
 
 pub fn set(map: &mut ObjMap, segments: &[Segment], value: Value, lowercase: bool) {
+    if segments
+        .iter()
+        .any(|segment| matches!(segment, Segment::Index(index) if *index > MAX_INDEX))
+    {
+        return;
+    }
     let Some((Segment::Key(key), rest)) = segments.split_first() else {
         return;
     };
-    let key = key_case(key, lowercase);
+    let key = map
+        .keys()
+        .find(|candidate| candidate.eq_ignore_ascii_case(key))
+        .cloned()
+        .unwrap_or_else(|| key_case(key, lowercase));
     if let Some(next) = rest.first() {
         let child = map.entry(key).or_insert_with(|| empty_for(next));
         set_value(child, rest, value, lowercase);
@@ -215,11 +296,17 @@ fn set_value(current: &mut Value, segments: &[Segment], value: Value, lowercase:
         *current = value;
         return;
     };
+    if matches!(current, Value::Null) {
+        *current = empty_for(segment);
+    }
     match (current, segment) {
         (Value::Object(object), Segment::Key(_)) => {
             set_object(Rc::make_mut(object), segments, value, lowercase);
         }
         (Value::Array(array), Segment::Index(index)) => {
+            if *index > MAX_INDEX {
+                return;
+            }
             let array = Rc::make_mut(array);
             if *index >= array.len() {
                 let Some(len) = index.checked_add(1) else {
@@ -251,10 +338,24 @@ fn set_value(current: &mut Value, segments: &[Segment], value: Value, lowercase:
 }
 
 pub fn set_object(object: &mut Object, segments: &[Segment], value: Value, lowercase: bool) {
+    if segments
+        .iter()
+        .any(|segment| matches!(segment, Segment::Index(index) if *index > MAX_INDEX))
+    {
+        return;
+    }
     let Some((Segment::Key(key), rest)) = segments.split_first() else {
         return;
     };
-    let key = Value::String(key_case(key, lowercase));
+    let key = object
+        .keys()
+        .find(|candidate| {
+            candidate
+                .as_string()
+                .is_ok_and(|candidate| candidate.eq_ignore_ascii_case(key))
+        })
+        .cloned()
+        .unwrap_or_else(|| Value::String(key_case(key, lowercase)));
     if let Some(next) = rest.first() {
         let child = object.get_or_insert_with(key, || empty_for(next));
         set_value(child, rest, value, lowercase);
@@ -293,12 +394,14 @@ fn remove_value(value: &mut Value, segments: &[Segment], prune: bool) -> bool {
             remove_object(Rc::make_mut(object), segments, prune)
         }
         (Value::Array(array), Segment::Index(index)) => {
+            let mut consumed = false;
             if let Some(child) = Rc::make_mut(array).get_mut(*index) {
                 if rest.is_empty() || remove_value(child, rest, prune) {
                     *child = Value::Null;
+                    consumed = true;
                 }
             }
-            false
+            prune && consumed && array.iter().all(|child| matches!(child, Value::Null))
         }
         _ => false,
     }
@@ -326,4 +429,39 @@ pub fn remove_object(object: &mut Object, segments: &[Segment], prune: bool) -> 
         }
     }
     prune && object.is_empty()
+}
+
+/// Check shape compatibility before consuming the normalized source path.
+pub fn can_set(map: &ObjMap, segments: &[Segment]) -> bool {
+    let Some((Segment::Key(key), rest)) = segments.split_first() else {
+        return false;
+    };
+    let existing = map
+        .iter()
+        .find_map(|(candidate, child)| candidate.eq_ignore_ascii_case(key).then_some(child));
+    can_set_value(existing, rest)
+}
+
+fn can_set_value(current: Option<&Value>, segments: &[Segment]) -> bool {
+    let Some((segment, rest)) = segments.split_first() else {
+        return true;
+    };
+    match (current, segment) {
+        (_, Segment::Wildcard) => false,
+        (_, Segment::Index(index)) if *index > MAX_INDEX => false,
+        (None, _) | (Some(Value::Null), _) => can_set_value(None, rest),
+        (Some(Value::Object(object)), Segment::Key(key)) => {
+            let child = object.iter().find_map(|(candidate, child)| {
+                candidate
+                    .as_string()
+                    .is_ok_and(|candidate| candidate.eq_ignore_ascii_case(key))
+                    .then_some(child)
+            });
+            can_set_value(child, rest)
+        }
+        (Some(Value::Array(array)), Segment::Index(index)) => {
+            can_set_value(array.get(*index), rest)
+        }
+        _ => false,
+    }
 }

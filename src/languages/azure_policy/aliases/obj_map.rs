@@ -277,29 +277,31 @@ pub const ROOT_FIELDS: &[&str] = &[
     "extendedLocation",
 ];
 
-const PROPERTIES_DOT: &[u8] = b"properties.";
-
 /// Check whether an alias short name collides with a reserved ARM root field
 /// and needs a collision-safe key.
 pub fn is_root_field_collision(short_name: &str, default_path: &str) -> bool {
-    ROOT_FIELDS
-        .iter()
-        .any(|f| f.eq_ignore_ascii_case(short_name))
-        && default_path.len() > PROPERTIES_DOT.len()
-        && default_path
-            .as_bytes()
-            .get(..PROPERTIES_DOT.len())
-            .is_some_and(|prefix| {
-                prefix
-                    .iter()
-                    .zip(PROPERTIES_DOT)
-                    .all(|(a, b)| a.to_ascii_lowercase() == *b)
-            })
+    let Some(short) = super::path::scalar_segments(short_name) else {
+        return false;
+    };
+    let Some(arm) = super::path::scalar_segments(default_path) else {
+        return false;
+    };
+    let [super::path::Segment::Key(short)] = short.as_slice() else {
+        return false;
+    };
+    ROOT_FIELDS.iter().any(|f| f.eq_ignore_ascii_case(short))
+        && super::path::without_properties(&arm).len() < arm.len()
+        && arm.len() > 1
 }
 
 /// Return a collision-safe key for an alias whose short name collides with a
 /// root ARM field.  The key is `_p_` + the lowercased short name.
 pub fn collision_safe_key(short_name: &str) -> String {
+    if let Some(segments) = super::path::scalar_segments(short_name) {
+        if let [super::path::Segment::Key(key)] = segments.as_slice() {
+            return alloc::format!("_p_{}", key.to_ascii_lowercase());
+        }
+    }
     alloc::format!("_p_{}", short_name.to_ascii_lowercase())
 }
 
