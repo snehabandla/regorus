@@ -20,14 +20,13 @@ pub struct BracketTag<'a> {
 
 pub fn normalize_bracket_tag(contents: &str) -> BracketTag<'_> {
     let trimmed = contents.trim();
-    if let Some(name) = strip_matching_outer_quotes(trimmed) {
-        BracketTag { name, quoted: true }
-    } else {
+    strip_matching_outer_quotes(trimmed).map_or(
         BracketTag {
             name: trimmed,
             quoted: false,
-        }
-    }
+        },
+        |name| BracketTag { name, quoted: true },
+    )
 }
 
 /// Classify a field path that may name the tag collection or one tag.
