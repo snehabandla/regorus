@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 use anyhow::{anyhow, bail, Result};
 
 use crate::languages::azure_policy::ast::{Expr, ExprLiteral, FieldKind};
+use crate::languages::azure_policy::tag::{classify_tag_field, TagField};
 use crate::rvm::instructions::{LoopMode, LoopStartParams};
 use crate::rvm::Instruction;
 
@@ -66,19 +67,7 @@ impl Compiler {
                 self.compile_resource_path_value("apiVersion", span)?
             }
             FieldKind::Tag(tag) => {
-                self.record_field_kind("tags");
-                self.record_tag_name(tag);
-                let tag_lower = tag.to_ascii_lowercase();
-                if let Some(override_reg) = self.resource_override_reg {
-                    self.emit_chained_index_literal_path(override_reg, &["tags", &tag_lower], span)?
-                } else {
-                    let input_reg = self.load_input(span)?;
-                    self.emit_chained_index_literal_path(
-                        input_reg,
-                        &["resource", "tags", &tag_lower],
-                        span,
-                    )?
-                }
+                self.compile_tag_value(tag, span)?
             }
             FieldKind::Alias(path) => {
                 self.record_alias(path);
@@ -166,6 +155,9 @@ impl Compiler {
         field_path: &str,
         span: &crate::lexer::Span,
     ) -> Result<u8> {
+        if let Some(TagField::Key(tag)) = classify_tag_field(field_path) {
+            return self.compile_tag_value(&tag, span);
+        }
         if let Some(binding) = self.resolve_count_binding(field_path)? {
             return self.compile_from_binding(&binding, field_path, span);
         }
@@ -173,6 +165,22 @@ impl Compiler {
             return self.compile_field_wildcard_collect(None, field_path, span);
         }
         self.compile_resource_path_value(field_path, span)
+    }
+
+    fn compile_tag_value(&mut self, tag: &str, span: &crate::lexer::Span) -> Result<u8> {
+        self.record_field_kind("tags");
+        self.record_tag_name(tag);
+        let tag_lower = tag.to_ascii_lowercase();
+        if let Some(override_reg) = self.resource_override_reg {
+            self.emit_chained_index_literal_path(override_reg, &["tags", &tag_lower], span)
+        } else {
+            let input_reg = self.load_input(span)?;
+            self.emit_chained_index_literal_path(
+                input_reg,
+                &["resource", "tags", &tag_lower],
+                span,
+            )
+        }
     }
 
     pub(super) fn compile_resource_path_value(

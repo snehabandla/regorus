@@ -17,6 +17,7 @@
 )]
 
 use crate::languages::azure_policy::strings;
+use crate::languages::azure_policy::tag::{classify_tag_field, TagField};
 use crate::value::Value;
 
 use alloc::string::{String, ToString as _};
@@ -311,6 +312,14 @@ pub fn match_question_hash_pattern(input: &str, pattern: &str) -> bool {
 // ── Path resolution ───────────────────────────────────────────────────
 
 pub fn resolve_path(root: &Value, path: &str) -> Value {
+    if let Some(tag_field) = classify_tag_field(path) {
+        match tag_field {
+            TagField::Key(tag) => return resolve_tag(root, &tag),
+            TagField::Empty => return Value::Undefined,
+            TagField::Collection | TagField::Wildcard => {}
+        }
+    }
+
     // An empty or unclosed bracket (e.g. `tags[ ]`, `tags[env`) names no
     // property; it must not collapse onto the parent object.
     let Some(segments) = tokenize_path(path) else {
@@ -355,10 +364,24 @@ pub fn resolve_path(root: &Value, path: &str) -> Value {
     current
 }
 
-/// The key named by the contents of a `[...]` path segment, using the same
-/// rule as the Azure Policy parser: trim surrounding whitespace (as
-/// `str::trim` does), then strip one matching pair of outer `'` or `"`
-/// quotes. Whitespace inside the quotes is kept.
+fn resolve_tag(root: &Value, tag: &str) -> Value {
+    let tags = resolve_path(root, "tags");
+    #[allow(clippy::pattern_type_mismatch)]
+    let Value::Object(map) = tags else {
+        return Value::Undefined;
+    };
+
+    for (key, value) in map.iter_sorted() {
+        if let Value::String(key) = key {
+            if strings::keys::eq(key, tag) {
+                return value.clone();
+            }
+        }
+    }
+
+    Value::Undefined
+}
+
 fn bracket_key(contents: &str) -> &str {
     let trimmed = contents.trim();
     trimmed
