@@ -223,6 +223,12 @@ fn review_non_key_array_chain_still_renames_base_r1_8() {
                 .contains_key(&Value::from("x")),
             "{short}"
         );
+        let unrelated = Value::from(json!({"type": "Test/widgets", "properties": {"other": [{"z": 1}]}}));
+        assert_eq!(
+            normalizer::normalize(&unrelated, Some(&registry), None),
+            Value::from(json!({"type": "Test/widgets", "other": [{"z": 1}]})),
+            "{short}"
+        );
     }
 }
 
@@ -258,6 +264,10 @@ fn review_bracket_properties_array_base_r1_10() {
         );
         assert_eq!(registry.denormalize(&normalized, None), raw);
     }
+    let unrelated = Value::from(json!({"type": "Test/widgets", "properties": {"other": []}}));
+    let normalized_unrelated = normalizer::normalize(&unrelated, Some(&registry), None);
+    assert_eq!(normalized_unrelated, Value::from(json!({"type": "Test/widgets", "other": []})));
+    assert_eq!(registry.denormalize(&normalized_unrelated, None), unrelated);
 }
 
 #[test]
