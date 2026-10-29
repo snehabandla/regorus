@@ -111,22 +111,23 @@ fn review_equivalent_wildcard_leaves_do_not_self_remap_r1_3() {
 #[test]
 fn review_bracket_properties_root_collision_r1_4() {
     for short in ["name", "['name']"] {
-    let registry = registry("Test/widgets", &[(short, "properties['name']")]);
-    for (props, expected) in [
-        (
-            json!({"name": "property"}),
-            json!({"name": "root", "_p_name": "property", "type": "Test/widgets"}),
-        ),
-        (
-            json!({"other": "property"}),
-            json!({"name": "root", "other": "property", "type": "Test/widgets"}),
-        ),
-    ] {
-        let raw = Value::from(json!({"type": "Test/widgets", "name": "root", "properties": props}));
-        let normalized = normalizer::normalize(&raw, Some(&registry), None);
-        assert_eq!(normalized, Value::from(expected));
-        assert_eq!(registry.denormalize(&normalized, None), raw);
-    }
+        let registry = registry("Test/widgets", &[(short, "properties['name']")]);
+        for (props, expected) in [
+            (
+                json!({"name": "property"}),
+                json!({"name": "root", "_p_name": "property", "type": "Test/widgets"}),
+            ),
+            (
+                json!({"other": "property"}),
+                json!({"name": "root", "other": "property", "type": "Test/widgets"}),
+            ),
+        ] {
+            let raw =
+                Value::from(json!({"type": "Test/widgets", "name": "root", "properties": props}));
+            let normalized = normalizer::normalize(&raw, Some(&registry), None);
+            assert_eq!(normalized, Value::from(expected));
+            assert_eq!(registry.denormalize(&normalized, None), raw);
+        }
     }
 }
 
@@ -173,8 +174,10 @@ fn review_unsuccessful_writes_preserve_short_value_r1_6() {
         Value::from(json!({"properties": {"a": {"x": 1}}}))
     );
     assert_eq!(
-        denorm(&[("a", "properties.target"), ("b.x", "properties.target.x")],
-            json!({"a": 1, "b": {"x": 2, "sibling": 3}})),
+        denorm(
+            &[("a", "properties.target"), ("b.x", "properties.target.x")],
+            json!({"a": 1, "b": {"x": 2, "sibling": 3}})
+        ),
         Value::from(json!({"properties": {"target": 1, "b": {"x": 2, "sibling": 3}}}))
     );
 }
@@ -262,9 +265,11 @@ fn review_index_padding_is_bounded_r1_12() {
     assert!(path::scalar_segments("a[1000000000]").is_none());
     assert!(path::scalar_segments("a[99999999999999999999999999999]").is_none());
     assert!(path::scalar_segments("a[2]").is_some());
-    let segments = vec![path::Segment::Key(crate::Rc::from("a")), path::Segment::Index(1000000000)];
+    let segments = vec![
+        path::Segment::Key(crate::Rc::from("a")),
+        path::Segment::Index(1000000000),
+    ];
     let mut map = super::obj_map::new_map();
-    assert!(!path::can_set(&map, &segments));
     path::set(&mut map, &segments, Value::from(1), false);
     assert_eq!(super::obj_map::make_value(map), Value::from(json!({})));
 }

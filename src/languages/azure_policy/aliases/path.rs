@@ -269,7 +269,10 @@ fn key_case(key: &Rc<str>, lowercase: bool) -> Rc<str> {
 }
 
 pub fn set(map: &mut ObjMap, segments: &[Segment], value: Value, lowercase: bool) {
-    if segments.iter().any(|segment| matches!(segment, Segment::Index(index) if *index > MAX_INDEX)) {
+    if segments
+        .iter()
+        .any(|segment| matches!(segment, Segment::Index(index) if *index > MAX_INDEX))
+    {
         return;
     }
     let Some((Segment::Key(key), rest)) = segments.split_first() else {
@@ -335,7 +338,10 @@ fn set_value(current: &mut Value, segments: &[Segment], value: Value, lowercase:
 }
 
 pub fn set_object(object: &mut Object, segments: &[Segment], value: Value, lowercase: bool) {
-    if segments.iter().any(|segment| matches!(segment, Segment::Index(index) if *index > MAX_INDEX)) {
+    if segments
+        .iter()
+        .any(|segment| matches!(segment, Segment::Index(index) if *index > MAX_INDEX))
+    {
         return;
     }
     let Some((Segment::Key(key), rest)) = segments.split_first() else {
