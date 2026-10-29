@@ -389,7 +389,7 @@ cases:
               "equals": "production"
             }
           },
-          "greater": 0
+          "equals": 2
         },
         "then": { "effect": "deny" }
       }
@@ -410,7 +410,7 @@ cases:
               "equals": "production"
             }
           },
-          "greater": 0
+          "equals": 2
         },
         "then": { "effect": "deny" }
       }
@@ -431,7 +431,7 @@ cases:
               "equals": "production"
             }
           },
-          "greater": 0
+          "equals": 2
         },
         "then": { "effect": "deny" }
       }
@@ -452,7 +452,7 @@ cases:
               "equals": "production"
             }
           },
-          "greater": 0
+          "equals": 2
         },
         "then": { "effect": "deny" }
       }
