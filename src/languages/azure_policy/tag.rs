@@ -6,7 +6,7 @@
 use alloc::string::String;
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum TagField {
+pub enum TagField {
     Collection,
     Key(String),
     Wildcard,
@@ -19,7 +19,7 @@ pub(crate) enum TagField {
 /// matching pair of outer quotes removed. Whitespace inside quotes remains
 /// part of the tag name. Wildcard spellings are left for the caller to handle
 /// according to its context.
-pub(crate) fn classify_tag_field(text: &str) -> Option<TagField> {
+pub fn classify_tag_field(text: &str) -> Option<TagField> {
     let lower = text.to_lowercase();
 
     match lower.as_str() {

@@ -373,7 +373,7 @@ fn resolve_tag(root: &Value, tag: &str) -> Value {
     };
 
     for (key, value) in map.iter_sorted() {
-        if let Value::String(key) = key {
+        if let Value::String(ref key) = *key {
             if strings::keys::eq(key, tag) {
                 return value.clone();
             }
