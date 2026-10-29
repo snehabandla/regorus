@@ -378,89 +378,53 @@ cases:
         environment: "prod"
     want_effect: "deny"
 
-  - note: field_tag_path_inside_tag_count
+  - note: value_count_dynamic_dotted_tag_path
     policy_rule: |
       {
         "if": {
           "count": {
-            "field": "tags[*]",
+            "value": "[parameters('requiredTags')]",
+            "name": "tag",
             "where": {
-              "field": "tags.env",
+              "field": "[concat('tags[', current('tag'), ']')]",
               "equals": "production"
             }
           },
-          "equals": 2
+          "equals": 1
         },
         "then": { "effect": "deny" }
       }
-    resource:
-      tags:
-        env: "production"
-        environment: "dev"
-    want_effect: "deny"
-
-  - note: field_tag_path_inside_tag_count_twin_no_match
-    policy_rule: |
-      {
-        "if": {
-          "count": {
-            "field": "tags[*]",
-            "where": {
-              "field": "tags.env",
-              "equals": "production"
-            }
-          },
-          "equals": 2
-        },
-        "then": { "effect": "deny" }
-      }
-    resource:
-      tags:
-        env: "staging"
-        environment: "dev"
-    want_undefined: true
-
-  - note: field_dotted_tag_path_inside_tag_count
-    policy_rule: |
-      {
-        "if": {
-          "count": {
-            "field": "tags[*]",
-            "where": {
-              "field": "tags.Department.Name",
-              "equals": "production"
-            }
-          },
-          "equals": 2
-        },
-        "then": { "effect": "deny" }
-      }
+    parameters:
+      requiredTags:
+        - "Department.Name"
     resource:
       tags:
         "department.name": "production"
-        environment: "dev"
     want_effect: "deny"
 
-  - note: field_dotted_tag_path_inside_tag_count_twin_no_match
+  - note: value_count_dynamic_dotted_tag_path_twin_no_match
     policy_rule: |
       {
         "if": {
           "count": {
-            "field": "tags[*]",
+            "value": "[parameters('requiredTags')]",
+            "name": "tag",
             "where": {
-              "field": "tags.Department.Name",
+              "field": "[concat('tags[', current('tag'), ']')]",
               "equals": "production"
             }
           },
-          "equals": 2
+          "equals": 1
         },
         "then": { "effect": "deny" }
       }
+    parameters:
+      requiredTags:
+        - "Department.Name"
     resource:
       tags:
         Department:
           Name: "production"
-        environment: "dev"
     want_undefined: true
 
   - note: field_tag_path_takes_precedence_over_value_count_name
