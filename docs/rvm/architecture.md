@@ -87,7 +87,7 @@ compact binary envelope that stays forward-compatible within a major format
 version:
 
 1. **Header**: magic `REGO` bytes followed by `SERIALIZATION_VERSION` (currently
-  `3`).
+  `7`).
 2. **Section manifest**: four little-endian `u32` lengths for entry points,
   sources, literals, and the rule tree, plus a single-byte `rego_v0` flag.
 3. **Preamble payloads**: each section is encoded with `postcard` using helper
@@ -104,6 +104,38 @@ core payload downgrades the result to `DeserializationResult::Partial`,
 preserving enough artifact data to trigger a recompilation. Successful loads
 call `Program::initialize_resolved_builtins` so host runtimes can plug in their
 builtin implementations.
+
+Format 7 adds `ObjectDeepSet` and its parameter table for nested partial-object
+rule heads. Earlier bytecode must be recompiled rather than decoded as format
+7. Nested heads preserve their object path and accumulate `contains` members
+in a set at the leaf; undefined keys or members contribute nothing, and
+conflicting leaf values produce an error. The RVM compiler still explicitly
+rejects `with`.
+
+Rule accumulation records materialized leaf paths per active rule invocation.
+A contributed object-valued leaf cannot also be an intermediate document for a
+different head, even when their values happen to agree. This ownership is
+isolated across nested calls and discarded on return or evaluation reset.
+
+Direct Rust RVM users must account for the added `Instruction::ObjectDeepSet`,
+`VmError::InvalidObjectDeepSetParams`, `VmError::InvalidObjectDeepSetOperand`,
+and `VmError::ObjectKeyConflict` variants
+in exhaustive matches. The compiler's former constant/nested-key unsupported
+errors are replaced by `UnsupportedRuleHeadPath` and `ConflictingRuleTypes`.
+These are Rust source-compatibility changes, separate from the bytecode format
+change; no new binding entry points are introduced.
+
+`InstructionData::add_object_deep_set_params` returns `None` when the `u16`
+index space is exhausted instead of aliasing an earlier entry. Partial-object
+default literals contain explicit `(path, value)` entries, preserving the
+boundary between intermediate documents and object-valued default leaves.
+
+JSON programs retain human-readable `literals` and add authoritative
+`typed_literals` encoded with the binary value codec, preserving sets and
+non-string object keys. Literals not representable in JSON use `null` in the
+readable field. The reader accepts older JSON without that field or
+the new instruction parameter table; legacy untyped literals retain their
+original JSON interpretation.
 
 ---
 

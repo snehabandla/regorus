@@ -10,21 +10,55 @@
     clippy::pattern_type_mismatch
 )]
 
-use super::{CompilationContext, Compiler, CompilerError, ContextType, Result, WorklistEntry};
-use crate::ast::{Expr, ExprRef, Rule, RuleHead};
+use super::{
+    CompilationContext, Compiler, CompilerError, ContextType, HeadKey, ObjectHead, Register,
+    Result, SpannedCompilerError, WorklistEntry,
+};
+use crate::ast::{Expr, ExprRef, NodeRef, Rule, RuleHead};
 use crate::compiler::destructuring_planner::plans::BindingPlan;
 use crate::lexer::Span;
 use crate::parser::Parser;
-use crate::rvm::program::{Program, RuleType};
+use crate::rvm::instructions::{ChainedIndexParams, LiteralOrRegister};
+use crate::rvm::program::{Program, RuleType, SpanInfo};
 use crate::rvm::Instruction;
-use crate::utils::{format_string_path, get_path_string};
+use crate::utils::{format_string_path, get_path_string, get_rule_path_components};
 use crate::Map;
 use crate::{CompiledPolicy, Value};
-use alloc::collections::BTreeSet;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+
+/// One element of a rule head reference.
+enum HeadItem {
+    Root,
+    Field(Value),
+    Index(ExprRef),
+}
+
+/// How a rule definition contributes to the document at a rule path.
+#[derive(Clone)]
+struct DefinitionShape {
+    rule_type: RuleType,
+    /// Keys below the rule path; non-empty exactly for partial objects.
+    keys: Vec<HeadKey>,
+    /// `contains` heads: the contributed value is a set element.
+    multi_value: bool,
+    /// Element of a Rego v0 `p.x { ... }` set rule.
+    value_literal: Option<Value>,
+}
+
+impl DefinitionShape {
+    const fn complete() -> Self {
+        Self {
+            rule_type: RuleType::Complete,
+            keys: Vec::new(),
+            multi_value: false,
+            value_literal: None,
+        }
+    }
+}
 
 impl<'a> Compiler<'a> {
     /// Extract a compile-time constant `Value` from an optional expression.
@@ -38,6 +72,24 @@ impl<'a> Compiler<'a> {
     }
 
     pub(super) fn compute_rule_type(&self, rule_path: &str) -> Result<RuleType> {
+        // A default registered here for a longer path (`default p.r := 0`
+        // at `p`) makes the document at `rule_path` an object.
+        let mut nested_default = false;
+        for (default_rule, _) in self
+            .policy
+            .inner
+            .default_rules
+            .get(rule_path)
+            .into_iter()
+            .flatten()
+        {
+            if let Rule::Default { refr, .. } = default_rule.as_ref() {
+                let mut items = Vec::new();
+                Self::collect_head_items(refr, &mut items)?;
+                nested_default |= items.len() > self.head_items_on_path(rule_path, default_rule)?;
+            }
+        }
+
         let Some(definitions) = self.policy.inner.rules.get(rule_path) else {
             // Default-only rules (e.g., `default deny := true`) have no regular definitions
             // in the `rules` map — they only exist in `default_rules`. Treat them as Complete.
@@ -50,33 +102,43 @@ impl<'a> Compiler<'a> {
             .into());
         };
 
-        let rule_types: BTreeSet<RuleType> = definitions
-            .iter()
-            .map(|def| {
-                if let Rule::Spec { head, .. } = def.as_ref() {
-                    match head {
-                        RuleHead::Set { .. } => RuleType::PartialSet,
-                        RuleHead::Compr { refr, assign, .. } => match refr.as_ref() {
-                            crate::ast::Expr::RefBrack { .. } if assign.is_some() => {
-                                RuleType::PartialObject
-                            }
-                            crate::ast::Expr::RefBrack { .. } => RuleType::PartialObject,
-                            _ => RuleType::Complete,
-                        },
-                        _ => RuleType::Complete,
-                    }
-                } else {
-                    RuleType::Complete
+        let mut rule_types = BTreeSet::new();
+        let mut leaf_kinds = BTreeMap::new();
+        let shapes = self.definition_shapes(rule_path, definitions)?;
+        for shape in &shapes {
+            // Definitions rooted at the same static prefix cannot mix
+            // single-value and set-valued heads, even if their dynamic keys
+            // happen to be disjoint for this input.
+            if leaf_kinds
+                .insert(Self::static_head_prefix(&shape), shape.multi_value)
+                .is_some_and(|multi_value| multi_value != shape.multi_value)
+            {
+                return Err(CompilerError::ConflictingRuleTypes {
+                    rule_path: rule_path.to_string(),
                 }
-            })
-            .collect();
+                .into());
+            }
+            let prefix = Self::static_head_prefix(shape);
+            if prefix.len() == shape.keys.len()
+                && shapes.iter().any(|other| {
+                    other.keys.len() > prefix.len()
+                        && Self::static_head_prefix(other).starts_with(&prefix)
+                })
+            {
+                return Err(CompilerError::ConflictingRuleTypes {
+                    rule_path: rule_path.to_string(),
+                }
+                .into());
+            }
+            rule_types.insert(shape.rule_type.clone());
+        }
 
+        if nested_default {
+            rule_types.insert(RuleType::PartialObject);
+        }
         if rule_types.len() > 1 {
-            return Err(CompilerError::General {
-                message: format!(
-                    "internal: rule '{}' has multiple types: {:?}",
-                    rule_path, rule_types
-                ),
+            return Err(CompilerError::ConflictingRuleTypes {
+                rule_path: rule_path.to_string(),
             }
             .into());
         }
@@ -89,52 +151,455 @@ impl<'a> Compiler<'a> {
         })
     }
 
-    fn validate_partial_object_shape(&self, refr: &ExprRef) -> Result<()> {
-        let Expr::RefBrack {
-            refr: prefix,
-            index,
-            ..
-        } = refr.as_ref()
-        else {
+    fn static_head_prefix(shape: &DefinitionShape) -> Vec<Value> {
+        shape
+            .keys
+            .iter()
+            .map_while(|key| match key {
+                HeadKey::Field(value) => Some(value.clone()),
+                HeadKey::Expr(expr) => super::expressions::try_eval_const(expr),
+            })
+            .take_while(|key| *key != Value::Undefined)
+            .collect()
+    }
+
+    pub(super) fn retain_owned_partial_object_defaults(
+        &self,
+        rule_path: &str,
+        defaults: &mut Value,
+    ) -> Result<()> {
+        let Some(definitions) = self.policy.inner.rules.get(rule_path) else {
             return Ok(());
         };
-
-        if Self::has_unsupported_bracket_prefix(prefix) {
-            return Err(CompilerError::PartialObjectNestedKeyUnsupported.at(refr.span()));
+        for shape in self.definition_shapes(rule_path, definitions)? {
+            let prefix = Self::static_head_prefix(&shape);
+            if prefix.len() == shape.keys.len() {
+                continue;
+            }
+            // A dynamically keyed document does not inherit defaults from
+            // separately registered static children.
+            let Some((last, ancestors)) = prefix.split_last() else {
+                *defaults = Value::Undefined;
+                return Ok(());
+            };
+            let current = ancestors.iter().try_fold(&mut *defaults, |value, key| {
+                value.as_object_mut().ok()?.get_mut(key)
+            });
+            if let Some(current) = current {
+                if let Ok(object) = current.as_object_mut() {
+                    object.remove(last);
+                }
+            }
         }
-
-        if Self::is_simple_literal(index) {
-            return Err(CompilerError::PartialObjectConstantKeyUnsupported.at(index.span()));
-        }
-
         Ok(())
     }
 
-    fn has_unsupported_bracket_prefix(expr: &ExprRef) -> bool {
-        match expr.as_ref() {
-            Expr::RefBrack { refr, index, .. } => {
-                !Self::is_string_literal(index) || Self::has_unsupported_bracket_prefix(refr)
+    pub(super) fn encode_partial_object_defaults(
+        &self,
+        rule_path: &str,
+        defaults: &Value,
+    ) -> Result<Value> {
+        let mut entries = Vec::new();
+        for (rule, _) in self
+            .policy
+            .inner
+            .default_rules
+            .get(rule_path)
+            .into_iter()
+            .flatten()
+        {
+            let Rule::Default { refr, .. } = rule.as_ref() else {
+                continue;
+            };
+            let mut items = Vec::new();
+            Self::collect_head_items(refr, &mut items)?;
+            let consumed = self.head_items_on_path(rule_path, rule)?;
+            let mut path = Vec::new();
+            for item in items.into_iter().skip(consumed) {
+                let key =
+                    match item {
+                        HeadItem::Field(value) => value,
+                        HeadItem::Index(expr) => super::expressions::try_eval_const(&expr)
+                            .ok_or_else(|| CompilerError::UnsupportedRuleHeadPath {
+                                rule_path: rule_path.to_string(),
+                            })?,
+                        HeadItem::Root => continue,
+                    };
+                path.push(key);
             }
-            Expr::RefDot { refr, .. } => Self::has_unsupported_bracket_prefix(refr),
-            _ => false,
+            if path.is_empty() {
+                continue;
+            }
+            let value = path
+                .iter()
+                .try_fold(defaults, |value, key| value.as_object().ok()?.get(key));
+            if let Some(value) = value.filter(|value| **value != Value::Undefined) {
+                entries.push(Value::from_array(alloc::vec![
+                    Value::from_array(path),
+                    value.clone(),
+                ]));
+            }
         }
+        Ok(Value::from_array(entries))
     }
 
-    fn is_string_literal(expr: &ExprRef) -> bool {
-        matches!(expr.as_ref(), Expr::String { .. } | Expr::RawString { .. })
+    /// Static partial documents exist even when none of their bodies match:
+    /// `p.q[k] contains v` contributes `q: {}`, and `p.a contains v`
+    /// contributes `a: set()`. Dynamic head keys do not materialize ancestors
+    /// beyond their first unknown key.
+    fn initial_partial_object(rule_path: &str, shapes: &[DefinitionShape]) -> Result<Value> {
+        let mut initial = Value::new_object();
+        let prefixes: Vec<Vec<Value>> = shapes.iter().map(Self::static_head_prefix).collect();
+        for (shape, prefix) in shapes.iter().zip(&prefixes) {
+            let mut keys = prefix.clone();
+            let mut leaf = if keys.len() == shape.keys.len() && shape.multi_value {
+                Value::new_set()
+            } else {
+                if keys.len() == shape.keys.len() {
+                    keys.pop();
+                }
+                Value::new_object()
+            };
+            // A dynamic ancestor owns the document's empty result. Both
+            // static set leaves and virtual-object prefixes beneath it only
+            // appear when their definitions contribute a value.
+            for (other, prefix) in shapes.iter().zip(&prefixes) {
+                if prefix.len() < other.keys.len()
+                    && keys.len() > prefix.len()
+                    && keys.starts_with(prefix)
+                {
+                    keys.truncate(prefix.len());
+                    leaf = Value::new_object();
+                }
+            }
+            let Some((last, ancestors)) = keys.split_last() else {
+                continue;
+            };
+            let conflict = || CompilerError::ConflictingRuleTypes {
+                rule_path: rule_path.to_string(),
+            };
+            let mut current = &mut initial;
+            for key in ancestors {
+                let object = current.as_object_mut().map_err(|_| conflict())?;
+                current = object.get_or_insert_with(key.clone(), Value::new_object);
+            }
+            let object = current.as_object_mut().map_err(|_| conflict())?;
+            match object.get(last) {
+                Some(existing)
+                    if matches!((existing, &leaf), (Value::Object(_), Value::Object(_)))
+                        || *existing == leaf => {}
+                Some(_) => return Err(conflict().into()),
+                None => {
+                    object.insert(last.clone(), leaf);
+                }
+            }
+        }
+        Ok(initial)
     }
 
-    fn is_simple_literal(expr: &ExprRef) -> bool {
-        match expr.as_ref() {
-            Expr::String { .. }
-            | Expr::RawString { .. }
-            | Expr::Number { .. }
-            | Expr::Bool { .. }
-            | Expr::Null { .. } => true,
-            // Unary expressions like `-1` are constant literals too.
-            Expr::UnaryExpr { expr, .. } => Self::is_simple_literal(expr),
-            _ => false,
+    /// Shapes of all definitions registered at `rule_path`. Fails if any
+    /// definition reaches `rule_path` only through a variable head key (see
+    /// `is_variable_key_rule_path`).
+    fn definition_shapes(
+        &self,
+        rule_path: &str,
+        definitions: &[NodeRef<Rule>],
+    ) -> Result<Vec<DefinitionShape>> {
+        definitions
+            .iter()
+            .filter_map(
+                |definition| match self.definition_shape(rule_path, definition) {
+                    Ok(Some(shape)) => Some(Ok(shape)),
+                    Ok(None)
+                        if matches!(
+                            definition.as_ref(),
+                            Rule::Spec {
+                                head: RuleHead::Func { .. },
+                                ..
+                            }
+                        ) =>
+                    {
+                        None
+                    }
+                    Ok(None) => Some(Err(CompilerError::UnsupportedRuleHeadPath {
+                        rule_path: rule_path.to_string(),
+                    }
+                    .into())),
+                    Err(error) => Some(Err(error)),
+                },
+            )
+            .collect()
+    }
+
+    /// True if every definition at `rule_path` reaches it through a variable
+    /// head key. The interpreter registers `p[k][j] := v` under `p.k` (named
+    /// after the variable), but no document lives there: the definition
+    /// belongs to `p`, so such paths are not separate rules for the RVM.
+    pub(super) fn is_variable_key_rule_path(&self, rule_path: &str) -> Result<bool> {
+        if self.policy.inner.default_rules.contains_key(rule_path) {
+            return Ok(false);
         }
+        let Some(definitions) = self.policy.inner.rules.get(rule_path) else {
+            return Ok(false);
+        };
+        for definition in definitions {
+            if self.definition_shape(rule_path, definition)?.is_some() {
+                return Ok(false);
+            }
+        }
+        Ok(!definitions.is_empty())
+    }
+
+    /// True if `rule_path` can be compiled as a rule of its own: it is
+    /// registered, is not a variable-key path, and every definition that can
+    /// contribute to its document is registered at it. A definition at a
+    /// shorter path whose head key there is a variable (`p[k] contains v`
+    /// against `p.a`) may also write under `rule_path`; such a path must be
+    /// read through the shorter rule instead.
+    pub(super) fn is_rule_path_for_lookup(&self, rule_path: &str) -> Result<bool> {
+        let inner = &self.policy.inner;
+        if !inner.rules.contains_key(rule_path) && !inner.default_rules.contains_key(rule_path) {
+            return Ok(false);
+        }
+        if self.is_variable_key_rule_path(rule_path)? {
+            return Ok(false);
+        }
+        let Some(components) = inner.rule_path_components.get(rule_path) else {
+            return Ok(false);
+        };
+        let registered = inner.rules.get(rule_path);
+        for prefix_len in 2..components.len() {
+            let prefix: Vec<&str> = components[..prefix_len]
+                .iter()
+                .map(String::as_str)
+                .collect();
+            let prefix_path = format_string_path(&prefix).map_err(CompilerError::from)?;
+            let Some(definitions) = inner.rules.get(&prefix_path) else {
+                continue;
+            };
+            // Surface conflicts between the definitions of the enclosing
+            // document even when only part of it is read.
+            self.compute_rule_type(&prefix_path)?;
+            let below = &components[prefix_len..];
+            for definition in definitions {
+                if registered.is_some_and(|rules| rules.iter().any(|rule| rule == definition))
+                    && self.definition_shape(rule_path, definition)?.is_some()
+                {
+                    continue;
+                }
+                let Some(shape) = self.definition_shape(&prefix_path, definition)? else {
+                    continue;
+                };
+                let may_contribute = !shape.keys.is_empty()
+                    && shape
+                        .keys
+                        .iter()
+                        .zip(below)
+                        .all(|(key, component)| match key {
+                            HeadKey::Field(field) => field
+                                .as_string()
+                                .is_ok_and(|field| field.as_ref() == component),
+                            HeadKey::Expr(_) => true,
+                        });
+                if may_contribute {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Determine how a rule definition contributes to the document at
+    /// `rule_path`. A definition is registered at every prefix of its head
+    /// reference, so the head keys below `rule_path` decide its shape:
+    /// `p.q[k] contains v` is a partial object `{q: {k: {v}}}` at `p`, a
+    /// partial object `{k: {v}}` at `p.q`; `p.r := 1` is a partial object
+    /// at `p` and a complete rule at `p.r`. Returns `None` if `rule_path` is
+    /// reached through a variable head key.
+    fn definition_shape(
+        &self,
+        rule_path: &str,
+        rule: &NodeRef<Rule>,
+    ) -> Result<Option<DefinitionShape>> {
+        let Rule::Spec { head, .. } = rule.as_ref() else {
+            return Ok(Some(DefinitionShape::complete()));
+        };
+        let (refr, is_set, is_func, set_key_missing) = match head {
+            RuleHead::Compr { refr, .. } => (refr, false, false, false),
+            RuleHead::Set { refr, key, .. } => (refr, true, false, key.is_none()),
+            RuleHead::Func { refr, .. } => (refr, false, true, false),
+        };
+
+        let unsupported = || -> SpannedCompilerError {
+            CompilerError::UnsupportedRuleHeadPath {
+                rule_path: rule_path.to_string(),
+            }
+            .at(refr.span())
+        };
+
+        let mut items = Vec::new();
+        Self::collect_head_items(refr, &mut items).map_err(|_| unsupported())?;
+
+        // Rego v0 `p.x { ... }` adds the string "x" to the set `p`.
+        let mut value_literal = None;
+        if set_key_missing && items.len() > 1 {
+            if let Some(HeadItem::Field(field)) = items.pop() {
+                value_literal = Some(field);
+            }
+        }
+
+        let consumed = self.head_items_on_path(rule_path, rule)?;
+        if consumed > items.len() && value_literal.is_some() {
+            return Ok(None);
+        }
+        let consumed = Some(consumed)
+            .filter(|consumed| *consumed >= 1 && *consumed <= items.len())
+            .ok_or_else(unsupported)?;
+        let (path_items, key_items) = items.split_at(consumed);
+        // Every key on the rule path must be a static string: a variable key
+        // there would make the rule path itself data dependent.
+        if path_items.iter().skip(1).any(|item| {
+            !matches!(item, HeadItem::Field(_))
+                && !matches!(item, HeadItem::Index(index) if matches!(index.as_ref(), Expr::String { .. }))
+        }) {
+            return Ok(None);
+        }
+
+        let keys: Vec<HeadKey> = key_items
+            .iter()
+            .map(|item| match item {
+                HeadItem::Field(field) => HeadKey::Field(field.clone()),
+                HeadItem::Index(index) => HeadKey::Expr(index.clone()),
+                HeadItem::Root => HeadKey::Field(Value::Undefined),
+            })
+            .collect();
+
+        let rule_type = match (keys.is_empty(), is_set, is_func) {
+            (true, true, _) => RuleType::PartialSet,
+            (true, false, _) => RuleType::Complete,
+            (false, _, true) => return Ok(None),
+            (false, _, false) => RuleType::PartialObject,
+        };
+
+        Ok(Some(DefinitionShape {
+            rule_type,
+            keys,
+            multi_value: is_set,
+            value_literal,
+        }))
+    }
+
+    /// Number of head items of `rule` (its root variable and the keys after
+    /// it) that spell out `rule_path` below the package.
+    fn head_items_on_path(&self, rule_path: &str, rule: &NodeRef<Rule>) -> Result<usize> {
+        let rule_components = self
+            .policy
+            .inner
+            .rule_path_components
+            .get(rule_path)
+            .ok_or_else(|| CompilerError::General {
+                message: format!("missing components for registered rule path '{rule_path}'"),
+            })?;
+        let module_index = self.find_module_index_for_rule(rule)? as usize;
+        let package_components = self
+            .policy
+            .get_modules()
+            .get(module_index)
+            .map(|module| get_rule_path_components(&module.package.refr))
+            .transpose()
+            .map_err(|e| CompilerError::General {
+                message: format!("invalid package path: {e}"),
+            })?
+            .map_or(0, |components| components.len());
+        // `data` and the package come first.
+        rule_components
+            .len()
+            .checked_sub(package_components + 1)
+            .ok_or_else(|| {
+                CompilerError::General {
+                    message: format!("rule path '{rule_path}' is shorter than its package"),
+                }
+                .into()
+            })
+    }
+
+    fn collect_head_items(refr: &ExprRef, items: &mut Vec<HeadItem>) -> Result<()> {
+        match refr.as_ref() {
+            Expr::Var { .. } => items.push(HeadItem::Root),
+            Expr::RefDot { refr, field, .. } => {
+                Self::collect_head_items(refr, items)?;
+                items.push(HeadItem::Field(field.1.clone()));
+            }
+            Expr::RefBrack { refr, index, .. } => {
+                Self::collect_head_items(refr, items)?;
+                items.push(HeadItem::Index(index.clone()));
+            }
+            _ => return Err(CompilerError::NotSimpleReferenceChain.at(refr.span())),
+        }
+        Ok(())
+    }
+
+    /// Emit the evaluation of entry point `rule_path` into `dest`. A rule path
+    /// that other definitions may also write to (see
+    /// `is_rule_path_for_lookup`) is read through the longest prefix that can
+    /// be compiled on its own.
+    fn emit_entry_point_lookup(&mut self, dest: Register, rule_path: &str) -> Result<()> {
+        let components = self
+            .policy
+            .inner
+            .rule_path_components
+            .get(rule_path)
+            .cloned();
+        let Some(components) = components.filter(|_| {
+            self.is_rule_path_for_lookup(rule_path)
+                .map(|is_rule| !is_rule)
+                .unwrap_or(false)
+        }) else {
+            let rule_idx = self.get_or_assign_rule_index(rule_path)?;
+            self.emit_call_rule(dest, rule_idx);
+            return Ok(());
+        };
+
+        for prefix_len in (2..components.len()).rev() {
+            let prefix: Vec<&str> = components[..prefix_len]
+                .iter()
+                .map(String::as_str)
+                .collect();
+            let prefix_path = format_string_path(&prefix).map_err(CompilerError::from)?;
+            if !self.is_rule_path_for_lookup(&prefix_path)? {
+                continue;
+            }
+            let rule_idx = self.get_or_assign_rule_index(&prefix_path)?;
+            let rule_reg = self.alloc_register()?;
+            self.emit_call_rule(rule_reg, rule_idx);
+            let path_components = components[prefix_len..]
+                .iter()
+                .map(|component| {
+                    LiteralOrRegister::Literal(
+                        self.add_literal(Value::String(component.as_str().into())),
+                    )
+                })
+                .collect();
+            let params_index = self.program.instruction_data.chained_index_params.len() as u16;
+            self.program
+                .instruction_data
+                .chained_index_params
+                .push(ChainedIndexParams {
+                    dest,
+                    root: rule_reg,
+                    path_components,
+                });
+            self.program
+                .instructions
+                .push(Instruction::ChainedIndex { params_index });
+            self.spans.push(SpanInfo::new(0, 0, 0, 0));
+            return Ok(());
+        }
+
+        Err(CompilerError::UnsupportedRuleHeadPath {
+            rule_path: rule_path.to_string(),
+        }
+        .into())
     }
 
     pub(super) fn get_or_assign_rule_index(&mut self, rule_path: &str) -> Result<u16> {
@@ -300,11 +765,10 @@ impl<'a> Compiler<'a> {
                     entry_point_name.to_string()
                 }
             };
-            let rule_idx = compiler.get_or_assign_rule_index(&rule_path)?;
             compiler
                 .entry_points
                 .insert(entry_point_name.to_string(), instruction_index);
-            compiler.emit_call_rule(result_reg, rule_idx);
+            compiler.emit_entry_point_lookup(result_reg, &rule_path)?;
 
             compiler.emit_return(result_reg);
         }
@@ -443,8 +907,50 @@ impl<'a> Compiler<'a> {
             let mut num_registers_used = 0;
             let mut rule_param_count: Option<usize> = None;
 
-            for (def_idx, rule_ref) in rule_definitions.iter().enumerate() {
-                ::core::convert::identity(def_idx);
+            let mut contributing_definitions = Vec::new();
+            for definition in rule_definitions {
+                if let Some(shape) = self.definition_shape(rule_path, definition)? {
+                    contributing_definitions.push((definition, shape));
+                }
+            }
+            let shapes: Vec<_> = contributing_definitions
+                .iter()
+                .map(|(_, shape)| shape.clone())
+                .collect();
+            // `ObjectSet` overwrites, so once any definition needs a deep or
+            // multi-value set, all of them use `ObjectDeepSet` to detect
+            // conflicting contributions consistently.
+            let deep_object_set = rule_type == RuleType::PartialObject
+                && shapes.iter().any(|shape| {
+                    shape.multi_value
+                        || shape.keys.len() != 1
+                        || !Self::static_head_prefix(shape).is_empty()
+                });
+
+            if rule_type == RuleType::PartialObject {
+                let initial = Self::initial_partial_object(rule_path, &shapes)?;
+                if initial != Value::new_object() {
+                    let span = rule_definitions.first().unwrap().span();
+                    let entry = self.program.instructions.len() as u32;
+                    let literal_idx = self.add_literal(initial);
+                    self.emit_instruction(
+                        Instruction::Load {
+                            dest: result_register,
+                            literal_idx,
+                        },
+                        span,
+                    );
+                    self.emit_instruction(Instruction::RuleReturn {}, span);
+                    self.rule_definitions[rule_index as usize].push(alloc::vec![entry]);
+                    self.rule_definition_function_params[rule_index as usize].push(None);
+                    self.rule_definition_destructuring_patterns[rule_index as usize].push(None);
+                    self.rule_definition_else_bodies[rule_index as usize].push(alloc::vec![false]);
+                    self.rule_definition_static_values[rule_index as usize].push(None);
+                    num_registers_used = 1;
+                }
+            }
+
+            for (def_idx, (rule_ref, shape)) in contributing_definitions.into_iter().enumerate() {
                 if let Rule::Spec { head, bodies, span } = rule_ref.as_ref() {
                     self.push_scope();
                     self.register_counter = 0;
@@ -452,23 +958,26 @@ impl<'a> Compiler<'a> {
                     let result_register = self.alloc_register()?;
 
                     self.current_module_index = self.find_module_index_for_rule(rule_ref)?;
+                    let module = self
+                        .policy
+                        .get_modules()
+                        .get(self.current_module_index as usize)
+                        .ok_or_else(|| CompilerError::General {
+                            message: "Missing definition module".to_string(),
+                        })?;
+                    self.current_package = get_path_string(&module.package.refr, Some("data"))
+                        .map_err(|error| CompilerError::General {
+                            message: format!("Failed to get definition package: {error}"),
+                        })?;
 
                     let (key_expr, value_expr) = match head {
-                        RuleHead::Compr { refr, assign, .. } => {
-                            if rule_type == RuleType::PartialObject {
-                                self.validate_partial_object_shape(refr)?;
-                            }
-
+                        RuleHead::Compr { assign, .. } => {
                             self.rule_definition_function_params[rule_index as usize].push(None);
                             self.rule_definition_destructuring_patterns[rule_index as usize]
                                 .push(None);
 
                             let output_expr = assign.as_ref().map(|assign| assign.value.clone());
-                            let key_expr = match refr.as_ref() {
-                                Expr::RefBrack { index, .. } => Some(index.clone()),
-                                _ => None,
-                            };
-                            (key_expr, output_expr)
+                            (None::<ExprRef>, output_expr)
                         }
                         RuleHead::Set { key, .. } => {
                             self.rule_definition_function_params[rule_index as usize].push(None);
@@ -568,11 +1077,18 @@ impl<'a> Compiler<'a> {
                         _ => span.clone(),
                     };
 
+                    let object_head = (rule_type == RuleType::PartialObject).then(|| ObjectHead {
+                        keys: shape.keys.clone(),
+                        multi_value: shape.multi_value,
+                        deep: deep_object_set,
+                    });
                     let context = CompilationContext {
                         dest_register: result_register,
                         context_type: ContextType::Rule(rule_type.clone()),
                         key_expr,
                         value_expr,
+                        object_head,
+                        value_literal: shape.value_literal.clone(),
                         span,
                         key_value_loops_hoisted: false,
                     };
@@ -597,7 +1113,9 @@ impl<'a> Compiler<'a> {
                                 value_expr.span(),
                             );
 
-                            self.emit_context_yield()?;
+                            // Loops in head keys (`p[input.keys[_]] contains 1`)
+                            // must be hoisted even without a body.
+                            self.hoist_loops_and_emit_context_yield()?;
 
                             self.emit_instruction(Instruction::RuleReturn {}, value_expr.span());
                             self.pop_scope();

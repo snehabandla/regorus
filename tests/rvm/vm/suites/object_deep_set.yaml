@@ -1,0 +1,171 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+cases:
+  - note: object_deep_set_nested_single_value
+    literals: [{}, a, b, 7]
+    instruction_params:
+      object_deep_set_params:
+        - {obj: 0, keys: [1, 2], value: 3}
+    instructions:
+      - "Load { dest: 0, literal_idx: 0 }"
+      - "Load { dest: 1, literal_idx: 1 }"
+      - "Load { dest: 2, literal_idx: 2 }"
+      - "Load { dest: 3, literal_idx: 3 }"
+      - "ObjectDeepSet { params_index: 0 }"
+      - "ObjectDeepSet { params_index: 0 }"
+      - "Return { value: 0 }"
+    want_result: {a: {b: 7}}
+
+  - note: object_deep_set_nested_set_deduplicates_and_accumulates
+    literals: [{}, a, b, 7, 8]
+    instruction_params:
+      object_deep_set_params:
+        - {obj: 0, keys: [1, 2], value: 3, multi_value: true}
+    instructions:
+      - "Load { dest: 0, literal_idx: 0 }"
+      - "Load { dest: 1, literal_idx: 1 }"
+      - "Load { dest: 2, literal_idx: 2 }"
+      - "Load { dest: 3, literal_idx: 3 }"
+      - "ObjectDeepSet { params_index: 0 }"
+      - "ObjectDeepSet { params_index: 0 }"
+      - "Load { dest: 3, literal_idx: 4 }"
+      - "ObjectDeepSet { params_index: 0 }"
+      - "Return { value: 0 }"
+    want_result: {a: {b: {set!: [7, 8]}}}
+
+  - note: object_deep_set_distinct_paths_and_non_string_key
+    literals: [{}, 1, false, 7, 8]
+    instruction_params:
+      object_deep_set_params:
+        - {obj: 0, keys: [1], value: 3, multi_value: true}
+        - {obj: 0, keys: [2], value: 4}
+    instructions:
+      - "Load { dest: 0, literal_idx: 0 }"
+      - "Load { dest: 1, literal_idx: 1 }"
+      - "Load { dest: 2, literal_idx: 2 }"
+      - "Load { dest: 3, literal_idx: 3 }"
+      - "Load { dest: 4, literal_idx: 4 }"
+      - "ObjectDeepSet { params_index: 0 }"
+      - "ObjectDeepSet { params_index: 1 }"
+      - "Return { value: 0 }"
+    want_result: {1: {set!: [7]}, false: 8}
+
+  - note: object_deep_set_undefined_key_is_noop
+    literals: [{}, a, 7]
+    instruction_params:
+      object_deep_set_params:
+        - {obj: 0, keys: [1, 2], value: 3, multi_value: true}
+    instructions:
+      - "Load { dest: 0, literal_idx: 0 }"
+      - "Load { dest: 1, literal_idx: 1 }"
+      - "Load { dest: 3, literal_idx: 2 }"
+      - "ObjectDeepSet { params_index: 0 }"
+      - "Return { value: 0 }"
+    want_result: {}
+
+  - note: object_deep_set_undefined_value_is_noop
+    literals: [{}, a]
+    instruction_params:
+      object_deep_set_params:
+        - {obj: 0, keys: [1], value: 2}
+    instructions:
+      - "Load { dest: 0, literal_idx: 0 }"
+      - "Load { dest: 1, literal_idx: 1 }"
+      - "ObjectDeepSet { params_index: 0 }"
+      - "Return { value: 0 }"
+    want_result: {}
+
+  - note: object_deep_set_conflicting_single_value
+    literals: [{a: {b: 1}}, a, b, 2]
+    instruction_params:
+      object_deep_set_params:
+        - {obj: 0, keys: [1, 2], value: 3}
+    instructions:
+      - "Load { dest: 0, literal_idx: 0 }"
+      - "Load { dest: 1, literal_idx: 1 }"
+      - "Load { dest: 2, literal_idx: 2 }"
+      - "Load { dest: 3, literal_idx: 3 }"
+      - "ObjectDeepSet { params_index: 0 }"
+    want_error: 'conflicting values at ["a"]["b"]'
+
+  - note: object_deep_set_conflicting_intermediate
+    literals: [{a: 1}, a, b, 2]
+    instruction_params:
+      object_deep_set_params:
+        - {obj: 0, keys: [1, 2], value: 3, multi_value: true}
+    instructions:
+      - "Load { dest: 0, literal_idx: 0 }"
+      - "Load { dest: 1, literal_idx: 1 }"
+      - "Load { dest: 2, literal_idx: 2 }"
+      - "Load { dest: 3, literal_idx: 3 }"
+      - "ObjectDeepSet { params_index: 0 }"
+    want_error: 'conflicting values at ["a"]'
+
+  - note: object_deep_set_conflicting_set_leaf
+    literals: [{a: {}}, a, 2]
+    instruction_params:
+      object_deep_set_params:
+        - {obj: 0, keys: [1], value: 2, multi_value: true}
+    instructions:
+      - "Load { dest: 0, literal_idx: 0 }"
+      - "Load { dest: 1, literal_idx: 1 }"
+      - "Load { dest: 2, literal_idx: 2 }"
+      - "ObjectDeepSet { params_index: 0 }"
+    want_error: 'conflicting values at ["a"]'
+
+  - note: object_deep_set_empty_path_rejected
+    literals: [{}, 2]
+    instruction_params:
+      object_deep_set_params:
+        - {obj: 0, keys: [], value: 1}
+    instructions:
+      - "Load { dest: 0, literal_idx: 0 }"
+      - "Load { dest: 1, literal_idx: 1 }"
+      - "ObjectDeepSet { params_index: 0 }"
+    want_error: "<empty key path>"
+
+  - note: object_deep_set_non_object_root
+    literals: [1, a, 2]
+    instruction_params:
+      object_deep_set_params:
+        - {obj: 0, keys: [1], value: 2}
+    instructions:
+      - "Load { dest: 0, literal_idx: 0 }"
+      - "Load { dest: 1, literal_idx: 1 }"
+      - "Load { dest: 2, literal_idx: 2 }"
+      - "ObjectDeepSet { params_index: 0 }"
+    want_error: "does not contain an object"
+
+  - note: object_deep_set_invalid_parameter_index
+    literals: []
+    instructions:
+      - "ObjectDeepSet { params_index: 0 }"
+    want_error: "Invalid object deep set params index"
+
+  - note: object_deep_set_copy_on_write_preserves_alias
+    literals: [{a: {b: {set!: [1]}}}, a, b, 2]
+    instruction_params:
+      object_deep_set_params:
+        - {obj: 0, keys: [1, 2], value: 3, multi_value: true}
+    instructions:
+      - "Load { dest: 0, literal_idx: 0 }"
+      - "Move { dest: 4, src: 0 }"
+      - "Load { dest: 1, literal_idx: 1 }"
+      - "Load { dest: 2, literal_idx: 2 }"
+      - "Load { dest: 3, literal_idx: 3 }"
+      - "ObjectDeepSet { params_index: 0 }"
+      - "Return { value: 4 }"
+    want_result: {a: {b: {set!: [1]}}}
+
+  - note: object_deep_set_root_can_also_be_value_register
+    literals: [{}, a]
+    instruction_params:
+      object_deep_set_params:
+        - {obj: 0, keys: [1], value: 0}
+    instructions:
+      - "Load { dest: 0, literal_idx: 0 }"
+      - "Load { dest: 1, literal_idx: 1 }"
+      - "ObjectDeepSet { params_index: 0 }"
+      - "Return { value: 0 }"
+    want_result: {a: {}}

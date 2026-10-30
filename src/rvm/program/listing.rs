@@ -507,6 +507,38 @@ fn format_instruction_readable(
             let comment = format!("Set field r{}[r{}] = r{}", obj, key, value);
             align_comment(&base, &comment, config.comment_column)
         }
+        Instruction::ObjectDeepSet { params_index } => program
+            .instruction_data
+            .get_object_deep_set_params(params_index)
+            .map_or_else(
+                || {
+                    let base = format!("{}ObjDeepSet   [INVALID P({})]", indent, params_index);
+                    align_comment(
+                        &base,
+                        "ERROR: Invalid object deep set parameters",
+                        config.comment_column,
+                    )
+                },
+                |params| {
+                    let keys: String = params.keys.iter().map(|k| format!("[r{}]", k)).collect();
+                    let (op, comment) = if params.multi_value {
+                        (
+                            "∪=",
+                            format!("Add r{} to set r{}{}", params.value, params.obj, keys),
+                        )
+                    } else {
+                        (
+                            "←",
+                            format!("Set r{}{} = r{}", params.obj, keys, params.value),
+                        )
+                    };
+                    let base = format!(
+                        "{}ObjDeepSet   r{}{} {} r{}",
+                        indent, params.obj, keys, op, params.value
+                    );
+                    align_comment(&base, &comment, config.comment_column)
+                },
+            ),
         Instruction::ObjectCreate { params_index } => {
             let params = program
                 .instruction_data
@@ -1022,6 +1054,7 @@ const fn get_instruction_name(instruction: &Instruction) -> &'static str {
         Instruction::HostAwait { .. } => "HOST_AWAIT",
         Instruction::Return { .. } => "RETURN",
         Instruction::ObjectSet { .. } => "OBJ_SET",
+        Instruction::ObjectDeepSet { .. } => "OBJ_DEEP_SET",
         Instruction::ObjectCreate { .. } => "OBJ_CREATE",
         Instruction::Index { .. } => "INDEX",
         Instruction::IndexLiteral { .. } => "INDEX_LIT",

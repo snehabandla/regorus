@@ -7,8 +7,8 @@ mod types;
 
 pub use params::{
     ArrayCreateParams, BuiltinCallParams, ChainedIndexParams, ComprehensionBeginParams,
-    FunctionCallParams, InstructionData, LoopStartParams, ObjectCreateParams, SetCreateParams,
-    VirtualDataDocumentLookupParams,
+    FunctionCallParams, InstructionData, LoopStartParams, ObjectCreateParams, ObjectDeepSetParams,
+    SetCreateParams, VirtualDataDocumentLookupParams,
 };
 pub use types::{
     ComprehensionMode, GuardMode, LiteralOrRegister, LogicalBlockMode, LoopMode, PolicyOp,
@@ -179,6 +179,15 @@ pub enum Instruction {
         obj: u8,
         key: u8,
         value: u8,
+    },
+
+    /// Insert a value below one or more keys of an object, creating
+    /// intermediate objects (and the leaf set when `multi_value`) as needed.
+    /// Undefined keys or value make it a no-op; a conflicting existing value
+    /// is an error. Used by partial object rules with nested heads.
+    ObjectDeepSet {
+        /// Index into program's instruction_data.object_deep_set_params table
+        params_index: u16,
     },
 
     /// Create object with optimized field setting - uses parameter table

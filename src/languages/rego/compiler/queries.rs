@@ -6,11 +6,15 @@
     clippy::pattern_type_mismatch
 )]
 
-use super::{Compiler, CompilerError, ComprehensionType, ContextType, Result};
+use super::{
+    Compiler, CompilerError, ComprehensionType, ContextType, HeadKey, ObjectHead, Register, Result,
+};
 use crate::ast::{self, LiteralStmt, Query};
-use crate::rvm::instructions::GuardMode;
+use crate::lexer::Span;
+use crate::rvm::instructions::{GuardMode, ObjectDeepSetParams};
 use crate::rvm::program::RuleType;
 use crate::rvm::Instruction;
+use crate::Value;
 use alloc::format;
 use alloc::vec::Vec;
 
@@ -115,12 +119,16 @@ impl<'a> Compiler<'a> {
             }
         }
 
-        let (key_expr, value_expr) = match self.context_stack.last_mut() {
+        let (key_expr, value_expr, object_head) = match self.context_stack.last_mut() {
             Some(context) => {
                 if context.key_value_loops_hoisted {
                     return self.emit_context_yield();
                 }
-                (context.key_expr.clone(), context.value_expr.clone())
+                (
+                    context.key_expr.clone(),
+                    context.value_expr.clone(),
+                    context.object_head.clone(),
+                )
             }
             None => return Ok(()),
         };
@@ -129,6 +137,12 @@ impl<'a> Compiler<'a> {
 
         if let Some(expr) = key_expr.as_ref() {
             key_value_loops.extend(self.get_expr_loops(expr)?);
+        }
+
+        for key in object_head.iter().flat_map(|head| head.keys.iter()) {
+            if let HeadKey::Expr(expr) = key {
+                key_value_loops.extend(self.get_expr_loops(expr)?);
+            }
         }
 
         if let Some(expr) = value_expr.as_ref() {
@@ -151,6 +165,11 @@ impl<'a> Compiler<'a> {
             let span = &context.span;
             let value_register = match context.value_expr {
                 Some(expr) => self.compile_rego_expr(&expr)?,
+                None if context.value_literal.is_some() => {
+                    let literal = context.value_literal.clone().unwrap_or(Value::Bool(true));
+                    self.load_literal_value(&literal, span)
+                        .map_err(|e| CompilerError::from(e).at(span))?
+                }
                 None => {
                     let value_reg = self.alloc_register()?;
                     self.emit_instruction(
@@ -206,16 +225,21 @@ impl<'a> Compiler<'a> {
                         span,
                     );
                 }
-                ContextType::Rule(RuleType::PartialObject) => {
-                    self.emit_instruction(
-                        Instruction::ObjectSet {
-                            obj: dest_register,
-                            key: key_register,
-                            value: value_register,
-                        },
-                        span,
-                    );
-                }
+                ContextType::Rule(RuleType::PartialObject) => match context.object_head {
+                    Some(head) => {
+                        self.emit_object_head_set(&head, dest_register, value_register, span)?
+                    }
+                    None => {
+                        self.emit_instruction(
+                            Instruction::ObjectSet {
+                                obj: dest_register,
+                                key: key_register,
+                                value: value_register,
+                            },
+                            span,
+                        );
+                    }
+                },
                 ContextType::Rule(RuleType::Complete) => {
                     self.emit_instruction(
                         Instruction::Move {
@@ -231,6 +255,57 @@ impl<'a> Compiler<'a> {
         } else {
             Err(CompilerError::MissingYieldContext.into())
         }
+    }
+
+    /// Store `value_register` below the head keys of a partial object rule.
+    fn emit_object_head_set(
+        &mut self,
+        head: &ObjectHead,
+        dest_register: Register,
+        value_register: Register,
+        span: &Span,
+    ) -> Result<()> {
+        let mut key_registers = Vec::with_capacity(head.keys.len());
+        for key in &head.keys {
+            let register = match key {
+                HeadKey::Expr(expr) => self.compile_rego_expr(expr)?,
+                HeadKey::Field(field) => self
+                    .load_literal_value(field, span)
+                    .map_err(|e| CompilerError::from(e).at(span))?,
+            };
+            key_registers.push(register);
+        }
+
+        match key_registers.as_slice() {
+            [key] if !head.multi_value && !head.deep => {
+                self.emit_instruction(
+                    Instruction::ObjectSet {
+                        obj: dest_register,
+                        key: *key,
+                        value: value_register,
+                    },
+                    span,
+                );
+            }
+            _ => {
+                let params_index = self
+                    .program
+                    .instruction_data
+                    .add_object_deep_set_params(ObjectDeepSetParams {
+                        obj: dest_register,
+                        keys: key_registers,
+                        value: value_register,
+                        multi_value: head.multi_value,
+                    })
+                    .ok_or_else(|| super::CompilerError::General {
+                        message: alloc::string::String::from(
+                            "ObjectDeepSet parameter table exhausted",
+                        ),
+                    })?;
+                self.emit_instruction(Instruction::ObjectDeepSet { params_index }, span);
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn compile_single_statement(&mut self, stmt: &LiteralStmt) -> Result<()> {

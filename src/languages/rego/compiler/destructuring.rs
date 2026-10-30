@@ -372,7 +372,7 @@ impl<'a> Compiler<'a> {
         Ok(dest)
     }
 
-    fn load_literal_value(&mut self, value: &Value, span: &Span) -> Result<Register> {
+    pub(super) fn load_literal_value(&mut self, value: &Value, span: &Span) -> Result<Register> {
         let literal_idx = self.add_literal(value.clone());
         let dest = self.alloc_register()?;
         self.emit_instruction(Instruction::Load { dest, literal_idx }, span);

@@ -20,6 +20,72 @@ pub(super) enum InstructionOutcome {
 }
 
 impl RegoVM {
+    fn object_key_path(keys: &[Value]) -> alloc::string::String {
+        keys.iter()
+            .map(|key| {
+                use core::fmt::Write as _;
+                let mut text = alloc::string::String::new();
+                if write!(&mut text, "[{key}]").is_err() {
+                    text.clear();
+                    text.push_str("[<unprintable key>]");
+                }
+                text
+            })
+            .collect()
+    }
+
+    /// Insert `value` below `keys` in `root`, creating intermediate objects and,
+    /// for `multi_value`, the leaf set. An existing intermediate that is not an
+    /// object, an existing leaf that is not a set (`multi_value`), or an
+    /// existing different leaf value (single value) is a conflict; the error
+    /// carries the conflicting key path. `root` must be an object.
+    fn object_deep_set(
+        root: &mut Value,
+        keys: &[Value],
+        value: Value,
+        multi_value: bool,
+    ) -> core::result::Result<(), alloc::string::String> {
+        let conflict = |depth: usize| {
+            Self::object_key_path(keys.get(..depth.saturating_add(1)).unwrap_or(keys))
+        };
+        let Some((leaf_key, intermediate_keys)) = keys.split_last() else {
+            return Err(alloc::string::String::from("<empty key path>"));
+        };
+        let mut current = root;
+        for (depth, key) in intermediate_keys.iter().enumerate() {
+            let Ok(object) = current.as_object_mut() else {
+                return Err(conflict(depth.saturating_sub(1)));
+            };
+            current = object.get_or_insert_with(key.clone(), Value::new_object);
+            if !matches!(current, Value::Object(_)) {
+                return Err(conflict(depth));
+            }
+        }
+        let depth = intermediate_keys.len();
+        let Ok(object) = current.as_object_mut() else {
+            return Err(conflict(depth.saturating_sub(1)));
+        };
+        if multi_value {
+            let leaf = object.get_or_insert_with(leaf_key.clone(), Value::new_set);
+            match leaf.as_set_mut() {
+                Ok(set) => {
+                    set.insert(value);
+                    Ok(())
+                }
+                Err(_) => Err(conflict(depth)),
+            }
+        } else {
+            match object.get(leaf_key) {
+                Some(existing) if *existing != value => Err(conflict(depth)),
+                Some(_) => Ok(()),
+                None => {
+                    object.insert(leaf_key.clone(), value);
+                    Ok(())
+                }
+            }
+        }
+    }
+
     pub(super) fn execute_instruction(
         &mut self,
         program: &Program,
@@ -462,6 +528,94 @@ impl RegoVM {
                         value: offending,
                         pc: self.pc,
                     });
+                }
+                Ok(InstructionOutcome::Continue)
+            }
+            ObjectDeepSet { params_index } => {
+                let invalid_operand = |source| VmError::InvalidObjectDeepSetOperand {
+                    source: alloc::boxed::Box::new(source),
+                };
+                let params = program
+                    .instruction_data
+                    .get_object_deep_set_params(params_index)
+                    .ok_or(VmError::InvalidObjectDeepSetParams {
+                        index: params_index,
+                        pc: self.pc,
+                        available: program.instruction_data.object_deep_set_params.len(),
+                    })?;
+
+                let value_value = self
+                    .get_register(params.value)
+                    .map_err(invalid_operand)?
+                    .clone();
+                let mut key_values = Vec::with_capacity(params.keys.len());
+                for &key in &params.keys {
+                    key_values.push(self.get_register(key).map_err(invalid_operand)?.clone());
+                }
+                // Like the interpreter, an undefined key or value contributes nothing.
+                if value_value == Value::Undefined
+                    || key_values.iter().any(|key| *key == Value::Undefined)
+                {
+                    return Ok(InstructionOutcome::Continue);
+                }
+
+                let obj = params.obj;
+                let ownership_depth = self
+                    .call_rule_stack
+                    .last()
+                    .filter(|context| {
+                        context.rule_type == crate::rvm::program::RuleType::PartialObject
+                            && context.result_reg == obj
+                    })
+                    .map(|_| self.call_rule_stack.len());
+                if let Some(leaves) =
+                    ownership_depth.and_then(|depth| self.object_head_leaves.get(&depth))
+                {
+                    let ancestor = (1..key_values.len()).any(|length| {
+                        key_values
+                            .get(..length)
+                            .is_some_and(|prefix| leaves.contains(prefix))
+                    });
+                    let descendant =
+                        leaves
+                            .range(key_values.clone()..)
+                            .next()
+                            .is_some_and(|path| {
+                                path.len() > key_values.len() && path.starts_with(&key_values)
+                            });
+                    if ancestor || descendant {
+                        return Err(VmError::ObjectKeyConflict {
+                            path: Self::object_key_path(&key_values),
+                            pc: self.pc,
+                        });
+                    }
+                }
+                // Take ownership so Rc refcount stays at 1 and make_mut is a no-op.
+                let mut obj_value = self.take_register(obj).map_err(invalid_operand)?;
+                if !matches!(obj_value, Value::Object(_)) {
+                    let offending = obj_value.clone();
+                    self.set_register(obj, obj_value).map_err(invalid_operand)?;
+                    return Err(invalid_operand(VmError::RegisterNotObject {
+                        register: obj,
+                        value: offending,
+                        pc: self.pc,
+                    }));
+                }
+                let result = Self::object_deep_set(
+                    &mut obj_value,
+                    &key_values,
+                    value_value,
+                    params.multi_value,
+                );
+                self.set_register(obj, obj_value).map_err(invalid_operand)?;
+                if let Err(path) = result {
+                    return Err(VmError::ObjectKeyConflict { path, pc: self.pc });
+                }
+                if let Some(depth) = ownership_depth {
+                    self.object_head_leaves
+                        .entry(depth)
+                        .or_default()
+                        .insert(key_values);
                 }
                 Ok(InstructionOutcome::Continue)
             }

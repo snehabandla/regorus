@@ -17,6 +17,11 @@ use std::fs;
 use std::sync::Arc;
 use test_generator::test_resources;
 
+mod partial_object_head_differential;
+mod partial_object_persistence;
+mod partial_object_regressions;
+mod partial_object_review_interactions;
+
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 struct TestCase {
     pub data: Option<Value>,

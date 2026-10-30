@@ -151,6 +151,17 @@ mod tests {
         chained_index_params: Vec<ChainedIndexParamsSpec>,
         #[serde(default, alias = "comprehension_start_params")]
         comprehension_begin_params: Vec<ComprehensionBeginParamsSpec>,
+        #[serde(default)]
+        object_deep_set_params: Vec<ObjectDeepSetParamsSpec>,
+    }
+
+    #[derive(Debug, Clone, Deserialize, Serialize)]
+    struct ObjectDeepSetParamsSpec {
+        obj: u16,
+        keys: Vec<u16>,
+        value: u16,
+        #[serde(default)]
+        multi_value: bool,
     }
 
     #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -640,6 +651,25 @@ mod tests {
                 program
                     .instruction_data
                     .add_comprehension_begin_params(comprehension_params);
+            }
+
+            for spec in params_spec.object_deep_set_params {
+                use crate::rvm::instructions::ObjectDeepSetParams;
+
+                let params = ObjectDeepSetParams {
+                    obj: spec.obj.try_into().unwrap(),
+                    keys: spec
+                        .keys
+                        .into_iter()
+                        .map(|k| k.try_into().unwrap())
+                        .collect(),
+                    value: spec.value.try_into().unwrap(),
+                    multi_value: spec.multi_value,
+                };
+                program
+                    .instruction_data
+                    .add_object_deep_set_params(params)
+                    .unwrap();
             }
         }
 

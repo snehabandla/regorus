@@ -7,6 +7,7 @@ use alloc::vec::Vec;
 
 use super::super::metadata::ProgramMetadata;
 use super::super::types::{BuiltinInfo, RuleInfo, SourceFile, SpanInfo};
+use super::value::{BinaryValue, BinaryValueRef};
 use super::Program;
 use crate::rvm::instructions::InstructionData;
 use crate::rvm::Instruction;
@@ -16,6 +17,20 @@ use indexmap::IndexMap;
 impl Program {
     /// Serialize to JSON format with complete program information and proper field names
     pub fn serialize_json(&self) -> Result<String, String> {
+        self.validate_limits()?;
+        let typed_literals: Vec<Vec<u8>> = self
+            .literals
+            .iter()
+            .map(|value| {
+                postcard::to_allocvec(&BinaryValueRef(value))
+                    .map_err(|error| format!("Typed literal serialization failed: {error}"))
+            })
+            .collect::<Result<_, _>>()?;
+        let literals: Vec<serde_json::Value> = self
+            .literals
+            .iter()
+            .map(|value| serde_json::to_value(value).unwrap_or(serde_json::Value::Null))
+            .collect();
         let json_data = serde_json::json!({
             "metadata": {
                 "compiler_version": self.metadata.compiler_version,
@@ -44,9 +59,11 @@ impl Program {
                 "set_create_params": self.instruction_data.set_create_params,
                 "virtual_data_document_lookup_params": self.instruction_data.virtual_data_document_lookup_params,
                 "chained_index_params": self.instruction_data.chained_index_params,
-                "comprehension_begin_params": self.instruction_data.comprehension_begin_params
+                "comprehension_begin_params": self.instruction_data.comprehension_begin_params,
+                "object_deep_set_params": self.instruction_data.object_deep_set_params
             },
-            "literals": self.literals,
+            "literals": literals,
+            "typed_literals": typed_literals,
             "builtin_info_table": self.builtin_info_table,
             "entry_points": self.entry_points,
             "sources": self.sources,
@@ -158,10 +175,23 @@ impl Program {
             serde_json::from_value(instruction_data_json.clone())
                 .map_err(|e| format!("Failed to deserialize instruction_data: {}", e))?;
 
-        let literals: Vec<Value> = json_data
-            .get("literals")
-            .map(|v| serde_json::from_value(v.clone()).unwrap_or_default())
-            .unwrap_or_default();
+        let literals: Vec<Value> = if let Some(typed) = json_data.get("typed_literals") {
+            let encoded: Vec<Vec<u8>> = serde_json::from_value(typed.clone())
+                .map_err(|error| format!("Invalid typed literals: {error}"))?;
+            encoded
+                .iter()
+                .map(|bytes| {
+                    postcard::from_bytes::<BinaryValue>(bytes)
+                        .map(|value| value.0)
+                        .map_err(|error| format!("Invalid typed literal: {error}"))
+                })
+                .collect::<Result<_, _>>()?
+        } else {
+            json_data
+                .get("literals")
+                .map(|value| serde_json::from_value(value.clone()).unwrap_or_default())
+                .unwrap_or_default()
+        };
 
         let builtin_info_table: Vec<BuiltinInfo> = json_data
             .get("builtin_info_table")
@@ -220,6 +250,7 @@ impl Program {
             needs_recompilation,
             rego_v0,
         };
+        program.validate_limits()?;
 
         // Recompute has_host_await when it was not provided in the JSON input
         // or when the provided value is not a valid boolean.

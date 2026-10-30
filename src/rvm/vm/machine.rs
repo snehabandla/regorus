@@ -16,7 +16,7 @@ use crate::utils::limits::{
 use crate::value::ResumeJsonError;
 use crate::value::Value;
 use crate::CompiledPolicy;
-use alloc::collections::{btree_map::Entry, BTreeMap, VecDeque};
+use alloc::collections::{btree_map::Entry, BTreeMap, BTreeSet, VecDeque};
 use alloc::ffi::CString;
 #[cfg(all(feature = "allocator-memory-limits", not(miri)))]
 use alloc::format;
@@ -75,6 +75,7 @@ pub struct RegoVM {
 
     /// Call rule execution stack for managing nested rule calls
     pub(super) call_rule_stack: Vec<CallRuleContext>,
+    pub(super) object_head_leaves: BTreeMap<usize, BTreeSet<Vec<Value>>>,
 
     /// Register stack for isolated register spaces during rule calls
     pub(super) register_stack: Vec<Vec<Value>>,
@@ -248,6 +249,7 @@ impl RegoVM {
             context: Value::Undefined,
             loop_stack: Vec::new(),
             call_rule_stack: Vec::new(),
+            object_head_leaves: BTreeMap::new(),
             register_stack: Vec::new(),
             comprehension_stack: Vec::new(),
             base_register_count: 2, // Default to 2 registers for basic operations

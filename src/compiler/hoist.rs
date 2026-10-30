@@ -442,6 +442,16 @@ impl LoopHoister {
                     }
                 };
 
+                // Every bracket index in the head reference (e.g. `p[a].q[b]`) is a
+                // key that the compiler evaluates after the body, so each one needs
+                // loop-hoisting data, not just the last one.
+                let head_keys = match head {
+                    RuleHead::Compr { refr, .. } | RuleHead::Set { refr, .. } => {
+                        Self::head_bracket_indices(refr)
+                    }
+                    RuleHead::Func { .. } => Vec::new(),
+                };
+
                 // Process each rule body (definitions)
                 for body in bodies {
                     // Create a context with the output expressions (using Rule context type)
@@ -464,8 +474,7 @@ impl LoopHoister {
                         populated_body_context.clone(),
                     )?;
 
-                    // Process the key expression if present
-                    if let Some(ref key) = key_expr {
+                    for key in &head_keys {
                         self.populate_output_expr(module_idx, key, &populated_body_context)?;
                     }
 
@@ -494,7 +503,7 @@ impl LoopHoister {
                     body_context.current_scope_bound_vars =
                         context.current_scope_bound_vars.clone();
 
-                    if let Some(ref key) = key_expr {
+                    for key in &head_keys {
                         self.populate_output_expr(module_idx, key, &body_context)?;
                     }
 
@@ -852,6 +861,24 @@ impl LoopHoister {
             // Other expressions don't contribute unbound vars from parent scope
             _ => false,
         }
+    }
+
+    /// Collects the bracket indices of a rule head reference, outermost first.
+    fn head_bracket_indices(refr: &ExprRef) -> Vec<ExprRef> {
+        let mut indices = Vec::new();
+        let mut current = refr;
+        loop {
+            match current.as_ref() {
+                Expr::RefBrack { refr, index, .. } => {
+                    indices.push(index.clone());
+                    current = refr;
+                }
+                Expr::RefDot { refr, .. } => current = refr,
+                _ => break,
+            }
+        }
+        indices.reverse();
+        indices
     }
 
     /// Populate loop information for output expressions (rule values, comprehension terms)

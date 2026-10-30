@@ -11,6 +11,12 @@ use thiserror::Error;
 /// VM execution errors
 #[derive(Error, Debug, Clone, PartialEq)]
 pub enum VmError {
+    #[error("Invalid ObjectDeepSet operand: {source}")]
+    InvalidObjectDeepSetOperand {
+        #[source]
+        source: alloc::boxed::Box<VmError>,
+    },
+
     #[error("Execution stopped: exceeded maximum instruction limit of {limit} after {executed} instructions (pc={pc})")]
     InstructionLimitExceeded {
         limit: usize,
@@ -136,6 +142,13 @@ pub enum VmError {
         available: usize,
     },
 
+    #[error("Invalid object deep set params index: {index} (pc={pc}, available={available})")]
+    InvalidObjectDeepSetParams {
+        index: u16,
+        pc: usize,
+        available: usize,
+    },
+
     #[error("Invalid loop params index: {index} (pc={pc}, available={available})")]
     InvalidLoopParams {
         index: u16,
@@ -213,6 +226,9 @@ pub enum VmError {
 
     #[error("Assertion failed (pc={pc})")]
     AssertionFailed { pc: usize },
+
+    #[error("Partial object rule conflict: object keys must be unique, conflicting values at {path} (pc={pc})")]
+    ObjectKeyConflict { path: String, pc: usize },
 
     #[error("Rule-data conflict: {message} (pc={pc})")]
     RuleDataConflict { message: String, pc: usize },

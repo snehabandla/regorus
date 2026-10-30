@@ -68,6 +68,7 @@ comprehension contexts. Outside loops it aborts the current rule.
 | Mnemonic                   | Operands / Params             | Behaviour                                                   |
 | :------------------------- | :---------------------------- | :---------------------------------------------------------- |
 | `ObjectSet`                | `obj, key, value`             | Mutates object in `obj` with key/value from registers.      |
+| `ObjectDeepSet`            | `params_index=pN`             | Sets `obj[k1]...[kn]` (creating intermediate objects) to `value`, or adds `value` to the set there when `multi_value`. Undefined key/value ⇒ no-op; conflicting existing value ⇒ error. Used by nested partial object rule heads. |
 | `ObjectCreate`             | `params_index=pN`             | Builds object from literal template and register entries.   |
 | `ArrayNew`                 | `dest`                        | Creates empty array.                                        |
 | `ArrayPush`                | `arr, value`                  | Appends to array.                                           |

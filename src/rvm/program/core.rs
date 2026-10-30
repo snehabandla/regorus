@@ -91,7 +91,7 @@ pub struct Program {
 
 impl Program {
     /// Current serialization format version
-    pub const SERIALIZATION_VERSION: u32 = 6;
+    pub const SERIALIZATION_VERSION: u32 = 7;
     /// Magic bytes to identify Regorus program files
     pub const MAGIC: [u8; 4] = *b"REGO";
     /// Maximum instructions supported (matches u16 jump targets)
@@ -142,6 +142,9 @@ impl Program {
 
     /// Validate that the program stays within supported bounds
     pub fn validate_limits(&self) -> Result<(), String> {
+        if self.instruction_data.object_deep_set_params.len() > usize::from(u16::MAX) + 1 {
+            return Err("ObjectDeepSet parameter table exceeds the u16 index space".to_string());
+        }
         if self.instructions.len() > Self::MAX_INSTRUCTIONS {
             return Err(format!(
                 "Program exceeds max instructions ({} > {})",

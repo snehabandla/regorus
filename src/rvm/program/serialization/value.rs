@@ -41,7 +41,14 @@ impl<'a> Serialize for BinaryValueRef<'a> {
                 serializer.serialize_newtype_variant("BinaryValue", VARIANT_BOOL, "Bool", &b)
             }
             Value::Number(ref n) => {
-                if let Some(value) = n.as_i64() {
+                if let Number::Float(value) = n {
+                    serializer.serialize_newtype_variant(
+                        "BinaryValue",
+                        VARIANT_NUMBER_F64,
+                        "NumberF64",
+                        value,
+                    )
+                } else if let Some(value) = n.as_i64() {
                     serializer.serialize_newtype_variant(
                         "BinaryValue",
                         VARIANT_NUMBER_I64,

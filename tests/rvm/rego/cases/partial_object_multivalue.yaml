@@ -1,0 +1,460 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Carries the partial-object multivalue coverage from #835, with valid
+# duplicate contributions rather than duplicate keys in an object literal.
+cases:
+  - note: dynamic_object_parent_does_not_insert_child_default_empty
+    data: {}
+    input: {ks: []}
+    modules:
+      - |
+        package test
+        p[k] := 1 if { some k in input.ks }
+        default p.r := 0
+        main := p
+    query: data.test.main
+    allow_interpreter_incorrect_behavior: true
+    want_result: {}
+
+  - note: dynamic_object_parent_does_not_insert_child_default_nonempty
+    data: {}
+    input: {ks: [a]}
+    modules:
+      - |
+        package test
+        p[k] := 1 if { some k in input.ks }
+        default p.r := 0
+        main := p
+    query: data.test.main
+    allow_interpreter_incorrect_behavior: true
+    want_result: {a: 1}
+
+  - note: dynamic_object_parent_does_not_insert_child_default_empty_suspendable
+    data: {}
+    input: {ks: []}
+    execution_mode: suspendable
+    modules:
+      - |
+        package test
+        default p.r := 0
+      - |
+        package test
+        p[k] := 1 if { some k in input.ks }
+        main := p
+    query: data.test.main
+    allow_interpreter_incorrect_behavior: true
+    want_result: {}
+
+  - note: dynamic_object_parent_does_not_insert_child_default_nonempty_suspendable
+    data: {}
+    input: {ks: [a]}
+    execution_mode: suspendable
+    modules:
+      - |
+        package test
+        default p.r := 0
+      - |
+        package test
+        p[k] := 1 if { some k in input.ks }
+        main := p
+    query: data.test.main
+    allow_interpreter_incorrect_behavior: true
+    want_result: {a: 1}
+
+  - note: mixed_dynamic_static_set_empty
+    data: {}
+    input: {ks: [], vs: []}
+    modules:
+      - |
+        package test
+        p[k] contains 1 if { some k in input.ks }
+        p.a contains v if { some v in input.vs }
+        main := p
+    query: data.test.main
+    allow_interpreter_incorrect_behavior: true
+    want_result: {}
+
+  - note: mixed_dynamic_static_set_empty_suspendable
+    data: {}
+    input: {ks: [], vs: []}
+    execution_mode: suspendable
+    modules:
+      - |
+        package test
+        p.a contains v if { some v in input.vs }
+      - |
+        package test
+        p[k] contains 1 if { some k in input.ks }
+        main := p
+    query: data.test.main
+    allow_interpreter_incorrect_behavior: true
+    want_result: {}
+
+  - note: mixed_dynamic_static_set_nonempty
+    data: {}
+    input: {ks: [], vs: [2]}
+    modules:
+      - |
+        package test
+        p[k] contains 1 if { some k in input.ks }
+        p.a contains v if { some v in input.vs }
+        main := p
+    query: data.test.main
+    want_result: {a: {set!: [2]}}
+
+  - note: mixed_dynamic_static_set_nonempty_suspendable
+    data: {}
+    input: {ks: [], vs: [2]}
+    execution_mode: suspendable
+    modules:
+      - |
+        package test
+        p.a contains v if { some v in input.vs }
+      - |
+        package test
+        p[k] contains 1 if { some k in input.ks }
+        main := p
+    query: data.test.main
+    want_result: {a: {set!: [2]}}
+
+  - note: mixed_dynamic_static_prefix_empty
+    data: {}
+    input: {ks: []}
+    modules:
+      - |
+        package test
+        p[k] contains 1 if { some k in input.ks }
+        p.q[k] contains 2 if { some k in input.ks }
+        main := p
+    query: data.test.main
+    allow_interpreter_incorrect_behavior: true
+    want_result: {}
+
+  - note: mixed_dynamic_static_prefix_empty_suspendable
+    data: {}
+    input: {ks: []}
+    execution_mode: suspendable
+    modules:
+      - |
+        package test
+        p[k] contains 1 if { some k in input.ks }
+      - |
+        package test
+        p.q[k] contains 2 if { some k in input.ks }
+        main := p
+    query: data.test.main
+    allow_interpreter_incorrect_behavior: true
+    want_result: {}
+
+  - note: mixed_dynamic_static_prefix_nonempty
+    data: {}
+    input: {ks: [a]}
+    modules:
+      - |
+        package test
+        p[k] contains 1 if { some k in input.ks }
+        p.q[k] contains 2 if { some k in input.ks }
+        main := p
+    query: data.test.main
+    want_result: {a: {set!: [1]}, q: {a: {set!: [2]}}}
+
+  - note: mixed_dynamic_static_prefix_nonempty_suspendable
+    data: {}
+    input: {ks: [a]}
+    execution_mode: suspendable
+    modules:
+      - |
+        package test
+        p.q[k] contains 2 if { some k in input.ks }
+      - |
+        package test
+        p[k] contains 1 if { some k in input.ks }
+        main := p
+    query: data.test.main
+    want_result: {a: {set!: [1]}, q: {a: {set!: [2]}}}
+
+  - note: simple_multivalue_partial_object
+    data: {}
+    modules:
+      - |
+        package test
+        servers := {"s1": ["p1", "p2"], "s2": ["p3"]}
+        ports[server] contains port if {
+          some server, port_list in servers
+          some port in port_list
+        }
+    query: data.test.ports
+    want_result:
+      s1: {set!: [p1, p2]}
+      s2: {set!: [p3]}
+
+  - note: multivalue_partial_object_with_input
+    data: {}
+    input:
+      hosts:
+        web1: {ports: [80, 443]}
+        web2: {ports: [80, 8080]}
+        db1: {ports: [5432]}
+    modules:
+      - |
+        package test
+        host_ports[host] contains port if {
+          some host, info in input.hosts
+          some port in info.ports
+        }
+    query: data.test.host_ports
+    want_result:
+      web1: {set!: [80, 443]}
+      web2: {set!: [80, 8080]}
+      db1: {set!: [5432]}
+
+  - note: multivalue_partial_object_single_element_sets
+    data: {}
+    modules:
+      - |
+        package test
+        groups := {"a": ["x"], "b": ["y"]}
+        items[g] contains v if {
+          some g, vals in groups
+          some v in vals
+        }
+    query: data.test.items
+    want_result:
+      a: {set!: [x]}
+      b: {set!: [y]}
+
+  - note: multivalue_partial_object_with_filter_and_nonmatching_group
+    data: {}
+    modules:
+      - |
+        package test
+        data_map := {"alice": [1, 2, 3, 4], "bob": [2, 4, 6], "odd": [1, 3]}
+        even_values[name] contains v if {
+          some name, values in data_map
+          some v in values
+          v % 2 == 0
+        }
+    query: data.test.even_values
+    want_result:
+      alice: {set!: [2, 4]}
+      bob: {set!: [2, 4, 6]}
+
+  - note: multivalue_partial_object_overlapping_values
+    data: {}
+    modules:
+      - |
+        package test
+        tags[category] contains tag if {
+          some category, values in {"colors": ["red", "blue", "blue"]}
+          some tag in values
+        }
+        tags[category] contains tag if {
+          some category, values in {"colors": ["blue", "green"], "sizes": ["small", "large"]}
+          some tag in values
+        }
+    query: data.test.tags
+    want_result:
+      colors: {set!: [red, blue, green]}
+      sizes: {set!: [small, large]}
+
+  - note: regular_partial_object_still_works
+    data: {}
+    modules:
+      - |
+        package test
+        info[name] := n if {
+          some name, n in {"a": 1, "b": 2, "c": 3}
+        }
+    query: data.test.info
+    want_result: {a: 1, b: 2, c: 3}
+
+  - note: simple_partial_set_still_works
+    data: {}
+    modules:
+      - |
+        package test
+        items contains x if { some x in [1, 2, 3] }
+    query: data.test.items
+    want_result: {set!: [1, 2, 3]}
+
+  - note: nested_partial_object_dot_prefix_preserved
+    data: {}
+    input: {keys: [a, b]}
+    modules:
+      - |
+        package test
+        p.q[k] contains 1 if { some k in input.keys }
+        main := p
+    query: data.test.main
+    want_result: {q: {a: {set!: [1]}, b: {set!: [1]}}}
+
+  - note: nested_partial_object_static_and_dynamic_keys_merge_across_modules
+    data: {}
+    input: {keys: [a, x]}
+    modules:
+      - |
+        package test
+        p[k] contains 1 if { some k in input.keys }
+        p["a"] contains 2
+      - |
+        package test
+        p.x contains 3
+        main := [p, p.a, p.x, p.missing]
+    query: data.test.main
+    # Undefined array members make the complete rule undefined.
+    want_result: "#undefined"
+
+  - note: nested_partial_object_static_and_dynamic_child_projection
+    data: {}
+    input: {keys: [a, x]}
+    modules:
+      - |
+        package test
+        p[k] contains 1 if { some k in input.keys }
+        p["a"] contains 2
+      - |
+        package test
+        p.x contains 3
+        main := [p, p.a, p.x]
+    query: data.test.main
+    allow_interpreter_incorrect_behavior: true
+    want_result:
+      - {a: {set!: [1, 2]}, x: {set!: [1, 3]}}
+      - {set!: [1, 2]}
+      - {set!: [1, 3]}
+
+  - note: nested_partial_object_raw_string_and_bodyless_head_loop
+    data: {}
+    input: {keys: [a, b, a]}
+    modules:
+      - |
+        package test
+        p[input.keys[_]] contains 1
+        p[`b`] contains 2
+        main := p
+    query: data.test.main
+    skip_interpreter: true
+    want_result: {a: {set!: [1]}, b: {set!: [1, 2]}}
+
+  - note: nested_partial_object_numeric_key
+    data: {}
+    modules:
+      - |
+        package test
+        p[1] contains 2
+        main := p
+    query: data.test.main
+    want_result: {1: {set!: [2]}}
+
+  - note: nested_partial_object_sibling_defaults_merge_with_static_members
+    data: {}
+    input: {enabled: true}
+    modules:
+      - |
+        package test
+        default p.r := 0
+        default p.s := 1
+        p.r := 2 if { input.enabled }
+        p.a contains 3 if { input.enabled }
+        main := p
+    query: data.test.main
+    want_result: {a: {set!: [3]}, r: 2, s: 1}
+
+  - note: nested_partial_object_defaults_without_matching_body
+    data: {}
+    input: {enabled: false}
+    modules:
+      - |
+        package test
+        default p.r := 0
+        default p.s := 1
+        p.r := 2 if { input.enabled }
+        p.a contains 3 if { input.enabled }
+        main := p
+    query: data.test.main
+    allow_interpreter_incorrect_behavior: true
+    want_result: {a: {set!: []}, r: 0, s: 1}
+
+  - note: nested_partial_object_empty_bodyless_head_loop
+    data: {}
+    input: {keys: []}
+    modules:
+      - |
+        package test
+        p[input.keys[_]] contains 1
+        p[`b`] contains 2
+        main := p
+    query: data.test.main
+    skip_interpreter: true
+    want_result: {b: {set!: [2]}}
+
+  - note: nested_partial_object_empty_dot_prefix
+    data: {}
+    input: {keys: []}
+    modules:
+      - |
+        package test
+        p.q[k] contains 1 if { some k in input.keys }
+        main := p
+    query: data.test.main
+    allow_interpreter_incorrect_behavior: true
+    want_result: {q: {}}
+
+  - note: nested_partial_object_static_set_survives_false_guard
+    data: {}
+    modules:
+      - |
+        package test
+        p.a contains 1 if { false }
+        p["b"] contains 2 if { false }
+        main := p
+    query: data.test.main
+    allow_interpreter_incorrect_behavior: true
+    want_result: {a: {set!: []}, b: {set!: []}}
+
+  - note: nested_partial_object_with_remains_explicitly_unsupported
+    data: {}
+    modules:
+      - |
+        package test
+        p[k] contains 1 if { some k in input.keys }
+        main := x if { x := p with input.keys as ["a"] }
+    query: data.test.main
+    want_error: "the `with` keyword is not supported by the compiler yet"
+    allow_interpreter_success: true
+
+  - note: nested_partial_object_conflicting_set_and_scalar_leaf
+    data: {}
+    modules:
+      - |
+        package test
+        p[k] contains 1 if { k := "a" }
+        p["a"] := 2
+        main := p
+    query: data.test.main
+    want_error: "conflicting values"
+    allow_interpreter_success: true
+
+  - note: nested_partial_object_disjoint_set_and_scalar_leaf
+    data: {}
+    modules:
+      - |
+        package test
+        p[k] contains 1 if { k := "a" }
+        p["b"] := 2
+        main := p
+    query: data.test.main
+    want_result: {a: {set!: [1]}, b: 2}
+
+  - note: nested_partial_object_mixed_set_object_types_rejected
+    data: {}
+    modules:
+      - |
+        package test
+        p.q[k] contains 1 if { k := "a" }
+        p contains 2
+        main := p.q
+    query: data.test.main
+    want_error: "conflicting rules"
+    allow_interpreter_success: true

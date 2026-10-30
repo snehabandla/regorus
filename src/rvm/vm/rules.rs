@@ -17,8 +17,24 @@ use super::execution_model::{
 use super::machine::RegoVM;
 
 impl RegoVM {
-    /// Returns true if the error represents a resource-limit violation that
-    /// must never be silently absorbed by rule evaluation.
+    fn empty_rule_result(&self, rule_info: &RuleInfo) -> Value {
+        let default = rule_info
+            .default_literal_index
+            .and_then(|index| self.program.literals.get(usize::from(index)));
+        if rule_info.rule_type == RuleType::PartialObject {
+            let mut result = Value::new_object();
+            if let Some(default) = default {
+                Self::merge_partial_object_defaults(&mut result, default);
+            }
+            result
+        } else {
+            default.cloned().unwrap_or(Value::Undefined)
+        }
+    }
+
+    /// Returns true if the error represents a resource-limit violation or a
+    /// partial object key conflict that must never be silently absorbed by
+    /// rule evaluation.
     pub(super) const fn is_fatal_vm_error(err: &VmError) -> bool {
         matches!(
             err,
@@ -28,7 +44,51 @@ impl RegoVM {
                 | VmError::RegexSizeLimitExceeded { .. }
                 | VmError::InstructionLimitExceeded { .. }
                 | VmError::NumericOverflow { .. }
+                | VmError::ObjectKeyConflict { .. }
+                | VmError::InvalidObjectDeepSetParams { .. }
+                | VmError::InvalidObjectDeepSetOperand { .. }
         )
+    }
+
+    /// Defaults are encoded as (path, value) entries so a produced leaf
+    /// replaces an object-valued default instead of deep-merging with it.
+    fn merge_partial_object_defaults(result: &mut Value, defaults: &Value) {
+        let Value::Array(entries) = defaults else {
+            return;
+        };
+        for entry in entries.iter() {
+            let Value::Array(entry) = entry else { continue };
+            let [Value::Array(path), value] = entry.as_slice() else {
+                continue;
+            };
+            let Some((leaf, ancestors)) = path.as_slice().split_last() else {
+                continue;
+            };
+            let current = ancestors.iter().try_fold(&mut *result, |current, key| {
+                Some(
+                    current
+                        .as_object_mut()
+                        .ok()?
+                        .get_or_insert_with(key.clone(), Value::new_object),
+                )
+            });
+            if let Some(current) = current {
+                if let Ok(object) = current.as_object_mut() {
+                    if !object.contains_key(leaf) {
+                        object.insert(leaf.clone(), value.clone());
+                    }
+                }
+            }
+        }
+    }
+
+    fn partial_object_defaults(&self, rule_info: &RuleInfo) -> Option<Value> {
+        if !matches!(rule_info.rule_type, RuleType::PartialObject) {
+            return None;
+        }
+        rule_info
+            .default_literal_index
+            .and_then(|idx| self.program.literals.get(usize::from(idx)).cloned())
     }
 
     /// Restore VM state that was swapped out for rule execution.
@@ -257,10 +317,7 @@ impl RegoVM {
             // No compiled definitions — check for a default value before returning Undefined.
             // Default-only rules (e.g., `default deny := true`) have no body definitions
             // but their default value was evaluated at compile time and stored as a literal.
-            let result = rule_info
-                .default_literal_index
-                .and_then(|idx| self.program.literals.get(usize::from(idx)).cloned())
-                .unwrap_or(Value::Undefined);
+            let result = self.empty_rule_result(&rule_info);
             if !is_function_rule {
                 let available = self.rule_cache.len();
                 let entry =
@@ -292,6 +349,7 @@ impl RegoVM {
 
         self.set_register(dest, Value::Undefined)?;
 
+        self.object_head_leaves.remove(&self.call_rule_stack.len());
         let call_context = self
             .call_rule_stack
             .pop()
@@ -345,6 +403,14 @@ impl RegoVM {
                         }
                     }
                 }
+            }
+        }
+
+        if !rule_failed_due_to_inconsistency {
+            if let Some(defaults) = self.partial_object_defaults(&rule_info) {
+                let mut value = self.take_register(dest)?;
+                Self::merge_partial_object_defaults(&mut value, &defaults);
+                self.set_register(dest, value)?;
             }
         }
 
@@ -419,10 +485,7 @@ impl RegoVM {
 
         if rule_info.definitions.is_empty() {
             // No compiled definitions — check for a default value before returning Undefined.
-            let result = rule_info
-                .default_literal_index
-                .and_then(|idx| self.program.literals.get(usize::from(idx)).cloned())
-                .unwrap_or(Value::Undefined);
+            let result = self.empty_rule_result(&rule_info);
             if !is_function_rule {
                 let available = self.rule_cache.len();
                 let entry =
@@ -837,6 +900,14 @@ impl RegoVM {
             }
         }
 
+        if !rule_failed_due_to_inconsistency {
+            if let Some(defaults) = self.partial_object_defaults(&rule_info) {
+                if let Some(slot) = parent_registers.get_mut(dest_idx) {
+                    Self::merge_partial_object_defaults(slot, &defaults);
+                }
+            }
+        }
+
         let register_count = parent_registers.len();
         let final_value =
             parent_registers
@@ -866,6 +937,7 @@ impl RegoVM {
         // Underflow here means malformed/poisoned program state; surface as a
         // typed error rather than a debug-only panic so the public load_program
         // contract holds the same in debug and release.
+        self.object_head_leaves.remove(&self.call_rule_stack.len());
         if self.call_rule_stack.pop().is_none() {
             return Err(VmError::CallRuleStackUnderflow { pc: self.pc });
         }

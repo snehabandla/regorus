@@ -162,7 +162,7 @@ cases:
       BAZ: 3
       FOO: 1
 
-  - note: partial_object_constant_key_unsupported_in_rvm
+  - note: partial_object_constant_key
     data: {}
     input:
       enabled: true
@@ -174,10 +174,9 @@ cases:
           input.enabled
         }
     query: data.test.p.fixed
-    want_error: "partial object rules with constant keys are not yet supported by the RVM compiler"
-    allow_interpreter_success: true
+    want_result: true
 
-  - note: partial_object_constant_key_explicit_value_unsupported_in_rvm
+  - note: partial_object_constant_key_explicit_value
     data: {}
     input:
       enabled: true
@@ -189,8 +188,7 @@ cases:
           input.enabled
         }
     query: data.test.p.fixed
-    want_error: "partial object rules with constant keys are not yet supported by the RVM compiler"
-    allow_interpreter_success: true
+    want_result: 7
 
   - note: partial_object_multiple_bodies_collects_all_bindings
     data: {}
@@ -335,7 +333,7 @@ cases:
     want_result:
       set!: ["BAR", "BAZ", "FOO"]
 
-  - note: partial_object_multilevel_key_unsupported_in_rvm
+  - note: partial_object_multilevel_key
     data: {}
     input:
       nested:
@@ -355,10 +353,11 @@ cases:
 
         main := p
     query: data.test.main
-    want_error: "partial object rules with nested bracket keys are not yet supported by the RVM compiler"
-    allow_interpreter_success: true
+    want_result:
+      app: {read: true, write: true}
+      ops: {deploy: true}
 
-  - note: partial_object_multilevel_key_explicit_value_unsupported_in_rvm
+  - note: partial_object_multilevel_key_explicit_value
     data: {}
     input:
       nested:
@@ -378,10 +377,11 @@ cases:
 
         main := p
     query: data.test.main
-    want_error: "partial object rules with nested bracket keys are not yet supported by the RVM compiler"
-    allow_interpreter_success: true
+    want_result:
+      app: {read: 1, write: 2}
+      ops: {deploy: 3}
 
-  - note: partial_object_hidden_dynamic_prefix_unsupported_in_rvm
+  - note: partial_object_hidden_dynamic_prefix
     data: {}
     input:
       nested:
@@ -403,8 +403,9 @@ cases:
 
         main := p
     query: data.test.main
-    want_error: "partial object rules with nested bracket keys are not yet supported by the RVM compiler"
-    allow_interpreter_success: true
+    want_result:
+      app: {q: {read: true, write: true}}
+      ops: {q: {deploy: true}}
 
   - note: partial_object_array_iteration_collects_all_bindings
     data: {}
@@ -572,7 +573,7 @@ cases:
           true
         }
     query: data.test.p
-    want_error: "has multiple types"
+    want_error: "conflicting rules"
 
   - note: partial_object_complete_rule_conflicts_with_partial_object
     data: {}
@@ -589,7 +590,7 @@ cases:
           some k, v in input.items
         }
     query: data.test.p
-    want_error: "multiple types"
+    want_error: "conflicting rules"
 
   - note: partial_object_partial_set_conflicts_with_partial_object
     data: {}
@@ -608,7 +609,7 @@ cases:
           some k, _ in input.items
         }
     query: data.test.p
-    want_error: "multiple types"
+    want_error: "conflicting rules"
 
   - note: partial_object_large_range_counts_all_entries
     data: {}
@@ -830,7 +831,7 @@ cases:
       b:
         nested: 2
 
-  - note: partial_object_dynamic_prefix_static_suffix_unsupported_in_rvm
+  - note: partial_object_dynamic_prefix_static_suffix
     data: {}
     input:
       items:
@@ -846,10 +847,9 @@ cases:
 
         main := p
     query: data.test.main
-    want_error: "partial object rules with nested bracket keys are not yet supported by the RVM compiler"
-    allow_interpreter_success: true
+    want_result: {a: {fixed: A}, b: {fixed: B}}
 
-  - note: partial_object_literal_prefix_nested_unsupported_in_rvm
+  - note: partial_object_literal_prefix_nested
     data: {}
     input:
       items:
@@ -865,10 +865,9 @@ cases:
 
         main := p
     query: data.test.main
-    want_error: "partial object rules with nested bracket keys are not yet supported by the RVM compiler"
-    allow_interpreter_success: true
+    want_result: {1: {a: 1, b: 2}}
 
-  - note: partial_object_three_level_nested_dynamic_unsupported_in_rvm
+  - note: partial_object_three_level_nested_dynamic
     data: {}
     input:
       nested:
@@ -888,8 +887,7 @@ cases:
 
         main := p
     query: data.test.main
-    want_error: "partial object rules with nested bracket keys are not yet supported by the RVM compiler"
-    allow_interpreter_success: true
+    want_result: {root: {app: {read: 1, write: 2}, ops: {deploy: 3}}}
 
   - note: partial_object_with_body_unsupported_in_rvm
     data: {}
