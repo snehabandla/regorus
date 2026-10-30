@@ -709,7 +709,10 @@ fn binary_v7_round_trips_object_deep_set() {
     let mut vm = RegoVM::new();
     vm.load_program(restored);
     let result = vm.execute().unwrap();
-    assert!(result["a"]["x"].as_set().unwrap().contains(&Value::from(1u64)));
+    assert!(result["a"]["x"]
+        .as_set()
+        .unwrap()
+        .contains(&Value::from(1u64)));
     assert_eq!(
         serde_json::to_string(&result).unwrap(),
         r#"{"a":{"x":[1]},"b":{"x":[2]}}"#

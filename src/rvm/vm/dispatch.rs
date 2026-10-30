@@ -55,6 +55,20 @@ impl RegoVM {
             use core::fmt::Write as _;
             let mut text = Bounded(alloc::string::String::new());
             path.push('[');
+            // Clip long strings first: `Value`'s Display renders the whole
+            // value before the bounded writer can cut it.
+            let clipped;
+            let key = match key {
+                Value::String(string) if string.len() > MAX_KEY_TEXT => {
+                    let mut end = MAX_KEY_TEXT;
+                    while !string.is_char_boundary(end) {
+                        end = end.saturating_sub(1);
+                    }
+                    clipped = Value::from(string.get(..end).unwrap_or_default());
+                    &clipped
+                }
+                _ => key,
+            };
             if write!(&mut text, "{key}").is_ok() {
                 path.push_str(&text.0);
             } else if text.0.is_empty() {
@@ -709,7 +723,7 @@ impl RegoVM {
                 };
                 let mut leaf_state = None;
                 if let Some(leaves) =
-                    ownership_depth.and_then(|depth| self.object_head_leaves.get(&depth))
+                    ownership_depth.and_then(|depth| self.object_head_leaves.get_mut(&depth))
                 {
                     let ancestor = (1..key_values.len()).any(|length| {
                         key_values
@@ -726,7 +740,9 @@ impl RegoVM {
                     if ancestor || descendant {
                         return Err(conflict(self.pc));
                     }
-                    leaf_state = leaves.get(&key_values).cloned();
+                    // Moved out (and reinserted below) so that the leaf's
+                    // multi-value set is not shared and grows in place.
+                    leaf_state = leaves.remove(&key_values);
                 }
                 // Take ownership so Rc refcount stays at 1 and make_mut is a no-op.
                 let mut obj_value = self.take_register(obj).map_err(invalid_operand)?;
