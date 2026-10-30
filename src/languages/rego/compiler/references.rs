@@ -349,6 +349,27 @@ impl<'a> Compiler<'a> {
             return self.compile_chain_access(import_reg, &chain.components, span);
         }
 
+        // A namespace registered only through functions or variable head keys
+        // (`lib.f(x) := x` read as `lib`) is a document under `data`.
+        if let Some(components) = self
+            .policy
+            .inner
+            .rule_path_components
+            .get(&current_pkg_prefix)
+            .cloned()
+        {
+            let data_chain = ReferenceChain {
+                root: ReferenceRoot::Variable("data".to_string()),
+                components: components
+                    .into_iter()
+                    .skip(1)
+                    .map(AccessComponent::Field)
+                    .chain(chain.components.iter().cloned())
+                    .collect(),
+            };
+            return self.compile_data_chain(&data_chain, span);
+        }
+
         // No rule or import found - undefined variable
         Err(CompilerError::UndefinedVariable {
             name: root.to_string(),

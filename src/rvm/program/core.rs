@@ -145,6 +145,14 @@ impl Program {
         if self.instruction_data.object_deep_set_params.len() > usize::from(u16::MAX) + 1 {
             return Err("ObjectDeepSet parameter table exceeds the u16 index space".to_string());
         }
+        if self
+            .instruction_data
+            .object_deep_set_params
+            .iter()
+            .any(|params| params.keys.is_empty())
+        {
+            return Err("ObjectDeepSet parameters must have at least one key".to_string());
+        }
         if self.instructions.len() > Self::MAX_INSTRUCTIONS {
             return Err(format!(
                 "Program exceeds max instructions ({} > {})",

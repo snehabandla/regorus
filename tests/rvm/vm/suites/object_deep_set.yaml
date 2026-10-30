@@ -123,7 +123,7 @@ cases:
       - "Load { dest: 0, literal_idx: 0 }"
       - "Load { dest: 1, literal_idx: 1 }"
       - "ObjectDeepSet { params_index: 0 }"
-    want_error: "<empty key path>"
+    want_error: "ObjectDeepSet parameters must have at least one key"
 
   - note: object_deep_set_non_object_root
     literals: [1, a, 2]

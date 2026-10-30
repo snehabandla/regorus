@@ -153,7 +153,12 @@ impl<'a> Compiler<'a> {
             if let Some(context) = self.context_stack.last_mut() {
                 context.key_value_loops_hoisted = true;
             }
-            self.compile_hoisted_loops(&[], &key_value_loops)
+            let result = self.compile_hoisted_loops(&[], &key_value_loops);
+            // Later bodies of the same definition (e.g. `else`) must hoist again.
+            if let Some(context) = self.context_stack.last_mut() {
+                context.key_value_loops_hoisted = false;
+            }
+            result
         } else {
             self.emit_context_yield()
         }

@@ -11,11 +11,10 @@ use thiserror::Error;
 /// VM execution errors
 #[derive(Error, Debug, Clone, PartialEq)]
 pub enum VmError {
-    #[error("Invalid ObjectDeepSet operand: {source}")]
-    InvalidObjectDeepSetOperand {
-        #[source]
-        source: alloc::boxed::Box<VmError>,
-    },
+    // Not a `source` field: the message already includes the operand error,
+    // and reporting it as a source too would print it twice in error chains.
+    #[error("Invalid ObjectDeepSet operand: {error}")]
+    InvalidObjectDeepSetOperand { error: alloc::boxed::Box<VmError> },
 
     #[error("Execution stopped: exceeded maximum instruction limit of {limit} after {executed} instructions (pc={pc})")]
     InstructionLimitExceeded {

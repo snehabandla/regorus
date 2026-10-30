@@ -10,7 +10,14 @@ use core::mem;
 use super::errors::{Result, VmError};
 use super::execution_model::{ExecutionMode, SuspendReason};
 use super::loops::LoopParams;
-use super::machine::RegoVM;
+use super::machine::{ObjectHeadLeaf, RegoVM};
+
+enum LeafSetError {
+    /// The contribution conflicts with the leaf's earlier contributions.
+    Conflict,
+    /// `object_deep_set` failed with the rendered conflicting key path.
+    Path(alloc::string::String),
+}
 
 pub(super) enum InstructionOutcome {
     Continue,
@@ -20,18 +27,45 @@ pub(super) enum InstructionOutcome {
 }
 
 impl RegoVM {
+    /// Render a conflicting key path for an error message. Each key is cut
+    /// after `MAX_KEY_TEXT` bytes so large keys do not bloat the error.
     fn object_key_path(keys: &[Value]) -> alloc::string::String {
-        keys.iter()
-            .map(|key| {
-                use core::fmt::Write as _;
-                let mut text = alloc::string::String::new();
-                if write!(&mut text, "[{key}]").is_err() {
-                    text.clear();
-                    text.push_str("[<unprintable key>]");
+        const MAX_KEY_TEXT: usize = 256;
+
+        struct Bounded(alloc::string::String);
+
+        impl core::fmt::Write for Bounded {
+            fn write_str(&mut self, text: &str) -> core::fmt::Result {
+                let room = MAX_KEY_TEXT.saturating_sub(self.0.len());
+                if text.len() <= room {
+                    self.0.push_str(text);
+                    return Ok(());
                 }
-                text
-            })
-            .collect()
+                let mut end = room;
+                while !text.is_char_boundary(end) {
+                    end = end.saturating_sub(1);
+                }
+                self.0.push_str(text.get(..end).unwrap_or_default());
+                Err(core::fmt::Error)
+            }
+        }
+
+        let mut path = alloc::string::String::new();
+        for key in keys {
+            use core::fmt::Write as _;
+            let mut text = Bounded(alloc::string::String::new());
+            path.push('[');
+            if write!(&mut text, "{key}").is_ok() {
+                path.push_str(&text.0);
+            } else if text.0.is_empty() {
+                path.push_str("<unprintable key>");
+            } else {
+                path.push_str(&text.0);
+                path.push_str("...");
+            }
+            path.push(']');
+        }
+        path
     }
 
     /// Insert `value` below `keys` in `root`, creating intermediate objects and,
@@ -82,6 +116,106 @@ impl RegoVM {
                     object.insert(leaf_key.clone(), value);
                     Ok(())
                 }
+            }
+        }
+    }
+
+    fn object_leaf_mut<'a>(root: &'a mut Value, keys: &[Value]) -> Option<&'a mut Value> {
+        keys.iter()
+            .try_fold(root, |value, key| value.as_object_mut().ok()?.get_mut(key))
+    }
+
+    /// Fail if a single-value leaf differs from the complete set written by
+    /// the multi-value definitions of the same leaf.
+    pub(super) fn check_object_head_leaves(
+        leaves: Option<&alloc::collections::BTreeMap<Vec<Value>, ObjectHeadLeaf>>,
+        pc: usize,
+    ) -> Result<()> {
+        for (path, leaf) in leaves.into_iter().flatten() {
+            if let ObjectHeadLeaf::Both { single, multi } = leaf {
+                if single != multi {
+                    return Err(VmError::ObjectKeyConflict {
+                        path: Self::object_key_path(path),
+                        pc,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Write one contribution of a partial object rule definition and return
+    /// the leaf's new ownership state. OPA accepts a single-value leaf and
+    /// multi-value contributions to the same leaf only if the single value
+    /// equals the complete set (checked when the rule finishes).
+    fn object_head_leaf_set(
+        root: &mut Value,
+        keys: &[Value],
+        value: Value,
+        multi_value: bool,
+        state: Option<ObjectHeadLeaf>,
+    ) -> core::result::Result<ObjectHeadLeaf, LeafSetError> {
+        let set_contains =
+            |set: &Value, element: &Value| set.as_set().is_ok_and(|set| set.contains(element));
+        match (state, multi_value) {
+            (None, _) => {
+                Self::object_deep_set(root, keys, value.clone(), multi_value)
+                    .map_err(LeafSetError::Path)?;
+                Ok(if multi_value {
+                    ObjectHeadLeaf::Multi
+                } else {
+                    ObjectHeadLeaf::Single(value)
+                })
+            }
+            (Some(ObjectHeadLeaf::Multi), true) => {
+                Self::object_deep_set(root, keys, value, true).map_err(LeafSetError::Path)?;
+                Ok(ObjectHeadLeaf::Multi)
+            }
+            (Some(ObjectHeadLeaf::Multi), false) => {
+                let leaf = Self::object_leaf_mut(root, keys).ok_or(LeafSetError::Conflict)?;
+                let multi = leaf.clone();
+                let is_subset = match (multi.as_set(), value.as_set()) {
+                    (Ok(multi), Ok(single)) => multi.is_subset(single),
+                    _ => false,
+                };
+                if !is_subset {
+                    return Err(LeafSetError::Conflict);
+                }
+                *leaf = value.clone();
+                Ok(ObjectHeadLeaf::Both {
+                    single: value,
+                    multi,
+                })
+            }
+            (Some(ObjectHeadLeaf::Single(single)), false) if single == value => {
+                Ok(ObjectHeadLeaf::Single(single))
+            }
+            (Some(ObjectHeadLeaf::Both { single, multi }), false) if single == value => {
+                Ok(ObjectHeadLeaf::Both { single, multi })
+            }
+            (Some(ObjectHeadLeaf::Single(_) | ObjectHeadLeaf::Both { .. }), false) => {
+                Err(LeafSetError::Conflict)
+            }
+            (Some(ObjectHeadLeaf::Single(single)), true) => {
+                if !set_contains(&single, &value) {
+                    return Err(LeafSetError::Conflict);
+                }
+                let mut multi = Value::new_set();
+                multi
+                    .as_set_mut()
+                    .map_err(|_| LeafSetError::Conflict)?
+                    .insert(value);
+                Ok(ObjectHeadLeaf::Both { single, multi })
+            }
+            (Some(ObjectHeadLeaf::Both { single, mut multi }), true) => {
+                if !set_contains(&single, &value) {
+                    return Err(LeafSetError::Conflict);
+                }
+                multi
+                    .as_set_mut()
+                    .map_err(|_| LeafSetError::Conflict)?
+                    .insert(value);
+                Ok(ObjectHeadLeaf::Both { single, multi })
             }
         }
     }
@@ -532,12 +666,13 @@ impl RegoVM {
                 Ok(InstructionOutcome::Continue)
             }
             ObjectDeepSet { params_index } => {
-                let invalid_operand = |source| VmError::InvalidObjectDeepSetOperand {
-                    source: alloc::boxed::Box::new(source),
+                let invalid_operand = |error| VmError::InvalidObjectDeepSetOperand {
+                    error: alloc::boxed::Box::new(error),
                 };
                 let params = program
                     .instruction_data
                     .get_object_deep_set_params(params_index)
+                    .filter(|params| !params.keys.is_empty())
                     .ok_or(VmError::InvalidObjectDeepSetParams {
                         index: params_index,
                         pc: self.pc,
@@ -568,27 +703,30 @@ impl RegoVM {
                             && context.result_reg == obj
                     })
                     .map(|_| self.call_rule_stack.len());
+                let conflict = |pc| VmError::ObjectKeyConflict {
+                    path: Self::object_key_path(&key_values),
+                    pc,
+                };
+                let mut leaf_state = None;
                 if let Some(leaves) =
                     ownership_depth.and_then(|depth| self.object_head_leaves.get(&depth))
                 {
                     let ancestor = (1..key_values.len()).any(|length| {
                         key_values
                             .get(..length)
-                            .is_some_and(|prefix| leaves.contains(prefix))
+                            .is_some_and(|prefix| leaves.contains_key(prefix))
                     });
                     let descendant =
                         leaves
                             .range(key_values.clone()..)
                             .next()
-                            .is_some_and(|path| {
+                            .is_some_and(|(path, _)| {
                                 path.len() > key_values.len() && path.starts_with(&key_values)
                             });
                     if ancestor || descendant {
-                        return Err(VmError::ObjectKeyConflict {
-                            path: Self::object_key_path(&key_values),
-                            pc: self.pc,
-                        });
+                        return Err(conflict(self.pc));
                     }
+                    leaf_state = leaves.get(&key_values).cloned();
                 }
                 // Take ownership so Rc refcount stays at 1 and make_mut is a no-op.
                 let mut obj_value = self.take_register(obj).map_err(invalid_operand)?;
@@ -601,21 +739,26 @@ impl RegoVM {
                         pc: self.pc,
                     }));
                 }
-                let result = Self::object_deep_set(
+                let result = Self::object_head_leaf_set(
                     &mut obj_value,
                     &key_values,
                     value_value,
                     params.multi_value,
+                    leaf_state,
                 );
                 self.set_register(obj, obj_value).map_err(invalid_operand)?;
-                if let Err(path) = result {
-                    return Err(VmError::ObjectKeyConflict { path, pc: self.pc });
-                }
+                let leaf_state = match result {
+                    Ok(leaf_state) => leaf_state,
+                    Err(LeafSetError::Conflict) => return Err(conflict(self.pc)),
+                    Err(LeafSetError::Path(path)) => {
+                        return Err(VmError::ObjectKeyConflict { path, pc: self.pc })
+                    }
+                };
                 if let Some(depth) = ownership_depth {
                     self.object_head_leaves
                         .entry(depth)
                         .or_default()
-                        .insert(key_values);
+                        .insert(key_values, leaf_state);
                 }
                 Ok(InstructionOutcome::Continue)
             }

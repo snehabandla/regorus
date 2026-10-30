@@ -349,7 +349,10 @@ impl RegoVM {
 
         self.set_register(dest, Value::Undefined)?;
 
-        self.object_head_leaves.remove(&self.call_rule_stack.len());
+        let leaves = self.object_head_leaves.remove(&self.call_rule_stack.len());
+        if !rule_failed_due_to_inconsistency {
+            Self::check_object_head_leaves(leaves.as_ref(), self.pc)?;
+        }
         let call_context = self
             .call_rule_stack
             .pop()
@@ -821,6 +824,13 @@ impl RegoVM {
                 .cloned()
                 .unwrap_or(Value::Undefined)
         };
+
+        if !rule_failed_due_to_inconsistency {
+            Self::check_object_head_leaves(
+                self.object_head_leaves.get(&self.call_rule_stack.len()),
+                self.pc,
+            )?;
+        }
 
         let mut current_window = Vec::default();
         mem::swap(&mut current_window, &mut self.registers);

@@ -217,3 +217,194 @@ fn review_native_float_literal_boundary() {
         }
     }
 }
+
+fn check(source: &str, input: &str, expected: Result<&str, &str>) {
+    for mode in modes() {
+        let result = run(source, input, mode);
+        match expected {
+            Ok(expected) => assert_eq!(
+                result.unwrap(),
+                Value::from_json_str(expected).unwrap(),
+                "{source} with {input} in {mode:?}"
+            ),
+            Err(message) => {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains(message), "{source} in {mode:?}: {error}");
+            }
+        }
+    }
+}
+
+#[test]
+fn review_variable_named_like_static_child_read_through_child() {
+    for name in ["a", "k"] {
+        let source = format!("p[{name}].c := 1 if {{ some {name} in input.ks }}\np.a.d := 2\n");
+        check(
+            &format!("{source}main := p.a.d"),
+            r#"{"ks":["b"]}"#,
+            Ok("2"),
+        );
+        check(
+            &format!("{source}main := p"),
+            r#"{"ks":["b"]}"#,
+            Ok(r#"{"a":{"d":2},"b":{"c":1}}"#),
+        );
+    }
+}
+
+#[test]
+fn review_single_and_multi_value_leaf() {
+    const CONFLICT: Result<&str, &str> = Err("conflicting values at [\"a\"]");
+    for (source, key, expected) in [
+        (
+            "p[k] := {1} if { k := input.key }\np.a contains 2",
+            "a",
+            CONFLICT,
+        ),
+        (
+            "p.a contains 2\np[k] := {1} if { k := input.key }",
+            "a",
+            CONFLICT,
+        ),
+        (
+            "p[k] := {1, 2} if { k := input.key }\np.a contains 1",
+            "a",
+            CONFLICT,
+        ),
+        (
+            "p[k] := 1 if { k := input.key }\np.a contains 1",
+            "a",
+            CONFLICT,
+        ),
+        (
+            "p.a contains x if { some x in [1, 2, 3] }\np[k] := {1, 2} if { k := input.key }",
+            "a",
+            CONFLICT,
+        ),
+        (
+            "p[k] := {1} if { k := input.key }\np.a contains 2",
+            "b",
+            Ok(r#"{"a":[2],"b":[1]}"#),
+        ),
+        (
+            "p[k] := {2} if { k := input.key }\np.a contains 2",
+            "a",
+            Ok(r#"{"a":[2]}"#),
+        ),
+        (
+            "p.a contains 2\np[k] := {2} if { k := input.key }",
+            "a",
+            Ok(r#"{"a":[2]}"#),
+        ),
+        (
+            "p.a contains 1\np[k] := {1, 2} if { k := input.key }\np.a contains 2",
+            "a",
+            Ok(r#"{"a":[1,2]}"#),
+        ),
+        (
+            "p[k] := {1, 2} if { k := input.key }\np.a contains x if { some x in [1, 2] }",
+            "a",
+            Ok(r#"{"a":[1,2]}"#),
+        ),
+        (
+            "p.a contains 2 if { false }\np[k] := set() if { k := input.key }",
+            "a",
+            Ok(r#"{"a":[]}"#),
+        ),
+    ] {
+        // Sets are sorted into arrays so the expectation can be written as JSON.
+        check(
+            &format!("{source}\nmain := {{k: sort(v) | some k, v in p}}"),
+            &format!(r#"{{"key":"{key}"}}"#),
+            expected,
+        );
+    }
+}
+
+#[test]
+fn review_input_index_head_read_through_data() {
+    for key in ["input.role", "r"] {
+        let body = if key == "r" {
+            " if { r := input.role }"
+        } else {
+            ""
+        };
+        let sources = [
+            format!("package test\np[{key}].enabled := true{body}"),
+            "package entry\nmain := data.test".to_owned(),
+        ];
+        let program = compile(&sources, "data.entry.main").unwrap();
+        for mode in modes() {
+            assert_eq!(
+                execute(program.clone(), r#"{"role":"a"}"#, mode).unwrap(),
+                Value::from_json_str(r#"{"p":{"a":{"enabled":true}}}"#).unwrap()
+            );
+        }
+    }
+}
+
+#[test]
+fn review_else_in_object_head() {
+    let sibling = "p.r[k] := 1 if { k := input.k }\n";
+    for (definition, expected) in [
+        ("p.q := 1 if { false } else := 2", r#"{"q":2,"r":{"a":1}}"#),
+        ("p.q := 1 if { true } else := 2", r#"{"q":1,"r":{"a":1}}"#),
+        (
+            "p.q := 1 if { false } else := 2 if { false } else := 3",
+            r#"{"q":3,"r":{"a":1}}"#,
+        ),
+        (
+            "p.q := 1 if { false } else := 2 if { input.missing }",
+            r#"{"r":{"a":1}}"#,
+        ),
+        (
+            "p.s.t := 1 if { false } else := 2",
+            r#"{"r":{"a":1},"s":{"t":2}}"#,
+        ),
+    ] {
+        check(
+            &format!("{definition}\n{sibling}main := p"),
+            r#"{"k":"a"}"#,
+            Ok(expected),
+        );
+    }
+    check(
+        "p.q := 1 if { false } else := 2\nmain := p",
+        "{}",
+        Ok(r#"{"q":2}"#),
+    );
+}
+
+#[test]
+fn review_function_only_namespace_compiles() {
+    // Reading a namespace that only holds functions compiles as a data
+    // reference, like any other path without rules. Its value (`{}` in OPA)
+    // is not materialized by the RVM.
+    for main in ["main := lib", "main := data.test.lib"] {
+        compile(
+            &[format!("package test\nlib.f(x) := x\n{main}")],
+            "data.test.main",
+        )
+        .unwrap();
+    }
+    check(
+        "lib.f(x) := x\nlib.v := 1\nmain := lib",
+        "{}",
+        Ok(r#"{"v":1}"#),
+    );
+    check("lib.f(x) := x\nmain := lib.f(3)", "{}", Ok("3"));
+}
+
+#[test]
+fn review_conflict_message_bounds_keys() {
+    let source = "p[k].x := 1 if { k := input.key }\np[k].x := 2 if { k := input.key }\nmain := p";
+    for (length, truncated) in [(10, false), (100_000, true)] {
+        let input = format!(r#"{{"key":"{}"}}"#, "k".repeat(length));
+        for mode in modes() {
+            let error = run(source, &input, mode).unwrap_err().to_string();
+            assert!(error.contains("conflicting values at"), "{error}");
+            assert_eq!(error.contains("...]"), truncated, "{error}");
+            assert!(error.len() < 1_000, "{} bytes", error.len());
+        }
+    }
+}

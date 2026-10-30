@@ -297,38 +297,22 @@ impl<'a> Compiler<'a> {
         Ok(initial)
     }
 
-    /// Shapes of all definitions registered at `rule_path`. Fails if any
-    /// definition reaches `rule_path` only through a variable head key (see
-    /// `is_variable_key_rule_path`).
+    /// Shapes of the definitions registered at `rule_path` that contribute
+    /// to its document. Functions and definitions that reach `rule_path` only
+    /// through a variable head key (see `is_variable_key_rule_path`) belong to
+    /// a shorter path and are skipped.
     fn definition_shapes(
         &self,
         rule_path: &str,
         definitions: &[NodeRef<Rule>],
     ) -> Result<Vec<DefinitionShape>> {
-        definitions
-            .iter()
-            .filter_map(
-                |definition| match self.definition_shape(rule_path, definition) {
-                    Ok(Some(shape)) => Some(Ok(shape)),
-                    Ok(None)
-                        if matches!(
-                            definition.as_ref(),
-                            Rule::Spec {
-                                head: RuleHead::Func { .. },
-                                ..
-                            }
-                        ) =>
-                    {
-                        None
-                    }
-                    Ok(None) => Some(Err(CompilerError::UnsupportedRuleHeadPath {
-                        rule_path: rule_path.to_string(),
-                    }
-                    .into())),
-                    Err(error) => Some(Err(error)),
-                },
-            )
-            .collect()
+        let mut shapes = Vec::with_capacity(definitions.len());
+        for definition in definitions {
+            if let Some(shape) = self.definition_shape(rule_path, definition)? {
+                shapes.push(shape);
+            }
+        }
+        Ok(shapes)
     }
 
     /// True if every definition at `rule_path` reaches it through a variable
@@ -379,7 +363,9 @@ impl<'a> Compiler<'a> {
             };
             // Surface conflicts between the definitions of the enclosing
             // document even when only part of it is read.
-            self.compute_rule_type(&prefix_path)?;
+            if !self.is_variable_key_rule_path(&prefix_path)? {
+                self.compute_rule_type(&prefix_path)?;
+            }
             let below = &components[prefix_len..];
             for definition in definitions {
                 if registered.is_some_and(|rules| rules.iter().any(|rule| rule == definition))
@@ -448,8 +434,12 @@ impl<'a> Compiler<'a> {
             }
         }
 
+        // The interpreter also registers the path components of a
+        // non-string index (`p[input.role].x` at `p.input.role.x`), so a path
+        // longer than the head can only be reached through such an index or
+        // through the value of a Rego v0 set rule.
         let consumed = self.head_items_on_path(rule_path, rule)?;
-        if consumed > items.len() && value_literal.is_some() {
+        if consumed > items.len() {
             return Ok(None);
         }
         let consumed = Some(consumed)
@@ -580,7 +570,12 @@ impl<'a> Compiler<'a> {
                     )
                 })
                 .collect();
-            let params_index = self.program.instruction_data.chained_index_params.len() as u16;
+            let params_index = u16::try_from(
+                self.program.instruction_data.chained_index_params.len(),
+            )
+            .map_err(|_| CompilerError::General {
+                message: "chained index parameter table exceeds the RVM index limit".to_string(),
+            })?;
             self.program
                 .instruction_data
                 .chained_index_params
@@ -1159,7 +1154,10 @@ impl<'a> Compiler<'a> {
                                 &body.span,
                             );
 
-                            if !body.query.stmts.is_empty() {
+                            let yields_into_object = self.context_stack.last().is_some_and(|ctx| {
+                                ctx.object_head.is_some() || ctx.key_expr.is_some()
+                            });
+                            if !body.query.stmts.is_empty() || yields_into_object {
                                 self.compile_query(&body.query)?;
                             } else if let Some(value_expr) = body_value_expr.clone() {
                                 let value_reg = self.compile_rego_expr(&value_expr)?;

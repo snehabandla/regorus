@@ -181,9 +181,15 @@ impl Program {
             encoded
                 .iter()
                 .map(|bytes| {
-                    postcard::from_bytes::<BinaryValue>(bytes)
-                        .map(|value| value.0)
-                        .map_err(|error| format!("Invalid typed literal: {error}"))
+                    let (value, rest) = postcard::take_from_bytes::<BinaryValue>(bytes)
+                        .map_err(|error| format!("Invalid typed literal: {error}"))?;
+                    if !rest.is_empty() {
+                        return Err(format!(
+                            "Invalid typed literal: {} trailing bytes",
+                            rest.len()
+                        ));
+                    }
+                    Ok(value.0)
                 })
                 .collect::<Result<_, _>>()?
         } else {

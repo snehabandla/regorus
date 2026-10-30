@@ -16,7 +16,7 @@ use crate::utils::limits::{
 use crate::value::ResumeJsonError;
 use crate::value::Value;
 use crate::CompiledPolicy;
-use alloc::collections::{btree_map::Entry, BTreeMap, BTreeSet, VecDeque};
+use alloc::collections::{btree_map::Entry, BTreeMap, VecDeque};
 use alloc::ffi::CString;
 #[cfg(all(feature = "allocator-memory-limits", not(miri)))]
 use alloc::format;
@@ -39,6 +39,16 @@ pub(super) enum MemoryBudgetLifecycle {
     ImplicitExecution,
     FfiResultSerialization,
     SuspendableExecution,
+}
+
+/// How the definitions of a partial object rule wrote one leaf. A
+/// single-value leaf must equal the complete set built by multi-value
+/// definitions of the same leaf, so both are kept until the rule finishes.
+#[derive(Debug, Clone)]
+pub(super) enum ObjectHeadLeaf {
+    Single(Value),
+    Multi,
+    Both { single: Value, multi: Value },
 }
 
 /// The Rego Virtual Machine
@@ -75,7 +85,8 @@ pub struct RegoVM {
 
     /// Call rule execution stack for managing nested rule calls
     pub(super) call_rule_stack: Vec<CallRuleContext>,
-    pub(super) object_head_leaves: BTreeMap<usize, BTreeSet<Vec<Value>>>,
+    /// Leaves written by the partial object rule at each call depth.
+    pub(super) object_head_leaves: BTreeMap<usize, BTreeMap<Vec<Value>, ObjectHeadLeaf>>,
 
     /// Register stack for isolated register spaces during rule calls
     pub(super) register_stack: Vec<Vec<Value>>,

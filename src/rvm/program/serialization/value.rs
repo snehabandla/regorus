@@ -6,7 +6,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 use core::str::FromStr as _;
-use serde::de::{self, EnumAccess, VariantAccess as _, Visitor};
+use serde::de::{self, DeserializeSeed, EnumAccess, SeqAccess, VariantAccess as _, Visitor};
 use serde::ser::{SerializeSeq as _, SerializeTuple as _};
 use serde::{Deserialize, Serialize};
 
@@ -209,7 +209,143 @@ enum BinaryVariant {
     NumberF64,
 }
 
-struct BinaryValueVisitor;
+/// Nesting limit for deserialized values. Literals compiled from policies are
+/// far shallower; the limit keeps an untrusted blob from exhausting the stack.
+const MAX_BINARY_VALUE_DEPTH: usize = 128;
+
+#[derive(Clone, Copy)]
+struct BinaryValueSeed {
+    depth: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for BinaryValueSeed {
+    type Value = BinaryValue;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if self.depth > MAX_BINARY_VALUE_DEPTH {
+            return Err(de::Error::custom(format!(
+                "serialized value exceeds maximum nesting depth of {MAX_BINARY_VALUE_DEPTH}"
+            )));
+        }
+        deserializer.deserialize_enum("BinaryValue", BINARY_VARIANTS, BinaryValueVisitor(self))
+    }
+}
+
+/// Elements of an array or set.
+#[derive(Clone, Copy)]
+struct BinaryItemsSeed(BinaryValueSeed);
+
+impl<'de> DeserializeSeed<'de> for BinaryItemsSeed {
+    type Value = Vec<BinaryValue>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> Visitor<'de> for BinaryItemsSeed {
+    type Value = Vec<BinaryValue>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("a sequence of BinaryValue")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut items = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(1024));
+        while let Some(item) = seq.next_element_seed(self.0)? {
+            items.push(item);
+        }
+        Ok(items)
+    }
+}
+
+/// `(key, value)` entries of an object.
+#[derive(Clone, Copy)]
+struct BinaryEntriesSeed(BinaryValueSeed);
+
+impl<'de> DeserializeSeed<'de> for BinaryEntriesSeed {
+    type Value = Vec<(BinaryValue, BinaryValue)>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> Visitor<'de> for BinaryEntriesSeed {
+    type Value = Vec<(BinaryValue, BinaryValue)>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("a sequence of (key, value) pairs of BinaryValue")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut entries = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(1024));
+        while let Some(entry) = seq.next_element_seed(BinaryEntrySeed(self.0))? {
+            entries.push(entry);
+        }
+        Ok(entries)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct BinaryEntrySeed(BinaryValueSeed);
+
+impl<'de> DeserializeSeed<'de> for BinaryEntrySeed {
+    type Value = (BinaryValue, BinaryValue);
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_tuple(2, self)
+    }
+}
+
+impl<'de> Visitor<'de> for BinaryEntrySeed {
+    type Value = (BinaryValue, BinaryValue);
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("a (key, value) pair of BinaryValue")
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let key = seq
+            .next_element_seed(self.0)?
+            .ok_or_else(|| de::Error::invalid_length(0, &self))?;
+        let value = seq
+            .next_element_seed(self.0)?
+            .ok_or_else(|| de::Error::invalid_length(1, &self))?;
+        Ok((key, value))
+    }
+}
+
+struct BinaryValueVisitor(BinaryValueSeed);
+
+impl BinaryValueVisitor {
+    fn child(&self) -> BinaryValueSeed {
+        BinaryValueSeed {
+            depth: self.0.depth.saturating_add(1),
+        }
+    }
+}
 
 impl<'de> Visitor<'de> for BinaryValueVisitor {
     type Value = BinaryValue;
@@ -264,12 +400,12 @@ impl<'de> Visitor<'de> for BinaryValueVisitor {
                 Ok(BinaryValue(Value::from(s)))
             }
             (BinaryVariant::Array, variant) => {
-                let items: Vec<BinaryValue> = variant.newtype_variant()?;
+                let items = variant.newtype_variant_seed(BinaryItemsSeed(self.child()))?;
                 let values: Vec<Value> = items.into_iter().map(BinaryValue::into_value).collect();
                 Ok(BinaryValue(Value::from(values)))
             }
             (BinaryVariant::Set, variant) => {
-                let items: Vec<BinaryValue> = variant.newtype_variant()?;
+                let items = variant.newtype_variant_seed(BinaryItemsSeed(self.child()))?;
                 let mut set = BTreeSet::new();
                 for item in items {
                     set.insert(item.into_value());
@@ -277,7 +413,7 @@ impl<'de> Visitor<'de> for BinaryValueVisitor {
                 Ok(BinaryValue(Value::from(set)))
             }
             (BinaryVariant::Object, variant) => {
-                let entries: Vec<(BinaryValue, BinaryValue)> = variant.newtype_variant()?;
+                let entries = variant.newtype_variant_seed(BinaryEntriesSeed(self.child()))?;
                 let mut map = Object::new();
                 for (key, value) in entries {
                     map.insert(key.into_value(), value.into_value());
@@ -304,7 +440,7 @@ impl<'de> Deserialize<'de> for BinaryValue {
     where
         D: serde::Deserializer<'de>,
     {
-        deserializer.deserialize_enum("BinaryValue", BINARY_VARIANTS, BinaryValueVisitor)
+        BinaryValueSeed { depth: 0 }.deserialize(deserializer)
     }
 }
 
