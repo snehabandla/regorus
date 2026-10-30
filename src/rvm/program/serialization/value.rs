@@ -41,12 +41,12 @@ impl<'a> Serialize for BinaryValueRef<'a> {
                 serializer.serialize_newtype_variant("BinaryValue", VARIANT_BOOL, "Bool", &b)
             }
             Value::Number(ref n) => {
-                if let Number::Float(value) = n {
+                if let Number::Float(value) = *n {
                     serializer.serialize_newtype_variant(
                         "BinaryValue",
                         VARIANT_NUMBER_F64,
                         "NumberF64",
-                        value,
+                        &value,
                     )
                 } else if let Some(value) = n.as_i64() {
                     serializer.serialize_newtype_variant(
@@ -340,7 +340,7 @@ impl<'de> Visitor<'de> for BinaryEntrySeed {
 struct BinaryValueVisitor(BinaryValueSeed);
 
 impl BinaryValueVisitor {
-    fn child(&self) -> BinaryValueSeed {
+    const fn child(&self) -> BinaryValueSeed {
         BinaryValueSeed {
             depth: self.0.depth.saturating_add(1),
         }

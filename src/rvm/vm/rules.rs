@@ -53,12 +53,14 @@ impl RegoVM {
     /// Defaults are encoded as (path, value) entries so a produced leaf
     /// replaces an object-valued default instead of deep-merging with it.
     fn merge_partial_object_defaults(result: &mut Value, defaults: &Value) {
-        let Value::Array(entries) = defaults else {
+        let Value::Array(ref entries) = *defaults else {
             return;
         };
         for entry in entries.iter() {
-            let Value::Array(entry) = entry else { continue };
-            let [Value::Array(path), value] = entry.as_slice() else {
+            let Value::Array(ref entry) = *entry else {
+                continue;
+            };
+            let [Value::Array(ref path), ref value] = *entry.as_slice() else {
                 continue;
             };
             let Some((leaf, ancestors)) = path.as_slice().split_last() else {

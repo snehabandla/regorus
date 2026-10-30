@@ -110,7 +110,7 @@ impl<'a> Compiler<'a> {
             // single-value and set-valued heads, even if their dynamic keys
             // happen to be disjoint for this input.
             if leaf_kinds
-                .insert(Self::static_head_prefix(&shape), shape.multi_value)
+                .insert(Self::static_head_prefix(shape), shape.multi_value)
                 .is_some_and(|multi_value| multi_value != shape.multi_value)
             {
                 return Err(CompilerError::ConflictingRuleTypes {

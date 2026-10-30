@@ -232,7 +232,7 @@ impl<'a> Compiler<'a> {
                 }
                 ContextType::Rule(RuleType::PartialObject) => match context.object_head {
                     Some(head) => {
-                        self.emit_object_head_set(&head, dest_register, value_register, span)?
+                        self.emit_object_head_set(&head, dest_register, value_register, span)?;
                     }
                     None => {
                         self.emit_instruction(

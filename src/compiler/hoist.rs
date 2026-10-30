@@ -864,9 +864,9 @@ impl LoopHoister {
     }
 
     /// Collects the bracket indices of a rule head reference, outermost first.
-    fn head_bracket_indices(refr: &ExprRef) -> Vec<ExprRef> {
+    fn head_bracket_indices(head: &ExprRef) -> Vec<ExprRef> {
         let mut indices = Vec::new();
-        let mut current = refr;
+        let mut current = head;
         loop {
             match current.as_ref() {
                 Expr::RefBrack { refr, index, .. } => {

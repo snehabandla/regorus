@@ -58,8 +58,8 @@ impl RegoVM {
             // Clip long strings first: `Value`'s Display renders the whole
             // value before the bounded writer can cut it.
             let clipped;
-            let key = match key {
-                Value::String(string) if string.len() > MAX_KEY_TEXT => {
+            let key = match *key {
+                Value::String(ref string) if string.len() > MAX_KEY_TEXT => {
                     let mut end = MAX_KEY_TEXT;
                     while !string.is_char_boundary(end) {
                         end = end.saturating_sub(1);
@@ -115,13 +115,13 @@ impl RegoVM {
         };
         if multi_value {
             let leaf = object.get_or_insert_with(leaf_key.clone(), Value::new_set);
-            match leaf.as_set_mut() {
-                Ok(set) => {
+            leaf.as_set_mut().map_or_else(
+                |_| Err(conflict(depth)),
+                |set| {
                     set.insert(value);
                     Ok(())
-                }
-                Err(_) => Err(conflict(depth)),
-            }
+                },
+            )
         } else {
             match object.get(leaf_key) {
                 Some(existing) if *existing != value => Err(conflict(depth)),
@@ -146,7 +146,11 @@ impl RegoVM {
         pc: usize,
     ) -> Result<()> {
         for (path, leaf) in leaves.into_iter().flatten() {
-            if let ObjectHeadLeaf::Both { single, multi } = leaf {
+            if let ObjectHeadLeaf::Both {
+                ref single,
+                ref multi,
+            } = *leaf
+            {
                 if single != multi {
                     return Err(VmError::ObjectKeyConflict {
                         path: Self::object_key_path(path),
@@ -702,9 +706,7 @@ impl RegoVM {
                     key_values.push(self.get_register(key).map_err(invalid_operand)?.clone());
                 }
                 // Like the interpreter, an undefined key or value contributes nothing.
-                if value_value == Value::Undefined
-                    || key_values.iter().any(|key| *key == Value::Undefined)
-                {
+                if value_value == Value::Undefined || key_values.contains(&Value::Undefined) {
                     return Ok(InstructionOutcome::Continue);
                 }
 
@@ -721,8 +723,7 @@ impl RegoVM {
                     path: Self::object_key_path(&key_values),
                     pc,
                 };
-                let mut leaf_state = None;
-                if let Some(leaves) =
+                let leaf_state = if let Some(leaves) =
                     ownership_depth.and_then(|depth| self.object_head_leaves.get_mut(&depth))
                 {
                     let ancestor = (1..key_values.len()).any(|length| {
@@ -742,8 +743,10 @@ impl RegoVM {
                     }
                     // Moved out (and reinserted below) so that the leaf's
                     // multi-value set is not shared and grows in place.
-                    leaf_state = leaves.remove(&key_values);
-                }
+                    leaves.remove(&key_values)
+                } else {
+                    None
+                };
                 // Take ownership so Rc refcount stays at 1 and make_mut is a no-op.
                 let mut obj_value = self.take_register(obj).map_err(invalid_operand)?;
                 if !matches!(obj_value, Value::Object(_)) {
@@ -763,8 +766,8 @@ impl RegoVM {
                     leaf_state,
                 );
                 self.set_register(obj, obj_value).map_err(invalid_operand)?;
-                let leaf_state = match result {
-                    Ok(leaf_state) => leaf_state,
+                let new_state = match result {
+                    Ok(new_state) => new_state,
                     Err(LeafSetError::Conflict) => return Err(conflict(self.pc)),
                     Err(LeafSetError::Path(path)) => {
                         return Err(VmError::ObjectKeyConflict { path, pc: self.pc })
@@ -774,7 +777,7 @@ impl RegoVM {
                     self.object_head_leaves
                         .entry(depth)
                         .or_default()
-                        .insert(key_values, leaf_state);
+                        .insert(key_values, new_state);
                 }
                 Ok(InstructionOutcome::Continue)
             }
