@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 pub mod binary;
 mod json;
+mod legacy_v6;
 pub mod value;
 
 use serde::{Deserialize, Serialize};

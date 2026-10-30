@@ -181,15 +181,6 @@ pub enum Instruction {
         value: u8,
     },
 
-    /// Insert a value below one or more keys of an object, creating
-    /// intermediate objects (and the leaf set when `multi_value`) as needed.
-    /// Undefined keys or value make it a no-op; a conflicting existing value
-    /// is an error. Used by partial object rules with nested heads.
-    ObjectDeepSet {
-        /// Index into program's instruction_data.object_deep_set_params table
-        params_index: u16,
-    },
-
     /// Create object with optimized field setting - uses parameter table
     ObjectCreate {
         /// Index into program's instruction_data.object_create_params table
@@ -424,6 +415,17 @@ pub enum Instruction {
         mode: LogicalBlockMode,
         /// Register that accumulates the result.
         result: u8,
+    },
+
+    // New variants go last: postcard encodes the variant index, so earlier
+    // binary format versions keep their opcode numbers.
+    /// Insert a value below one or more keys of an object, creating
+    /// intermediate objects (and the leaf set when `multi_value`) as needed.
+    /// Undefined keys or value make it a no-op; a conflicting existing value
+    /// is an error. Used by partial object rules with nested heads.
+    ObjectDeepSet {
+        /// Index into program's instruction_data.object_deep_set_params table
+        params_index: u16,
     },
 }
 

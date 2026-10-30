@@ -622,6 +622,120 @@ fn registered_host_await_legacy_program_keeps_raw_payload() {
     }
 }
 
+const LEGACY_V6_PROGRAM: &[u8] = include_bytes!("fixtures/host_await_registered_raw_e39a1d16.rvm");
+
+fn deserialize_complete(blob: &[u8]) -> std::sync::Arc<Program> {
+    match Program::deserialize_binary(blob).expect("failed to deserialize program") {
+        DeserializationResult::Complete(program) => std::sync::Arc::new(program),
+        DeserializationResult::Partial(_) => panic!("expected a complete program"),
+    }
+}
+
+fn host_await_argument(program: std::sync::Arc<Program>) -> Value {
+    let mut vm = RegoVM::new();
+    vm.set_execution_mode(ExecutionMode::Suspendable);
+    vm.load_program(program);
+    let _ = vm.execute().expect("failed to execute program");
+    match vm.execution_state() {
+        ExecutionState::Suspended {
+            reason: SuspendReason::HostAwait { argument, .. },
+            ..
+        } => argument.clone(),
+        state => panic!("expected HostAwait suspension, got {state:?}"),
+    }
+}
+
+/// Insert `instruction` before the first instruction of a version 6 program,
+/// keeping the version 6 core layout.
+fn splice_v6_instruction(blob: &[u8], instruction: Instruction) -> Vec<u8> {
+    let read_u32 = |offset: usize| {
+        usize::try_from(u32::from_le_bytes(
+            blob[offset..offset + 4].try_into().unwrap(),
+        ))
+        .unwrap()
+    };
+    assert_eq!(read_u32(4), 6);
+    let core_start = 25
+        + [8, 12, 16, 20]
+            .iter()
+            .map(|&offset| read_u32(offset))
+            .sum::<usize>();
+    let core = &blob[core_start + 4..core_start + 4 + read_u32(core_start)];
+    // Instruction count: postcard varint.
+    let (mut count, mut length) = (0usize, 0usize);
+    loop {
+        let byte = core[length];
+        count |= usize::from(byte & 0x7f) << (7 * length);
+        length += 1;
+        if byte & 0x80 == 0 {
+            break;
+        }
+    }
+    let mut new_core = postcard::to_allocvec(&(count + 1)).unwrap();
+    new_core.extend(postcard::to_allocvec(&instruction).unwrap());
+    new_core.extend_from_slice(&core[length..]);
+    let mut spliced = blob[..core_start].to_vec();
+    spliced.extend_from_slice(&u32::try_from(new_core.len()).unwrap().to_le_bytes());
+    spliced.extend(new_core);
+    spliced
+}
+
+#[test]
+fn binary_v6_program_keeps_raw_payload_through_v7() {
+    let program = deserialize_complete(LEGACY_V6_PROGRAM);
+    let blob = program.serialize_binary().unwrap();
+    assert_eq!(blob[4..8], 7u32.to_le_bytes());
+    let restored = deserialize_complete(&blob);
+    assert_eq!(restored.serialize_binary().unwrap(), blob);
+    assert_eq!(host_await_argument(restored), Value::from("legacy"));
+}
+
+#[test]
+fn binary_v7_round_trips_object_deep_set() {
+    let program = compile_rule(
+        "package test\nq[k].x contains v if { some k, v in {\"a\": 1, \"b\": 2} }\np := q",
+    );
+    assert!(program
+        .instructions
+        .iter()
+        .any(|instruction| matches!(instruction, Instruction::ObjectDeepSet { .. })));
+    let blob = program.serialize_binary().unwrap();
+    assert_eq!(blob[4..8], 7u32.to_le_bytes());
+    let restored = deserialize_complete(&blob);
+    assert_eq!(
+        restored.instruction_data.object_deep_set_params.len(),
+        program.instruction_data.object_deep_set_params.len()
+    );
+    let mut vm = RegoVM::new();
+    vm.load_program(restored);
+    let result = vm.execute().unwrap();
+    assert!(result["a"]["x"].as_set().unwrap().contains(&Value::from(1u64)));
+    assert_eq!(
+        serde_json::to_string(&result).unwrap(),
+        r#"{"a":{"x":[1]},"b":{"x":[2]}}"#
+    );
+}
+
+#[test]
+fn binary_v6_rejects_object_deep_set_opcode() {
+    let valid = splice_v6_instruction(LEGACY_V6_PROGRAM, Instruction::LoadTrue { dest: 0 });
+    let program = deserialize_complete(&valid);
+    assert!(matches!(
+        program.instructions[0],
+        Instruction::LoadTrue { dest: 0 }
+    ));
+
+    let invalid = splice_v6_instruction(
+        LEGACY_V6_PROGRAM,
+        Instruction::ObjectDeepSet { params_index: 0 },
+    );
+    let error = Program::deserialize_binary(&invalid).unwrap_err();
+    assert!(
+        error.contains("ObjectDeepSet requires version 7"),
+        "{error}"
+    );
+}
+
 #[test]
 fn registered_host_await_rejects_wrong_arity_before_compiling_inputs() {
     for (arg_count, call, actual_count) in [
