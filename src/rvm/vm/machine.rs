@@ -1060,8 +1060,8 @@ impl RegoVM {
             },
         )?;
         *slot = value;
-        if self.explain.paths {
-            self.explain.clear_path(index);
+        if self.explain_paths() {
+            self.explain_clear_path(index);
         }
         Ok(())
     }

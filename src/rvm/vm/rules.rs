@@ -43,7 +43,7 @@ impl RegoVM {
             let mut current_register_window = Vec::default();
             mem::swap(&mut current_register_window, &mut self.registers);
             self.return_register_window(current_register_window);
-            if self.explain.paths {
+            if self.explain_paths() {
                 self.explain_pop_frame();
             }
             self.registers = restored_registers;
@@ -97,7 +97,7 @@ impl RegoVM {
 
         self.register_stack.push(previous_registers);
         self.registers = register_window;
-        if self.explain.paths {
+        if self.explain_paths() {
             self.explain_push_frame(function_call_params.map_or(&[][..], |p| p.arg_registers()));
         }
 
@@ -111,7 +111,7 @@ impl RegoVM {
                 self.registers
                     .resize(num_retained_registers, Value::Undefined);
                 self.registers.resize(num_registers, Value::Undefined);
-                if self.explain.paths {
+                if self.explain_paths() {
                     self.explain_body_start(num_retained_registers);
                 }
 
@@ -209,7 +209,7 @@ impl RegoVM {
             let mut current_register_window = Vec::default();
             mem::swap(&mut current_register_window, &mut self.registers);
             self.return_register_window(current_register_window);
-            if self.explain.paths {
+            if self.explain_paths() {
                 self.explain_pop_frame();
             }
 

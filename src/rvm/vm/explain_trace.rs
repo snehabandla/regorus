@@ -435,6 +435,16 @@ impl RegoVM {
         self.explain.reset();
     }
 
+    #[inline(always)]
+    pub(super) fn explain_paths(&self) -> bool {
+        self.explain.paths
+    }
+
+    #[inline(always)]
+    pub(super) fn explain_clear_path(&mut self, reg: u8) {
+        self.explain.clear_path(reg);
+    }
+
     #[inline]
     pub(super) fn explain_reg_path(&self, reg: u8) -> u32 {
         if self.explain.paths {

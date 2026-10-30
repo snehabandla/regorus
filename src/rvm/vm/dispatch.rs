@@ -64,14 +64,14 @@ impl RegoVM {
             }
             LoadData { dest } => {
                 self.set_register(dest, self.data.clone())?;
-                if self.explain.paths {
+                if self.explain_paths() {
                     self.explain_path_root(dest, true);
                 }
                 Ok(InstructionOutcome::Continue)
             }
             LoadInput { dest } => {
                 self.set_register(dest, self.input.clone())?;
-                if self.explain.paths {
+                if self.explain_paths() {
                     self.explain_path_root(dest, false);
                 }
                 Ok(InstructionOutcome::Continue)
@@ -825,7 +825,7 @@ impl RegoVM {
                     body_start: loop_params.body_start,
                     loop_end: loop_params.loop_end,
                 };
-                if self.explain.paths {
+                if self.explain_paths() {
                     self.explain_loop_collection(params.collection, params.value_reg);
                 }
                 self.execute_loop_start(&mode, params)?;
@@ -1201,7 +1201,7 @@ impl RegoVM {
                         available: program.instruction_data.comprehension_begin_params.len(),
                     })?
                     .clone();
-                if self.explain.paths {
+                if self.explain_paths() {
                     self.explain_loop_collection(params.collection_reg, params.value_reg);
                 }
                 self.execute_comprehension_begin(&params)?;

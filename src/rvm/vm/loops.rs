@@ -522,7 +522,7 @@ impl RegoVM {
                     }
                     if let Some(item_value) = items.get(*index).cloned() {
                         self.set_register(value_reg, item_value)?;
-                        if self.explain.paths {
+                        if self.explain_paths() {
                             self.explain_iteration(value_reg, &Value::from(*index));
                         }
                         Ok(true)
@@ -547,7 +547,7 @@ impl RegoVM {
                         self.set_register(key_reg, key.clone())?;
                     }
                     self.set_register(value_reg, value)?;
-                    if self.explain.paths {
+                    if self.explain_paths() {
                         self.explain_iteration(value_reg, key);
                     }
                     Ok(true)
@@ -564,7 +564,7 @@ impl RegoVM {
                         self.set_register(key_reg, item.clone())?;
                     }
                     self.set_register(value_reg, item.clone())?;
-                    if self.explain.paths {
+                    if self.explain_paths() {
                         self.explain_iteration(value_reg, item);
                     }
                     Ok(true)

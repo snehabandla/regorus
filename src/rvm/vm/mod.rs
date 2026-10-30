@@ -8,6 +8,8 @@ mod dispatch;
 mod errors;
 mod execution;
 mod execution_model;
+#[cfg(not(feature = "explanations"))]
+mod explain_stub;
 #[cfg(feature = "explanations")]
 mod explain_trace;
 mod functions;
