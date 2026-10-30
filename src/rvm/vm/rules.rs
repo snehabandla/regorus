@@ -43,7 +43,7 @@ impl RegoVM {
             let mut current_register_window = Vec::default();
             mem::swap(&mut current_register_window, &mut self.registers);
             self.return_register_window(current_register_window);
-            if self.explain_paths() {
+            if self.explain_frames() {
                 self.explain_pop_frame();
             }
             self.registers = restored_registers;
@@ -97,7 +97,7 @@ impl RegoVM {
 
         self.register_stack.push(previous_registers);
         self.registers = register_window;
-        if self.explain_paths() {
+        if self.explain_frames() {
             self.explain_push_frame(function_call_params.map_or(&[][..], |p| p.arg_registers()));
         }
 
@@ -111,7 +111,7 @@ impl RegoVM {
                 self.registers
                     .resize(num_retained_registers, Value::Undefined);
                 self.registers.resize(num_registers, Value::Undefined);
-                if self.explain_paths() {
+                if self.explain_frames() {
                     self.explain_body_start(num_retained_registers);
                 }
 
@@ -137,6 +137,12 @@ impl RegoVM {
                 #[cfg(feature = "explanations")]
                 if self.explain.enabled {
                     self.explain_body_end(body_result.is_ok());
+                    if body_result.is_ok()
+                        && !is_function_call
+                        && matches!(rule_info.rule_type, RuleType::Complete)
+                    {
+                        self.explain_complete_body(result_reg);
+                    }
                 }
                 match body_result {
                     Ok(_) => {
@@ -209,7 +215,7 @@ impl RegoVM {
             let mut current_register_window = Vec::default();
             mem::swap(&mut current_register_window, &mut self.registers);
             self.return_register_window(current_register_window);
-            if self.explain_paths() {
+            if self.explain_frames() {
                 self.explain_pop_frame();
             }
 

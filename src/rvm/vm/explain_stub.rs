@@ -14,6 +14,10 @@ impl RegoVM {
         false
     }
     #[inline(always)]
+    pub(super) fn explain_frames(&self) -> bool {
+        false
+    }
+    #[inline(always)]
     pub(super) fn explain_clear_path(&mut self, _reg: u8) {}
     #[inline(always)]
     pub(super) fn explain_reg_path(&self, _reg: u8) -> u32 {

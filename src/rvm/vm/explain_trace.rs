@@ -61,6 +61,10 @@ pub enum ExplainDetail {
     Summary,
     /// Both operand values for every event, plus per-event rows.
     Detailed,
+    /// `Summary`, plus for each derivation (emitted value or complete-rule
+    /// result, up to `max_derivations`) the conditions on the successful
+    /// path that produced it, with their operand values.
+    Attributed,
 }
 
 /// Per-evaluation limits of the recorder.
@@ -74,6 +78,8 @@ pub struct TraceBudget {
     pub max_value_len: u32,
     /// Maximum number of interned concrete path nodes.
     pub max_path_nodes: u32,
+    /// Maximum number of derivations kept (`Attributed`).
+    pub max_derivations: u32,
 }
 
 impl Default for TraceBudget {
@@ -83,6 +89,7 @@ impl Default for TraceBudget {
             max_values: 16_384,
             max_value_len: 64,
             max_path_nodes: 16_384,
+            max_derivations: 64,
         }
     }
 }
@@ -93,6 +100,7 @@ pub enum TraceLimit {
     Events,
     Values,
     Paths,
+    Derivations,
 }
 
 /// Present when a report is incomplete.
@@ -108,6 +116,9 @@ pub struct TraceTruncation {
     /// Concrete path nodes that could not be stored (operands lose their
     /// concrete path, not their value).
     pub paths_elided: u32,
+    /// Derivations observed but not kept (`Attributed`). Kept derivations
+    /// are complete; dropped ones are only counted.
+    pub derivations_dropped: u32,
 }
 
 /// What a static decoder (B6) knows about a condition site.
@@ -184,8 +195,55 @@ pub(super) struct Event {
     passed: bool,
 }
 
+/// A condition that holds on the current derivation path (`Attributed`).
+/// `(depth, anchor)` orders it: the rule-frame depth and the pc in that
+/// frame. Conditions of a returned call are re-anchored to the call site.
+#[derive(Debug, Clone)]
+struct Live {
+    depth: u16,
+    anchor: u32,
+    pc: u32,
+    rule: u16,
+    definition: u16,
+    body: u16,
+    left: Value,
+    right: Option<Value>,
+    lp: u32,
+    rp: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Derivation {
+    rule: u16,
+    definition: u16,
+    value: u32,
+    start: u32,
+    len: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DerivationCondition {
+    pc: u32,
+    rule: u16,
+    definition: u16,
+    body: u16,
+    v0: u32,
+    v1: u32,
+    p0: u32,
+    p1: u32,
+}
+
 #[derive(Debug, Default)]
 pub(super) struct Recorder {
+    /// Frame hooks are active (concrete paths or `Attributed`).
+    pub(super) frames: bool,
+    /// The emission hook is active (`emissions` or `Attributed`).
+    pub(super) emit_hook: bool,
+    live: Vec<Live>,
+    call_pcs: Vec<u32>,
+    derivations: Vec<Derivation>,
+    derivation_conditions: Vec<DerivationCondition>,
+    derivations_dropped: u32,
     pub(super) enabled: bool,
     pub(super) emissions: bool,
     pub(super) capture: ExplainCapture,
@@ -228,6 +286,11 @@ impl Recorder {
         self.nodes.clear();
         self.reg_paths.clear();
         self.path_frames.clear();
+        self.live.clear();
+        self.call_pcs.clear();
+        self.derivations.clear();
+        self.derivation_conditions.clear();
+        self.derivations_dropped = 0;
         if self.want_paths {
             self.nodes.push((NO_PATH, Value::Undefined));
             self.nodes.push((NO_PATH, Value::Undefined));
@@ -377,14 +440,44 @@ impl Recorder {
     }
 
     fn truncation(&self) -> Option<TraceTruncation> {
-        (self.events_dropped > 0 || self.values_elided > 0 || self.paths_elided > 0).then_some(
-            TraceTruncation {
+        (self.events_dropped > 0
+            || self.values_elided > 0
+            || self.paths_elided > 0
+            || self.derivations_dropped > 0)
+            .then_some(TraceTruncation {
                 limit: self.limit,
                 events_dropped: self.events_dropped,
                 values_elided: self.values_elided,
                 paths_elided: self.paths_elided,
-            },
-        )
+                derivations_dropped: self.derivations_dropped,
+            })
+    }
+
+    fn attributed(&self) -> bool {
+        self.detail == ExplainDetail::Attributed
+    }
+
+    fn sync_flags(&mut self) {
+        self.paths = self.want_paths && self.enabled;
+        self.frames = self.enabled && (self.want_paths || self.attributed());
+        self.emit_hook = self.emissions || self.attributed();
+    }
+
+    fn depth(&self) -> u16 {
+        u16::try_from(self.call_pcs.len()).unwrap_or(u16::MAX)
+    }
+
+    /// Drops conditions that are no longer on the current path: deeper
+    /// frames, and conditions at or after `pc` in this frame (a loop went
+    /// back for its next iteration).
+    fn unwind_live(&mut self, depth: u16, pc: u32) {
+        while let Some(top) = self.live.last() {
+            if top.depth > depth || (top.depth == depth && top.anchor >= pc) {
+                self.live.pop();
+            } else {
+                break;
+            }
+        }
     }
 }
 
@@ -412,7 +505,7 @@ impl RegoVM {
     pub fn set_explain_detail(&mut self, detail: ExplainDetail, paths: bool) {
         self.explain.detail = detail;
         self.explain.want_paths = paths;
-        self.explain.paths = paths && self.explain.enabled;
+        self.explain.sync_flags();
         self.explain.reset();
     }
 
@@ -420,8 +513,8 @@ impl RegoVM {
     pub fn set_explain_capture(&mut self, capture: ExplainCapture, emissions: bool) {
         self.explain.capture = capture;
         self.explain.enabled = capture == ExplainCapture::Eager;
-        self.explain.paths = self.explain.want_paths && self.explain.enabled;
         self.explain.emissions = emissions;
+        self.explain.sync_flags();
         self.explain.reset();
     }
 
@@ -438,6 +531,11 @@ impl RegoVM {
     #[inline(always)]
     pub(super) fn explain_paths(&self) -> bool {
         self.explain.paths
+    }
+
+    #[inline(always)]
+    pub(super) fn explain_frames(&self) -> bool {
+        self.explain.frames
     }
 
     #[inline(always)]
@@ -527,6 +625,16 @@ impl RegoVM {
     #[cold]
     #[inline(never)]
     pub(super) fn explain_push_frame(&mut self, args: &[u8]) {
+        if self.explain.attributed() {
+            // A new call at this site replaces an earlier call's conditions.
+            let pc = u32::try_from(self.pc).unwrap_or(u32::MAX);
+            let depth = self.explain.depth();
+            self.explain.unwind_live(depth, pc);
+            self.explain.call_pcs.push(pc);
+        }
+        if !self.explain.paths {
+            return;
+        }
         let mut frame = Vec::with_capacity(args.len() + 1);
         frame.push([NO_PATH; 2]);
         for &arg in args {
@@ -539,6 +647,22 @@ impl RegoVM {
     #[cold]
     #[inline(never)]
     pub(super) fn explain_pop_frame(&mut self) {
+        if self.explain.attributed() {
+            let depth = self.explain.depth();
+            if let Some(call_pc) = self.explain.call_pcs.pop() {
+                let caller = depth.saturating_sub(1);
+                for live in self.explain.live.iter_mut().rev() {
+                    if live.depth < depth {
+                        break;
+                    }
+                    live.depth = caller;
+                    live.anchor = call_pc;
+                }
+            }
+        }
+        if !self.explain.paths {
+            return;
+        }
         if let Some(caller) = self.explain.path_frames.pop() {
             self.explain.reg_paths = caller;
         }
@@ -548,7 +672,75 @@ impl RegoVM {
     #[cold]
     #[inline(never)]
     pub(super) fn explain_body_start(&mut self, retained: usize) {
-        self.explain.reg_paths.truncate(retained);
+        if self.explain.attributed() {
+            let depth = self.explain.depth();
+            while self.explain.live.last().is_some_and(|l| l.depth >= depth) {
+                self.explain.live.pop();
+            }
+        }
+        if self.explain.paths {
+            self.explain.reg_paths.truncate(retained);
+        }
+    }
+
+    /// `Attributed`: keep the current path's conditions as one derivation of
+    /// `value` (an emitted value or a complete rule's result).
+    fn explain_derivation(&mut self, value: &Value) {
+        if *value == Value::Undefined {
+            return;
+        }
+        let rec = &mut self.explain;
+        if rec.derivations.len() >= rec.budget.max_derivations as usize {
+            rec.derivations_dropped = rec.derivations_dropped.saturating_add(1);
+            rec.note_limit(TraceLimit::Derivations);
+            return;
+        }
+        let depth = rec.depth();
+        let first = rec
+            .live
+            .iter()
+            .rposition(|l| l.depth < depth)
+            .map_or(0, |i| i + 1);
+        let start = u32::try_from(rec.derivation_conditions.len()).unwrap_or(u32::MAX);
+        let v = rec.value(value);
+        for i in first..rec.live.len() {
+            let live = rec.live[i].clone();
+            let v0 = rec.value(&live.left);
+            let v1 = live.right.as_ref().map_or(NO_VALUE, |r| rec.value(r));
+            rec.derivation_conditions.push(DerivationCondition {
+                pc: live.pc,
+                rule: live.rule,
+                definition: live.definition,
+                body: live.body,
+                v0,
+                v1,
+                p0: live.lp,
+                p1: live.rp,
+            });
+        }
+        let len = u32::try_from(rec.live.len() - first).unwrap_or(u32::MAX);
+        let (rule, definition, _) = self.explain_scope();
+        self.explain.derivations.push(Derivation {
+            rule,
+            definition,
+            value: v,
+            start,
+            len,
+        });
+    }
+
+    /// A complete (non-function) rule body succeeded with `result_reg`.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn explain_complete_body(&mut self, result_reg: u8) {
+        if self.explain.attributed() {
+            let value = self
+                .registers
+                .get(usize::from(result_reg))
+                .cloned()
+                .unwrap_or(Value::Undefined);
+            self.explain_derivation(&value);
+        }
     }
 
     fn explain_scope(&self) -> (u16, u16, u16) {
@@ -583,9 +775,6 @@ impl RegoVM {
     #[cold]
     #[inline(never)]
     pub(super) fn explain_condition(&mut self, left: u8, right: Option<u8>, passed: bool) {
-        if !self.explain.has_room() {
-            return;
-        }
         let operands = match right {
             Some(right) => Some((left, right)),
             None => self.pc.checked_sub(1).and_then(|prev| {
@@ -626,6 +815,37 @@ impl RegoVM {
                 }
             }),
         };
+        if self.explain.attributed() {
+            let (l, r) = operands.map_or((left, None), |(l, r)| (l, Some(r)));
+            let depth = self.explain.depth();
+            let pc = u32::try_from(self.pc).unwrap_or(u32::MAX);
+            self.explain.unwind_live(depth, pc);
+            if passed {
+                let (rule, definition, body) = self.explain_scope();
+                let get = |reg: u8| {
+                    self.registers
+                        .get(usize::from(reg))
+                        .cloned()
+                        .unwrap_or(Value::Undefined)
+                };
+                let live = Live {
+                    depth,
+                    anchor: pc,
+                    pc,
+                    rule,
+                    definition,
+                    body,
+                    left: get(l),
+                    right: r.map(get),
+                    lp: self.explain_reg_path(l),
+                    rp: r.map_or(NO_PATH, |r| self.explain_reg_path(r)),
+                };
+                self.explain.live.push(live);
+            }
+        }
+        if !self.explain.has_room() {
+            return;
+        }
         if !self.explain.wants_values(self.pc, passed) {
             self.explain_push(
                 EventKind::Condition,
@@ -676,14 +896,17 @@ impl RegoVM {
     #[cold]
     #[inline(never)]
     pub(super) fn explain_emission(&mut self, value: u8) {
-        if !self.explain.has_room() {
-            return;
-        }
         let v = self
             .registers
             .get(usize::from(value))
             .cloned()
             .unwrap_or(Value::Undefined);
+        if self.explain.attributed() {
+            self.explain_derivation(&v);
+        }
+        if !self.explain.emissions || !self.explain.has_room() {
+            return;
+        }
         let v0 = self.explain.value(&v);
         self.explain_push(
             EventKind::Emission,
@@ -710,10 +933,10 @@ impl RegoVM {
             }
             ExplainCapture::Lazy => {
                 self.explain.enabled = true;
-                self.explain.paths = self.explain.want_paths;
+                self.explain.sync_flags();
                 let replayed = self.execute_entry_point_by_name(entry_point);
                 self.explain.enabled = false;
-                self.explain.paths = false;
+                self.explain.sync_flags();
                 let replayed = replayed.map_err(ExplainProtoError::Vm)?;
                 if replayed != *query_result {
                     self.explain.reset();
@@ -943,6 +1166,59 @@ impl RegoVM {
         (kind, operator)
     }
 
+    /// `Attributed`: one emission per kept derivation of `rule`, whose
+    /// conditions are the path that produced it (including called helpers'
+    /// conditions, which the B4 types cannot yet attribute to the call).
+    fn derivation_emissions(&self, rule: u16) -> Vec<EmissionExplanation> {
+        let rec = &self.explain;
+        rec.derivations
+            .iter()
+            .filter(|d| d.rule == rule)
+            .enumerate()
+            .map(|(index, d)| {
+                let start = d.start as usize;
+                let end = start + d.len as usize;
+                let conditions = rec
+                    .derivation_conditions
+                    .get(start..end)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|c| {
+                        let name = self
+                            .program
+                            .rule_infos
+                            .get(usize::from(c.rule))
+                            .map_or("", |info| info.name.as_str());
+                        let st = self.site_static(c.pc as usize, name, c.definition, c.body);
+                        ConditionExplanation {
+                            text: st.text.clone(),
+                            outcome: Outcome::Success,
+                            kind: st.kind,
+                            location: st.location.clone(),
+                            operator: st.operator,
+                            left: self.reported(c.v0, c.p0, st.left_as_written.as_ref()),
+                            right: self.reported(c.v1, c.p1, st.right_as_written.as_ref()),
+                            witness: None,
+                            binding: None,
+                        }
+                    })
+                    .collect();
+                EmissionExplanation {
+                    index,
+                    definition: usize::from(d.definition),
+                    key: None,
+                    value: rec
+                        .values
+                        .get(d.value as usize)
+                        .map_or(ReportedValue::Known(Value::Undefined), |v| {
+                            ReportedValue::Known(v.clone())
+                        }),
+                    conditions,
+                }
+            })
+            .collect()
+    }
+
     /// Aggregates events per (rule, definition, body) and per condition site,
     /// so report size is bounded by program size plus stored emissions. The
     /// reported sample is the site's first failing event if any, else its
@@ -1084,21 +1360,24 @@ impl RegoVM {
                         .collect(),
                 })
                 .collect();
-            let emissions = rule
-                .emissions
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &(definition, value))| {
-                    self.reported(value, NO_PATH, None)
-                        .map(|operand| EmissionExplanation {
-                            index: i,
-                            definition: usize::from(definition),
-                            key: None,
-                            value: operand.value,
-                            conditions: Vec::new(),
-                        })
-                })
-                .collect();
+            let emissions = if self.explain.attributed() {
+                self.derivation_emissions(index)
+            } else {
+                rule.emissions
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &(definition, value))| {
+                        self.reported(value, NO_PATH, None)
+                            .map(|operand| EmissionExplanation {
+                                index: i,
+                                definition: usize::from(definition),
+                                key: None,
+                                value: operand.value,
+                                conditions: Vec::new(),
+                            })
+                    })
+                    .collect()
+            };
             let kind = if info.function_info.is_some() {
                 RuleKind::Function
             } else {

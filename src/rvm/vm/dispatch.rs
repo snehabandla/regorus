@@ -702,7 +702,7 @@ impl RegoVM {
             }
             SetAdd { set, value } => {
                 #[cfg(feature = "explanations")]
-                if self.explain.enabled && self.explain.emissions {
+                if self.explain.enabled && self.explain.emit_hook {
                     self.explain_emission(value);
                 }
                 let value_to_add = self.get_register(value)?.clone();
