@@ -30,7 +30,7 @@ pub fn apply_alias_entries(
     let sub_resource_set = &aliases.sub_resource_arrays;
 
     for (lc_key, entry) in entries {
-        if entry.is_wildcard || !entry.has_valid_paths() {
+        if entry.is_wildcard || !entry.has_valid_short_name() {
             continue;
         }
 

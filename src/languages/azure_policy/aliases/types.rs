@@ -424,7 +424,7 @@ pub struct ResolvedEntry {
     /// Whether the parsed `short_name` contains an array wildcard segment.
     ///
     /// Quoted keys such as `['[*]']` are not wildcards. A short name that does
-    /// not parse is reported as `false`; see [`Self::has_valid_paths`].
+    /// not parse is reported as `false`; see [`Self::has_valid_short_name`].
     pub is_wildcard: bool,
     /// Pre-lowercased short name as `Rc<str>` for allocation-free common-case inserts.
     pub(crate) short_name_lc: Rc<str>,
@@ -433,8 +433,8 @@ pub struct ResolvedEntry {
     /// Precomputed path segments for each versioned path, in the same order
     /// as `versioned_paths`.
     pub(crate) versioned_path_segments: Vec<Vec<super::path::Segment>>,
-    /// Whether the short name and every ARM path parse.
-    valid_paths: bool,
+    /// Whether the short name parses.
+    valid_short_name: bool,
 }
 
 impl ResolvedEntry {
@@ -465,11 +465,7 @@ impl ResolvedEntry {
                     .unwrap_or_default()
             })
             .collect::<Vec<_>>();
-        let valid_paths = short_path.is_some()
-            && !default_path_segments.is_empty()
-            && versioned_path_segments
-                .iter()
-                .all(|segments| !segments.is_empty());
+        let valid_short_name = short_path.is_some();
         Self {
             short_name,
             default_path,
@@ -479,14 +475,15 @@ impl ResolvedEntry {
             short_name_lc,
             default_path_segments,
             versioned_path_segments,
-            valid_paths,
+            valid_short_name,
         }
     }
 
-    /// Whether the short name and every ARM path parse. Entries with
-    /// unparseable paths are skipped during normalization and denormalization.
-    pub const fn has_valid_paths(&self) -> bool {
-        self.valid_paths
+    /// Whether the short name parses. Entries with an unparseable short name
+    /// are skipped during normalization and denormalization; an unparseable
+    /// ARM path skips the entry only for the API versions that select it.
+    pub const fn has_valid_short_name(&self) -> bool {
+        self.valid_short_name
     }
 
     /// Select the ARM path for a given API version.

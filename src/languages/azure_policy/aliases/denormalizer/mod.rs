@@ -123,7 +123,7 @@ pub fn denormalize_with_aliases(
     if let Some(entries) = entries {
         let mut writes = Vec::new();
         for (lc_key, entry) in entries {
-            if entry.is_wildcard || !entry.has_valid_paths() {
+            if entry.is_wildcard || !entry.has_valid_short_name() {
                 continue;
             }
 

@@ -175,9 +175,10 @@ fn remap_at_depth_in_btree(
     }
 }
 
-/// Move a value between paths inside one array element. The source is
-/// removed (pruning containers it empties) only after the target is written,
-/// so an element whose shape blocks the target keeps its source.
+/// Move a value between paths inside one array element. Nothing changes when
+/// the element's shape blocks the target; otherwise the source is removed
+/// (pruning containers it empties) and the target written. See
+/// [`keeps_source`] for sources that are copied instead.
 fn remap_deep_field_in_btree(btree: &mut Object, source: &str, target: &str, lowercase: bool) {
     let Some(val) = read_dotted_path_btree(btree, source, !lowercase) else {
         return;
@@ -188,9 +189,21 @@ fn remap_deep_field_in_btree(btree: &mut Object, source: &str, target: &str, low
         return;
     };
     if path::can_set_object(btree, &target) {
-        path::remove_object(btree, &source, true);
+        if !keeps_source(&source, lowercase) {
+            path::remove_object(btree, &source, true);
+        }
         path::set_object(btree, &target, val, lowercase);
     }
+}
+
+/// The normalizer (`lowercase`) copies an indexed ARM source instead of
+/// moving it: removing one array slot would leave a `null` hole that other
+/// aliases over the same array would read.
+fn keeps_source(source: &[Segment], lowercase: bool) -> bool {
+    lowercase
+        && source
+            .iter()
+            .any(|segment| matches!(segment, Segment::Index(_)))
 }
 
 /// Read a value at a dotted path from a BTreeMap.
@@ -225,7 +238,9 @@ fn remap_deep_field(obj: &mut ObjMap, source: &str, target: &str, lowercase: boo
         return;
     };
     if path::can_set(obj, &target) {
-        path::remove(obj, &source);
+        if !keeps_source(&source, lowercase) {
+            path::remove(obj, &source);
+        }
         path::set(obj, &target, val, lowercase);
     }
 }

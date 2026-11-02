@@ -625,3 +625,57 @@ fn invalid_short_names_are_skipped_and_dotted_names_parse() {
         Some(json!({"type": "Test/widgets", "x": 1, "a": {"b": 1}})),
     );
 }
+
+#[test]
+fn indexed_element_remap_source_is_kept_for_other_aliases() {
+    let aliases = [
+        ("nics[*].primaryIp", "properties.nics[*].ips[0]"),
+        ("nics[*].ips[*]", "properties.nics[*].ips[*]"),
+    ];
+    round_trip(
+        &aliases,
+        json!({"type": "Test/widgets", "properties": {"nics": [{"ips": ["a", "b"]}]}}),
+        Some(json!({"type": "Test/widgets", "nics": [{"primaryip": "a", "ips": ["a", "b"]}]})),
+    );
+    let registry = registry("Test/widgets", &aliases);
+    assert_eq!(
+        registry.denormalize(
+            &Value::from(
+                json!({"type": "Test/widgets", "nics": [{"primaryip": "z", "ips": ["a", "b"]}]})
+            ),
+            None,
+        ),
+        Value::from(json!({"type": "Test/widgets", "properties": {"nics": [{"ips": ["z", "b"]}]}}))
+    );
+}
+
+#[test]
+fn malformed_versioned_path_only_disables_its_version() {
+    let mut registry = AliasRegistry::new();
+    registry
+        .load_from_json(
+            &json!([{
+                "namespace": "Test",
+                "resourceTypes": [{"resourceType": "widgets", "aliases": [{
+                    "name": "Test/widgets/flag",
+                    "defaultPath": "properties.config.enabled",
+                    "paths": [{"path": "properties.future[", "apiVersions": ["v2"]}]
+                }]}]
+            }])
+            .to_string(),
+        )
+        .unwrap();
+    let raw =
+        Value::from(json!({"type": "Test/widgets", "properties": {"config": {"enabled": true}}}));
+    let normalized = normalizer::normalize(&raw, Some(&registry), None);
+    assert_eq!(
+        normalized,
+        Value::from(json!({"type": "Test/widgets", "config": {"enabled": true}, "flag": true}))
+    );
+    assert_eq!(registry.denormalize(&normalized, None), raw);
+    let versioned = normalizer::normalize(&raw, Some(&registry), Some("v2"));
+    assert_eq!(
+        versioned,
+        Value::from(json!({"type": "Test/widgets", "config": {"enabled": true}}))
+    );
+}
