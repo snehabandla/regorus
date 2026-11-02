@@ -473,24 +473,24 @@ fn remove_value(
         }
         (Value::Array(array), Segment::Index(index)) => {
             let array = Rc::make_mut(array);
-            let Some(child) = array.get_mut(*index) else {
+            let Some(element) = array.get_mut(*index) else {
                 return false;
             };
             prefix.push(Segment::Index(*index));
-            let consumed = rest.is_empty() || remove_value(child, rest, prefix, prune);
-            if consumed {
-                *child = Value::Null;
+            let removed = rest.is_empty() || remove_value(element, rest, prefix, prune);
+            if removed {
+                *element = Value::Null;
                 if let Prune::Tracked { consumed, .. } = prune {
                     consumed.insert(key(prefix));
                 }
             }
             prefix.pop();
-            if !consumed {
+            if !removed {
                 return false;
             }
             match prune {
                 Prune::Never => false,
-                Prune::Empty => array.iter().all(|child| matches!(child, Value::Null)),
+                Prune::Empty => array.iter().all(|item| matches!(item, Value::Null)),
                 Prune::Tracked { shapes, consumed } => {
                     let raw = shapes.get(&key(prefix));
                     let raw_len = raw.copied().flatten().unwrap_or(0);

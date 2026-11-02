@@ -69,7 +69,7 @@ pub fn apply_alias_entries(
                     lc_key.clone()
                 };
                 if path::scalar_segments(&key)
-                    .is_some_and(|segments| path::get_map(result, &segments).is_some())
+                    .is_some_and(|short| path::get_map(result, &short).is_some())
                 {
                     provenance.preserved.insert(lc_key.clone());
                 }

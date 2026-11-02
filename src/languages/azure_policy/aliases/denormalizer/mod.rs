@@ -222,13 +222,11 @@ fn denormalize_inner(
             let mut consumed = BTreeSet::new();
             for write in writes.iter().filter(|write| write.active) {
                 if let Some(source_properties) = write.source_properties {
-                    let mut prune = match provenance {
-                        Some(provenance) => path::Prune::Tracked {
-                            shapes: &provenance.shapes,
+                    let mut prune =
+                        provenance.map_or(path::Prune::Empty, |record| path::Prune::Tracked {
+                            shapes: &record.shapes,
                             consumed: &mut consumed,
-                        },
-                        None => path::Prune::Empty,
-                    };
+                        });
                     path::remove_with(
                         if source_properties {
                             &mut next_properties

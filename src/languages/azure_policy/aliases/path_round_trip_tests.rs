@@ -220,7 +220,10 @@ fn non_key_array_chain_still_renames_base() {
         let raw = Value::from(json!({"type": "Test/widgets", "properties": {"x": [{"z": 1}]}}));
         let normalized = normalizer::normalize(&raw, Some(&registry), None);
         let mut expected = renamed;
-        expected["type"] = json!("Test/widgets");
+        expected
+            .as_object_mut()
+            .unwrap()
+            .insert("type".into(), json!("Test/widgets"));
         assert_eq!(normalized, Value::from(expected), "{short}");
         let unrelated =
             Value::from(json!({"type": "Test/widgets", "properties": {"other": [{"z": 1}]}}));
@@ -289,46 +292,58 @@ fn index_padding_is_bounded() {
 
 #[test]
 fn round_trips() {
-    for (resource_type, aliases, raw_json) in [
+    for (resource_type, aliases, raw_json, normalized_json) in [
         (
             "Test/widgets",
             vec![("renamed['Mixed.Key']", "properties.original['Mixed.Key']")],
             json!({"type": "Test/widgets", "properties": {"original": {"Mixed.Key": 1, "sibling": 2}}}),
+            json!({"original": {"mixed.key": 1, "sibling": 2}, "renamed": {"mixed.key": 1}, "type": "Test/widgets"}),
         ),
         (
             "Test/widgets",
             vec![("renamed[2].leaf", "properties.original[2].leaf")],
             json!({"type": "Test/widgets", "properties": {"original": [null, null, {"leaf": 1, "sibling": 2}]}}),
+            json!({"original": [null, null, {"leaf": 1, "sibling": 2}], "renamed": [null, null, {"leaf": 1}], "type": "Test/widgets"}),
         ),
         (
             "Test/widgets",
             vec![("renamed['a.b']", "properties.original['a.b']")],
             json!({"type": "Test/widgets", "properties": {"original": {"a.b": 1, "sibling": 2}}}),
+            json!({"original": {"a.b": 1, "sibling": 2}, "renamed": {"a.b": 1}, "type": "Test/widgets"}),
         ),
         (
             "Test/widgets",
             vec![("renamed[0].leaf", "properties.original[0].leaf")],
             json!({"type": "Test/widgets", "properties": {"original": [{"leaf": 1, "sibling": 2}]}}),
+            json!({"original": [{"leaf": 1, "sibling": 2}], "renamed": [{"leaf": 1}], "type": "Test/widgets"}),
         ),
         (
             "Test/widgets",
             vec![("Config.a", "properties.config.a")],
             json!({"type": "Test/widgets", "properties": {"Config": {"a": 1, "b": 2}}}),
+            json!({"config": {"a": 1, "b": 2}, "type": "Test/widgets"}),
         ),
         (
             "Test/widgets",
             vec![("a", "properties.b"), ("b", "properties.c")],
             json!({"type": "Test/widgets", "properties": {"b": 1, "c": 2}}),
+            json!({"a": 1, "b": 2, "c": 2, "type": "Test/widgets"}),
         ),
         (
             "Test.Data/widgets",
             vec![("a.b", "x.b")],
             json!({"type": "Test.Data/widgets", "x": {"b": 1, "sibling": 2}}),
+            json!({"a": {"b": 1}, "type": "Test.Data/widgets", "x": {"b": 1, "sibling": 2}}),
         ),
     ] {
         let registry = registry(resource_type, &aliases);
         let raw = Value::from(raw_json);
         let normalized = normalizer::normalize(&raw, Some(&registry), None);
+        assert_eq!(
+            normalized,
+            Value::from(normalized_json),
+            "{resource_type}: {aliases:?}"
+        );
         assert_eq!(
             registry.denormalize(&normalized, None),
             raw,
@@ -618,5 +633,12 @@ fn index_bound_is_inclusive_at_max() {
         false,
     );
     let value = super::obj_map::make_value(map);
-    assert_eq!(value["a"].as_array().unwrap().len(), 4096);
+    let array = value
+        .as_object()
+        .unwrap()
+        .get(&Value::from("a"))
+        .unwrap()
+        .as_array()
+        .unwrap();
+    assert_eq!(array.len(), 4096);
 }
