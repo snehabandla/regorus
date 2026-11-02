@@ -1009,3 +1009,46 @@ fn registered_host_await_uses_last_supported_register_window() {
         other => panic!("expected structured register-overflow error, got {other:?}: {error}"),
     }
 }
+
+#[test]
+fn spans_refer_to_their_own_source() -> anyhow::Result<()> {
+    // The entry point is in the second module, so its spans are recorded
+    // before any span of the first module.
+    let mut engine = Engine::new();
+    engine.add_policy(
+        "lib.rego".to_string(),
+        "package lib\nimport rego.v1\n\nadmin if input.role == \"admin\"\n".to_string(),
+    )?;
+    engine.add_policy(
+        "main.rego".to_string(),
+        "package main\nimport rego.v1\n\n\n\nallow if data.lib.admin\n".to_string(),
+    )?;
+    engine.add_policy(
+        "unused.rego".to_string(),
+        "package unused\n\nx := 1\n".to_string(),
+    )?;
+    let compiled = engine.compile_with_entrypoint(&Rc::from("data.main.allow"))?;
+    let program = Compiler::compile_from_policy(&compiled, &["data.main.allow"])?;
+
+    let mut names = BTreeSet::new();
+    for span in program.instruction_spans.iter().flatten() {
+        if span.line == 0 {
+            continue;
+        }
+        let source = &program.sources[span.source_index];
+        let line = source
+            .content
+            .lines()
+            .nth(span.line - 1)
+            .unwrap_or_default();
+        match source.name.as_str() {
+            "main.rego" => assert!(line.starts_with("allow"), "{line}"),
+            "lib.rego" => assert!(line.starts_with("admin"), "{line}"),
+            name => panic!("span in {name}"),
+        }
+        names.insert(source.name.as_str());
+    }
+    assert_eq!(names, BTreeSet::from(["lib.rego", "main.rego"]));
+    assert_eq!(program.sources.len(), 3);
+    Ok(())
+}

@@ -168,10 +168,28 @@ impl<'a> Compiler<'a> {
 
         self.program.rule_infos = rule_infos_map.into_values().collect();
 
+        // Spans refer to sources by the index assigned on first use, so the
+        // sources that spans refer to come first, in that order.
+        let mut sources: Vec<Option<(String, String)>> = vec![None; self.source_to_index.len()];
+        let mut unreferenced = Vec::new();
         for module in self.policy.get_modules().iter() {
             let source = &module.package.refr.span().source;
             let source_path = source.get_path().to_string();
             let source_content = source.get_contents().to_string();
+            match self.source_to_index.get(&source_path) {
+                Some(&index) => {
+                    if let Some(slot @ None) = sources.get_mut(index) {
+                        *slot = Some((source_path, source_content));
+                    }
+                }
+                None => unreferenced.push((source_path, source_content)),
+            }
+        }
+        for (source_path, source_content) in sources
+            .into_iter()
+            .map(Option::unwrap_or_default)
+            .chain(unreferenced)
+        {
             self.program.add_source(source_path, source_content);
         }
 
