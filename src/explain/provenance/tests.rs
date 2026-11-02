@@ -1067,3 +1067,52 @@ fn carriage_returns_and_tabs() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn operations_beside_names_of_the_same_length() -> anyhow::Result<()> {
+    // `in input.a | input.` and `x in input.x | input` have the length of
+    // the collection too, but do not start and end between operands.
+    let provenance = allow(
+        "  some x in input.a | input.abc\n  some y in input.a & input.abc\n  some z in input.x | input.ab.c\n",
+    )?;
+    let loops: Vec<_> = provenance
+        .sites()
+        .iter()
+        .filter(|site| site.kind == ConditionKind::Iteration)
+        .map(|site| (site.text.as_str(), at(site)))
+        .collect();
+    assert_eq!(
+        loops,
+        vec![
+            ("input.a | input.abc", Some(("p.rego", 5, 13))),
+            ("input.a & input.abc", Some(("p.rego", 6, 13))),
+            ("input.x | input.ab.c", Some(("p.rego", 7, 13))),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn empty_sets_objects_and_spaced_calls() -> anyhow::Result<()> {
+    let provenance = allow(
+        "  input.s == set()\n  some {\"a\": 1, \"b\": x} in input.items\n  some y in sort (input.ys)\n  y == x\n",
+    )?;
+    let sites: Vec<_> = provenance
+        .sites()
+        .iter()
+        .map(|site| (site.text.as_str(), at(site)))
+        .collect();
+    let pattern = ("{\"a\": 1, \"b\": x}", Some(("p.rego", 6, 8)));
+    assert_eq!(
+        sites,
+        vec![
+            ("input.s == set()", Some(("p.rego", 5, 3))),
+            ("input.items", Some(("p.rego", 6, 28))),
+            // The check of the `"a": 1` field of the pattern.
+            pattern,
+            ("sort (input.ys)", Some(("p.rego", 7, 13))),
+            ("y == x", Some(("p.rego", 8, 3))),
+        ]
+    );
+    Ok(())
+}

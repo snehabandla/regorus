@@ -448,9 +448,10 @@ fn writes(program: &Program, instruction: &Instruction) -> [Option<u8>; 3] {
 /// and the length from its first token to its last; a string token's span
 /// excludes its quotes. A statement and a literal start at their first
 /// token, but a reference such as `input.user.name` or `f(x)` points at its
-/// last `.`, `[` or `(`, and an operation such as `a + b` or `x in xs` at its
+/// last `.`, `[` or `(`, and an operation such as `a + b` or `a | b` at its
 /// operator. The expression is found as the tokens around that one that
-/// span the length.
+/// span the length. A check whose expression cannot be found this way, such
+/// as one anchored at a unary minus, has empty text and no location.
 struct SourceIndex<'a> {
     file: &'a str,
     content: &'a str,
@@ -554,6 +555,12 @@ impl<'a> SourceIndex<'a> {
             let first = self.tokens.binary_search_by_key(&start, |t| t.start).ok()?;
             (first <= anchor && self.balanced(first, last)).then_some((first, last))
         };
+        let starting = || {
+            let end = at.start.checked_add(span.length)?;
+            let rest = self.tokens.get(anchor..)?;
+            let last = anchor.checked_add(rest.binary_search_by_key(&end, |t| t.end).ok()?)?;
+            self.balanced(anchor, last).then_some((anchor, last))
+        };
         match self.symbol(anchor) {
             // A reference ends with the field or brackets after its last
             // separator.
@@ -561,9 +568,14 @@ impl<'a> SourceIndex<'a> {
             Some("[" | "(") if self.continues(anchor) => {
                 ending(self.closing(anchor, self.tokens.len())?)
             }
-            Some(_) if !matches!(self.symbol(anchor), Some("[" | "(" | "{")) => {
+            // A call may also have a space before its arguments.
+            Some("[" | "(") => {
+                starting().or_else(|| ending(self.closing(anchor, self.tokens.len())?))
+            }
+            Some(_) if self.bracket(anchor) == 0 => {
                 // An operation: the expression must be the only one around
-                // its operator with the length of the span.
+                // its operator that has the length of the span and starts
+                // and ends between operands.
                 let mut found = None;
                 for first in (0..anchor).rev() {
                     let start = self.tokens.get(first)?.start;
@@ -572,25 +584,77 @@ impl<'a> SourceIndex<'a> {
                         break;
                     }
                     let rest = self.tokens.get(anchor..)?;
-                    if let Ok(last) = rest.binary_search_by_key(&end, |t| t.end) {
-                        let last = anchor.checked_add(last)?;
-                        if self.balanced(first, last) {
-                            if found.is_some() {
-                                return None;
-                            }
-                            found = Some((first, last));
+                    let Ok(last) = rest.binary_search_by_key(&end, |t| t.end) else {
+                        continue;
+                    };
+                    let last = anchor.checked_add(last)?;
+                    if self.bounded(first, last) && self.balanced(first, last) {
+                        if found.is_some() {
+                            return None;
                         }
+                        found = Some((first, last));
                     }
                 }
                 found
             }
             // Anything else starts the expression.
-            _ => {
-                let end = at.start.checked_add(span.length)?;
-                let rest = self.tokens.get(anchor..)?;
-                let last = anchor.checked_add(rest.binary_search_by_key(&end, |t| t.end).ok()?)?;
-                self.balanced(anchor, last).then_some((anchor, last))
+            _ => starting(),
+        }
+    }
+
+    /// Whether an operand can start at token `first` and end at `last`:
+    /// neither continues the term or statement around it.
+    fn bounded(&self, first: usize, last: usize) -> bool {
+        let starts = match first
+            .checked_sub(1)
+            .and_then(|i| Some((i, self.tokens.get(i)?)))
+        {
+            None => true,
+            Some((before, token)) => {
+                token.line < self.tokens.get(first).map_or(0, |t| t.line)
+                    || match token.kind {
+                        TokenClass::Symbol => {
+                            !matches!(self.symbol(before), Some("." | ")" | "]" | "}"))
+                        }
+                        TokenClass::Name => {
+                            self.content
+                                .get(token.start..token.end)
+                                .is_some_and(|word| {
+                                    matches!(
+                                        word,
+                                        "as" | "contains"
+                                            | "default"
+                                            | "else"
+                                            | "every"
+                                            | "if"
+                                            | "in"
+                                            | "not"
+                                            | "some"
+                                            | "with"
+                                    )
+                                })
+                        }
+                        _ => false,
+                    }
             }
+        };
+        let ends = self.tokens.get(last).is_some_and(|token| {
+            token.kind != TokenClass::Symbol || matches!(self.symbol(last), Some(")" | "]" | "}"))
+        });
+        let next = last.saturating_add(1);
+        starts && ends && self.symbol(next) != Some(".") && !self.continues(next)
+    }
+
+    /// 1 for a token that opens a bracket, -1 for one that closes it.
+    fn bracket(&self, index: usize) -> i8 {
+        let Some(token) = self.tokens.get(index) else {
+            return 0;
+        };
+        match self.content.get(token.start..token.end) {
+            // The lexer reads an empty set's `set(` as one token.
+            Some("[" | "(" | "{" | "set(") if token.kind != TokenClass::Quoted => 1,
+            Some("]" | ")" | "}") if token.kind == TokenClass::Symbol => -1,
+            _ => 0,
         }
     }
 
@@ -598,15 +662,13 @@ impl<'a> SourceIndex<'a> {
     fn closing(&self, open: usize, limit: usize) -> Option<usize> {
         let mut depth = 0_usize;
         for index in open..limit {
-            match self.symbol(index) {
-                Some("[" | "(" | "{") => depth = depth.saturating_add(1),
-                Some("]" | ")" | "}") => {
-                    depth = depth.checked_sub(1)?;
-                    if depth == 0 {
-                        return Some(index);
-                    }
-                }
-                _ => {}
+            depth = match self.bracket(index) {
+                1 => depth.saturating_add(1),
+                -1 => depth.checked_sub(1)?,
+                _ => continue,
+            };
+            if depth == 0 {
+                return Some(index);
             }
         }
         None
@@ -616,14 +678,12 @@ impl<'a> SourceIndex<'a> {
     fn balanced(&self, first: usize, last: usize) -> bool {
         let mut depth = 0_usize;
         for index in first..=last {
-            match self.symbol(index) {
-                Some("[" | "(" | "{") => depth = depth.saturating_add(1),
-                Some("]" | ")" | "}") => match depth.checked_sub(1) {
-                    Some(d) => depth = d,
-                    None => return false,
-                },
-                _ => {}
-            }
+            depth = match (self.bracket(index), depth.checked_sub(1)) {
+                (1, _) => depth.saturating_add(1),
+                (-1, Some(depth)) => depth,
+                (-1, None) => return false,
+                _ => depth,
+            };
         }
         depth == 0
     }
