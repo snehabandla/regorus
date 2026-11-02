@@ -563,6 +563,7 @@ impl RegoVM {
                 .record_rule_summary(rule_index, succeeded, Some(result_from_rule.clone()));
             if let Some(last) = self.trace.rule_outcomes.last_mut() {
                 last.result_path = result_path;
+                last.assumption_dependent = result_is_assumption_dependent;
             }
             // Track assumption-dependent depth so negation handling can detect it.
             if succeeded && result_is_assumption_dependent {
@@ -1179,6 +1180,12 @@ impl RegoVM {
                 last.result_path = return_provenance
                     .as_ref()
                     .map(|path| alloc::string::String::from(path.as_ref()));
+                last.assumption_dependent = pe_result_is_assumption_dependent;
+            }
+            // Track assumption-dependent depth so negation handling can
+            // detect it, as run-to-completion does.
+            if succeeded && pe_result_is_assumption_dependent {
+                self.assumption_dependent_depth = self.assumption_dependent_depth.saturating_add(1);
             }
         }
         #[cfg(feature = "explanations")]

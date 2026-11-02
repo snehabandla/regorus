@@ -5811,3 +5811,454 @@ allow if {
         assert!(text.contains("westus-kept"), "{report:#}");
     }
 }
+
+// ---------------------------------------------------------------------------
+// RG-12: an outer helper-call condition takes a failed inner condition's
+// provenance only when the helper returned falsy.
+// ---------------------------------------------------------------------------
+
+/// `left.provenance` of every reported condition with exactly `text`, in
+/// report order, across rules, definitions and emissions.
+fn rg12_left_provenances(report: &serde_json::Value, text: &str) -> Vec<Option<String>> {
+    fn walk(value: &serde_json::Value, text: &str, out: &mut Vec<Option<String>>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if map.get("text").and_then(|t| t.as_str()) == Some(text)
+                    && map.contains_key("outcome")
+                {
+                    out.push(
+                        map.get("left")
+                            .and_then(|l| l.get("provenance"))
+                            .and_then(|p| p.as_str())
+                            .map(str::to_string),
+                    );
+                }
+                for (key, item) in map {
+                    if key != "helper_conditions" {
+                        walk(item, text, out);
+                    }
+                }
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|item| walk(item, text, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(report, text, &mut out);
+    out
+}
+
+const RG12_TWO_DEFINITIONS: &str = r#"package p
+import rego.v1
+_ok(r) if r.a.x == "yes"
+_ok(r) if r.b == "yes"
+"#;
+
+/// Reports for `deny` in both execution modes (Full values), with the outer
+/// condition's provenances. Panics if the condition is never reported.
+fn rg12_outer(policy: &str, input: &str, text: &str) -> Vec<Vec<Option<String>>> {
+    rgr3_reports(
+        policy,
+        input,
+        "data.p.deny",
+        evaluation_trace::ValueMode::Full,
+    )
+    .iter()
+    .map(|report| {
+        let found = rg12_left_provenances(report, text);
+        assert!(!found.is_empty(), "{text} not reported: {report:#}");
+        found
+    })
+    .collect()
+}
+
+#[test]
+fn rg12_succeeding_helper_does_not_borrow_a_failed_definition_path() {
+    let policy = format!(
+        "{RG12_TWO_DEFINITIONS}deny contains r.name if {{\n    some r in input.resources\n    _ok(r)\n}}\n"
+    );
+    let input = r#"{"resources": [{"name": "n", "a": {"x": "no"}, "b": "yes"}]}"#;
+    for provenances in rg12_outer(&policy, input, "_ok(r)") {
+        for provenance in provenances {
+            assert!(
+                !provenance.as_deref().unwrap_or("").contains(".a.x"),
+                "a succeeding helper took its failed definition's path: {provenance:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn rg12_succeeding_helper_does_not_borrow_a_failed_iteration_path() {
+    let policy = r#"package p
+import rego.v1
+_has_ok(r) if {
+    some e in r.items
+    e.ok == true
+}
+deny contains r.name if {
+    some r in input.resources
+    _has_ok(r)
+}
+"#;
+    let input = r#"{"resources": [{"name": "n", "items": [{"ok": false}, {"ok": true}]}]}"#;
+    for provenances in rg12_outer(policy, input, "_has_ok(r)") {
+        for provenance in provenances {
+            assert!(
+                !provenance.as_deref().unwrap_or("").contains("items[0]"),
+                "a succeeding helper took its failed iteration's path: {provenance:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn rg12_negated_helper_that_held_does_not_borrow_a_failed_path() {
+    let policy = format!(
+        "{RG12_TWO_DEFINITIONS}deny contains r.name if {{\n    some r in input.resources\n    not _ok(r)\n}}\n"
+    );
+    let input = r#"{"resources": [{"name": "n", "a": {"x": "no"}, "b": "yes"}]}"#;
+    for provenances in rg12_outer(&policy, input, "not _ok(r)") {
+        for provenance in provenances {
+            assert!(
+                !provenance.as_deref().unwrap_or("").contains(".a.x"),
+                "`not` over a helper that held took a failed path: {provenance:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn rg12_falsy_helper_still_derives_its_failed_path() {
+    // Controls: a helper that returned falsy keeps the derived provenance,
+    // directly and behind `not`.
+    let input = r#"{"resources": [{"name": "n", "a": {"x": "no"}, "b": "no"}]}"#;
+    let direct = format!(
+        "{RG12_TWO_DEFINITIONS}deny contains r.name if {{\n    some r in input.resources\n    _ok(r)\n}}\n"
+    );
+    for provenances in rg12_outer(&direct, input, "_ok(r)") {
+        assert!(
+            provenances
+                .iter()
+                .any(|p| p.as_deref() == Some("input.resources[0].b")),
+            "{provenances:?}"
+        );
+    }
+    let negated = format!(
+        "{RG12_TWO_DEFINITIONS}deny contains r.name if {{\n    some r in input.resources\n    not _ok(r)\n}}\n"
+    );
+    for provenances in rg12_outer(&negated, input, "not _ok(r)") {
+        assert!(
+            provenances
+                .iter()
+                .any(|p| p.as_deref() == Some("input.resources[0].b")),
+            "{provenances:?}"
+        );
+    }
+}
+
+/// Causality report for `deny` in partial-evaluation mode with `unknowns`,
+/// in both execution modes, with the outer condition's provenances.
+fn rg12_outer_pe(
+    policy: &str,
+    input: &str,
+    text: &str,
+    unknowns: &[&str],
+) -> Vec<Vec<Option<String>>> {
+    let entry = "data.p.deny";
+    let mut engine = Engine::new();
+    engine
+        .add_policy("rg12.rego".into(), policy.into())
+        .unwrap();
+    let compiled = engine.compile_with_entrypoint(&Rc::from(entry)).unwrap();
+    let program =
+        languages::rego::compiler::Compiler::compile_from_policy(&compiled, &[entry]).unwrap();
+    [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ]
+    .into_iter()
+    .map(|execution_mode| {
+        let mut vm = rvm::RegoVM::new_with_policy(compiled.clone());
+        vm.load_program(program.clone());
+        vm.set_execution_mode(execution_mode);
+        vm.set_explanation_settings(evaluation_trace::ExplanationSettings {
+            enabled: true,
+            value_mode: evaluation_trace::ValueMode::Full,
+            condition_mode: evaluation_trace::ConditionMode::AllContributing,
+            detail: evaluation_trace::ExplanationDetail::Full,
+            assume_unknown_input: true,
+            eval_mode: evaluation_trace::EvaluationMode::PartialEval,
+            unknowns: unknowns.iter().map(|u| (*u).into()).collect(),
+            ..Default::default()
+        });
+        vm.set_input(Value::from_json_str(input).unwrap());
+        let result = vm.execute_entry_point_by_name(entry).unwrap();
+        let report: serde_json::Value =
+            serde_json::from_str(&vm.take_causality_report(result).unwrap()).unwrap();
+        let found = rg12_left_provenances(&report, text);
+        assert!(
+            !found.is_empty(),
+            "{text} not reported ({execution_mode:?}): {report:#}"
+        );
+        found
+    })
+    .collect()
+}
+
+#[test]
+fn rg12_negated_helper_held_by_an_assumption_does_not_borrow_a_failed_path() {
+    // In partial evaluation `not` turns an assumption-dependent `true` into
+    // `true`, so the outer guard succeeds although the helper held (assumed).
+    let policy = format!(
+        "{RG12_TWO_DEFINITIONS}deny contains r.name if {{\n    some r in input.resources\n    not _ok(r)\n}}\n"
+    );
+    let input = r#"{"resources": [{"name": "n", "a": {"x": "no"}}]}"#;
+    for provenances in rg12_outer_pe(&policy, input, "not _ok(r)", &["input.resources[0].b"]) {
+        for provenance in provenances {
+            assert!(
+                !provenance.as_deref().unwrap_or("").contains(".a.x"),
+                "a helper held by an assumption took a failed path: {provenance:?}"
+            );
+        }
+    }
+    // Control: in the same mode, a helper that is concretely falsy (no
+    // unknown reached) still derives its last failed path.
+    let falsy = r#"{"resources": [{"name": "n", "a": {"x": "no"}, "b": "no"}]}"#;
+    for provenances in rg12_outer_pe(&policy, falsy, "not _ok(r)", &["input.other"]) {
+        assert!(
+            provenances
+                .iter()
+                .any(|p| p.as_deref() == Some("input.resources[0].b")),
+            "{provenances:?}"
+        );
+    }
+}
+
+#[test]
+fn rg12_assumption_in_a_nested_or_cut_helper_is_not_definite() {
+    // The assumption sits one helper deeper (`_ok` -> `_inner`).
+    let nested = r#"package p
+import rego.v1
+_ok(r) if r.a.x == "yes"
+_ok(r) if _inner(r)
+_inner(r) if r.b == "yes"
+deny contains r.name if {
+    some r in input.resources
+    not _ok(r)
+}
+"#;
+    let input = r#"{"resources": [{"name": "n", "a": {"x": "no"}}]}"#;
+    for provenances in rg12_outer_pe(nested, input, "not _ok(r)", &["input.resources[0].b"]) {
+        for provenance in provenances {
+            assert!(
+                !provenance.as_deref().unwrap_or("").contains(".a.x"),
+                "nested assumption: {provenance:?}"
+            );
+        }
+    }
+    // The assumption sits below the helper depth cap, so it is never
+    // reported; the cut expansion must count as possibly assumed.
+    let mut deep =
+        String::from("package p\nimport rego.v1\n_ok(r) if r.a.x == \"yes\"\n_ok(r) if _h1(r)\n");
+    for level in 1..=10 {
+        deep.push_str(&format!("_h{level}(r) if _h{}(r)\n", level + 1));
+    }
+    deep.push_str("_h11(r) if r.b == \"yes\"\n");
+    deep.push_str("deny contains r.name if {\n    some r in input.resources\n    not _ok(r)\n}\n");
+    for provenances in rg12_outer_pe(&deep, input, "not _ok(r)", &["input.resources[0].b"]) {
+        for provenance in provenances {
+            assert!(
+                !provenance.as_deref().unwrap_or("").contains(".a.x"),
+                "assumption below the depth cap: {provenance:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn rg12_assumption_hidden_from_reported_conditions_is_not_definite() {
+    let input = r#"{"resources": [{"name": "n", "a": {"x": "no"}}]}"#;
+    // The nested call is wrapped in a comparison, so it is not expanded as a
+    // helper, and its assumption never appears among `_ok`'s conditions.
+    let wrapped = r#"package p
+import rego.v1
+_ok(r) if r.a.x == "yes"
+_ok(r) if _inner(r) == true
+_inner(r) if r.b == "yes"
+deny contains r.name if {
+    some r in input.resources
+    not _ok(r)
+}
+"#;
+    // `not r.b` over an unknown records its assumption only in the trace's
+    // assumptions; the guard itself reports success.
+    let negation = r#"package p
+import rego.v1
+_ok(r) if r.a.x == "yes"
+_ok(r) if not r.b
+deny contains r.name if {
+    some r in input.resources
+    not _ok(r)
+}
+"#;
+    for (name, policy) in [("wrapped", wrapped), ("negation", negation)] {
+        for provenances in rg12_outer_pe(policy, input, "not _ok(r)", &["input.resources[0].b"]) {
+            for provenance in provenances {
+                assert!(
+                    !provenance.as_deref().unwrap_or("").contains(".a.x"),
+                    "{name}: a helper held by a hidden assumption took a failed path: {provenance:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn rg12_each_call_uses_its_own_assumption_status() {
+    // r0's helper held by an assumption (its `b` is unknown); r1's helper is
+    // concretely falsy. Each outer condition must use its own call.
+    let policy = format!(
+        "{RG12_TWO_DEFINITIONS}deny contains r.name if {{\n    some r in input.resources\n    not _ok(r)\n}}\n"
+    );
+    let input = r#"{"resources": [{"name": "r0", "a": {"x": "no"}},
+                                 {"name": "r1", "a": {"x": "no"}, "b": "no"}]}"#;
+    for provenances in rg12_outer_pe(&policy, input, "not _ok(r)", &["input.resources[0].b"]) {
+        assert!(
+            provenances
+                .iter()
+                .all(|p| !p.as_deref().unwrap_or("").contains("resources[0].a.x")),
+            "r0 took a failed path: {provenances:?}"
+        );
+        assert!(
+            provenances
+                .iter()
+                .any(|p| p.as_deref() == Some("input.resources[1].b")),
+            "r1 lost its derived path: {provenances:?}"
+        );
+    }
+}
+
+#[test]
+fn suspendable_partial_evaluation_negates_assumption_dependent_helpers() {
+    // `not` over a helper that held only by an assumption is indeterminate in
+    // partial evaluation, so the negation is assumed to hold. Both execution
+    // modes must agree (regression in 6d351052, which stopped suspendable
+    // calls from leaking callee provenance and exposed the missing counter).
+    let policy = format!(
+        "{RG12_TWO_DEFINITIONS}deny contains r.name if {{\n    some r in input.resources\n    not _ok(r)\n}}\n"
+    );
+    let entry = "data.p.deny";
+    let run = |input: &str, execution_mode| {
+        let mut engine = Engine::new();
+        engine.add_policy("p.rego".into(), policy.clone()).unwrap();
+        let compiled = engine.compile_with_entrypoint(&Rc::from(entry)).unwrap();
+        let program =
+            languages::rego::compiler::Compiler::compile_from_policy(&compiled, &[entry]).unwrap();
+        let mut vm = rvm::RegoVM::new_with_policy(compiled);
+        vm.load_program(program);
+        vm.set_execution_mode(execution_mode);
+        vm.set_explanation_settings(evaluation_trace::ExplanationSettings {
+            enabled: true,
+            assume_unknown_input: true,
+            eval_mode: evaluation_trace::EvaluationMode::PartialEval,
+            unknowns: vec!["input.resources[0].b".into()],
+            ..Default::default()
+        });
+        vm.set_input(Value::from_json_str(input).unwrap());
+        vm.execute_entry_point_by_name(entry).unwrap()
+    };
+    let names = |names: &[&str]| {
+        Value::from(
+            names
+                .iter()
+                .map(|n| Value::from(*n))
+                .collect::<std::collections::BTreeSet<Value>>(),
+        )
+    };
+    for (input, expected) in [
+        // Held by an assumption: indeterminate, so `not` is assumed to hold.
+        (
+            r#"{"resources": [{"name": "n", "a": {"x": "no"}}]}"#,
+            names(&["n"]),
+        ),
+        // Controls: concretely falsy, and concretely true.
+        (
+            r#"{"resources": [{"name": "n", "a": {"x": "no"}, "b": "no"}]}"#,
+            names(&["n"]),
+        ),
+        (
+            r#"{"resources": [{"name": "n", "a": {"x": "yes"}, "b": "no"}]}"#,
+            names(&[]),
+        ),
+    ] {
+        for execution_mode in [
+            rvm::vm::ExecutionMode::RunToCompletion,
+            rvm::vm::ExecutionMode::Suspendable,
+        ] {
+            assert_eq!(
+                run(input, execution_mode),
+                expected,
+                "{execution_mode:?} {input}"
+            );
+        }
+    }
+}
+
+#[test]
+fn rgp3_assumption_counter_leaks_into_an_unrelated_negation() {
+    // KNOWN DEFECT (RG-P3), pinned so a fix is noticed. Partial evaluation
+    // tracks assumption dependence with one VM-wide counter, so a helper that
+    // held only by an assumption and was consumed positively makes a later
+    // `not` over a concretely true helper hold. The correct answer for both
+    // cases is the empty set; both execution modes currently over-approximate.
+    let cases = [
+        (
+            "package p\nimport rego.v1\n_a(r) if r.u == 1\n_b(r) if r.k == 1\ndeny contains r.name if {\n    some r in input.resources\n    _a(r)\n    not _b(r)\n}\n",
+            r#"{"resources": [{"name": "n", "k": 1}]}"#,
+            "input.resources[0].u",
+            "n",
+        ),
+        (
+            "package p\nimport rego.v1\n_pending(r) if r.b == \"yes\"\n_known(unused, r) if r.a == \"yes\"\ndeny contains \"bad\" if {\n    v := _pending(input)\n    not _known(v, input)\n}\n",
+            r#"{"a": "yes"}"#,
+            "input.b",
+            "bad",
+        ),
+    ];
+    let entry = "data.p.deny";
+    for (policy, input, unknown, leaked) in cases {
+        for execution_mode in [
+            rvm::vm::ExecutionMode::RunToCompletion,
+            rvm::vm::ExecutionMode::Suspendable,
+        ] {
+            let mut engine = Engine::new();
+            engine.add_policy("p.rego".into(), policy.into()).unwrap();
+            let compiled = engine.compile_with_entrypoint(&Rc::from(entry)).unwrap();
+            let program =
+                languages::rego::compiler::Compiler::compile_from_policy(&compiled, &[entry])
+                    .unwrap();
+            let mut vm = rvm::RegoVM::new_with_policy(compiled);
+            vm.load_program(program);
+            vm.set_execution_mode(execution_mode);
+            vm.set_explanation_settings(evaluation_trace::ExplanationSettings {
+                enabled: true,
+                assume_unknown_input: true,
+                eval_mode: evaluation_trace::EvaluationMode::PartialEval,
+                unknowns: vec![unknown.into()],
+                ..Default::default()
+            });
+            vm.set_input(Value::from_json_str(input).unwrap());
+            let expected = Value::from(
+                [Value::from(leaked)]
+                    .into_iter()
+                    .collect::<std::collections::BTreeSet<Value>>(),
+            );
+            assert_eq!(
+                vm.execute_entry_point_by_name(entry).unwrap(),
+                expected,
+                "{execution_mode:?} {input}"
+            );
+        }
+    }
+}

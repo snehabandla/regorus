@@ -226,6 +226,12 @@ pub struct RuleOutcome {
     /// (set on summary outcomes), so a report can redact a helper's result by
     /// where it came from.
     pub result_path: Option<String>,
+    /// Number of condition outcomes recorded when this outcome was recorded,
+    /// so a report can find the call that finished just before a condition.
+    pub conditions_recorded: u32,
+    /// The call recorded an assumption at any depth (summary outcomes), so
+    /// its result is not concretely known.
+    pub assumption_dependent: bool,
 }
 
 /// A single emitted result value for a partial-set rule.
@@ -686,6 +692,7 @@ impl EvaluationTrace {
         result_value: Option<Value>,
     ) {
         let result_idx = result_value.and_then(|v| self.capture_value(v));
+        let conditions_recorded = u32::try_from(self.condition_outcomes.len()).unwrap_or(u32::MAX);
         self.rule_outcomes.push(RuleOutcome {
             rule_index,
             definition_index,
@@ -693,6 +700,8 @@ impl EvaluationTrace {
             result_value_idx: result_idx,
             is_summary: false,
             result_path: None,
+            conditions_recorded,
+            assumption_dependent: false,
         });
     }
 
@@ -709,6 +718,7 @@ impl EvaluationTrace {
         result_value: Option<Value>,
     ) {
         let result_idx = result_value.and_then(|v| self.capture_value(v));
+        let conditions_recorded = u32::try_from(self.condition_outcomes.len()).unwrap_or(u32::MAX);
         self.rule_outcomes.push(RuleOutcome {
             rule_index,
             definition_index: 0,
@@ -716,6 +726,8 @@ impl EvaluationTrace {
             result_value_idx: result_idx,
             is_summary: true,
             result_path: None,
+            conditions_recorded,
+            assumption_dependent: false,
         });
     }
 

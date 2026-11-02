@@ -2440,14 +2440,41 @@ fn materialize_conditions(
 /// stack blow-up on pathological policies (mutually-recursive helpers).
 const MAX_HELPER_DEPTH: usize = 8;
 
+/// A rule or function call whose result a condition guard checks.
+#[derive(Clone, Copy)]
+struct HelperCall {
+    rule_index: u16,
+    /// The guard checks `not <call>` rather than the call result itself.
+    through_not: bool,
+}
+
+impl HelperCall {
+    /// Whether the helper definitely returned a falsy value (false or
+    /// undefined), judged from the guarding condition's outcome: a direct
+    /// guard fails, and a `not` guard holds, exactly when the helper was
+    /// falsy. Anything else, including an `assumed` outcome, is not definite.
+    /// (An assumption is recorded inside the helper, so the guard itself is
+    /// not expected to be `assumed`.) In partial evaluation `not` also holds
+    /// over a helper that held only by an assumption; callers rule that out
+    /// with [`call_depends_on_assumption`].
+    fn returned_falsy(self, outer_outcome: &str) -> bool {
+        outer_outcome
+            == if self.through_not {
+                "success"
+            } else {
+                "failure"
+            }
+    }
+}
+
 /// If the Guard at `outer_pc` fires on a register written by a rule call
 /// (either `CallRule` for a bare rule reference, or `FunctionCall` for a
 /// helper-function call — the compiler picks `FunctionCall` for helpers with
-/// arguments like `_frontdoor_has_waf(resource)`), return the callee rule
-/// index. Handles both the positive `_helper(x)` and negated `not _helper(x)`
-/// forms (the latter has a `Not` between the call and the Guard). Returns
-/// `None` otherwise.
-fn detect_helper_call_at_guard(outer_pc: usize, program: &Program) -> Option<u16> {
+/// arguments like `_frontdoor_has_waf(resource)`), return the call. Handles
+/// both the positive `_helper(x)` and negated `not _helper(x)` forms (the
+/// latter has a `Not` between the call and the Guard, recorded as
+/// `through_not`). Returns `None` otherwise.
+fn detect_helper_call_at_guard(outer_pc: usize, program: &Program) -> Option<HelperCall> {
     let guard = program.instructions.get(outer_pc)?;
     let guard_reg = match *guard {
         Instruction::Guard { register, .. } => register,
@@ -2460,8 +2487,11 @@ fn detect_helper_call_at_guard(outer_pc: usize, program: &Program) -> Option<u16
 
     // Case 1: `_helper(x)` -- CallRule or FunctionCall writes directly to
     // the guard register.
-    if let Some(rule_idx) = call_writes_to(prev, guard_reg, program) {
-        return Some(rule_idx);
+    if let Some(rule_index) = call_writes_to(prev, guard_reg, program) {
+        return Some(HelperCall {
+            rule_index,
+            through_not: false,
+        });
     }
 
     // Case 2: `not _helper(x)` -- Not writes to the guard register from an
@@ -2476,8 +2506,11 @@ fn detect_helper_call_at_guard(outer_pc: usize, program: &Program) -> Option<u16
             while cur > start {
                 cur = cur.saturating_sub(1);
                 let candidate = program.instructions.get(cur)?;
-                if let Some(rule_idx) = call_writes_to(candidate, operand, program) {
-                    return Some(rule_idx);
+                if let Some(rule_index) = call_writes_to(candidate, operand, program) {
+                    return Some(HelperCall {
+                        rule_index,
+                        through_not: true,
+                    });
                 }
             }
         }
@@ -2537,10 +2570,10 @@ fn collect_helper_condition_outcomes(
 /// written by a rule call, materialize the helper's evaluated inner
 /// conditions as structural children.
 ///
-/// Returns the conditions plus whether expansion was cut short by the depth
-/// cap. Detection deliberately runs *before* the cap check so the two empty
-/// cases stay distinguishable: no helper call at all reports `false`, while a
-/// real helper we declined to expand reports `true`.
+/// Returns the conditions, whether expansion was cut short by the depth cap,
+/// and the detected call. Detection deliberately runs *before* the cap check
+/// so the two empty cases stay distinguishable: no helper call at all reports
+/// `false`, while a real helper we declined to expand reports `true`.
 #[allow(clippy::too_many_arguments)]
 fn materialize_helper_conditions(
     outer_pc: usize,
@@ -2550,12 +2583,13 @@ fn materialize_helper_conditions(
     trace: &EvaluationTrace,
     settings: &ExplanationSettings,
     depth: usize,
-) -> (Vec<ConditionExplanation>, bool) {
-    let Some(helper_rule_index) = detect_helper_call_at_guard(outer_pc, program) else {
-        return (Vec::new(), false);
+) -> (Vec<ConditionExplanation>, bool, Option<HelperCall>) {
+    let Some(call) = detect_helper_call_at_guard(outer_pc, program) else {
+        return (Vec::new(), false, None);
     };
+    let helper_rule_index = call.rule_index;
     if depth >= MAX_HELPER_DEPTH {
-        return (Vec::new(), true);
+        return (Vec::new(), true, Some(call));
     }
     let inner_outcomes = collect_helper_condition_outcomes(
         outer_outcome_idx,
@@ -2564,7 +2598,7 @@ fn materialize_helper_conditions(
         trace,
     );
     if inner_outcomes.is_empty() {
-        return (Vec::new(), false);
+        return (Vec::new(), false, Some(call));
     }
     let mut inner = materialize_condition_explanations_at_depth(
         inner_outcomes,
@@ -2594,7 +2628,7 @@ fn materialize_helper_conditions(
     // move), not authorable predicates.
     inner.retain(|c| !(c.kind == "unknown" && c.text.is_empty()));
 
-    (inner, false)
+    (inner, false, Some(call))
 }
 
 /// Walk backward from `outer_pc` to locate the `FunctionCall`
@@ -2766,12 +2800,43 @@ const fn is_identifier_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
+/// Whether the call to `call`'s helper that finished just before the
+/// condition at `outer_outcome_idx` depended on an assumption at any depth,
+/// as the VM recorded on its summary. In partial evaluation `not` treats such
+/// a result as unknown, so the guard can hold although the helper held.
+/// Fails closed when the summary cannot be found.
+fn call_depends_on_assumption(
+    call: HelperCall,
+    outer_outcome_idx: usize,
+    trace: &EvaluationTrace,
+) -> bool {
+    if trace.assumptions.is_empty() {
+        return false;
+    }
+    trace
+        .rule_outcomes
+        .iter()
+        .rev()
+        .find(|outcome| {
+            outcome.is_summary
+                && outcome.rule_index == call.rule_index
+                && usize::try_from(outcome.conditions_recorded)
+                    .is_ok_and(|recorded| recorded <= outer_outcome_idx)
+        })
+        .is_none_or(|outcome| outcome.assumption_dependent)
+}
+
 /// Derive the outer truthiness condition's `left.provenance` from the
 /// last failed helper inner condition. When the outer already has a
 /// provenance we don't overwrite; when it has an operand but no provenance,
 /// we augment it; when it has no operand at all, we leave it alone (a fully
 /// missing `left` on the outer is the engine's signal that the operand isn't
 /// meaningfully attributable to a single value).
+///
+/// Callers apply it only when the helper definitely returned falsy. Known
+/// limitation: a definition that holds but returns `false` is falsy too, and
+/// an earlier definition's failed condition can then still be borrowed;
+/// telling the producing attempt apart needs attempt boundaries (RG-11).
 fn derive_left_provenance_from_helper(
     left: Option<OperandExplanation>,
     helper_conditions: &[ConditionExplanation],
@@ -3101,19 +3166,30 @@ fn materialize_condition_explanations_at_depth(
         // For a truthiness condition whose backing Guard fires on a register
         // written by a rule call (`_helper(x)` or `not _helper(x)`), stitch
         // the helper's evaluated inner conditions as structural children.
-        let (helper_conditions, helper_conditions_truncated) = materialize_helper_conditions(
-            pc_usize,
-            *outcome_idx,
-            outcome.rule_index,
-            program,
-            trace,
-            settings,
-            depth,
-        );
+        let (helper_conditions, helper_conditions_truncated, helper_call) =
+            materialize_helper_conditions(
+                pc_usize,
+                *outcome_idx,
+                outcome.rule_index,
+                program,
+                trace,
+                settings,
+                depth,
+            );
 
         // Derive outer `left.provenance` from the last failed helper inner
-        // condition when the outer condition doesn't already carry one.
-        let left = derive_left_provenance_from_helper(left, &helper_conditions);
+        // condition when the outer condition doesn't already carry one, but
+        // only when the helper returned falsy: a helper that held may have
+        // failed alternatives (earlier definitions or iterations) that did not
+        // produce its result.
+        let left = if helper_call.is_some_and(|call| {
+            call.returned_falsy(outcome_str)
+                && !call_depends_on_assumption(call, *outcome_idx, trace)
+        }) {
+            derive_left_provenance_from_helper(left, &helper_conditions)
+        } else {
+            left
+        };
         let scopes = program
             .condition_scopes
             .get(pc_usize)
