@@ -14,10 +14,12 @@
 //! its conditions and its reads of the `context` root are not described.
 
 use super::report::{ConditionKind, Operator, RuleKind, SourceLocation};
+use crate::lexer::{Lexer, Source, Token, TokenKind};
 use crate::rvm::instructions::{GuardMode, Instruction};
 use crate::rvm::program::{Program, SpanInfo};
 use alloc::string::{String, ToString as _};
 use alloc::vec::Vec;
+use core::num::{NonZeroU32, NonZeroUsize};
 
 /// Identifies a [`CheckSite`] within its [`Provenance`].
 ///
@@ -91,10 +93,13 @@ pub struct Provenance {
 impl Provenance {
     /// Decodes the checks of `program`.
     pub fn new(program: &Program) -> Self {
+        if program.rule_infos.is_empty() {
+            return Self::default();
+        }
         let sources: Vec<SourceIndex> = program
             .sources
             .iter()
-            .map(|source| SourceIndex::new(&source.content))
+            .map(|source| SourceIndex::new(&source.name, &source.content))
             .collect();
         let rules = program
             .rule_infos
@@ -109,45 +114,47 @@ impl Provenance {
             })
             .collect();
         let owners = owner_starts(program);
+        let mut next_owner = 0_usize;
+        let mut owner = None;
+        // The reference each register holds, as written.
+        let mut paths: Vec<Option<String>> = alloc::vec![None; 256];
         let mut sites: Vec<CheckSite> = Vec::new();
         let mut ordinal = 0_usize;
-        let mut previous_owner = None;
         for (pc, instruction) in program.instructions.iter().enumerate() {
-            let Some(shape) = check_shape(program, pc, instruction) else {
-                continue;
-            };
-            let owner_index = owners.partition_point(|&(at, _)| at <= pc);
-            let Some(&(start, owner)) = owner_index.checked_sub(1).and_then(|i| owners.get(i))
-            else {
-                continue;
-            };
-            ordinal = if previous_owner == Some(owner) {
-                ordinal.saturating_add(1)
-            } else {
-                0
-            };
-            previous_owner = Some(owner);
-            let (text, location) = program
-                .instruction_spans
-                .get(pc)
-                .and_then(Option::as_ref)
-                .and_then(|span| span_source(program, &sources, span))
-                .map_or((String::new(), None), |(text, at)| (text, Some(at)));
-            let path = |reg: Option<u8>| {
-                reg.and_then(|reg| reference(program, &sources, start, pc, reg, 0))
-            };
-            sites.push(CheckSite {
-                id: SiteId(u32::try_from(sites.len()).unwrap_or(u32::MAX)),
-                pc,
-                owner,
-                ordinal,
-                kind: shape.kind,
-                operator: shape.operator,
-                text,
-                location,
-                left_path: path(shape.left),
-                right_path: path(shape.right),
-            });
+            while let Some(&(start, next)) = owners.get(next_owner) {
+                if start > pc {
+                    break;
+                }
+                paths.fill(None);
+                ordinal = 0;
+                owner = Some(next);
+                next_owner = next_owner.saturating_add(1);
+            }
+            let span = program.instruction_spans.get(pc).and_then(Option::as_ref);
+            if let (Some(owner), Some(shape)) = (owner, check_shape(program, pc, instruction)) {
+                let (text, location) = span
+                    .and_then(|span| Some((sources.get(span.source_index)?, span)))
+                    .and_then(|(source, span)| {
+                        let (first, last) = source.expression(span)?;
+                        Some((source.text(first, last)?, Some(source.location(first)?)))
+                    })
+                    .unwrap_or_default();
+                let path = |reg: Option<u8>| paths.get(usize::from(reg?)).cloned().flatten();
+                sites.push(CheckSite {
+                    id: SiteId(u32::try_from(sites.len()).unwrap_or(u32::MAX)),
+                    pc,
+                    owner,
+                    ordinal,
+                    kind: shape.kind,
+                    operator: shape.operator,
+                    text,
+                    location,
+                    left_path: path(shape.left),
+                    right_path: path(shape.right),
+                });
+                ordinal = ordinal.saturating_add(1);
+            }
+            track(program, &sources, instruction, span, &mut paths);
         }
         Self { rules, sites }
     }
@@ -295,65 +302,59 @@ fn owner_starts(program: &Program) -> Vec<(usize, ConditionOwner)> {
     starts
 }
 
-/// The reference that register `reg` holds at `pc`, as written. Looks back
-/// from `pc` to `start` for the instruction that wrote the register.
-fn reference(
+/// Updates `paths` with the registers that `instruction` writes.
+fn track(
     program: &Program,
     sources: &[SourceIndex],
-    start: usize,
-    pc: usize,
-    reg: u8,
-    depth: u8,
-) -> Option<String> {
-    if depth > 16 {
-        return None;
-    }
-    let data = &program.instruction_data;
-    let at = (start..pc).rev().find(|&at| {
-        program
-            .instructions
-            .get(at)
-            .is_some_and(|i| writes(program, i, reg))
-    })?;
-    match *program.instructions.get(at)? {
-        Instruction::Move { src, .. } => {
-            reference(program, sources, start, at, src, depth.saturating_add(1))
-        }
+    instruction: &Instruction,
+    span: Option<&SpanInfo>,
+    paths: &mut [Option<String>],
+) {
+    let path = |reg: u8| paths.get(usize::from(reg)).cloned().flatten();
+    let value = match *instruction {
+        Instruction::Move { src, .. } => path(src),
+        Instruction::LoadInput { .. } => Some("input".to_string()),
+        Instruction::LoadData { .. } => Some("data".to_string()),
         Instruction::LoopStart { params_index } => {
-            let params = data.get_loop_params(params_index)?;
+            let Some(params) = program.instruction_data.get_loop_params(params_index) else {
+                return;
+            };
+            let value = path(params.collection).map(|path| alloc::format!("{path}[_]"));
+            for reg in [params.key_reg, params.result_reg, params.value_reg] {
+                if let Some(slot) = paths.get_mut(usize::from(reg)) {
+                    *slot = None;
+                }
+            }
             // A loop that needs no key, such as `every x in xs`, uses one
             // register for the key and the value; it holds the value.
-            if params.value_reg != reg {
-                return None;
+            if let Some(slot) = paths.get_mut(usize::from(params.value_reg)) {
+                *slot = value;
             }
-            let collection = reference(
-                program,
-                sources,
-                start,
-                at,
-                params.collection,
-                depth.saturating_add(1),
-            )?;
-            Some(alloc::format!("{collection}[_]"))
+            return;
         }
-        Instruction::LoadInput { .. }
-        | Instruction::LoadData { .. }
-        | Instruction::Index { .. }
+        Instruction::Index { .. }
         | Instruction::IndexLiteral { .. }
         | Instruction::ChainedIndex { .. }
         | Instruction::VirtualDataDocumentLookup { .. }
-        | Instruction::CallRule { .. } => {
-            let span = program.instruction_spans.get(at)?.as_ref()?;
-            span_source(program, sources, span).map(|(text, _)| text)
-        }
+        | Instruction::CallRule { .. } => span.and_then(|span| {
+            let source = sources.get(span.source_index)?;
+            let (first, last) = source.expression(span)?;
+            source.is_reference(first, last).then_some(())?;
+            source.text(first, last)
+        }),
         _ => None,
+    };
+    for reg in writes(program, instruction).into_iter().flatten() {
+        if let Some(slot) = paths.get_mut(usize::from(reg)) {
+            *slot = value.clone();
+        }
     }
 }
 
-/// Whether `instruction` writes register `reg`. Loop and comprehension
+/// The registers that `instruction` writes. Loop and comprehension
 /// registers are attributed to the instruction that starts the loop or
 /// comprehension.
-fn writes(program: &Program, instruction: &Instruction, reg: u8) -> bool {
+fn writes(program: &Program, instruction: &Instruction) -> [Option<u8>; 3] {
     use Instruction::*;
     let data = &program.instruction_data;
     match *instruction {
@@ -389,43 +390,45 @@ fn writes(program: &Program, instruction: &Instruction, reg: u8) -> bool {
         | Contains { dest, .. }
         | Count { dest, .. }
         | CallRule { dest, .. }
-        | PolicyCondition { dest, .. } => dest == reg,
-        ArrayPush { arr, .. } | ArrayPushDefined { arr, .. } => arr == reg,
-        SetAdd { set, .. } => set == reg,
-        ObjectSet { obj, .. } => obj == reg,
-        CoalesceUndefinedToNull { register } => register == reg,
-        RuleInit { result_reg, .. } => result_reg == reg,
+        | PolicyCondition { dest, .. } => [Some(dest), None, None],
+        ArrayPush { arr, .. } | ArrayPushDefined { arr, .. } => [Some(arr), None, None],
+        SetAdd { set, .. } => [Some(set), None, None],
+        ObjectSet { obj, .. } => [Some(obj), None, None],
+        CoalesceUndefinedToNull { register } => [Some(register), None, None],
+        RuleInit { result_reg, .. } => [Some(result_reg), None, None],
         LogicalBlockStart { result, .. }
         | AllOfNext { result, .. }
         | AnyOfNext { result, .. }
-        | LogicalBlockEnd { result, .. } => result == reg,
+        | LogicalBlockEnd { result, .. } => [Some(result), None, None],
         BuiltinCall { params_index } => data
             .get_builtin_call_params(params_index)
-            .is_some_and(|p| p.dest == reg),
+            .map_or([None; 3], |p| [Some(p.dest), None, None]),
         FunctionCall { params_index } => data
             .get_function_call_params(params_index)
-            .is_some_and(|p| p.dest == reg),
+            .map_or([None; 3], |p| [Some(p.dest), None, None]),
         ObjectCreate { params_index } => data
             .get_object_create_params(params_index)
-            .is_some_and(|p| p.dest == reg),
+            .map_or([None; 3], |p| [Some(p.dest), None, None]),
         ArrayCreate { params_index } => data
             .get_array_create_params(params_index)
-            .is_some_and(|p| p.dest == reg),
+            .map_or([None; 3], |p| [Some(p.dest), None, None]),
         SetCreate { params_index } => data
             .get_set_create_params(params_index)
-            .is_some_and(|p| p.dest == reg),
+            .map_or([None; 3], |p| [Some(p.dest), None, None]),
         VirtualDataDocumentLookup { params_index } => data
             .get_virtual_data_document_lookup_params(params_index)
-            .is_some_and(|p| p.dest == reg),
+            .map_or([None; 3], |p| [Some(p.dest), None, None]),
         ChainedIndex { params_index } => data
             .get_chained_index_params(params_index)
-            .is_some_and(|p| p.dest == reg),
-        LoopStart { params_index } => data
-            .get_loop_params(params_index)
-            .is_some_and(|p| p.key_reg == reg || p.value_reg == reg || p.result_reg == reg),
+            .map_or([None; 3], |p| [Some(p.dest), None, None]),
+        LoopStart { params_index } => data.get_loop_params(params_index).map_or([None; 3], |p| {
+            [Some(p.key_reg), Some(p.value_reg), Some(p.result_reg)]
+        }),
         ComprehensionBegin { params_index } => data
             .get_comprehension_begin_params(params_index)
-            .is_some_and(|p| p.key_reg == reg || p.value_reg == reg || p.result_reg == reg),
+            .map_or([None; 3], |p| {
+                [Some(p.key_reg), Some(p.value_reg), Some(p.result_reg)]
+            }),
         Return { .. }
         | AssertEq { .. }
         | Guard { .. }
@@ -435,202 +438,245 @@ fn writes(program: &Program, instruction: &Instruction, reg: u8) -> bool {
         | RuleReturn {}
         | Halt {}
         | ComprehensionYield { .. }
-        | ComprehensionEnd {} => false,
+        | ComprehensionEnd {} => [None; 3],
     }
 }
 
-fn span_source(
-    program: &Program,
-    sources: &[SourceIndex],
-    span: &SpanInfo,
-) -> Option<(String, SourceLocation)> {
-    sources.get(span.source_index)?.text(program, span)
-}
-
-/// Maps the lexer's (line, column) positions in one source to byte offsets.
+/// The tokens of one source, as the parser read them.
 ///
-/// The lexer counts a tab as 4 columns and a character of a raw string as 1
-/// column; everything else is counted in bytes. A string token's span
-/// excludes its quotes, so a range that starts or ends inside the quotes is
-/// widened to include them.
-struct SourceIndex {
-    /// Byte offset of the start of each line.
-    lines: Vec<usize>,
-    /// Byte offsets of the opening and closing quote of each string, and
-    /// whether it is a raw string.
-    strings: Vec<(usize, usize, bool)>,
+/// The parser gives an expression the line and column of one of its tokens
+/// and the length from its first token to its last; a string token's span
+/// excludes its quotes. A statement and a literal start at their first
+/// token, but a reference such as `input.user.name` or `f(x)` points at its
+/// last `.`, `[` or `(`, and an operation such as `a + b` or `x in xs` at its
+/// operator. The expression is found as the tokens around that one that
+/// span the length.
+struct SourceIndex<'a> {
+    file: &'a str,
+    content: &'a str,
+    tokens: Vec<SourceToken>,
 }
 
-impl SourceIndex {
-    fn new(content: &str) -> Self {
-        let mut lines = alloc::vec![0];
-        let mut strings = Vec::new();
-        let mut open: Option<(usize, char)> = None;
-        let mut comment = false;
-        let mut escaped = false;
-        for (at, ch) in content.char_indices() {
-            if ch == '\n' {
-                lines.push(at.saturating_add(1));
-                comment = false;
-            }
-            match open {
-                _ if comment => {}
-                Some((_, '"')) if escaped => escaped = false,
-                Some((_, '"')) if ch == '\\' => escaped = true,
-                Some((start, quote)) if ch == quote => {
-                    strings.push((start, at, quote == '`'));
-                    open = None;
-                }
-                Some(_) => {}
-                None if ch == '"' || ch == '`' => open = Some((at, ch)),
-                None if ch == '#' => comment = true,
-                None => {}
-            }
+#[derive(Clone, Copy)]
+struct SourceToken {
+    line: usize,
+    column: usize,
+    /// Byte range as the lexer reports it, without quotes.
+    start: usize,
+    end: usize,
+    kind: TokenClass,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TokenClass {
+    Name,
+    Number,
+    /// A string or raw string.
+    Quoted,
+    Symbol,
+}
+
+impl SourceToken {
+    /// Byte range including the quotes of a string.
+    const fn lexeme(&self) -> (usize, usize) {
+        match self.kind {
+            TokenClass::Quoted => (self.start.saturating_sub(1), self.end.saturating_add(1)),
+            _ => (self.start, self.end),
         }
-        Self { lines, strings }
     }
+}
 
-    fn string_at(&self, at: usize) -> Option<(usize, usize, bool)> {
-        let index = self.strings.partition_point(|&(open, _, _)| open < at);
-        let (open, close, raw) = *self.strings.get(index.checked_sub(1)?)?;
-        (at <= close).then_some((open, close, raw))
-    }
-
-    /// Text of `span` in `program` and where it starts.
-    fn text(&self, program: &Program, span: &SpanInfo) -> Option<(String, SourceLocation)> {
-        let source = program.sources.get(span.source_index)?;
-        let content = source.content.as_str();
-        let (start, end) = self.range(content, span)?;
-        let text = content.get(start..end)?.to_string();
-        let line = self.lines.partition_point(|&at| at <= start);
-        let line_start = *self.lines.get(line.checked_sub(1)?)?;
-        let location = SourceLocation {
-            file: source.name.clone(),
-            line,
-            column: self.columns(content, line_start, start)?,
-        };
-        Some((text, location))
-    }
-
-    /// Lexer column of byte offset `at` on the line starting at `line_start`.
-    fn columns(&self, content: &str, line_start: usize, at: usize) -> Option<usize> {
-        self.positions(content, line_start)
-            .find(|&(offset, _)| offset >= at)
-            .filter(|&(offset, _)| offset == at)
-            .map(|(_, column)| column)
-    }
-
-    /// Byte offset of the lexer position (`line`, `column`).
-    fn offset(&self, content: &str, line: usize, column: usize) -> Option<usize> {
-        let line_start = *self.lines.get(line.checked_sub(1)?)?;
-        self.positions(content, line_start)
-            .find(|&(_, at)| at >= column)
-            .filter(|&(_, at)| at == column)
-            .map(|(offset, _)| offset)
-    }
-
-    /// The byte offset and lexer column of each character of the line
-    /// starting at `line_start`, and of the end of the line.
-    fn positions<'a>(
-        &'a self,
-        content: &'a str,
-        line_start: usize,
-    ) -> impl Iterator<Item = (usize, usize)> + 'a {
-        let line = content.get(line_start..).unwrap_or_default();
-        let line = line.split_inclusive('\n').next().unwrap_or_default();
-        let end = line_start.saturating_add(line.trim_end_matches('\n').len());
-        line.char_indices()
-            .map(move |(offset, ch)| (line_start.saturating_add(offset), ch))
-            .chain(core::iter::once((end, '\n')))
-            .scan(1_usize, move |column, (offset, ch)| {
-                let here = *column;
-                let raw = self
-                    .string_at(offset)
-                    .is_some_and(|(open, _, raw)| raw && open < offset);
-                *column = column.saturating_add(match ch {
-                    '\t' => 4,
-                    '\r' if !raw => 0,
-                    _ if raw => 1,
-                    _ => ch.len_utf8(),
+impl<'a> SourceIndex<'a> {
+    fn new(file: &'a str, content: &'a str) -> Self {
+        let mut tokens = Vec::new();
+        let max = NonZeroUsize::MAX;
+        if let Ok(source) = Source::from_contents_with_limits(file.into(), content.into(), max, max)
+        {
+            let to_usize = |n: u32| usize::try_from(n).unwrap_or(usize::MAX);
+            let mut lexer = Lexer::new(&source);
+            lexer.set_max_col(NonZeroU32::MAX);
+            while let Ok(Token(kind, span)) = lexer.next_token() {
+                let kind = match kind {
+                    TokenKind::Ident => TokenClass::Name,
+                    TokenKind::Number => TokenClass::Number,
+                    TokenKind::String | TokenKind::RawString => TokenClass::Quoted,
+                    TokenKind::Eof => break,
+                    _ => TokenClass::Symbol,
+                };
+                tokens.push(SourceToken {
+                    line: to_usize(span.line),
+                    column: to_usize(span.col),
+                    start: to_usize(span.start),
+                    end: to_usize(span.end),
+                    kind,
                 });
-                Some((offset, here))
-            })
-            .take_while(move |&(offset, _)| offset <= end)
-    }
-
-    /// Byte range of `span`, including the quotes of strings at its ends.
-    ///
-    /// The parser gives a reference such as `input.user.name`,
-    /// `data.roles[input.role]` or `f(x)` the line and column of its last
-    /// `.`, `[` or `(`, but the length of the whole reference. The end of
-    /// the reference is found from that separator and the start from the
-    /// length.
-    fn range(&self, content: &str, span: &SpanInfo) -> Option<(usize, usize)> {
-        let at = self.offset(content, span.line, span.column)?;
-        let start = match content.get(at..)?.chars().next()? {
-            '.' | '[' | '(' => self.reference_end(content, at)?.checked_sub(span.length)?,
-            _ => at,
-        };
-        let end = start.checked_add(span.length)?;
-        content.get(start..end)?;
-        // A span that starts at a string's first character starts at its
-        // opening quote; one that ends at a closing quote includes it.
-        let opening = self
-            .string_at(start)
-            .filter(|&(open, _, _)| open.checked_add(1) == Some(start));
-        let closing = self
-            .string_at(end)
-            .filter(|&(open, close, _)| close == end && open < end);
-        Some((
-            opening.map_or(start, |(open, _, _)| open),
-            closing.map_or(end, |(_, close, _)| close.saturating_add(1)),
-        ))
-    }
-
-    /// End of the reference whose last separator is at byte `at`: the end of
-    /// the field after a `.`, or just past the bracket matching a `[` or `(`.
-    fn reference_end(&self, content: &str, at: usize) -> Option<usize> {
-        let rest = content.get(at..)?;
-        if rest.starts_with('.') {
-            let field = rest
-                .get(1..)?
-                .find(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
-                .unwrap_or(rest.len().saturating_sub(1));
-            return at.checked_add(field)?.checked_add(1);
+            }
         }
-        let mut depth = 0_usize;
-        let mut chars = rest.char_indices();
-        while let Some((offset, ch)) = chars.next() {
-            let offset = at.saturating_add(offset);
-            match ch {
-                '"' | '`' => {
-                    let (_, close, _) = self.string_at(offset.saturating_add(1))?;
-                    while chars
-                        .next()
-                        .is_some_and(|(next, _)| at.saturating_add(next) < close)
-                    {
+        Self {
+            file,
+            content,
+            tokens,
+        }
+    }
+
+    fn symbol(&self, index: usize) -> Option<&str> {
+        let token = self.tokens.get(index)?;
+        (token.kind == TokenClass::Symbol)
+            .then(|| self.content.get(token.start..token.end))
+            .flatten()
+    }
+
+    /// Whether the token at `index` continues a reference: a `[` or `(`
+    /// directly after a term.
+    fn continues(&self, index: usize) -> bool {
+        let Some(previous) = index.checked_sub(1).and_then(|i| self.tokens.get(i)) else {
+            return false;
+        };
+        let ends_term = previous.kind != TokenClass::Symbol
+            || matches!(self.symbol(index.saturating_sub(1)), Some(")" | "]" | "}"));
+        ends_term
+            && self
+                .tokens
+                .get(index)
+                .is_some_and(|t| previous.lexeme().1 == t.start)
+    }
+
+    /// The first and last token of the expression of `span`.
+    fn expression(&self, span: &SpanInfo) -> Option<(usize, usize)> {
+        let anchor = self
+            .tokens
+            .binary_search_by(|t| (t.line, t.column).cmp(&(span.line, span.column)))
+            .ok()?;
+        let at = self.tokens.get(anchor)?;
+        // The expression ending with token `last`, if it is balanced.
+        let ending = |last: usize| {
+            let start = self.tokens.get(last)?.end.checked_sub(span.length)?;
+            let first = self.tokens.binary_search_by_key(&start, |t| t.start).ok()?;
+            (first <= anchor && self.balanced(first, last)).then_some((first, last))
+        };
+        match self.symbol(anchor) {
+            // A reference ends with the field or brackets after its last
+            // separator.
+            Some(".") => ending(anchor.checked_add(1)?),
+            Some("[" | "(") if self.continues(anchor) => {
+                ending(self.closing(anchor, self.tokens.len())?)
+            }
+            Some(_) if !matches!(self.symbol(anchor), Some("[" | "(" | "{")) => {
+                // An operation: the expression must be the only one around
+                // its operator with the length of the span.
+                let mut found = None;
+                for first in (0..anchor).rev() {
+                    let start = self.tokens.get(first)?.start;
+                    let end = start.checked_add(span.length)?;
+                    if end <= at.end {
+                        break;
+                    }
+                    let rest = self.tokens.get(anchor..)?;
+                    if let Ok(last) = rest.binary_search_by_key(&end, |t| t.end) {
+                        let last = anchor.checked_add(last)?;
+                        if self.balanced(first, last) {
+                            if found.is_some() {
+                                return None;
+                            }
+                            found = Some((first, last));
+                        }
                     }
                 }
-                '[' | '(' | '{' => depth = depth.saturating_add(1),
-                ']' | ')' | '}' => {
+                found
+            }
+            // Anything else starts the expression.
+            _ => {
+                let end = at.start.checked_add(span.length)?;
+                let rest = self.tokens.get(anchor..)?;
+                let last = anchor.checked_add(rest.binary_search_by_key(&end, |t| t.end).ok()?)?;
+                self.balanced(anchor, last).then_some((anchor, last))
+            }
+        }
+    }
+
+    /// The token closing the bracket at `open`, if it is before `limit`.
+    fn closing(&self, open: usize, limit: usize) -> Option<usize> {
+        let mut depth = 0_usize;
+        for index in open..limit {
+            match self.symbol(index) {
+                Some("[" | "(" | "{") => depth = depth.saturating_add(1),
+                Some("]" | ")" | "}") => {
                     depth = depth.checked_sub(1)?;
                     if depth == 0 {
-                        return offset.checked_add(1);
-                    }
-                }
-                '#' => {
-                    let line_end = content.get(offset..)?.find('\n')?;
-                    let line_end = offset.saturating_add(line_end);
-                    while chars
-                        .next()
-                        .is_some_and(|(next, _)| at.saturating_add(next) < line_end)
-                    {
+                        return Some(index);
                     }
                 }
                 _ => {}
             }
         }
         None
+    }
+
+    /// Whether the brackets of tokens `first..=last` match.
+    fn balanced(&self, first: usize, last: usize) -> bool {
+        let mut depth = 0_usize;
+        for index in first..=last {
+            match self.symbol(index) {
+                Some("[" | "(" | "{") => depth = depth.saturating_add(1),
+                Some("]" | ")" | "}") => match depth.checked_sub(1) {
+                    Some(d) => depth = d,
+                    None => return false,
+                },
+                _ => {}
+            }
+        }
+        depth == 0
+    }
+
+    /// Whether tokens `first..=last` are a reference such as `input.a`,
+    /// `data.roles[input.role]` or `f(x)`.
+    fn is_reference(&self, first: usize, last: usize) -> bool {
+        if self.tokens.get(first).map(|t| t.kind) != Some(TokenClass::Name) {
+            return false;
+        }
+        let mut index = first.saturating_add(1);
+        while index <= last {
+            if !self.continues(index) && self.symbol(index) != Some(".") {
+                return false;
+            }
+            index = match self.symbol(index) {
+                Some(".") => {
+                    let field = index.saturating_add(1);
+                    if self.tokens.get(field).map(|t| t.kind) != Some(TokenClass::Name) {
+                        return false;
+                    }
+                    field.saturating_add(1)
+                }
+                Some("[" | "(") => match self.closing(index, last.saturating_add(1)) {
+                    Some(close) => close.saturating_add(1),
+                    None => return false,
+                },
+                _ => return false,
+            };
+        }
+        index == last.saturating_add(1)
+    }
+
+    /// Text of tokens `first..=last`.
+    fn text(&self, first: usize, last: usize) -> Option<String> {
+        let start = self.tokens.get(first)?.lexeme().0;
+        let end = self.tokens.get(last)?.lexeme().1;
+        Some(self.content.get(start..end)?.to_string())
+    }
+
+    /// Where the token `first` starts.
+    fn location(&self, first: usize) -> Option<SourceLocation> {
+        let token = self.tokens.get(first)?;
+        // The lexer places a string after its opening quote.
+        let column = match token.kind {
+            TokenClass::Quoted => token.column.checked_sub(1)?,
+            _ => token.column,
+        };
+        Some(SourceLocation {
+            file: self.file.into(),
+            line: token.line,
+            column,
+        })
     }
 }
 

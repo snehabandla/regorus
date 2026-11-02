@@ -692,3 +692,378 @@ fn azure_policy_programs_have_no_sites() -> anyhow::Result<()> {
     assert_eq!(provenance.rule(0), None);
     Ok(())
 }
+
+fn allow(body: &str) -> anyhow::Result<Provenance> {
+    provenance(
+        &alloc::format!("package test\nimport rego.v1\n\nallow if {{\n{body}}}\n"),
+        &["data.test.allow"],
+    )
+}
+
+#[test]
+fn statements_that_start_with_brackets() -> anyhow::Result<()> {
+    use ConditionKind::*;
+    let provenance = allow(
+        "  x := 1\n  (input.x + 1) > 2\n  [1] == input.y\n  [a, b] := input.pair\n  a == b\n",
+    )?;
+    let allow = "data.test.allow";
+    assert_eq!(
+        rows(&provenance),
+        vec![
+            row(
+                allow,
+                Some(0),
+                "(input.x + 1) > 2",
+                Comparison,
+                Some(Operator::Gt),
+                None,
+                None
+            ),
+            row(
+                allow,
+                Some(0),
+                "[1] == input.y",
+                Comparison,
+                Some(Operator::Eq),
+                None,
+                Some("input.y")
+            ),
+            // The length check of the destructuring.
+            row(
+                allow,
+                Some(0),
+                "[a, b] := input.pair",
+                Comparison,
+                Some(Operator::Eq),
+                None,
+                None
+            ),
+            // The values come from the destructuring, not a reference.
+            row(
+                allow,
+                Some(0),
+                "a == b",
+                Comparison,
+                Some(Operator::Eq),
+                None,
+                None
+            ),
+        ]
+    );
+    let columns: Vec<_> = provenance.sites().iter().map(at).collect();
+    assert_eq!(
+        columns,
+        vec![
+            Some(("p.rego", 6, 3)),
+            Some(("p.rego", 7, 3)),
+            Some(("p.rego", 8, 3)),
+            Some(("p.rego", 9, 3)),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn operations_as_collections() -> anyhow::Result<()> {
+    use ConditionKind::*;
+    let provenance =
+        allow("  some x in input.a | input.b\n  x == 1\n  some y in input.c\n  y == 2\n")?;
+    let allow = "data.test.allow";
+    assert_eq!(
+        rows(&provenance),
+        vec![
+            row(
+                allow,
+                Some(0),
+                "input.a | input.b",
+                Iteration,
+                None,
+                None,
+                None
+            ),
+            row(
+                allow,
+                Some(0),
+                "x == 1",
+                Comparison,
+                Some(Operator::Eq),
+                None,
+                None
+            ),
+            row(
+                allow,
+                Some(0),
+                "input.c",
+                Iteration,
+                None,
+                Some("input.c"),
+                None
+            ),
+            row(
+                allow,
+                Some(0),
+                "y == 2",
+                Comparison,
+                Some(Operator::Eq),
+                Some("input.c[_]"),
+                None
+            ),
+        ]
+    );
+    assert_eq!(
+        provenance.sites().first().and_then(at),
+        Some(("p.rego", 5, 13))
+    );
+    Ok(())
+}
+
+#[test]
+fn roots_read_as_their_names() -> anyhow::Result<()> {
+    use ConditionKind::*;
+    let provenance = allow("  input.expected == input\n  some r in input\n  r == 1\n")?;
+    let allow = "data.test.allow";
+    assert_eq!(
+        rows(&provenance),
+        vec![
+            row(
+                allow,
+                Some(0),
+                "input.expected == input",
+                Comparison,
+                Some(Operator::Eq),
+                Some("input.expected"),
+                Some("input")
+            ),
+            row(
+                allow,
+                Some(0),
+                "input",
+                Iteration,
+                None,
+                Some("input"),
+                None
+            ),
+            row(
+                allow,
+                Some(0),
+                "r == 1",
+                Comparison,
+                Some(Operator::Eq),
+                Some("input[_]"),
+                None
+            ),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn destructured_values_are_not_references() -> anyhow::Result<()> {
+    use ConditionKind::*;
+    let provenance = allow(
+        "  {\"role\": role} := input.user\n  role == \"admin\"\n  some [x, 1] in input.pairs\n  x > 0\n  some k, v in input.m\n  k == v\n",
+    )?;
+    let allow = "data.test.allow";
+    let eq = Some(Operator::Eq);
+    assert_eq!(
+        rows(&provenance),
+        vec![
+            row(
+                allow,
+                Some(0),
+                "role == \"admin\"",
+                Comparison,
+                eq,
+                None,
+                None
+            ),
+            row(
+                allow,
+                Some(0),
+                "input.pairs",
+                Iteration,
+                None,
+                Some("input.pairs"),
+                None
+            ),
+            // The length and element checks of the pattern.
+            row(allow, Some(0), "[x, 1]", Comparison, eq, None, None),
+            row(allow, Some(0), "[x, 1]", Comparison, eq, None, None),
+            row(
+                allow,
+                Some(0),
+                "x > 0",
+                Comparison,
+                Some(Operator::Gt),
+                None,
+                None
+            ),
+            row(
+                allow,
+                Some(0),
+                "input.m",
+                Iteration,
+                None,
+                Some("input.m"),
+                None
+            ),
+            row(
+                allow,
+                Some(0),
+                "k == v",
+                Comparison,
+                eq,
+                None,
+                Some("input.m[_]")
+            ),
+        ]
+    );
+    let columns: Vec<_> = provenance.sites().iter().skip(2).take(2).map(at).collect();
+    assert_eq!(
+        columns,
+        vec![Some(("p.rego", 7, 8)), Some(("p.rego", 7, 8))]
+    );
+    Ok(())
+}
+
+#[test]
+fn long_chains_of_bindings() -> anyhow::Result<()> {
+    let mut body = String::from("  a0 := input.role\n");
+    for i in 1..40 {
+        body.push_str(&alloc::format!("  a{i} := a{}\n", i - 1));
+    }
+    body.push_str("  a39 == \"admin\"\n");
+    let provenance = allow(&body)?;
+    let paths: Vec<_> = provenance
+        .sites()
+        .iter()
+        .map(|site| (site.left_path.as_deref(), site.right_path.as_deref()))
+        .collect();
+    assert_eq!(paths, vec![(Some("input.role"), None)]);
+    Ok(())
+}
+
+#[test]
+fn several_definitions_and_clauses() -> anyhow::Result<()> {
+    use ConditionKind::*;
+    let program = compile(
+        &[
+            (
+                "p.rego",
+                "package test\nimport rego.v1\nimport data.lib as l\n\nallow if input.a == 1\nallow if input.b == 2\nallow if {\n  l.x == input.y\n  count([v | some v in input.vs; v > 1]) > 0\n}\nf(1) := 1\nf(x) := 2 if x > 3\ng if f(input.n) == 2\n",
+            ),
+            ("lib.rego", "package lib\nx := 3\n"),
+        ],
+        &["data.test.allow", "data.test.g"],
+    )?;
+    let provenance = Provenance::new(&program);
+    let gt = Some(Operator::Gt);
+    let eq = Some(Operator::Eq);
+    assert_eq!(
+        rows(&provenance),
+        vec![
+            row(
+                "data.test.allow",
+                Some(0),
+                "input.a == 1",
+                Comparison,
+                eq,
+                Some("input.a"),
+                None
+            ),
+            row(
+                "data.test.allow",
+                Some(0),
+                "input.b == 2",
+                Comparison,
+                eq,
+                Some("input.b"),
+                None
+            ),
+            row(
+                "data.test.allow",
+                Some(0),
+                "l.x == input.y",
+                Comparison,
+                eq,
+                Some("l.x"),
+                Some("input.y")
+            ),
+            row(
+                "data.test.allow",
+                Some(0),
+                "input.vs",
+                Iteration,
+                None,
+                Some("input.vs"),
+                None
+            ),
+            row(
+                "data.test.allow",
+                Some(0),
+                "v > 1",
+                Comparison,
+                gt,
+                Some("input.vs[_]"),
+                None
+            ),
+            row(
+                "data.test.allow",
+                Some(0),
+                "count([v | some v in input.vs; v > 1]) > 0",
+                Comparison,
+                gt,
+                None,
+                None
+            ),
+            row(
+                "data.test.g",
+                Some(0),
+                "f(input.n) == 2",
+                Comparison,
+                eq,
+                None,
+                None
+            ),
+            // Matching the argument of `f(1)`.
+            row("data.test.f", None, "1", Comparison, eq, None, None),
+            row("data.test.f", Some(0), "x > 3", Comparison, gt, None, None),
+        ]
+    );
+    let owners: Vec<_> = provenance
+        .sites()
+        .iter()
+        .map(|site| (site.owner.definition, site.owner.body, site.ordinal))
+        .collect();
+    assert_eq!(
+        owners,
+        vec![
+            (0, Some(0), 0),
+            (1, Some(0), 0),
+            (2, Some(0), 0),
+            (2, Some(0), 1),
+            (2, Some(0), 2),
+            (2, Some(0), 3),
+            (0, Some(0), 0),
+            (0, None, 0),
+            (1, Some(0), 0),
+        ]
+    );
+    Ok(())
+}
+
+#[test]
+fn carriage_returns_and_tabs() -> anyhow::Result<()> {
+    let provenance = provenance(
+        "package test\r\nimport rego.v1\r\n\r\nallow if {\r\n\tinput.a == 1\r\n\t\tinput.b ==\t2\r\n}\r\n",
+        &["data.test.allow"],
+    )?;
+    assert_eq!(texts(&provenance), vec!["input.a == 1", "input.b ==\t2"]);
+    let columns: Vec<_> = provenance.sites().iter().map(at).collect();
+    // The lexer counts a tab as 4 columns.
+    assert_eq!(
+        columns,
+        vec![Some(("p.rego", 5, 5)), Some(("p.rego", 6, 9))]
+    );
+    Ok(())
+}
