@@ -55,6 +55,27 @@ pub enum ContextType {
     Every,
 }
 
+/// A key of a partial object rule head, relative to the rule path being compiled.
+#[derive(Debug, Clone)]
+pub(super) enum HeadKey {
+    /// A bracket index (`p[k]`, `p["a"]`, `p[1]`).
+    Expr(ExprRef),
+    /// A dotted field (`p.q`).
+    Field(Value),
+}
+
+/// Where a partial object rule definition places its value below the rule path.
+#[derive(Debug, Clone)]
+pub(super) struct ObjectHead {
+    /// Keys from the rule path to the leaf, outermost first. Never empty.
+    pub(super) keys: Vec<HeadKey>,
+    /// `contains` heads: the leaf is a set the value is added to.
+    pub(super) multi_value: bool,
+    /// Emit `ObjectDeepSet` even for a single single-valued key, so that all
+    /// definitions of a rule detect conflicts consistently.
+    pub(super) deep: bool,
+}
+
 /// Compilation context for handling different types of rule bodies and comprehensions
 #[derive(Debug, Clone)]
 pub struct CompilationContext {
@@ -62,6 +83,11 @@ pub struct CompilationContext {
     pub(super) dest_register: Register,
     pub(super) key_expr: Option<ExprRef>,
     pub(super) value_expr: Option<ExprRef>,
+    /// Head keys of a partial object rule definition (`key_expr` is unused then).
+    pub(super) object_head: Option<ObjectHead>,
+    /// Constant value yielded when there is no `value_expr` (the element of a
+    /// Rego v0 `p.x { ... }` set rule). Defaults to `true` when absent.
+    pub(super) value_literal: Option<Value>,
     pub(super) span: Span,
     pub(super) key_value_loops_hoisted: bool,
 }

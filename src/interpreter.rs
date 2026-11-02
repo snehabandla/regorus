@@ -4012,48 +4012,46 @@ impl Interpreter {
         self.data = Value::Undefined;
         self.ensure_loop_var_values_capacity();
 
-        let default_rules = self.compiled_policy.default_rules.get(rule_path).cloned();
+        let Some(rules) = self.compiled_policy.default_rules.get(rule_path).cloned() else {
+            bail!("Could not find default rule for path: {}", rule_path);
+        };
 
-        if let Some(rules) = default_rules {
-            for (rule, _) in rules {
-                for module in self.compiled_policy.modules.iter() {
-                    if module.policy.contains(&rule) {
-                        let prev_module = self.set_current_module(Some(module.clone()))?;
-                        let result = self.eval_default_rule(&rule);
-                        self.set_current_module(prev_module)?;
-
-                        if result.is_ok() {
-                            let registered_components = self
-                                .compiled_policy
-                                .rule_path_components
-                                .get(rule_path)
-                                .ok_or_else(|| {
-                                    anyhow!(
-                                        "missing components for registered rule path {rule_path}"
-                                    )
-                                })?;
-                            let (root, tail) =
-                                registered_components.split_first().ok_or_else(|| {
-                                    anyhow!("internal error: expected rule path components")
-                                })?;
-                            if root != "data" {
-                                bail!("internal error: rule path must start with data");
-                            }
-                            let value_path: Vec<&str> = tail.iter().map(String::as_str).collect();
-                            let value = Self::get_value_chained(self.data.clone(), &value_path);
-
-                            if value != Value::Undefined {
-                                return Ok(value);
-                            }
-                        }
-
-                        return result.map(|_| Value::Undefined);
-                    }
-                }
+        // `default_rules` also indexes every prefix of a rule path, so a path
+        // may have several defaults below it (e.g. `default p.a := 1` and
+        // `default p.b := 2` at `p`). Evaluate them all.
+        let mut found = false;
+        for (rule, _) in rules {
+            let module = self
+                .compiled_policy
+                .modules
+                .iter()
+                .find(|module| module.policy.contains(&rule))
+                .cloned();
+            if let Some(module) = module {
+                found = true;
+                let prev_module = self.set_current_module(Some(module))?;
+                let result = self.eval_default_rule(&rule);
+                self.set_current_module(prev_module)?;
+                result?;
             }
         }
+        if !found {
+            bail!("Could not find default rule for path: {}", rule_path);
+        }
 
-        bail!("Could not find default rule for path: {}", rule_path);
+        let registered_components = self
+            .compiled_policy
+            .rule_path_components
+            .get(rule_path)
+            .ok_or_else(|| anyhow!("missing components for registered rule path {rule_path}"))?;
+        let (root, tail) = registered_components
+            .split_first()
+            .ok_or_else(|| anyhow!("internal error: expected rule path components"))?;
+        if root != "data" {
+            bail!("internal error: rule path must start with data");
+        }
+        let value_path: Vec<&str> = tail.iter().map(String::as_str).collect();
+        Ok(Self::get_value_chained(self.data.clone(), &value_path))
     }
 
     fn update_data(

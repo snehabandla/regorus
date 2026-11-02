@@ -150,7 +150,9 @@ impl<'a> Compiler<'a> {
             .iter()
             .filter_map(|(rule_path, &rule_index)| {
                 let rule_type = &self.rule_types[rule_index as usize];
-                if *rule_type == RuleType::Complete {
+                // Partial object rules merge the defaults below them
+                // (e.g. `default p.r := 0` into `p`) at finalization.
+                if matches!(rule_type, RuleType::Complete | RuleType::PartialObject) {
                     Some((rule_path.clone(), rule_index as usize))
                 } else {
                     None
@@ -159,7 +161,7 @@ impl<'a> Compiler<'a> {
             .collect();
 
         for (rule_path, rule_index) in rule_paths_to_evaluate {
-            if let Some(default_literal_index) = self.evaluate_default_rule(&rule_path) {
+            if let Some(default_literal_index) = self.evaluate_default_rule(&rule_path)? {
                 if let Some(rule_info) = rule_infos_map.get_mut(&rule_index) {
                     rule_info.set_default_literal_index(default_literal_index);
                 }
@@ -191,24 +193,29 @@ impl<'a> Compiler<'a> {
         Ok(self.program)
     }
 
-    fn evaluate_default_rule(&mut self, rule_path: &str) -> Option<u16> {
+    fn evaluate_default_rule(&mut self, rule_path: &str) -> Result<Option<u16>> {
         if !self.policy.inner.default_rules.contains_key(rule_path) {
-            return None;
+            return Ok(None);
         }
 
         let mut interpreter = Interpreter::new_from_compiled_policy(self.policy.inner.clone());
 
         match interpreter.eval_default_rule_for_compiler(rule_path) {
-            Ok(computed_value) => {
+            Ok(mut computed_value) => {
+                self.retain_owned_partial_object_defaults(rule_path, &mut computed_value)?;
+                if self.compute_rule_type(rule_path)? == RuleType::PartialObject {
+                    computed_value =
+                        self.encode_partial_object_defaults(rule_path, &computed_value)?;
+                }
                 if computed_value != Value::Undefined {
                     let literal_index = self.add_literal(computed_value);
-                    return Some(literal_index);
+                    return Ok(Some(literal_index));
                 }
             }
             Err(_e) => {}
         }
 
-        None
+        Ok(None)
     }
 
     fn extract_destructuring_blocks(&self, rule_index: u16) -> Vec<Option<u32>> {
