@@ -7,7 +7,6 @@
 use crate::Rc;
 use crate::Value;
 
-use super::super::obj_map::remove_element_field;
 use super::super::obj_map::{
     collision_safe_key, is_root_field_collision, obj_insert_rc, set_nested_lowercased, ObjMap,
 };
@@ -34,7 +33,10 @@ pub fn apply_alias_entries(
     // Snapshot raw container shapes before any alias write changes them.
     if let Some(provenance) = provenance.as_deref_mut() {
         for (lc_key, entry) in entries {
-            if entry.is_wildcard || sub_resource_set.contains(lc_key.as_str()) {
+            if entry.is_wildcard
+                || !entry.has_valid_paths()
+                || sub_resource_set.contains(lc_key.as_str())
+            {
                 continue;
             }
             if let Some(segments) = path::scalar_segments(lc_key) {
@@ -44,7 +46,7 @@ pub fn apply_alias_entries(
     }
 
     for (lc_key, entry) in entries {
-        if entry.is_wildcard {
+        if entry.is_wildcard || !entry.has_valid_paths() {
             continue;
         }
 
@@ -98,11 +100,9 @@ pub fn apply_alias_entries(
     });
 
     for remap in &agg.element_remaps {
+        // Moves the ARM field so the normalized output only has the alias
+        // short name; a stale source would duplicate under restored casing.
         apply_element_remap_precomputed(result, remap);
-        // Remove the original ARM field so the normalized output only has the
-        // alias short name.  Without this, the stale source key survives and
-        // casing restoration during denormalization can produce a duplicate.
-        remove_element_field(result, &remap.array_chain, &remap.source_field);
     }
 
     for (source_lc, target_lc) in &agg.array_renames_normalize {

@@ -3,6 +3,11 @@
 
 //! Alias-local path grammar. Quotes have no escapes and close only before
 //! optional whitespace and `]`; delimiters inside quoted keys are literal.
+//!
+//! Unquoted brackets follow the policy compiler's field paths: only the exact
+//! text `[*]` is a wildcard (`[ * ]` is the key `*`), trimmed digits are an
+//! index (`[ 0 ]`), and a dot before a bracket is accepted (`a.[0]`). Paths
+//! longer than [`MAX_SEGMENTS`] are rejected.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
@@ -21,6 +26,9 @@ pub enum Segment {
 
 /// Bound sparse catalog writes to at most 4096 array elements.
 pub const MAX_INDEX: usize = 4095;
+
+/// Bound path depth so recursive set/remove stay shallow on hostile catalogs.
+pub const MAX_SEGMENTS: usize = 64;
 
 pub struct Path {
     pub segments: Vec<Segment>,
@@ -50,6 +58,9 @@ pub fn parse(path: &str) -> Option<Path> {
             wildcards.push((start, end));
         }
         segments.push(segment);
+        if segments.len() > MAX_SEGMENTS {
+            return None;
+        }
         pos = end;
         match path.as_bytes().get(pos) {
             None => {
@@ -567,6 +578,14 @@ pub fn can_set(map: &ObjMap, segments: &[Segment]) -> bool {
             .find_map(|(candidate, child)| candidate.eq_ignore_ascii_case(key).then_some(child))
     });
     can_set_value(existing, rest)
+}
+
+/// [`can_set`] for a path inside an array element object.
+pub fn can_set_object(object: &Object, segments: &[Segment]) -> bool {
+    let Some((Segment::Key(key), rest)) = segments.split_first() else {
+        return false;
+    };
+    can_set_value(object_child(object, key), rest)
 }
 
 fn can_set_value(current: Option<&Value>, segments: &[Segment]) -> bool {

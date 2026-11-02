@@ -9,9 +9,7 @@ use alloc::vec::Vec;
 use crate::value::Object;
 use crate::Value;
 
-use super::super::obj_map::{
-    obj_get, obj_get_mut, set_nested_lowercased, set_nested_verbatim, ObjMap,
-};
+use super::super::obj_map::{obj_get, obj_get_mut, ObjMap};
 use super::super::path::{self, Segment};
 use super::super::types::PrecomputedRemap;
 
@@ -177,15 +175,21 @@ fn remap_at_depth_in_btree(
     }
 }
 
-/// Remap a value between dotted paths directly in a BTreeMap.
+/// Move a value between paths inside one array element. The source is
+/// removed (pruning containers it empties) only after the target is written,
+/// so an element whose shape blocks the target keeps its source.
 fn remap_deep_field_in_btree(btree: &mut Object, source: &str, target: &str, lowercase: bool) {
-    let val = match read_dotted_path_btree(btree, source, !lowercase) {
-        Some(v) => v,
-        None => return,
+    let Some(val) = read_dotted_path_btree(btree, source, !lowercase) else {
+        return;
     };
-
-    if let Some(segments) = path::scalar_segments(target) {
-        path::set_object(btree, &segments, val, lowercase);
+    let (Some(source), Some(target)) =
+        (path::scalar_segments(source), path::scalar_segments(target))
+    else {
+        return;
+    };
+    if path::can_set_object(btree, &target) {
+        path::remove_object(btree, &source, true);
+        path::set_object(btree, &target, val, lowercase);
     }
 }
 
@@ -209,18 +213,20 @@ fn read_dotted_path_btree(btree: &Object, path: &str, case_insensitive: bool) ->
     path::get(value, rest, case_insensitive).cloned()
 }
 
-/// Remap a value from one (possibly nested) dot-separated path to another
-/// in an ObjMap.  Used only at the top level when `depth >= array_chain.len()`.
+/// [`remap_deep_field_in_btree`] at the top level, used only when
+/// `depth >= array_chain.len()`.
 fn remap_deep_field(obj: &mut ObjMap, source: &str, target: &str, lowercase: bool) {
-    let val = match read_dotted_path(obj, source, !lowercase) {
-        Some(v) => v,
-        None => return,
+    let Some(val) = read_dotted_path(obj, source, !lowercase) else {
+        return;
     };
-
-    if lowercase {
-        set_nested_lowercased(obj, target, val);
-    } else {
-        set_nested_verbatim(obj, target, val);
+    let (Some(source), Some(target)) =
+        (path::scalar_segments(source), path::scalar_segments(target))
+    else {
+        return;
+    };
+    if path::can_set(obj, &target) {
+        path::remove(obj, &source);
+        path::set(obj, &target, val, lowercase);
     }
 }
 

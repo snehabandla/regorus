@@ -450,6 +450,8 @@ pub struct ResolvedEntry {
     /// Precomputed path segments for each versioned path, in the same order
     /// as `versioned_paths`.
     pub(crate) versioned_path_segments: Vec<Vec<super::path::Segment>>,
+    /// Whether the short name and every ARM path parse.
+    valid_paths: bool,
 }
 
 impl ResolvedEntry {
@@ -460,7 +462,9 @@ impl ResolvedEntry {
         versioned_paths: Vec<(String, String)>,
         metadata: Option<AliasPathMetadata>,
     ) -> Self {
-        let is_wildcard = super::path::parse(&short_name)
+        let short_path = super::path::parse(&short_name);
+        let is_wildcard = short_path
+            .as_ref()
             .is_some_and(|path| path.segments.contains(&super::path::Segment::Wildcard));
         let short_name_lc = if short_name.bytes().all(|b| !b.is_ascii_uppercase()) {
             Rc::from(short_name.as_str())
@@ -477,7 +481,12 @@ impl ResolvedEntry {
                     .map(|path| path.segments)
                     .unwrap_or_default()
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let valid_paths = short_path.is_some()
+            && !default_path_segments.is_empty()
+            && versioned_path_segments
+                .iter()
+                .all(|segments| !segments.is_empty());
         Self {
             short_name,
             default_path,
@@ -487,18 +496,14 @@ impl ResolvedEntry {
             short_name_lc,
             default_path_segments,
             versioned_path_segments,
+            valid_paths,
         }
     }
 
     /// Whether the short name and every ARM path parse. Entries with
     /// unparseable paths are skipped during normalization and denormalization.
-    pub fn has_valid_paths(&self) -> bool {
-        super::path::parse(&self.short_name).is_some()
-            && !self.default_path_segments.is_empty()
-            && self
-                .versioned_path_segments
-                .iter()
-                .all(|segments| !segments.is_empty())
+    pub const fn has_valid_paths(&self) -> bool {
+        self.valid_paths
     }
 
     /// Select the ARM path for a given API version.

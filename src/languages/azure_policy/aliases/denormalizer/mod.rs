@@ -29,8 +29,6 @@ use super::normalizer::{apply_element_remap, ElementRemap};
 
 use casing::{build_casing_map, default_casing_map, denormalize_value, restore_casing};
 
-use super::obj_map::remove_element_field;
-
 struct ScalarWrite {
     short: Vec<Segment>,
     arm: Vec<Segment>,
@@ -152,7 +150,7 @@ fn denormalize_inner(
     if let Some(entries) = entries {
         let mut writes = Vec::new();
         for (lc_key, entry) in entries {
-            if entry.is_wildcard {
+            if entry.is_wildcard || !entry.has_valid_paths() {
                 continue;
             }
 
@@ -177,7 +175,10 @@ fn denormalize_inner(
             };
 
             let arm_segments = entry.select_path_segments(api_version);
+            // A whole-`properties` alias is merged into Phase 2a's properties
+            // in Phase 4, so only an object can be written there.
             if matches!(arm_segments, [Segment::Key(key)] if key.eq_ignore_ascii_case("properties"))
+                && !matches!(val, Value::Object(_))
             {
                 continue;
             }
@@ -192,10 +193,13 @@ fn denormalize_inner(
                 if let Some(stripped) = first.strip_prefix("_p_") {
                     *first = Rc::from(stripped);
                     source_properties = Some(true);
-                } else if !ROOT_FIELDS
+                } else if ROOT_FIELDS
                     .iter()
                     .any(|field| field.eq_ignore_ascii_case(first))
                 {
+                    // Phase 1 copied the whole root field into `result`.
+                    source_properties = Some(false);
+                } else {
                     source_properties = Some(!is_data_plane);
                 }
             }
@@ -279,7 +283,6 @@ fn denormalize_inner(
                     target_field: rev.target_field.clone(),
                 };
                 apply_element_remap(&mut properties, &remap, false);
-                remove_element_field(&mut properties, &rev.array_chain, &rev.cleanup_field);
             }
             // Reverse leaf remaps still navigate the alias base.
             for (alias_base_lc, arm_base) in &agg.array_renames_denormalize {

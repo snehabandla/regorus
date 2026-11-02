@@ -338,12 +338,12 @@ cases:
               config:
                 score: 5
     # Normalize: "config.score" (dotted ARM leaf) → "rating" (alias short name).
-    # The stale "config.score" path must be removed; only "rating" should remain.
+    # The stale "config.score" path must be removed, along with the "config"
+    # object it leaves empty; only "rating" should remain.
     expected_normalized:
       type: "Microsoft.Test/widgets"
       items:
         - name: w1
-          config: {}
           rating: 5
     # Round-trip: normalize → denormalize should restore ARM structure.
     round_trip: true
@@ -436,7 +436,6 @@ cases:
       type: "Microsoft.Test/widgets"
       items:
         - name: w1
-          config: {}
           rating: 9
     round_trip: true
     expected_round_trip:

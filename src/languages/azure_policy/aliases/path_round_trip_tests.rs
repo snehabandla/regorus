@@ -642,3 +642,137 @@ fn index_bound_is_inclusive_at_max() {
         .unwrap();
     assert_eq!(array.len(), 4096);
 }
+
+fn round_trip(aliases: &[(&str, &str)], raw: Json, normalized: Option<Json>) {
+    let registry = registry("Test/widgets", aliases);
+    let raw = Value::from(raw);
+    let actual = normalizer::normalize(&raw, Some(&registry), None);
+    if let Some(normalized) = normalized {
+        assert_eq!(actual, Value::from(normalized), "{aliases:?}");
+    }
+    assert_eq!(registry.denormalize(&actual, None), raw, "{aliases:?}");
+}
+
+#[test]
+fn failed_element_remap_keeps_source() {
+    assert_eq!(
+        denorm(
+            &[("rules[*].displayName", "properties.rules[*].target.x")],
+            json!({"rules": [{"displayName": "x", "target": 5}, {"displayName": "y"}]})
+        ),
+        Value::from(json!({"properties": {"rules": [
+            {"displayName": "x", "target": 5},
+            {"target": {"x": "y"}}
+        ]}}))
+    );
+    round_trip(
+        &[("rules[*].display.name", "properties.rules[*].target.x")],
+        json!({"type": "Test/widgets", "properties": {"rules": [{"target": {"x": "v"}, "display": 5}]}}),
+        Some(json!({"type": "Test/widgets", "rules": [{"target": {"x": "v"}, "display": 5}]})),
+    );
+}
+
+#[test]
+fn element_remap_prunes_emptied_leaf_parents() {
+    round_trip(
+        &[("items[*].new.x", "properties.items[*].old.y")],
+        json!({"type": "Test/widgets", "properties": {"items": [{"old": {"y": 1}}, {"old": {"y": 2, "z": 3}}, {"old": {}}]}}),
+        Some(
+            json!({"type": "Test/widgets", "items": [{"new": {"x": 1}}, {"new": {"x": 2}, "old": {"z": 3}}, {"old": {}}]}),
+        ),
+    );
+    round_trip(
+        &[(
+            "items[*].renamed['a.b']",
+            "properties.items[*].original['c.d']",
+        )],
+        json!({"type": "Test/widgets", "properties": {"items": [{"original": {"c.d": 1}}]}}),
+        Some(json!({"type": "Test/widgets", "items": [{"renamed": {"a.b": 1}}]})),
+    );
+}
+
+#[test]
+fn whole_properties_alias_round_trips() {
+    round_trip(
+        &[("x", "properties")],
+        json!({"type": "Test/widgets", "properties": {"a": 1}}),
+        Some(json!({"type": "Test/widgets", "a": 1, "x": {"a": 1}})),
+    );
+    assert_eq!(
+        denorm(
+            &[("x", "properties")],
+            json!({"a": 1, "x": {"a": 2, "b": 3}})
+        ),
+        Value::from(json!({"properties": {"a": 2, "b": 3}}))
+    );
+}
+
+#[test]
+fn root_field_short_path_is_moved() {
+    let aliases = [("sku.name", "properties.hardwareProfile.vmSize")];
+    assert_eq!(
+        denorm(&aliases, json!({"sku": {"name": "D2"}})),
+        Value::from(json!({"properties": {"hardwareProfile": {"vmSize": "D2"}}}))
+    );
+    assert_eq!(
+        denorm(&aliases, json!({"sku": {"name": "D2", "tier": "t"}})),
+        Value::from(
+            json!({"sku": {"tier": "t"}, "properties": {"hardwareProfile": {"vmSize": "D2"}}})
+        )
+    );
+    assert_eq!(
+        denorm(&[("sku.name", "sku.name")], json!({"sku": {"name": "D2"}})),
+        Value::from(json!({"sku": {"name": "D2"}}))
+    );
+    round_trip(
+        &aliases,
+        json!({"type": "Test/widgets", "properties": {"hardwareProfile": {"vmSize": "D2"}}}),
+        None,
+    );
+}
+
+#[test]
+fn invalid_short_names_are_skipped_and_dotted_names_parse() {
+    for short in ["a..b", "a]", "a."] {
+        round_trip(
+            &[(short, "properties.x")],
+            json!({"type": "Test/widgets", "properties": {"x": 1}}),
+            Some(json!({"type": "Test/widgets", "x": 1})),
+        );
+    }
+    round_trip(
+        &[("a. b", "properties.x")],
+        json!({"type": "Test/widgets", "properties": {"x": 1}}),
+        Some(json!({"type": "Test/widgets", "x": 1, "a": {"b": 1}})),
+    );
+}
+
+#[test]
+fn grammar_matches_compiler_field_paths() {
+    for (text, expected) in [
+        (
+            "a[ 0 ]",
+            vec![path::Segment::Key("a".into()), path::Segment::Index(0)],
+        ),
+        (
+            "a.[0]",
+            vec![path::Segment::Key("a".into()), path::Segment::Index(0)],
+        ),
+        (
+            "a[ * ]",
+            vec![
+                path::Segment::Key("a".into()),
+                path::Segment::Key("*".into()),
+            ],
+        ),
+    ] {
+        assert_eq!(path::parse(text).unwrap().segments, expected, "{text}");
+    }
+    let at_limit = vec!["a"; path::MAX_SEGMENTS].join(".");
+    assert_eq!(
+        path::parse(&at_limit).unwrap().segments.len(),
+        path::MAX_SEGMENTS
+    );
+    assert!(path::parse(&(at_limit.clone() + ".a")).is_none());
+    assert!(path::parse(&(at_limit + "[0]")).is_none());
+}
