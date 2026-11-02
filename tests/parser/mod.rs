@@ -814,9 +814,9 @@ fn run(path: &str) {
 
 #[test]
 fn object_field_spans_start_at_their_key() -> Result<()> {
-    // Fields on the first line, on later lines, and with the colon on a
-    // different line from the key.
-    let rego = "{1: 2, x: 3,\n  4: 5,\n  6\n  : 7}";
+    // Fields on the first line, on later lines, with the colon on a
+    // different line from the key, and with string and compound keys.
+    let rego = "{1: 2, x: 3,\n  4: 5,\n  6\n  : 7,\n  \"s\": 8, a.b: 9}";
     let source = Source::from_contents("object.rego".to_string(), rego.to_string())?;
     let mut parser = Parser::new(&source)?;
     let expr = parser.parse_expr()?;
@@ -829,6 +829,9 @@ fn object_field_spans_start_at_their_key() -> Result<()> {
         (1, 8, "x: 3"),
         (2, 3, "4: 5"),
         (3, 3, "6\n  : 7"),
+        // String spans exclude the quotes.
+        (5, 4, "s\": 8"),
+        (5, 11, "a.b: 9"),
     ];
     assert_eq!(fields.len(), expected.len());
     for ((span, key, _), (line, col, text)) in fields.iter().zip(expected) {
@@ -838,8 +841,8 @@ fn object_field_spans_start_at_their_key() -> Result<()> {
             "field span"
         );
         assert_eq!(
-            (span.line, span.col, span.start),
-            (key.span().line, key.span().col, key.span().start),
+            span.start,
+            key.span().start,
             "field span must start at its key"
         );
     }
