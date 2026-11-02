@@ -837,7 +837,7 @@ fn object_field_spans_start_at_their_key() -> Result<()> {
     for ((span, key, _), (line, col, text)) in fields.iter().zip(expected) {
         assert_eq!(
             (span.line, span.col, span.text()),
-            (line, col, text.into()),
+            (line, col, text),
             "field span"
         );
         assert_eq!(
