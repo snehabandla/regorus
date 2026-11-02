@@ -18,13 +18,11 @@
 //! need to know about aliases — the normalizer handles the translation once
 //! before evaluation.
 //!
-//! Alias and ARM paths are parsed with a bracket-aware grammar when the
-//! catalog is loaded: dotted fields and bracket subscripts, including quoted
-//! keys containing dots, brackets or literal `[*]`. Quotes have no escapes and
-//! close only before optional whitespace and `]`. Only an unquoted `[*]` is an
-//! array wildcard; unquoted numeric subscripts are array indices. Parsed paths
-//! drive wildcard classification, element remaps, array base renames and
-//! casing restoration.
+//! Alias and ARM paths accept dotted fields and bracket subscripts, including
+//! quoted keys containing dots, brackets or literal `[*]`. Quotes have no
+//! escapes and close only before optional whitespace and `]`. Only an unquoted
+//! `[*]` is an array wildcard; unquoted numeric subscripts are array indices.
+//! Catalog indices above 4095 are rejected to bound sparse array padding.
 
 pub mod denormalizer;
 pub mod normalizer;
@@ -34,6 +32,8 @@ pub mod types;
 
 #[cfg(test)]
 mod bracket_tests;
+#[cfg(test)]
+mod path_round_trip_tests;
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString as _};
@@ -331,6 +331,9 @@ impl AliasRegistry {
     }
 
     /// Denormalize a normalized resource back to ARM JSON structure.
+    ///
+    /// Every value at a scalar alias short path is moved to its ARM path,
+    /// including raw data stored there.
     ///
     /// Convenience method that combines alias lookup and denormalization.
     /// The resource type is extracted from the `type` field of `normalized`

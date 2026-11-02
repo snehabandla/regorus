@@ -424,15 +424,17 @@ pub struct ResolvedEntry {
     /// Whether the parsed `short_name` contains an array wildcard segment.
     ///
     /// Quoted keys such as `['[*]']` are not wildcards. A short name that does
-    /// not parse is reported as `false`.
+    /// not parse is reported as `false`; see [`Self::has_valid_paths`].
     pub is_wildcard: bool,
     /// Pre-lowercased short name as `Rc<str>` for allocation-free common-case inserts.
     pub(crate) short_name_lc: Rc<str>,
-    /// Precomputed `default_path.split('.').collect()` for fast ARM path navigation.
-    pub(crate) default_path_segments: Vec<Rc<str>>,
+    /// Precomputed bracket-aware segments for fast ARM path navigation.
+    pub(crate) default_path_segments: Vec<super::path::Segment>,
     /// Precomputed path segments for each versioned path, in the same order
     /// as `versioned_paths`.
-    pub(crate) versioned_path_segments: Vec<Vec<Rc<str>>>,
+    pub(crate) versioned_path_segments: Vec<Vec<super::path::Segment>>,
+    /// Whether the short name and every ARM path parse.
+    valid_paths: bool,
 }
 
 impl ResolvedEntry {
@@ -443,18 +445,31 @@ impl ResolvedEntry {
         versioned_paths: Vec<(String, String)>,
         metadata: Option<AliasPathMetadata>,
     ) -> Self {
-        let is_wildcard = super::path::parse(&short_name)
+        let short_path = super::path::parse(&short_name);
+        let is_wildcard = short_path
+            .as_ref()
             .is_some_and(|path| path.segments.contains(&super::path::Segment::Wildcard));
         let short_name_lc = if short_name.bytes().all(|b| !b.is_ascii_uppercase()) {
             Rc::from(short_name.as_str())
         } else {
             Rc::from(short_name.to_ascii_lowercase())
         };
-        let default_path_segments = default_path.split('.').map(Rc::from).collect();
+        let default_path_segments = super::path::parse(&default_path)
+            .map(|path| path.segments)
+            .unwrap_or_default();
         let versioned_path_segments = versioned_paths
             .iter()
-            .map(|(_, p)| p.split('.').map(Rc::from).collect())
-            .collect();
+            .map(|(_, p)| {
+                super::path::parse(p)
+                    .map(|path| path.segments)
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>();
+        let valid_paths = short_path.is_some()
+            && !default_path_segments.is_empty()
+            && versioned_path_segments
+                .iter()
+                .all(|segments| !segments.is_empty());
         Self {
             short_name,
             default_path,
@@ -464,7 +479,14 @@ impl ResolvedEntry {
             short_name_lc,
             default_path_segments,
             versioned_path_segments,
+            valid_paths,
         }
+    }
+
+    /// Whether the short name and every ARM path parse. Entries with
+    /// unparseable paths are skipped during normalization and denormalization.
+    pub const fn has_valid_paths(&self) -> bool {
+        self.valid_paths
     }
 
     /// Select the ARM path for a given API version.
@@ -485,9 +507,12 @@ impl ResolvedEntry {
     /// Select pre-tokenized path segments for a given API version.
     ///
     /// Returns the versioned segments if `api_version` matches, otherwise
-    /// the default segments.  This avoids per-call `split('.')` for both
+    /// the default segments. This avoids per-call path parsing for both
     /// default and versioned scalar alias navigation.
-    pub(crate) fn select_path_segments(&self, api_version: Option<&str>) -> &[Rc<str>] {
+    pub(crate) fn select_path_segments(
+        &self,
+        api_version: Option<&str>,
+    ) -> &[super::path::Segment] {
         if let Some(ver) = api_version {
             for (i, (v, _)) in self.versioned_paths.iter().enumerate() {
                 if v.eq_ignore_ascii_case(ver) {

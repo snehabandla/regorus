@@ -11,26 +11,38 @@ mod sub_resource;
 mod tests;
 
 use alloc::collections::BTreeSet;
+use alloc::vec::Vec;
 
 use crate::Value;
 
 use crate::Rc;
 
 use super::obj_map::{
-    extract_type_field, is_root_field_collision, make_value, new_map, obj_insert,
-    set_nested_verbatim, val_str, ROOT_FIELDS,
+    extract_type_field, is_root_field_collision, make_value, new_map, obj_insert, val_str,
+    ROOT_FIELDS,
 };
+use super::path::{self, Segment};
 use super::types::ResolvedAliases;
 use super::AliasRegistry;
 
 use super::normalizer::{apply_element_remap, ElementRemap};
 
 use casing::{build_casing_map, default_casing_map, denormalize_value, restore_casing};
-use helpers::find_key_ci;
 
-use super::obj_map::remove_element_field;
+struct ScalarWrite {
+    short: Vec<Segment>,
+    arm: Vec<Segment>,
+    value: Value,
+    source_properties: Option<bool>,
+    target_properties: bool,
+    active: bool,
+}
 
 /// Denormalize a normalized resource back to ARM JSON structure.
+///
+/// Every value found at a scalar alias short path is moved to its ARM path,
+/// including raw data the normalizer copied there unchanged; arrays left
+/// all-`null` by that move are dropped.
 pub fn denormalize(
     normalized: &Value,
     registry: Option<&AliasRegistry>,
@@ -93,12 +105,6 @@ pub fn denormalize_with_aliases(
         }
 
         let lookup_key = key_s.strip_prefix("_p_").unwrap_or(key_s);
-        let lookup_key_lc = lookup_key.to_ascii_lowercase();
-        let has_alias = entries.is_some_and(|e| e.contains_key(lookup_key_lc.as_str()));
-        if has_alias {
-            continue;
-        }
-
         let denorm_val = denormalize_value(val, &casing_map);
 
         if key_s.starts_with("_p_") {
@@ -115,8 +121,9 @@ pub fn denormalize_with_aliases(
 
     // Phase 2b: Aliased scalar fields → versioned ARM paths.
     if let Some(entries) = entries {
+        let mut writes = Vec::new();
         for (lc_key, entry) in entries {
-            if entry.is_wildcard {
+            if entry.is_wildcard || !entry.has_valid_paths() {
                 continue;
             }
 
@@ -126,33 +133,97 @@ pub fn denormalize_with_aliases(
 
             let normalized_key = if is_root_field_collision(&entry.short_name, &entry.default_path)
             {
-                alloc::format!("_p_{}", entry.short_name.to_ascii_lowercase())
+                super::obj_map::collision_safe_key(&entry.short_name)
             } else {
                 lc_key.clone()
             };
 
-            // Fast-path: direct BTreeMap lookup for lowercase keys,
-            // with case-insensitive fallback for mixed-case external input.
-            let nk_val = Value::String(Rc::from(normalized_key.as_str()));
-            let val = obj.get(&nk_val).or_else(|| {
-                obj.iter()
-                    .find(|(k, _)| {
-                        val_str(k).is_some_and(|s| s.eq_ignore_ascii_case(&normalized_key))
-                    })
-                    .map(|(_, v)| v)
-            });
-            let val = match val {
-                Some(v) => v,
-                None => continue,
+            let Some(mut short_segments) = path::scalar_segments(&normalized_key) else {
+                continue;
+            };
+            let Some(val) = path::get(normalized, &short_segments, true) else {
+                continue;
             };
 
-            let arm_path = entry.select_path(api_version);
+            let arm_segments = entry.select_path_segments(api_version);
+            // A whole-`properties` alias is merged into Phase 2a's properties
+            // in Phase 4, so only an object can be written there.
+            if matches!(arm_segments, [Segment::Key(key)] if key.eq_ignore_ascii_case("properties"))
+                && !matches!(val, Value::Object(_))
+            {
+                continue;
+            }
             let denorm_val = denormalize_value(val, &casing_map);
+            let target = path::without_properties(arm_segments);
+            let target_properties = target.len() != arm_segments.len();
+            if target.is_empty() {
+                continue;
+            }
+            let mut source_properties = None;
+            if let Some(Segment::Key(first)) = short_segments.first_mut() {
+                if let Some(stripped) = first.strip_prefix("_p_") {
+                    *first = Rc::from(stripped);
+                    source_properties = Some(true);
+                } else if ROOT_FIELDS
+                    .iter()
+                    .any(|field| field.eq_ignore_ascii_case(first))
+                {
+                    // Phase 1 copied the whole root field into `result`.
+                    source_properties = Some(false);
+                } else {
+                    source_properties = Some(!is_data_plane);
+                }
+            }
+            if source_properties == Some(target_properties)
+                && path::equivalent(&short_segments, target)
+            {
+                source_properties = None;
+            }
+            writes.push(ScalarWrite {
+                short: short_segments,
+                arm: target.to_vec(),
+                value: denorm_val,
+                source_properties,
+                target_properties,
+                active: true,
+            });
+        }
 
-            if let Some(props_path) = arm_path.strip_prefix("properties.") {
-                set_nested_verbatim(&mut properties, props_path, denorm_val);
-            } else {
-                set_nested_verbatim(&mut result, arm_path, denorm_val);
+        // Consume only Phase 2a paths, before any ARM writes. If writes collide
+        // structurally, retry without failed writes so their sources survive.
+        loop {
+            let mut next_properties = properties.clone();
+            let mut next_result = result.clone();
+            for write in writes.iter().filter(|write| write.active) {
+                if let Some(source_properties) = write.source_properties {
+                    path::remove(
+                        if source_properties {
+                            &mut next_properties
+                        } else {
+                            &mut next_result
+                        },
+                        &write.short,
+                    );
+                }
+            }
+            let mut failed = false;
+            for write in writes.iter_mut().filter(|write| write.active) {
+                let destination = if write.target_properties {
+                    &mut next_properties
+                } else {
+                    &mut next_result
+                };
+                if path::can_set(destination, &write.arm) {
+                    path::set(destination, &write.arm, write.value.clone(), false);
+                } else {
+                    write.active = false;
+                    failed = true;
+                }
+            }
+            if !failed {
+                properties = next_properties;
+                result = next_result;
+                break;
             }
         }
 
@@ -168,32 +239,18 @@ pub fn denormalize_with_aliases(
                     .unwrap_or(&aliases.default_aggregates)
             });
 
-            // Phase 2c: Precomputed array base renames.
-            for (alias_base_lc, arm_base) in &agg.array_renames_denormalize {
-                if let Some(key) = find_key_ci(&properties, alias_base_lc) {
-                    if let Some(val) = properties.remove(key.as_ref()) {
-                        obj_insert(&mut properties, arm_base, val);
-                    }
-                }
-            }
-
             // Phase 2d: Precomputed reverse element-level field remaps.
             for rev in &agg.reverse_element_remaps {
                 let remap = ElementRemap {
                     array_chain: rev.array_chain.clone(),
                     source_field: rev.source_field.clone(),
-                    target_field: if rev.target_field.contains('.') {
-                        rev.target_field
-                            .split('.')
-                            .map(|segment| restore_casing(segment, &casing_map))
-                            .collect::<alloc::vec::Vec<_>>()
-                            .join(".")
-                    } else {
-                        restore_casing(&rev.target_field, &casing_map)
-                    },
+                    target_field: rev.target_field.clone(),
                 };
                 apply_element_remap(&mut properties, &remap, false);
-                remove_element_field(&mut properties, &rev.array_chain, &rev.cleanup_field);
+            }
+            // Reverse leaf remaps still navigate the alias base.
+            for (alias_base_lc, arm_base) in &agg.array_renames_denormalize {
+                path::rename(&mut properties, alias_base_lc, arm_base, false);
             }
         }
     }
