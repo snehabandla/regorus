@@ -17,11 +17,23 @@
 //! alias short names are direct paths. This means the compiler and VM never
 //! need to know about aliases — the normalizer handles the translation once
 //! before evaluation.
+//!
+//! Alias and ARM paths accept dotted fields and bracket subscripts, including
+//! quoted keys containing dots, brackets or literal `[*]`. Quotes have no
+//! escapes and close only before optional whitespace and `]`. Only an unquoted
+//! `[*]` is an array wildcard; unquoted numeric subscripts are array indices.
+//! Catalog indices above 4095 are rejected to bound sparse array padding.
 
 pub mod denormalizer;
 pub mod normalizer;
 pub(crate) mod obj_map;
+mod path;
 pub mod types;
+
+#[cfg(test)]
+mod bracket_tests;
+#[cfg(test)]
+mod review_tests;
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString as _};
@@ -483,52 +495,74 @@ fn compute_aggregates_for_version(
 
         // Select the ARM path for this version (or default).
         let selected_path = entry.select_path(api_version);
-        let short_parts: Vec<&str> = entry.short_name.split("[*].").collect();
-        let arm_raw_parts: Vec<&str> = selected_path.split("[*].").collect();
+        let Some(short_path) = path::parse(&entry.short_name) else {
+            continue;
+        };
+        let Some(arm_path) = path::parse(selected_path) else {
+            continue;
+        };
+        let short_parts: Vec<_> = short_path
+            .segments
+            .split(|segment| *segment == path::Segment::Wildcard)
+            .collect();
+        let arm_parts: Vec<_> = arm_path
+            .segments
+            .split(|segment| *segment == path::Segment::Wildcard)
+            .collect();
 
-        if short_parts.len() >= 2 && arm_raw_parts.len() >= 2 {
-            if let (Some(short_leaf), Some(arm_leaf_raw)) =
-                (short_parts.last(), arm_raw_parts.last())
-            {
-                let arm_leaf = arm_leaf_raw
-                    .strip_prefix("properties.")
-                    .unwrap_or(arm_leaf_raw);
-
-                if !short_leaf.eq_ignore_ascii_case(arm_leaf) {
-                    let array_chain: Vec<Vec<String>> = short_parts
-                        .split_last()
-                        .map(|(_, init)| init)
+        if short_parts.len() >= 2 && arm_parts.len() >= 2 {
+            if let (Some(short_leaf), Some(arm_leaf_raw)) = (short_parts.last(), arm_parts.last()) {
+                let arm_leaf = path::without_properties(arm_leaf_raw);
+                if !short_leaf.is_empty()
+                    && !arm_leaf.is_empty()
+                    && !path::equivalent(short_leaf, arm_leaf)
+                {
+                    let array_chain: Option<Vec<Vec<String>>> = short_parts
+                        .get(..short_parts.len().saturating_sub(1))
                         .unwrap_or_default()
                         .iter()
-                        .map(|part| part.split('.').map(|s| s.to_ascii_lowercase()).collect())
+                        .map(|part| {
+                            if part.is_empty() {
+                                return None;
+                            }
+                            part.iter()
+                                .map(|segment| match segment {
+                                    path::Segment::Key(key) => Some(key.to_ascii_lowercase()),
+                                    _ => None,
+                                })
+                                .collect()
+                        })
                         .collect();
+                    if let Some(array_chain) = array_chain {
+                        let arm_leaf = path::render(arm_leaf);
+                        let source_lc = arm_leaf.to_ascii_lowercase();
+                        let target_lc = path::render(short_leaf).to_ascii_lowercase();
+                        element_remaps.push(PrecomputedRemap {
+                            array_chain: array_chain.clone(),
+                            source_field: source_lc.clone(),
+                            target_field: target_lc.clone(),
+                        });
 
-                    let source_lc = arm_leaf.to_ascii_lowercase();
-                    let target_lc = short_leaf.to_ascii_lowercase();
-
-                    element_remaps.push(PrecomputedRemap {
-                        array_chain: array_chain.clone(),
-                        source_field: source_lc.clone(),
-                        target_field: target_lc.clone(),
-                    });
-
-                    reverse_element_remaps.push(PrecomputedReverseRemap {
-                        array_chain: array_chain.clone(),
-                        source_field: target_lc.clone(),
-                        target_field: source_lc,
-                        cleanup_field: target_lc,
-                    });
+                        reverse_element_remaps.push(PrecomputedReverseRemap {
+                            array_chain: array_chain.clone(),
+                            source_field: target_lc.clone(),
+                            target_field: arm_leaf,
+                            cleanup_field: target_lc,
+                        });
+                    }
                 }
             }
         }
 
         // Compute array base rename.
-        if let (Some(short_base), Some(arm_base)) = (
-            entry.short_name.split("[*]").next(),
-            selected_path.split("[*]").next(),
-        ) {
-            let arm_base_stripped = arm_base.strip_prefix("properties.").unwrap_or(arm_base);
-            if !short_base.eq_ignore_ascii_case(arm_base_stripped) {
+        if let (Some(short_base), Some(arm_base)) = (short_parts.first(), arm_parts.first()) {
+            let arm_base_stripped = path::without_properties(arm_base);
+            if !short_base.is_empty()
+                && !arm_base_stripped.is_empty()
+                && !path::equivalent(short_base, arm_base_stripped)
+            {
+                let short_base = path::render(short_base);
+                let arm_base_stripped = path::render(arm_base_stripped);
                 // Normalize direction: (arm_base_lc, short_base_lc)
                 let norm_pair = (
                     arm_base_stripped.to_ascii_lowercase(),
@@ -539,10 +573,7 @@ fn compute_aggregates_for_version(
                 }
 
                 // Denormalize direction: (short_base_lc, arm_base)
-                let denorm_pair = (
-                    short_base.to_ascii_lowercase(),
-                    arm_base_stripped.to_string(),
-                );
+                let denorm_pair = (short_base.to_ascii_lowercase(), arm_base_stripped);
                 if seen_denorm.insert(denorm_pair.clone()) {
                     renames_denorm.push(denorm_pair);
                 }
@@ -573,8 +604,8 @@ fn detect_sub_resource_array(
     sub_resource_arrays: &mut BTreeSet<String>,
 ) {
     // Split short name and default path by `[*].`
-    let short_parts: Vec<&str> = short_name.split("[*].").collect();
-    let path_parts: Vec<&str> = default_path.split("[*].").collect();
+    let short_parts = path::wildcard_parts(short_name);
+    let path_parts = path::wildcard_parts(default_path);
 
     if short_parts.len() < 2 || path_parts.len() < 2 {
         return; // No wildcard — not a sub-resource array alias
