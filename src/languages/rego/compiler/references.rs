@@ -169,7 +169,8 @@ impl<'a> Compiler<'a> {
             let rule_candidate =
                 format_string_path(&static_prefix[0..=i]).map_err(CompilerError::from)?;
 
-            if let Ok(rule_index) = self.get_or_assign_rule_index(&rule_candidate) {
+            if self.is_rule_path_for_lookup(&rule_candidate)? {
+                let rule_index = self.get_or_assign_rule_index(&rule_candidate)?;
                 // Found a rule match! Call the rule
                 let rule_result_reg = self.alloc_register()?;
                 self.emit_instruction(
@@ -194,15 +195,20 @@ impl<'a> Compiler<'a> {
         // Check if this path could be a prefix of any rules (for virtual document lookup)
         // Convert the full chain to a pattern that includes wildcards for dynamic components
         let path_pattern = self.create_path_pattern(&chain.components);
-        let matching_rules: BTreeSet<String> = self
+        let mut matching_rules = BTreeSet::new();
+        for rule_path in self
             .policy
             .inner
             .rules
             .keys()
             .chain(self.policy.inner.default_rules.keys())
-            .filter(|rule_path| self.matches_path_pattern(rule_path, &path_pattern))
-            .cloned()
-            .collect();
+        {
+            if self.matches_path_pattern(rule_path, &path_pattern)
+                && self.is_rule_path_for_lookup(rule_path)?
+            {
+                matching_rules.insert(rule_path.clone());
+            }
+        }
 
         if !matching_rules.is_empty() {
             // This path is a prefix of some rules - use DataVirtualDocumentLookup
@@ -309,7 +315,8 @@ impl<'a> Compiler<'a> {
                     append_path_component(&rule_candidate, field).map_err(CompilerError::from)?;
             }
 
-            if let Ok(rule_index) = self.get_or_assign_rule_index(&rule_candidate) {
+            if self.is_rule_path_for_lookup(&rule_candidate)? {
+                let rule_index = self.get_or_assign_rule_index(&rule_candidate)?;
                 let rule_result_reg = self.alloc_register()?;
                 self.emit_instruction(
                     Instruction::CallRule {
@@ -340,6 +347,27 @@ impl<'a> Compiler<'a> {
                 return Ok(import_reg);
             }
             return self.compile_chain_access(import_reg, &chain.components, span);
+        }
+
+        // A namespace registered only through functions or variable head keys
+        // (`lib.f(x) := x` read as `lib`) is a document under `data`.
+        if let Some(components) = self
+            .policy
+            .inner
+            .rule_path_components
+            .get(&current_pkg_prefix)
+            .cloned()
+        {
+            let data_chain = ReferenceChain {
+                root: ReferenceRoot::Variable("data".to_string()),
+                components: components
+                    .into_iter()
+                    .skip(1)
+                    .map(AccessComponent::Field)
+                    .chain(chain.components.iter().cloned())
+                    .collect(),
+            };
+            return self.compile_data_chain(&data_chain, span);
         }
 
         // No rule or import found - undefined variable

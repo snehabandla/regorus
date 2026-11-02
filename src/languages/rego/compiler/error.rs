@@ -68,13 +68,11 @@ pub enum CompilerError {
     #[error("Invalid function expression with package")]
     InvalidFunctionExpressionWithPackage,
 
-    #[error("partial object rules with constant keys are not yet supported by the RVM compiler")]
-    PartialObjectConstantKeyUnsupported,
+    #[error("rule path '{rule_path}' is not supported by the RVM compiler: it is reached through a non-string head key or names a function")]
+    UnsupportedRuleHeadPath { rule_path: String },
 
-    #[error(
-        "partial object rules with nested bracket keys are not yet supported by the RVM compiler"
-    )]
-    PartialObjectNestedKeyUnsupported,
+    #[error("conflicting rules for '{rule_path}': definitions produce different kinds of document (set, object or single value)")]
+    ConflictingRuleTypes { rule_path: String },
 
     #[error("Compilation error: {message}")]
     General { message: String },

@@ -249,6 +249,7 @@ impl RegoVM {
         // Clear stacks - these are small structs that don't need pooling
         self.loop_stack.clear();
         self.call_rule_stack.clear();
+        self.object_head_leaves.clear();
         self.comprehension_stack.clear();
 
         // Return register windows to pool for reuse

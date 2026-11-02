@@ -157,6 +157,8 @@ impl<'a> Compiler<'a> {
             dest_register: result_reg,
             key_expr: None,
             value_expr: None,
+            object_head: None,
+            value_literal: None,
             span: span.clone(),
             key_value_loops_hoisted: false,
         };

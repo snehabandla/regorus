@@ -6,6 +6,7 @@ use alloc::string::{String, ToString as _};
 use alloc::vec::Vec;
 use postcard::{from_bytes, to_allocvec};
 
+use super::legacy_v6::ProgramV6;
 use super::{DeserializationResult, Program};
 use crate::value::Value;
 
@@ -157,7 +158,9 @@ impl Program {
                 program.rego_v0 = Self::legacy_rego_v0(data, version).unwrap_or(false);
                 Ok(DeserializationResult::Partial(program))
             }
-            6 => {
+            // Version 7 appended the `ObjectDeepSet` parameter table; the
+            // version 6 core is decoded through its own layout.
+            6 | 7 => {
                 if data.len() < 29 {
                     return Err("Data too short for header".to_string());
                 }
@@ -235,14 +238,19 @@ impl Program {
                     }
                 };
 
-                let mut program =
-                    match from_bytes::<Program>(Self::get_slice(data, binary_start, binary_end)?) {
-                        Ok(prog) => prog,
-                        Err(_e) => {
-                            needs_recompilation = true;
-                            Program::new()
-                        }
-                    };
+                let core = Self::get_slice(data, binary_start, binary_end)?;
+                let decoded = if version == 6 {
+                    from_bytes::<ProgramV6>(core).map(ProgramV6::into_program)
+                } else {
+                    from_bytes::<Program>(core).map(Ok)
+                };
+                let mut program = match decoded {
+                    Ok(prog) => prog?,
+                    Err(_e) => {
+                        needs_recompilation = true;
+                        Program::new()
+                    }
+                };
 
                 program.entry_points = entry_points;
                 program.sources = sources;
@@ -250,6 +258,7 @@ impl Program {
                 program.rule_tree = rule_tree;
                 program.rego_v0 = rego_v0;
                 program.needs_recompilation = needs_recompilation;
+                program.validate_limits()?;
 
                 if !program.builtin_info_table.is_empty() {
                     if let Err(_e) = program.initialize_resolved_builtins() {
@@ -281,7 +290,7 @@ impl Program {
         let version = Self::read_u32(data, 4).ok();
 
         match version {
-            Some(1..=6) => Ok(true),
+            Some(1..=7) => Ok(true),
             _ => Ok(false),
         }
     }

@@ -41,6 +41,16 @@ pub(super) enum MemoryBudgetLifecycle {
     SuspendableExecution,
 }
 
+/// How the definitions of a partial object rule wrote one leaf. A
+/// single-value leaf must equal the complete set built by multi-value
+/// definitions of the same leaf, so both are kept until the rule finishes.
+#[derive(Debug, Clone)]
+pub(super) enum ObjectHeadLeaf {
+    Single(Value),
+    Multi,
+    Both { single: Value, multi: Value },
+}
+
 /// The Rego Virtual Machine
 #[derive(Debug)]
 pub struct RegoVM {
@@ -75,6 +85,8 @@ pub struct RegoVM {
 
     /// Call rule execution stack for managing nested rule calls
     pub(super) call_rule_stack: Vec<CallRuleContext>,
+    /// Leaves written by the partial object rule at each call depth.
+    pub(super) object_head_leaves: BTreeMap<usize, BTreeMap<Vec<Value>, ObjectHeadLeaf>>,
 
     /// Register stack for isolated register spaces during rule calls
     pub(super) register_stack: Vec<Vec<Value>>,
@@ -248,6 +260,7 @@ impl RegoVM {
             context: Value::Undefined,
             loop_stack: Vec::new(),
             call_rule_stack: Vec::new(),
+            object_head_leaves: BTreeMap::new(),
             register_stack: Vec::new(),
             comprehension_stack: Vec::new(),
             base_register_count: 2, // Default to 2 registers for basic operations
