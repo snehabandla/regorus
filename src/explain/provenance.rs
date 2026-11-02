@@ -527,19 +527,41 @@ impl<'a> SourceIndex<'a> {
             .flatten()
     }
 
+    fn is_keyword(&self, index: usize) -> bool {
+        self.tokens.get(index).is_some_and(|token| {
+            token.kind == TokenClass::Name
+                && matches!(
+                    self.content.get(token.start..token.end),
+                    Some(
+                        "as" | "contains"
+                            | "default"
+                            | "else"
+                            | "every"
+                            | "if"
+                            | "in"
+                            | "not"
+                            | "some"
+                            | "with"
+                    )
+                )
+        })
+    }
+
     /// Whether the token at `index` continues a reference: a `[` or `(`
-    /// directly after a term.
+    /// directly after a term, or the `(` of a call after a space.
     fn continues(&self, index: usize) -> bool {
-        let Some(previous) = index.checked_sub(1).and_then(|i| self.tokens.get(i)) else {
+        let before = index.wrapping_sub(1);
+        let (Some(previous), Some(token)) = (self.tokens.get(before), self.tokens.get(index))
+        else {
             return false;
         };
+        let call = self.symbol(index) == Some("(")
+            && previous.kind == TokenClass::Name
+            && previous.line == token.line
+            && !self.is_keyword(before);
         let ends_term = previous.kind != TokenClass::Symbol
-            || matches!(self.symbol(index.saturating_sub(1)), Some(")" | "]" | "}"));
-        ends_term
-            && self
-                .tokens
-                .get(index)
-                .is_some_and(|t| previous.lexeme().1 == t.start)
+            || matches!(self.symbol(before), Some(")" | "]" | "}"));
+        call || (ends_term && previous.lexeme().1 == token.start)
     }
 
     /// The first and last token of the expression of `span`.
@@ -567,10 +589,6 @@ impl<'a> SourceIndex<'a> {
             Some(".") => ending(anchor.checked_add(1)?),
             Some("[" | "(") if self.continues(anchor) => {
                 ending(self.closing(anchor, self.tokens.len())?)
-            }
-            // A call may also have a space before its arguments.
-            Some("[" | "(") => {
-                starting().or_else(|| ending(self.closing(anchor, self.tokens.len())?))
             }
             Some(_) if self.bracket(anchor) == 0 => {
                 // An operation: the expression must be the only one around
@@ -605,38 +623,15 @@ impl<'a> SourceIndex<'a> {
     /// Whether an operand can start at token `first` and end at `last`:
     /// neither continues the term or statement around it.
     fn bounded(&self, first: usize, last: usize) -> bool {
-        let starts = match first
-            .checked_sub(1)
-            .and_then(|i| Some((i, self.tokens.get(i)?)))
-        {
-            None => true,
-            Some((before, token)) => {
-                token.line < self.tokens.get(first).map_or(0, |t| t.line)
-                    || match token.kind {
-                        TokenClass::Symbol => {
-                            !matches!(self.symbol(before), Some("." | ")" | "]" | "}"))
-                        }
-                        TokenClass::Name => {
-                            self.content
-                                .get(token.start..token.end)
-                                .is_some_and(|word| {
-                                    matches!(
-                                        word,
-                                        "as" | "contains"
-                                            | "default"
-                                            | "else"
-                                            | "every"
-                                            | "if"
-                                            | "in"
-                                            | "not"
-                                            | "some"
-                                            | "with"
-                                    )
-                                })
-                        }
-                        _ => false,
-                    }
+        let before = first.wrapping_sub(1);
+        let starts = match (self.tokens.get(before), self.tokens.get(first)) {
+            (Some(token), Some(at)) => {
+                token.line < at.line
+                    || self.is_keyword(before)
+                    || (token.kind == TokenClass::Symbol
+                        && !matches!(self.symbol(before), Some("." | ")" | "]" | "}")))
             }
+            _ => true,
         };
         let ends = self.tokens.get(last).is_some_and(|token| {
             token.kind != TokenClass::Symbol || matches!(self.symbol(last), Some(")" | "]" | "}"))

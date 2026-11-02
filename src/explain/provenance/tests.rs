@@ -1116,3 +1116,25 @@ fn empty_sets_objects_and_spaced_calls() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn spaced_calls_beside_operations_and_statements() -> anyhow::Result<()> {
+    // `some x in input.a | sort` and `(input.ys);true` have the length of
+    // the collection too.
+    let provenance =
+        allow("  some x in input.a | sort (input.a)\n  some y in sort (input.ys);true\n")?;
+    let loops: Vec<_> = provenance
+        .sites()
+        .iter()
+        .filter(|site| site.kind == ConditionKind::Iteration)
+        .map(|site| (site.text.as_str(), at(site)))
+        .collect();
+    assert_eq!(
+        loops,
+        vec![
+            ("input.a | sort (input.a)", Some(("p.rego", 5, 13))),
+            ("sort (input.ys)", Some(("p.rego", 6, 13))),
+        ]
+    );
+    Ok(())
+}
