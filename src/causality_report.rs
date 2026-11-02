@@ -755,6 +755,12 @@ pub struct ConditionExplanation {
     /// Policy conditions never carry scopes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scopes: Vec<&'static str>,
+    /// For a condition that checks a rule or function call, directly or through
+    /// `not`: the full name of the called rule (for example
+    /// `"data.policy._secure"`), which `helper_conditions` belong to. Present
+    /// even when those conditions were not expanded. Omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub helper_rule: Option<String>,
     /// For truthiness conditions whose backing register was written by a
     /// `CallRule` (i.e. the customer wrote `not _helper(x)` or bare
     /// `_helper(x)` as a guard), this carries the helper's evaluated inner
@@ -3195,6 +3201,12 @@ fn materialize_condition_explanations_at_depth(
             .get(pc_usize)
             .map(|scopes| scopes.iter().map(|scope| scope.as_str()).collect())
             .unwrap_or_default();
+        let helper_rule = helper_call.and_then(|call| {
+            program
+                .rule_infos
+                .get(usize::from(call.rule_index))
+                .map(|info| info.name.clone())
+        });
 
         conditions.push(ConditionExplanation {
             text,
@@ -3209,6 +3221,7 @@ fn materialize_condition_explanations_at_depth(
             builtin_name,
             negated,
             scopes,
+            helper_rule,
             helper_conditions,
             helper_conditions_truncated,
         });
@@ -5116,6 +5129,7 @@ mod tests {
                 builtin_name: None,
                 negated: false,
                 scopes: Vec::new(),
+                helper_rule: None,
                 helper_conditions: Vec::new(),
                 helper_conditions_truncated: false,
             },
@@ -5140,6 +5154,7 @@ mod tests {
                 builtin_name: None,
                 negated: false,
                 scopes: Vec::new(),
+                helper_rule: None,
                 helper_conditions: Vec::new(),
                 helper_conditions_truncated: false,
             },
@@ -5199,6 +5214,7 @@ mod tests {
                     builtin_name: None,
                     negated: false,
                     scopes: Vec::new(),
+                    helper_rule: None,
                     helper_conditions: Vec::new(),
                     helper_conditions_truncated: false,
                 }],

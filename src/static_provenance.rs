@@ -1260,15 +1260,17 @@ fn peek_through_negation(
         }
     }
 
-    get_provenance(reg_prov, not_operand)
-        .filter(|provenance| provenance.is_input_rooted() || provenance.is_data_rooted())
-        .cloned()
-        .map(|provenance| NegationLookThrough {
-            operator: None,
-            operands: None,
-            inner_provenance: Some(provenance),
-            builtin_name: None,
-        })
+    // Any other operand (a rule or function call result, a local, a value
+    // with no input path): the condition is still inverted, so report it as a
+    // negated truthiness check, attributed only when the operand is rooted.
+    Some(NegationLookThrough {
+        operator: None,
+        operands: None,
+        inner_provenance: get_provenance(reg_prov, not_operand)
+            .filter(|provenance| provenance.is_input_rooted() || provenance.is_data_rooted())
+            .cloned(),
+        builtin_name: None,
+    })
 }
 
 /// Result of looking through a `Not` instruction at the source condition.

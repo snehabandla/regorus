@@ -6262,3 +6262,274 @@ fn rgp3_assumption_counter_leaks_into_an_unrelated_negation() {
         }
     }
 }
+
+/// Run `data.t.deny` with causality explanations, in causality mode or in
+/// partial-evaluation mode with an unrelated unknown, and return the report.
+fn rg10_report(
+    policy: &str,
+    input: &str,
+    condition_mode: evaluation_trace::ConditionMode,
+    partial_eval: bool,
+) -> serde_json::Value {
+    let entry = "data.t.deny";
+    let mut engine = Engine::new();
+    engine.add_policy("t.rego".into(), policy.into()).unwrap();
+    let compiled = engine.compile_with_entrypoint(&Rc::from(entry)).unwrap();
+    let program =
+        languages::rego::compiler::Compiler::compile_from_policy(&compiled, &[entry]).unwrap();
+    let mut vm = rvm::RegoVM::new_with_policy(compiled);
+    vm.load_program(program);
+    vm.set_explanation_settings(evaluation_trace::ExplanationSettings {
+        enabled: true,
+        value_mode: evaluation_trace::ValueMode::Full,
+        condition_mode,
+        detail: evaluation_trace::ExplanationDetail::Full,
+        assume_unknown_input: partial_eval,
+        eval_mode: if partial_eval {
+            evaluation_trace::EvaluationMode::PartialEval
+        } else {
+            evaluation_trace::EvaluationMode::Causality
+        },
+        unknowns: if partial_eval {
+            vec!["input.unrelated".into()]
+        } else {
+            Vec::new()
+        },
+        ..Default::default()
+    });
+    vm.set_input(Value::from_json_str(input).unwrap());
+    let result = vm.execute_entry_point_by_name(entry).unwrap();
+    serde_json::from_str(&vm.take_causality_report(result).unwrap()).unwrap()
+}
+
+/// Every reported condition of `data.t.deny`, including nested
+/// `helper_conditions`, with its nesting depth.
+fn rg10_conditions(report: &serde_json::Value) -> Vec<(usize, serde_json::Value)> {
+    fn walk(
+        condition: &serde_json::Value,
+        depth: usize,
+        out: &mut Vec<(usize, serde_json::Value)>,
+    ) {
+        out.push((depth, condition.clone()));
+        for inner in condition["helper_conditions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            walk(inner, depth + 1, out);
+        }
+    }
+    let mut out = Vec::new();
+    for rule in report["rules"].as_array().expect("rules") {
+        if rule["name"] != "data.t.deny" {
+            continue;
+        }
+        for group in ["definitions", "emissions"] {
+            for item in rule[group].as_array().into_iter().flatten() {
+                for condition in item["conditions"].as_array().into_iter().flatten() {
+                    walk(condition, 0, &mut out);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn rg10_modes() -> [(evaluation_trace::ConditionMode, bool); 4] {
+    use evaluation_trace::ConditionMode::{AllContributing, PrimaryOnly};
+    [
+        (PrimaryOnly, false),
+        (AllContributing, false),
+        (PrimaryOnly, true),
+        (AllContributing, true),
+    ]
+}
+
+/// The conditions whose text is exactly `text`; panics when there are none.
+fn rg10_find(report: &serde_json::Value, text: &str) -> Vec<(usize, serde_json::Value)> {
+    let found: Vec<_> = rg10_conditions(report)
+        .into_iter()
+        .filter(|(_, condition)| condition["text"] == text)
+        .collect();
+    assert!(!found.is_empty(), "no condition `{text}` in {report:#}");
+    found
+}
+
+const RG10_INPUT: &str = r#"{"r": {"httpsOnly": false, "tls": "1.0"}}"#;
+
+#[test]
+fn rg10_not_over_calls_and_locals_is_negated() {
+    let cases = [
+        (
+            "package t\nimport rego.v1\n_secure if {\n    input.r.httpsOnly == true\n    input.r.tls == \"1.2\"\n}\ndeny contains \"x\" if {\n    not _secure\n}\n",
+            "not _secure",
+        ),
+        (
+            "package t\nimport rego.v1\n_secure(r) if {\n    r.httpsOnly == true\n    r.tls == \"1.2\"\n}\ndeny contains \"x\" if {\n    not _secure(input.r)\n}\n",
+            "not _secure(input.r)",
+        ),
+        (
+            "package t\nimport rego.v1\n_secure(r) if r.httpsOnly == true\n_secure(r) if r.tls == \"1.2\"\ndeny contains \"x\" if {\n    not _secure(input.r)\n}\n",
+            "not _secure(input.r)",
+        ),
+        (
+            "package t\nimport rego.v1\n_https(r) if r.httpsOnly == true\n_bad(r) if {\n    r.tls != \"1.2\"\n    not _https(r)\n}\ndeny contains \"x\" if {\n    _bad(input.r)\n}\n",
+            "not _https(r)",
+        ),
+        (
+            "package t\nimport rego.v1\ndeny contains \"x\" if {\n    ok := input.r.tls == \"1.2\"\n    not ok\n}\n",
+            "not ok",
+        ),
+        // A reference into a value with no input path (an array literal).
+        (
+            "package t\nimport rego.v1\ndeny contains \"x\" if {\n    some r in [input.r]\n    not r.missing\n}\n",
+            "not r.missing",
+        ),
+    ];
+    for (policy, text) in cases {
+        for (mode, partial_eval) in rg10_modes() {
+            let report = rg10_report(policy, RG10_INPUT, mode, partial_eval);
+            for (_, condition) in rg10_find(&report, text) {
+                assert_eq!(
+                    condition["negated"], true,
+                    "{mode:?} pe={partial_eval}: `{text}` must be negated: {condition:#}"
+                );
+                assert_eq!(condition["kind"], "truthiness", "{condition:#}");
+                assert_eq!(condition["outcome"], "success", "{condition:#}");
+            }
+        }
+    }
+}
+
+#[test]
+fn rg10_helper_rule_names_the_called_rule_in_both_polarities() {
+    let cases = [
+        // (policy, input, condition text, expected helper_rule, expected depth)
+        (
+            "package t\nimport rego.v1\n_secure if {\n    input.r.httpsOnly == true\n    input.r.tls == \"1.2\"\n}\ndeny contains \"x\" if {\n    not _secure\n}\n",
+            RG10_INPUT,
+            "not _secure",
+            "data.t._secure",
+            0,
+        ),
+        (
+            "package t\nimport rego.v1\n_secure(r) if r.httpsOnly == true\n_secure(r) if r.tls == \"1.2\"\ndeny contains \"x\" if {\n    not _secure(input.r)\n}\n",
+            RG10_INPUT,
+            "not _secure(input.r)",
+            "data.t._secure",
+            0,
+        ),
+        // Positive call that holds.
+        (
+            "package t\nimport rego.v1\n_weak(r) if r.tls != \"1.2\"\ndeny contains \"x\" if {\n    _weak(input.r)\n}\n",
+            RG10_INPUT,
+            "_weak(input.r)",
+            "data.t._weak",
+            0,
+        ),
+        // Positive call that fails.
+        (
+            "package t\nimport rego.v1\n_weak(r) if r.tls != \"1.2\"\ndeny contains \"x\" if {\n    _weak(input.r)\n}\n",
+            r#"{"r": {"httpsOnly": false, "tls": "1.2"}}"#,
+            "_weak(input.r)",
+            "data.t._weak",
+            0,
+        ),
+        // Nested inside a helper, and the outer call itself.
+        (
+            "package t\nimport rego.v1\n_https(r) if r.httpsOnly == true\n_bad(r) if {\n    r.tls != \"1.2\"\n    not _https(r)\n}\ndeny contains \"x\" if {\n    _bad(input.r)\n}\n",
+            RG10_INPUT,
+            "not _https(r)",
+            "data.t._https",
+            1,
+        ),
+        (
+            "package t\nimport rego.v1\n_https(r) if r.httpsOnly == true\n_bad(r) if {\n    r.tls != \"1.2\"\n    not _https(r)\n}\ndeny contains \"x\" if {\n    _bad(input.r)\n}\n",
+            RG10_INPUT,
+            "_bad(input.r)",
+            "data.t._bad",
+            0,
+        ),
+    ];
+    for (policy, input, text, rule, depth) in cases {
+        for (mode, partial_eval) in rg10_modes() {
+            let report = rg10_report(policy, input, mode, partial_eval);
+            for (found_depth, condition) in rg10_find(&report, text) {
+                assert_eq!(found_depth, depth, "{condition:#}");
+                assert_eq!(
+                    condition["helper_rule"], rule,
+                    "{mode:?} pe={partial_eval}: `{text}` must name its helper: {condition:#}"
+                );
+                // A call read through `not` is negated; a direct call is not.
+                assert_eq!(
+                    condition.get("negated").is_some(),
+                    text.starts_with("not "),
+                    "{condition:#}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn rg10_depth_cut_call_still_names_its_rule() {
+    let mut policy = String::from("package t\nimport rego.v1\n\n");
+    policy.push_str("h10(r) if {\n    r.tls == \"1.2\"\n    r.httpsOnly == true\n}\n");
+    for level in (1..10).rev() {
+        policy.push_str(&format!(
+            "h{level}(r) if {{\n    r.tls != \"x\"\n    h{}(r)\n}}\n",
+            level + 1
+        ));
+    }
+    policy.push_str("deny contains \"x\" if {\n    not h1(input.r)\n}\n");
+    for (mode, partial_eval) in rg10_modes() {
+        let report = rg10_report(&policy, RG10_INPUT, mode, partial_eval);
+        let cut: Vec<_> = rg10_conditions(&report)
+            .into_iter()
+            .filter(|(_, condition)| condition["helper_conditions_truncated"] == true)
+            .collect();
+        assert!(
+            !cut.is_empty(),
+            "{mode:?}: the chain must be cut: {report:#}"
+        );
+        for (_, condition) in cut {
+            let rule = condition["helper_rule"]
+                .as_str()
+                .unwrap_or_else(|| panic!("a cut call must still name its rule: {condition:#}"));
+            assert!(rule.starts_with("data.t.h"), "{condition:#}");
+        }
+    }
+}
+
+#[test]
+fn rg10_controls_keep_their_shape() {
+    let policy = "package t\nimport rego.v1\n_weak(r) if r.tls != \"1.2\"\ndeny contains \"x\" if {\n    r := input.r\n    r.tls != \"1.2\"\n    not r.httpsOnly == true\n    not startswith(r.tls, \"2\")\n    not r.missing\n    _weak(r)\n}\n";
+    for (mode, partial_eval) in rg10_modes() {
+        let report = rg10_report(policy, RG10_INPUT, mode, partial_eval);
+        for (_, condition) in rg10_find(&report, "_weak(r)") {
+            assert!(condition.get("negated").is_none(), "{condition:#}");
+            assert_eq!(condition["helper_rule"], "data.t._weak", "{condition:#}");
+        }
+        for (_, condition) in rg10_find(&report, "r.tls != \"1.2\"") {
+            assert!(condition.get("helper_rule").is_none(), "{condition:#}");
+            assert!(condition.get("negated").is_none(), "{condition:#}");
+        }
+        for (_, condition) in rg10_find(&report, "not r.httpsOnly == true") {
+            assert_eq!(condition["kind"], "comparison", "{condition:#}");
+            assert_eq!(condition["negated"], true, "{condition:#}");
+            assert!(condition.get("helper_rule").is_none(), "{condition:#}");
+        }
+        for (_, condition) in rg10_find(&report, "not startswith(r.tls, \"2\")") {
+            assert_eq!(condition["kind"], "builtin", "{condition:#}");
+            assert_eq!(condition["negated"], true, "{condition:#}");
+        }
+        for (_, condition) in rg10_find(&report, "not r.missing") {
+            assert_eq!(condition["negated"], true, "{condition:#}");
+            assert_eq!(
+                condition["left"]["provenance"], "input.r.missing",
+                "{condition:#}"
+            );
+            assert_eq!(condition["left"]["absent"], true, "{condition:#}");
+        }
+    }
+}
