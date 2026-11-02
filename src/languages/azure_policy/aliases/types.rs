@@ -405,6 +405,23 @@ pub struct PrecomputedReverseRemap {
     pub cleanup_field: String,
 }
 
+/// Record of how normalization treated alias short paths, consumed by
+/// [`AliasRegistry::denormalize_with_provenance`](super::AliasRegistry::denormalize_with_provenance).
+///
+/// Produced by
+/// [`AliasRegistry::normalize_with_provenance`](super::AliasRegistry::normalize_with_provenance).
+/// It lists aliases whose short-path value is raw resource data rather than a
+/// value read from the ARM path, and the raw shape of containers along alias
+/// short paths, so denormalization leaves raw data and original `null`
+/// elements in place.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AliasProvenance {
+    /// Lowercase alias keys whose short-path value the normalizer did not write.
+    pub(crate) preserved: BTreeSet<String>,
+    /// Raw container shapes keyed by lowercase short path.
+    pub(crate) shapes: super::path::Shapes,
+}
+
 /// A resolved alias entry with its default path and optional versioned paths.
 #[derive(Debug, Clone)]
 pub struct ResolvedEntry {
@@ -421,7 +438,10 @@ pub struct ResolvedEntry {
     pub metadata: Option<AliasPathMetadata>,
 
     // ── Precomputed fields (derived at registry-load time) ──────────────
-    /// Whether `short_name` contains an unquoted `[*]` array segment.
+    /// Whether the parsed `short_name` contains an array wildcard segment.
+    ///
+    /// Quoted keys such as `['[*]']` are not wildcards. A short name that does
+    /// not parse is reported as `false`; see [`Self::has_valid_paths`].
     pub is_wildcard: bool,
     /// Pre-lowercased short name as `Rc<str>` for allocation-free common-case inserts.
     pub(crate) short_name_lc: Rc<str>,
@@ -468,6 +488,17 @@ impl ResolvedEntry {
             default_path_segments,
             versioned_path_segments,
         }
+    }
+
+    /// Whether the short name and every ARM path parse. Entries with
+    /// unparseable paths are skipped during normalization and denormalization.
+    pub fn has_valid_paths(&self) -> bool {
+        super::path::parse(&self.short_name).is_some()
+            && !self.default_path_segments.is_empty()
+            && self
+                .versioned_path_segments
+                .iter()
+                .all(|segments| !segments.is_empty())
     }
 
     /// Select the ARM path for a given API version.

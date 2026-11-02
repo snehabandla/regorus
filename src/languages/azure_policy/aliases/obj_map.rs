@@ -74,11 +74,6 @@ pub fn obj_contains(map: &ObjMap, key: &str) -> bool {
     map.contains_key(key)
 }
 
-/// Remove a key, returning its value if present.
-pub fn obj_remove(map: &mut ObjMap, key: &str) -> Option<Value> {
-    map.remove(key)
-}
-
 /// Convert an [`ObjMap`] into a [`Value::Object`].
 ///
 /// Keys are converted from `Rc<str>` to `Value::String` and inserted into
@@ -318,19 +313,8 @@ pub fn remove_element_field(obj: &mut ObjMap, array_chain: &[Vec<String>], field
 
 fn remove_field_at_depth(obj: &mut ObjMap, array_chain: &[Vec<String>], depth: usize, field: &str) {
     let Some(nav) = array_chain.get(depth) else {
-        if field.contains('[') {
-            if let Some(segments) = super::path::scalar_segments(field) {
-                super::path::remove(obj, &segments);
-            }
-            return;
-        }
-        let segments: Vec<&str> = field.split('.').collect();
-        if segments.len() == 1 {
-            if let Some(&seg) = segments.first() {
-                obj_remove(obj, seg);
-            }
-        } else if segments.len() > 1 {
-            remove_at_dotted_path(obj, &segments);
+        if let Some(segments) = super::path::scalar_segments(field) {
+            super::path::remove_with(obj, &segments, &mut super::path::Prune::Never);
         }
         return;
     };
@@ -381,19 +365,8 @@ fn remove_field_at_depth_obj(
     field: &str,
 ) {
     let Some(nav) = array_chain.get(depth) else {
-        if field.contains('[') {
-            if let Some(segments) = super::path::scalar_segments(field) {
-                super::path::remove_object(obj, &segments, false);
-            }
-            return;
-        }
-        let segments: Vec<&str> = field.split('.').collect();
-        if segments.len() == 1 {
-            if let Some(&seg) = segments.first() {
-                obj.remove(&Value::from(seg));
-            }
-        } else if segments.len() > 1 {
-            remove_at_dotted_path_obj(obj, &segments);
+        if let Some(segments) = super::path::scalar_segments(field) {
+            super::path::remove_object(obj, &segments, false);
         }
         return;
     };
@@ -433,89 +406,6 @@ fn remove_field_at_depth_obj(
                 let inner_btree = Rc::make_mut(obj_rc);
                 remove_field_at_depth_obj(inner_btree, array_chain, depth.saturating_add(1), field);
             }
-        }
-    }
-}
-
-/// Remove the leaf segment at a dotted path directly in an Object.
-fn remove_at_dotted_path_obj(obj: &mut Object, segments: &[&str]) {
-    let Some((&leaf, parent_segs)) = segments.split_last() else {
-        return;
-    };
-    if parent_segs.is_empty() {
-        obj.remove(&Value::from(leaf));
-        return;
-    }
-
-    let Some(&first) = parent_segs.first() else {
-        return;
-    };
-    let first_key = Value::from(first);
-    let parent_val = match obj.get_mut(&first_key) {
-        Some(v) => v,
-        None => return,
-    };
-
-    if parent_segs.len() == 1 {
-        if let Value::Object(inner_rc) = parent_val {
-            let inner_btree = Rc::make_mut(inner_rc);
-            inner_btree.remove(&Value::from(leaf));
-        }
-    } else {
-        let mut cur = parent_val;
-        for &seg in parent_segs.iter().skip(1) {
-            cur = match cur.as_object_mut() {
-                Ok(inner) => match inner.get_mut(&Value::from(seg)) {
-                    Some(v) => v,
-                    None => return,
-                },
-                Err(_) => return,
-            };
-        }
-        if let Value::Object(inner_rc) = cur {
-            let inner_btree = Rc::make_mut(inner_rc);
-            inner_btree.remove(&Value::from(leaf));
-        }
-    }
-}
-
-/// Remove the leaf segment at a dot-separated path from an ObjMap.
-fn remove_at_dotted_path(obj: &mut ObjMap, segments: &[&str]) {
-    let Some((&leaf, parent_segs)) = segments.split_last() else {
-        return;
-    };
-    if parent_segs.is_empty() {
-        obj_remove(obj, leaf);
-        return;
-    }
-
-    let Some(&first) = parent_segs.first() else {
-        return;
-    };
-    let parent_val = match obj_get_mut(obj, first) {
-        Some(v) => v,
-        None => return,
-    };
-
-    if parent_segs.len() == 1 {
-        if let Value::Object(inner_rc) = parent_val {
-            let inner_btree = Rc::make_mut(inner_rc);
-            inner_btree.remove(&Value::from(leaf));
-        }
-    } else {
-        let mut cur = parent_val;
-        for &seg in parent_segs.iter().skip(1) {
-            cur = match cur.as_object_mut() {
-                Ok(inner) => match inner.get_mut(&Value::from(seg)) {
-                    Some(v) => v,
-                    None => return,
-                },
-                Err(_) => return,
-            };
-        }
-        if let Value::Object(inner_rc) = cur {
-            let inner_btree = Rc::make_mut(inner_rc);
-            inner_btree.remove(&Value::from(leaf));
         }
     }
 }

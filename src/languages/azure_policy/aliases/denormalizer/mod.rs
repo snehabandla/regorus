@@ -22,7 +22,7 @@ use super::obj_map::{
     ROOT_FIELDS,
 };
 use super::path::{self, Segment};
-use super::types::ResolvedAliases;
+use super::types::{AliasProvenance, ResolvedAliases};
 use super::AliasRegistry;
 
 use super::normalizer::{apply_element_remap, ElementRemap};
@@ -41,13 +41,35 @@ struct ScalarWrite {
 }
 
 /// Denormalize a normalized resource back to ARM JSON structure.
+///
+/// Every value found at a scalar alias short path is moved to its ARM path,
+/// including raw data the normalizer copied there unchanged; arrays left
+/// all-`null` by that move are dropped. Use [`denormalize_with_provenance`]
+/// to round-trip such data.
 pub fn denormalize(
     normalized: &Value,
     registry: Option<&AliasRegistry>,
     api_version: Option<&str>,
 ) -> Value {
     let aliases = registry.and_then(|r| extract_type_field(normalized).and_then(|rt| r.get(rt)));
-    denormalize_with_aliases(normalized, aliases, api_version)
+    denormalize_inner(normalized, aliases, api_version, None)
+}
+
+/// Denormalize using the record from
+/// [`normalize_with_provenance`](super::normalizer::normalize_with_provenance).
+///
+/// Alias values the normalizer left as raw data stay in place, and only
+/// containers and `null` elements absent from the raw resource are pruned.
+/// Values added after normalization, such as by a Modify effect, are still
+/// moved to their ARM paths.
+pub fn denormalize_with_provenance(
+    normalized: &Value,
+    registry: Option<&AliasRegistry>,
+    api_version: Option<&str>,
+    provenance: &AliasProvenance,
+) -> Value {
+    let aliases = registry.and_then(|r| extract_type_field(normalized).and_then(|rt| r.get(rt)));
+    denormalize_inner(normalized, aliases, api_version, Some(provenance))
 }
 
 /// Internal denormalization with pre-resolved alias data.
@@ -55,6 +77,15 @@ pub fn denormalize_with_aliases(
     normalized: &Value,
     aliases: Option<&ResolvedAliases>,
     api_version: Option<&str>,
+) -> Value {
+    denormalize_inner(normalized, aliases, api_version, None)
+}
+
+fn denormalize_inner(
+    normalized: &Value,
+    aliases: Option<&ResolvedAliases>,
+    api_version: Option<&str>,
+    provenance: Option<&AliasProvenance>,
 ) -> Value {
     let obj = match normalized.as_object() {
         Ok(o) => o,
@@ -125,7 +156,9 @@ pub fn denormalize_with_aliases(
                 continue;
             }
 
-            if sub_resource_set.contains(lc_key.as_str()) {
+            if sub_resource_set.contains(lc_key.as_str())
+                || provenance.is_some_and(|p| p.preserved.contains(lc_key))
+            {
                 continue;
             }
 
@@ -144,6 +177,10 @@ pub fn denormalize_with_aliases(
             };
 
             let arm_segments = entry.select_path_segments(api_version);
+            if matches!(arm_segments, [Segment::Key(key)] if key.eq_ignore_ascii_case("properties"))
+            {
+                continue;
+            }
             let denorm_val = denormalize_value(val, &casing_map);
             let target = path::without_properties(arm_segments);
             let target_properties = target.len() != arm_segments.len();
@@ -182,15 +219,24 @@ pub fn denormalize_with_aliases(
         loop {
             let mut next_properties = properties.clone();
             let mut next_result = result.clone();
+            let mut consumed = BTreeSet::new();
             for write in writes.iter().filter(|write| write.active) {
                 if let Some(source_properties) = write.source_properties {
-                    path::remove(
+                    let mut prune = match provenance {
+                        Some(provenance) => path::Prune::Tracked {
+                            shapes: &provenance.shapes,
+                            consumed: &mut consumed,
+                        },
+                        None => path::Prune::Empty,
+                    };
+                    path::remove_with(
                         if source_properties {
                             &mut next_properties
                         } else {
                             &mut next_result
                         },
                         &write.short,
+                        &mut prune,
                     );
                 }
             }
