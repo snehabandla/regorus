@@ -565,17 +565,130 @@ fn ids_are_stable() -> anyhow::Result<()> {
 }
 
 #[test]
-fn instruction_source_of_dispatch_is_none() -> anyhow::Result<()> {
+fn only_check_instructions_are_sites() -> anyhow::Result<()> {
     let program = compile(&[("p.rego", POLICY)], &["data.test.allow"])?;
-    assert_eq!(instruction_source(&program, 0), None);
-    assert_eq!(instruction_source(&program, usize::MAX), None);
-    let site = Provenance::new(&program).sites().first().cloned();
-    let source = site
-        .as_ref()
-        .and_then(|site| instruction_source(&program, site.pc));
+    let provenance = Provenance::new(&program);
+    // The entry dispatch at pc 0 is not a check, nor is any pc past the end.
+    assert_eq!(provenance.site_at(0), None);
+    assert_eq!(provenance.site_at(program.instructions.len()), None);
+    assert_eq!(provenance.site(SiteId(u32::MAX)), None);
+    let first = provenance.sites().first();
+    assert!(first.is_some());
+    assert_eq!(first.and_then(|site| provenance.site_at(site.pc)), first);
+    Ok(())
+}
+
+#[test]
+fn loop_values_without_keys() -> anyhow::Result<()> {
+    use ConditionKind::*;
+    let provenance = provenance(
+        "package test\nimport rego.v1\n\nall if {\n  every x in input.xs { x > 0 }\n}\n\nany if {\n  some y in input.ys\n  y < 0\n}\n\nkeys if {\n  some k, _ in input.zs\n  k == \"a\"\n}\n",
+        &["data.test.all", "data.test.any", "data.test.keys"],
+    )?;
+    let every = "every x in input.xs { x > 0 }";
     assert_eq!(
-        source,
-        site.and_then(|site| Some((site.text, site.location?)))
+        rows(&provenance),
+        vec![
+            row(
+                "data.test.all",
+                Some(0),
+                every,
+                Iteration,
+                None,
+                Some("input.xs"),
+                None
+            ),
+            row(
+                "data.test.all",
+                Some(0),
+                "x > 0",
+                Comparison,
+                Some(Operator::Gt),
+                Some("input.xs[_]"),
+                None
+            ),
+            // The result of the `every` must be true.
+            row(
+                "data.test.all",
+                Some(0),
+                every,
+                Truthiness,
+                None,
+                None,
+                None
+            ),
+            row(
+                "data.test.any",
+                Some(0),
+                "input.ys",
+                Iteration,
+                None,
+                Some("input.ys"),
+                None
+            ),
+            row(
+                "data.test.any",
+                Some(0),
+                "y < 0",
+                Comparison,
+                Some(Operator::Lt),
+                Some("input.ys[_]"),
+                None
+            ),
+            row(
+                "data.test.keys",
+                Some(0),
+                "input.zs",
+                Iteration,
+                None,
+                Some("input.zs"),
+                None
+            ),
+            // A key is not a value read from the collection.
+            row(
+                "data.test.keys",
+                Some(0),
+                "k == \"a\"",
+                Comparison,
+                Some(Operator::Eq),
+                None,
+                None
+            ),
+        ]
     );
+    Ok(())
+}
+
+/// Azure Policy programs have no rule information, so their conditions are
+/// not decoded. Reads of the `context` root, such as
+/// `[resourceGroup().name]`, therefore never produce a site or a path.
+#[cfg(feature = "azure_policy")]
+#[test]
+fn azure_policy_programs_have_no_sites() -> anyhow::Result<()> {
+    use crate::languages::azure_policy::{compiler, parser};
+    let json = r#"{
+  "if": {
+    "allOf": [
+      { "field": "location", "notEquals": "[resourceGroup().location]" },
+      { "value": "[resourceGroup().name]", "like": "rg-prod-*" },
+      { "value": "[subscription().subscriptionId]", "equals": "s" }
+    ]
+  },
+  "then": { "effect": "deny" }
+}"#;
+    let source = crate::lexer::Source::from_contents("policy.json".into(), json.into())?;
+    let rule = parser::parse_policy_rule(&source).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let program = compiler::compile_policy_rule(&rule)?;
+    assert!(program
+        .instructions
+        .iter()
+        .any(|i| matches!(i, Instruction::LoadContext { .. })));
+    assert!(program
+        .instructions
+        .iter()
+        .any(|i| matches!(i, Instruction::PolicyCondition { .. })));
+    let provenance = Provenance::new(&program);
+    assert_eq!(provenance.sites(), &[]);
+    assert_eq!(provenance.rule(0), None);
     Ok(())
 }

@@ -8,6 +8,10 @@
 //! [`ConditionKind`] and [`Operator`], the references its operands were read
 //! from, and the rule or function that owns it. Explanation capture records
 //! only program counters; reports resolve them through this table.
+//!
+//! Only programs compiled from Rego are decoded. A program without rule
+//! information, such as one compiled from Azure Policy, has no sites, so
+//! its conditions and its reads of the `context` root are not described.
 
 use super::report::{ConditionKind, Operator, RuleKind, SourceLocation};
 use crate::rvm::instructions::{GuardMode, Instruction};
@@ -171,13 +175,6 @@ impl Provenance {
     }
 }
 
-/// Returns the policy text of the instruction at `pc` and where it starts.
-pub fn instruction_source(program: &Program, pc: usize) -> Option<(String, SourceLocation)> {
-    let span = program.instruction_spans.get(pc)?.as_ref()?;
-    let source = program.sources.get(span.source_index)?;
-    SourceIndex::new(&source.content).text(program, span)
-}
-
 struct Shape {
     kind: ConditionKind,
     operator: Option<Operator>,
@@ -324,7 +321,9 @@ fn reference(
         }
         Instruction::LoopStart { params_index } => {
             let params = data.get_loop_params(params_index)?;
-            if params.value_reg != reg || params.key_reg == reg {
+            // A loop that needs no key, such as `every x in xs`, uses one
+            // register for the key and the value; it holds the value.
+            if params.value_reg != reg {
                 return None;
             }
             let collection = reference(
@@ -351,7 +350,9 @@ fn reference(
     }
 }
 
-/// Whether `instruction` writes register `reg`.
+/// Whether `instruction` writes register `reg`. Loop and comprehension
+/// registers are attributed to the instruction that starts the loop or
+/// comprehension.
 fn writes(program: &Program, instruction: &Instruction, reg: u8) -> bool {
     use Instruction::*;
     let data = &program.instruction_data;
@@ -425,7 +426,16 @@ fn writes(program: &Program, instruction: &Instruction, reg: u8) -> bool {
         ComprehensionBegin { params_index } => data
             .get_comprehension_begin_params(params_index)
             .is_some_and(|p| p.key_reg == reg || p.value_reg == reg || p.result_reg == reg),
-        _ => false,
+        Return { .. }
+        | AssertEq { .. }
+        | Guard { .. }
+        | ReturnUndefinedIfNotTrue { .. }
+        | LoopNext { .. }
+        | DestructuringSuccess {}
+        | RuleReturn {}
+        | Halt {}
+        | ComprehensionYield { .. }
+        | ComprehensionEnd {} => false,
     }
 }
 

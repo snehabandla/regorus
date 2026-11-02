@@ -50,9 +50,7 @@ pub(crate) mod fixtures;
 mod tests;
 
 pub use error::ExplainError;
-pub use provenance::{
-    instruction_source, CheckSite, ConditionOwner, Provenance, RuleOwner, SiteId,
-};
+pub use provenance::{CheckSite, ConditionOwner, Provenance, RuleOwner, SiteId};
 pub use report::{
     ConditionExplanation, ConditionKind, DefinitionExplanation, EmissionExplanation,
     ExplanationReport, LoopWitness, Operand, Operator, Outcome, PartialEvalResult, ReportedValue,
