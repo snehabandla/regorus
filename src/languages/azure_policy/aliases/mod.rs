@@ -330,37 +330,10 @@ impl AliasRegistry {
         normalizer::build_input_envelope(normalized, context, parameters)
     }
 
-    /// Normalize a raw ARM resource and record alias provenance.
-    ///
-    /// Returns the normalized resource (not wrapped; see
-    /// [`normalizer::build_input_envelope`]) and the record to pass to
-    /// [`Self::denormalize_with_provenance`].
-    pub fn normalize_with_provenance(
-        &self,
-        arm_resource: &crate::Value,
-        api_version: Option<&str>,
-    ) -> (crate::Value, types::AliasProvenance) {
-        normalizer::normalize_with_provenance(arm_resource, Some(self), api_version)
-    }
-
-    /// Denormalize using the record from [`Self::normalize_with_provenance`].
-    ///
-    /// Raw data the normalizer left at alias short paths round-trips
-    /// unchanged; values added after normalization still map to ARM paths.
-    pub fn denormalize_with_provenance(
-        &self,
-        normalized: &crate::Value,
-        api_version: Option<&str>,
-        provenance: &types::AliasProvenance,
-    ) -> crate::Value {
-        denormalizer::denormalize_with_provenance(normalized, Some(self), api_version, provenance)
-    }
-
     /// Denormalize a normalized resource back to ARM JSON structure.
     ///
-    /// Without a provenance record, every value at a scalar alias short path
-    /// is moved to its ARM path, including raw data stored there; see
-    /// [`Self::denormalize_with_provenance`].
+    /// Every value at a scalar alias short path is moved to its ARM path,
+    /// including raw data stored there.
     ///
     /// Convenience method that combines alias lookup and denormalization.
     /// The resource type is extracted from the `type` field of `normalized`

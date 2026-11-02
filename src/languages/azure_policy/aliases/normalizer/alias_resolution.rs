@@ -11,7 +11,7 @@ use super::super::obj_map::{
     collision_safe_key, is_root_field_collision, obj_insert_rc, set_nested_lowercased, ObjMap,
 };
 use super::super::path;
-use super::super::types::{AliasProvenance, ResolvedAliases};
+use super::super::types::ResolvedAliases;
 use super::element_remap::apply_element_remap_precomputed;
 use super::flatten::normalize_value;
 
@@ -25,25 +25,9 @@ pub fn apply_alias_entries(
     raw: &Value,
     aliases: &ResolvedAliases,
     api_version: Option<&str>,
-    mut provenance: Option<&mut AliasProvenance>,
 ) {
     let entries = &aliases.entries;
     let sub_resource_set = &aliases.sub_resource_arrays;
-
-    // Snapshot raw container shapes before any alias write changes them.
-    if let Some(provenance) = provenance.as_deref_mut() {
-        for (lc_key, entry) in entries {
-            if entry.is_wildcard
-                || !entry.has_valid_paths()
-                || sub_resource_set.contains(lc_key.as_str())
-            {
-                continue;
-            }
-            if let Some(segments) = path::scalar_segments(lc_key) {
-                path::record_shapes(result, &segments, &mut provenance.shapes);
-            }
-        }
-    }
 
     for (lc_key, entry) in entries {
         if entry.is_wildcard || !entry.has_valid_paths() {
@@ -64,18 +48,6 @@ pub fn apply_alias_entries(
         };
 
         let Some(value) = value else {
-            if let Some(provenance) = provenance.as_deref_mut() {
-                let key = if is_root_field_collision(&entry.short_name, &entry.default_path) {
-                    collision_safe_key(&entry.short_name)
-                } else {
-                    lc_key.clone()
-                };
-                if path::scalar_segments(&key)
-                    .is_some_and(|short| path::get_map(result, &short).is_some())
-                {
-                    provenance.preserved.insert(lc_key.clone());
-                }
-            }
             continue;
         };
         let value = normalize_value(&value, &entry.short_name, None);

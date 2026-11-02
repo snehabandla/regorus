@@ -405,23 +405,6 @@ pub struct PrecomputedReverseRemap {
     pub cleanup_field: String,
 }
 
-/// Record of how normalization treated alias short paths, consumed by
-/// [`AliasRegistry::denormalize_with_provenance`](super::AliasRegistry::denormalize_with_provenance).
-///
-/// Produced by
-/// [`AliasRegistry::normalize_with_provenance`](super::AliasRegistry::normalize_with_provenance).
-/// It lists aliases whose short-path value is raw resource data rather than a
-/// value read from the ARM path, and the raw shape of containers along alias
-/// short paths, so denormalization leaves raw data and original `null`
-/// elements in place.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AliasProvenance {
-    /// Lowercase alias keys whose short-path value the normalizer did not write.
-    pub(crate) preserved: BTreeSet<String>,
-    /// Raw container shapes keyed by lowercase short path.
-    pub(crate) shapes: super::path::Shapes,
-}
-
 /// A resolved alias entry with its default path and optional versioned paths.
 #[derive(Debug, Clone)]
 pub struct ResolvedEntry {

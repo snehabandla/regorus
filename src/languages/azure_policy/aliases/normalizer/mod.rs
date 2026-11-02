@@ -19,7 +19,7 @@ use crate::Value;
 use super::obj_map::{
     extract_type_field, make_value, new_map, obj_contains, obj_insert, val_str, ObjMap, ROOT_FIELDS,
 };
-use super::types::{AliasProvenance, ResolvedAliases};
+use super::types::ResolvedAliases;
 use super::AliasRegistry;
 
 use flatten::{lowercase_object_keys, normalize_value};
@@ -37,22 +37,6 @@ pub fn normalize(
     normalize_with_aliases(arm_resource, aliases, api_version)
 }
 
-/// Normalize and record which alias short-path values are raw resource data.
-///
-/// Pass the record to
-/// [`denormalize_with_provenance`](super::denormalizer::denormalize_with_provenance)
-/// so raw data at dotted or indexed short paths round-trips unchanged.
-pub fn normalize_with_provenance(
-    arm_resource: &Value,
-    registry: Option<&AliasRegistry>,
-    api_version: Option<&str>,
-) -> (Value, AliasProvenance) {
-    let aliases = registry.and_then(|r| extract_type_field(arm_resource).and_then(|rt| r.get(rt)));
-    let mut provenance = AliasProvenance::default();
-    let normalized = normalize_inner(arm_resource, aliases, api_version, Some(&mut provenance));
-    (normalized, provenance)
-}
-
 /// Internal normalization with pre-resolved alias data.
 ///
 /// Core implementation used by [`normalize`] after looking up the alias
@@ -61,15 +45,6 @@ pub fn normalize_with_aliases(
     arm_resource: &Value,
     aliases: Option<&ResolvedAliases>,
     api_version: Option<&str>,
-) -> Value {
-    normalize_inner(arm_resource, aliases, api_version, None)
-}
-
-fn normalize_inner(
-    arm_resource: &Value,
-    aliases: Option<&ResolvedAliases>,
-    api_version: Option<&str>,
-    provenance: Option<&mut AliasProvenance>,
 ) -> Value {
     let obj = match arm_resource.as_object() {
         Ok(o) => o,
@@ -126,13 +101,7 @@ fn normalize_inner(
 
     // Per-alias path resolution.
     if let Some(aliases) = aliases {
-        alias_resolution::apply_alias_entries(
-            &mut result,
-            arm_resource,
-            aliases,
-            api_version,
-            provenance,
-        );
+        alias_resolution::apply_alias_entries(&mut result, arm_resource, aliases, api_version);
     }
 
     make_value(result)

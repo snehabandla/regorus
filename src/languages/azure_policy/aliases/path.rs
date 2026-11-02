@@ -9,7 +9,6 @@
 //! index (`[ 0 ]`), and a dot before a bracket is accepted (`a.[0]`). Paths
 //! longer than [`MAX_SEGMENTS`] are rejected.
 
-use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -155,11 +154,6 @@ pub fn without_properties(segments: &[Segment]) -> &[Segment] {
     } else {
         segments
     }
-}
-
-/// Case-insensitive identity of a path, used by provenance records.
-pub fn key(segments: &[Segment]) -> String {
-    render(segments).to_ascii_lowercase()
 }
 
 pub fn render(segments: &[Segment]) -> String {
@@ -408,120 +402,56 @@ pub fn set_object(object: &mut Object, segments: &[Segment], value: Value, lower
     }
 }
 
-/// Raw container shapes along alias short paths: array length, or `None`
-/// for an object.
-pub type Shapes = BTreeMap<String, Option<usize>>;
-
 /// How removal treats containers it leaves empty.
-pub enum Prune<'a> {
+#[derive(Clone, Copy)]
+enum Prune {
     /// Keep emptied containers.
     Never,
     /// Remove emptied objects and arrays left all-null.
     Empty,
-    /// Remove only containers absent from `shapes`, and only trailing nulls
-    /// past the raw array length or consumed during this pass.
-    Tracked {
-        shapes: &'a Shapes,
-        consumed: &'a mut BTreeSet<String>,
-    },
-}
-
-/// Record raw container shapes along `segments` before alias writes.
-pub fn record_shapes(map: &ObjMap, segments: &[Segment], shapes: &mut Shapes) {
-    let mut current = segments.get(..1).and_then(|first| get_map(map, first));
-    for depth in 1..segments.len() {
-        let Some(value) = current else {
-            return;
-        };
-        let shape = match value {
-            Value::Array(array) => Some(array.len()),
-            Value::Object(_) => None,
-            _ => return,
-        };
-        let (Some(prefix), Some(next)) = (segments.get(..depth), segments.get(depth..=depth))
-        else {
-            return;
-        };
-        shapes.insert(key(prefix), shape);
-        current = get(value, next, true);
-    }
 }
 
 /// Remove a consumed alias leaf without discarding unrelated siblings.
 pub fn remove(map: &mut ObjMap, segments: &[Segment]) {
-    remove_with(map, segments, &mut Prune::Empty);
+    remove_with(map, segments, Prune::Empty);
 }
 
-pub fn remove_with(map: &mut ObjMap, segments: &[Segment], prune: &mut Prune<'_>) {
+fn remove_with(map: &mut ObjMap, segments: &[Segment], prune: Prune) {
     let Some((Segment::Key(key), rest)) = segments.split_first() else {
         return;
     };
     let Some(actual) = map_key(map, key) else {
         return;
     };
-    let mut prefix = alloc::vec![Segment::Key(Rc::clone(&actual))];
     if rest.is_empty()
         || map
             .get_mut(&actual)
-            .is_some_and(|value| remove_value(value, rest, &mut prefix, prune))
+            .is_some_and(|value| remove_value(value, rest, prune))
     {
         map.remove(&actual);
     }
 }
 
-fn remove_value(
-    value: &mut Value,
-    segments: &[Segment],
-    prefix: &mut Vec<Segment>,
-    prune: &mut Prune<'_>,
-) -> bool {
+fn remove_value(value: &mut Value, segments: &[Segment], prune: Prune) -> bool {
     let Some((first, rest)) = segments.split_first() else {
         return false;
     };
     match (value, first) {
         (Value::Object(object), Segment::Key(_)) => {
-            remove_in_object(Rc::make_mut(object), segments, prefix, prune)
+            remove_in_object(Rc::make_mut(object), segments, prune)
         }
         (Value::Array(array), Segment::Index(index)) => {
             let array = Rc::make_mut(array);
             let Some(element) = array.get_mut(*index) else {
                 return false;
             };
-            prefix.push(Segment::Index(*index));
-            let removed = rest.is_empty() || remove_value(element, rest, prefix, prune);
-            if removed {
-                *element = Value::Null;
-                if let Prune::Tracked { consumed, .. } = prune {
-                    consumed.insert(key(prefix));
-                }
-            }
-            prefix.pop();
-            if !removed {
+            if !rest.is_empty() && !remove_value(element, rest, prune) {
                 return false;
             }
+            *element = Value::Null;
             match prune {
                 Prune::Never => false,
                 Prune::Empty => array.iter().all(|item| matches!(item, Value::Null)),
-                Prune::Tracked { shapes, consumed } => {
-                    let raw = shapes.get(&key(prefix));
-                    let raw_len = raw.copied().flatten().unwrap_or(0);
-                    let mut values = array.to_vec();
-                    while let Some(Value::Null) = values.last() {
-                        let last = values.len().saturating_sub(1);
-                        prefix.push(Segment::Index(last));
-                        let removable = last >= raw_len || consumed.contains(&key(prefix));
-                        prefix.pop();
-                        if !removable {
-                            break;
-                        }
-                        values.pop();
-                    }
-                    let empty = values.is_empty();
-                    if values.len() != array.len() {
-                        *array = values.into();
-                    }
-                    empty && raw.is_none()
-                }
             }
         }
         _ => false,
@@ -529,42 +459,29 @@ fn remove_value(
 }
 
 pub fn remove_object(object: &mut Object, segments: &[Segment], prune: bool) -> bool {
-    let mut prune = if prune { Prune::Empty } else { Prune::Never };
-    remove_in_object(object, segments, &mut Vec::new(), &mut prune)
+    remove_in_object(
+        object,
+        segments,
+        if prune { Prune::Empty } else { Prune::Never },
+    )
 }
 
-fn remove_in_object(
-    object: &mut Object,
-    segments: &[Segment],
-    prefix: &mut Vec<Segment>,
-    prune: &mut Prune<'_>,
-) -> bool {
+fn remove_in_object(object: &mut Object, segments: &[Segment], prune: Prune) -> bool {
     let Some((Segment::Key(key_name), rest)) = segments.split_first() else {
         return false;
     };
-    let mut removed = false;
     if let Some(actual) = object_key(object, key_name) {
-        prefix.push(Segment::Key(
-            actual
-                .as_string()
-                .map_or_else(|_| Rc::clone(key_name), Rc::clone),
-        ));
         if rest.is_empty()
             || object
                 .get_mut(&actual)
-                .is_some_and(|value| remove_value(value, rest, prefix, prune))
+                .is_some_and(|value| remove_value(value, rest, prune))
         {
             object.remove(&actual);
-            removed = true;
         }
-        prefix.pop();
     }
     match prune {
         Prune::Never => false,
         Prune::Empty => object.is_empty(),
-        Prune::Tracked { shapes, .. } => {
-            removed && object.is_empty() && !shapes.contains_key(&key(prefix))
-        }
     }
 }
 

@@ -396,23 +396,6 @@ fn parser_and_padding_discriminators() {
     );
 }
 
-fn round_trip_with_provenance(
-    aliases: &[(&str, &str)],
-    raw: Json,
-    normalized: Json,
-) -> (AliasRegistry, super::types::AliasProvenance) {
-    let registry = registry("Test/widgets", aliases);
-    let raw = Value::from(raw);
-    let (actual, provenance) = registry.normalize_with_provenance(&raw, None);
-    assert_eq!(actual, Value::from(normalized), "{aliases:?}");
-    assert_eq!(
-        registry.denormalize_with_provenance(&actual, None, &provenance),
-        raw,
-        "{aliases:?}"
-    );
-    (registry, provenance)
-}
-
 #[test]
 fn standalone_properties_leaf_is_not_stripped() {
     assert_eq!(
@@ -456,23 +439,7 @@ fn reverse_element_remap_cleanup_is_case_insensitive() {
 }
 
 #[test]
-fn provenance_preserves_raw_short_path_data() {
-    round_trip_with_provenance(
-        &[("settings.flag", "properties.flag")],
-        json!({"type": "Test/widgets", "properties": {"settings": {"flag": true, "other": 1}}}),
-        json!({"type": "Test/widgets", "settings": {"flag": true, "other": 1}}),
-    );
-    round_trip_with_provenance(
-        &[("rules[0]", "properties.firstRule")],
-        json!({"type": "Test/widgets", "properties": {"rules": [5, 6]}}),
-        json!({"type": "Test/widgets", "rules": [5, 6]}),
-    );
-    round_trip_with_provenance(
-        &[("flag", "properties.other")],
-        json!({"type": "Test/widgets", "properties": {"flag": 1}}),
-        json!({"type": "Test/widgets", "flag": 1}),
-    );
-    // Without a record, plain denormalize consumes every alias value.
+fn plain_denormalize_consumes_raw_short_path_data() {
     let registry = registry("Test/widgets", &[("settings.flag", "properties.flag")]);
     assert_eq!(
         registry.denormalize(
@@ -482,65 +449,6 @@ fn provenance_preserves_raw_short_path_data() {
         Value::from(
             json!({"type": "Test/widgets", "properties": {"flag": true, "settings": {"other": 1}}})
         )
-    );
-}
-
-#[test]
-fn provenance_maps_values_added_after_normalization() {
-    let (registry, provenance) = round_trip_with_provenance(
-        &[
-            ("settings.flag", "properties.flag"),
-            ("rules[1]", "properties.second"),
-        ],
-        json!({"type": "Test/widgets", "properties": {"other": 1}}),
-        json!({"type": "Test/widgets", "other": 1}),
-    );
-    let modified = Value::from(json!({
-        "type": "Test/widgets", "other": 1, "settings": {"flag": true}, "rules": [null, 2]
-    }));
-    assert_eq!(
-        registry.denormalize_with_provenance(&modified, None, &provenance),
-        Value::from(json!({
-            "type": "Test/widgets",
-            "properties": {"other": 1, "flag": true, "second": 2}
-        }))
-    );
-}
-
-#[test]
-fn provenance_prunes_only_padding_and_consumed_nulls() {
-    round_trip_with_provenance(
-        &[("rules[1]", "properties.second")],
-        json!({"type": "Test/widgets", "properties": {"second": 6}}),
-        json!({"type": "Test/widgets", "rules": [null, 6], "second": 6}),
-    );
-    round_trip_with_provenance(
-        &[("rules[1]", "properties.second")],
-        json!({"type": "Test/widgets", "properties": {"rules": [null], "second": 6}}),
-        json!({"type": "Test/widgets", "rules": [null, 6], "second": 6}),
-    );
-    round_trip_with_provenance(
-        &[("rules[0]", "properties.first")],
-        json!({"type": "Test/widgets", "properties": {"rules": [], "first": 6}}),
-        json!({"type": "Test/widgets", "rules": [6], "first": 6}),
-    );
-    round_trip_with_provenance(
-        &[
-            ("rules[0]", "properties.first"),
-            ("rules[1]", "properties.second"),
-        ],
-        json!({"type": "Test/widgets", "properties": {"first": 5, "second": 6}}),
-        json!({"type": "Test/widgets", "rules": [5, 6], "first": 5, "second": 6}),
-    );
-    round_trip_with_provenance(
-        &[("a.b", "properties.c")],
-        json!({"type": "Test/widgets", "properties": {"a": {}, "c": 1}}),
-        json!({"type": "Test/widgets", "a": {"b": 1}, "c": 1}),
-    );
-    round_trip_with_provenance(
-        &[("x[1]", "properties.y")],
-        json!({"type": "Test/widgets", "properties": {"x": [null, null, 3], "y": 5}}),
-        json!({"type": "Test/widgets", "x": [null, 5, 3], "y": 5}),
     );
 }
 
