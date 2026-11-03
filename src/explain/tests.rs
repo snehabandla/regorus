@@ -4,8 +4,9 @@
 use super::fixtures::{
     attributed_report, complete_rule_report, conflict_report, known,
     partial_eval_builtin_call_result, partial_eval_conflict_result, partial_eval_object_result,
-    partial_eval_partial_result, partial_eval_result, partial_eval_set_result,
-    partial_eval_unsupported_result, partial_object_report, partial_set_report, redacted,
+    partial_eval_partial_object_result, partial_eval_partial_result, partial_eval_result,
+    partial_eval_set_result, partial_eval_unsupported_result, partial_object_report,
+    partial_set_report, redacted,
 };
 use super::*;
 use crate::rvm::program::RuleType;
@@ -214,6 +215,41 @@ fn partial_eval_partial_result_json() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The unresolved alternatives of a partial object omit an unknown key and
+/// keep a known one.
+#[test]
+fn partial_eval_partial_object_result_json() -> anyhow::Result<()> {
+    let mode = |value: &str| {
+        format!(
+            r#"[{{"text":"input.mode == \"{value}\"","kind":"condition_holds","operator":"==","input_path":"input.mode","value":"{value}"}}]"#
+        )
+    };
+    let expected = [
+        r#"{"kind":"partial_object","status":"partial","residual_queries":["#,
+        r#"{"key":"a","value":1,"conditions":"#,
+        &mode("a"),
+        r#"},{"value":2,"conditions":"#,
+        &mode("b"),
+        r#","status":"unresolved","unresolved":{"reason":"tainted_key","detail":"the key input.name is unknown"}},"#,
+        r#"{"key":"c","value":3,"conditions":"#,
+        &mode("c"),
+        r#","status":"unresolved","unresolved":{"reason":"unsupported_builtin","detail":"glob.match"}},"#,
+        r#"{"key":"d","value":4,"conditions":"#,
+        &mode("d"),
+        r#","status":"unresolved","unresolved":{"reason":"unsupported_construct"}}]}"#,
+    ]
+    .concat();
+    let result = partial_eval_partial_object_result();
+    assert_eq!(serde_json::to_string(&result)?, expected);
+    let json = serde_json::to_value(&result)?;
+    let tainted = json
+        .pointer("/residual_queries/1")
+        .and_then(serde_json::Value::as_object)
+        .context("tainted-key alternative")?;
+    assert!(!tainted.contains_key("key"));
+    Ok(())
+}
+
 /// The result status is `partial` if and only if an alternative is
 /// unresolved, and only unresolved alternatives say why.
 #[test]
@@ -224,6 +260,10 @@ fn partial_eval_fixtures_keep_alternative_status_invariants() {
         partial_eval_object_result(),
         partial_eval_builtin_call_result(),
         partial_eval_partial_result(),
+        partial_eval_partial_object_result(),
+        partial_eval_conflict_result(),
+        partial_eval_unsupported_result(),
+        fixtures::partial_eval_nested_collection_unsupported(),
     ] {
         let unresolved = result
             .residual_queries
@@ -240,14 +280,17 @@ fn partial_eval_fixtures_keep_alternative_status_invariants() {
     }
 }
 
-/// A result that is not exact carries nothing a consumer could apply.
+/// A result that is neither exact nor partial carries nothing a consumer
+/// could apply.
 #[test]
 fn inexact_partial_eval_results_have_no_outcome() {
     for result in [
         partial_eval_conflict_result(),
         partial_eval_unsupported_result(),
+        fixtures::partial_eval_nested_collection_unsupported(),
     ] {
         assert_ne!(result.status, ResidualStatus::Exact);
+        assert_ne!(result.status, ResidualStatus::Partial);
         assert_eq!(result.result, Value::Undefined);
         assert!(result.residual_queries.is_empty());
         assert!(!result.warnings.is_empty());

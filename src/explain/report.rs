@@ -1032,13 +1032,16 @@ pub struct SourceLocation {
 /// different definitions, or from different iterations of one body, are not,
 /// and conflicting values are an error in Rego rather than a first match.
 /// Producers therefore return [`ResidualStatus::PossibleConflict`] whenever
-/// they can't rule out a conflict: in an `Exact` result for a complete rule
-/// or function, any two alternatives with different values (by Rego
-/// equality) are in one `else` chain or one is a trailing default, and in a
-/// partial object no two alternatives with the same key and different values
-/// can hold together. The unknown key or value of an unresolved alternative
-/// counts as different from every other. `PossibleConflict` and
-/// `Unsupported` take precedence over `Partial`.
+/// they can't rule out a conflict. In an `Exact` or `Partial` result for a
+/// complete rule or function, any two alternatives with different values
+/// (by Rego equality) are in one `else` chain or one is a trailing default,
+/// and in a partial object no two alternatives with the same key and
+/// different values can hold together. So that conflicts fail closed, an
+/// unresolved key counts as possibly equal to every other key, and an
+/// unresolved value as different from every other value: an alternative
+/// with an unresolved key that can hold together with another alternative
+/// of the same partial object makes the result `PossibleConflict`.
+/// `PossibleConflict` and `Unsupported` take precedence over `Partial`.
 ///
 /// JSON can't distinguish a set from an array, or a non-string object key
 /// from a string, so producers return [`ResidualStatus::Unsupported`] when a
@@ -1249,7 +1252,12 @@ pub enum ResidualKind {
 ///
 /// - `startswith`, `endswith` and `contains`, on strings;
 /// - `regex.match`, only with a constant pattern: its first argument is a
-///   [`ResidualArgument::Value`] string.
+///   [`ResidualArgument::Value`] string. The pattern has regorus
+///   `regex.match` semantics: the syntax of the Rust `regex` crate (close
+///   to RE2) and an unanchored match. Consumers reject a pattern their
+///   engine can't evaluate with identical semantics, and producers report a
+///   pattern that doesn't compile as
+///   [`ResidualUnresolvedReason::UnsupportedBuiltin`].
 ///
 /// Consumers must fail closed: they reject a call to any other builtin, or
 /// one that breaks these rules.

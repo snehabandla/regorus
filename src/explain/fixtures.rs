@@ -481,19 +481,6 @@ pub fn partial_eval_builtin_call_result() -> PartialEvalResult {
 /// input.sku.tier == "Free"`, with all of `input` unknown. The second
 /// message can't be built, so its alternative is unresolved.
 pub fn partial_eval_partial_result() -> PartialEvalResult {
-    fn equals(path: &str, value: &str) -> ResidualCondition {
-        ResidualCondition {
-            text: format!(r#"{path} == "{value}""#),
-            kind: ResidualKind::ConditionHolds,
-            operator: Some(Operator::Eq),
-            input_path: Some(String::from(path)),
-            value: Some(Value::from(value)),
-            negated: Vec::new(),
-            call: None,
-            rule: None,
-            location: None,
-        }
-    }
     PartialEvalResult {
         kind: RuleKind::PartialSet,
         status: ResidualStatus::Partial,
@@ -502,14 +489,17 @@ pub fn partial_eval_partial_result() -> PartialEvalResult {
             ResidualQuery {
                 key: None,
                 value: Value::from("public access"),
-                conditions: vec![equals("input.properties.publicNetworkAccess", "Enabled")],
+                conditions: vec![residual_equals(
+                    "input.properties.publicNetworkAccess",
+                    "Enabled",
+                )],
                 status: ResidualAlternativeStatus::Exact,
                 unresolved: None,
             },
             ResidualQuery {
                 key: None,
                 value: Value::Undefined,
-                conditions: vec![equals("input.sku.tier", "Free")],
+                conditions: vec![residual_equals("input.sku.tier", "Free")],
                 status: ResidualAlternativeStatus::Unresolved,
                 unresolved: Some(ResidualUnresolved {
                     reason: ResidualUnresolvedReason::UnknownValue,
@@ -597,6 +587,87 @@ pub fn partial_eval_nested_collection_unsupported() -> PartialEvalResult {
         warnings: vec![String::from(
             "input.x in [{1, 2}]: nested set is not JSON-lossless",
         )],
+    }
+}
+
+/// `labels` with alternatives on mutually exclusive values of `input.mode`,
+/// so none can hold together and an unresolved key can't conflict:
+///
+/// ```rego
+/// labels["a"] := 1 if input.mode == "a"
+/// labels[input.name] := 2 if input.mode == "b"
+/// labels["c"] := 3 if { input.mode == "c"; glob.match("*.x", [], input.host) }
+/// labels["d"] := 4 if { input.mode == "d"; every p in input.ports { p > 0 } }
+/// ```
+pub fn partial_eval_partial_object_result() -> PartialEvalResult {
+    fn unresolved(
+        key: Option<&str>,
+        value: i64,
+        mode: &str,
+        reason: ResidualUnresolvedReason,
+        detail: Option<&str>,
+    ) -> ResidualQuery {
+        ResidualQuery {
+            key: key.map(Value::from),
+            value: Value::from(value),
+            conditions: vec![residual_equals("input.mode", mode)],
+            status: ResidualAlternativeStatus::Unresolved,
+            unresolved: Some(ResidualUnresolved {
+                reason,
+                detail: detail.map(String::from),
+            }),
+        }
+    }
+    PartialEvalResult {
+        kind: RuleKind::PartialObject,
+        status: ResidualStatus::Partial,
+        result: Value::Undefined,
+        residual_queries: vec![
+            ResidualQuery {
+                key: Some(Value::from("a")),
+                value: Value::from(1),
+                conditions: vec![residual_equals("input.mode", "a")],
+                status: ResidualAlternativeStatus::Exact,
+                unresolved: None,
+            },
+            unresolved(
+                None,
+                2,
+                "b",
+                ResidualUnresolvedReason::TaintedKey,
+                Some("the key input.name is unknown"),
+            ),
+            unresolved(
+                Some("c"),
+                3,
+                "c",
+                ResidualUnresolvedReason::UnsupportedBuiltin,
+                Some("glob.match"),
+            ),
+            unresolved(
+                Some("d"),
+                4,
+                "d",
+                ResidualUnresolvedReason::UnsupportedConstruct,
+                None,
+            ),
+        ],
+        warnings: Vec::new(),
+    }
+}
+
+/// `path == "value"`, as a residual condition with no rule or location.
+fn residual_equals(path: &str, value: &str) -> ResidualCondition {
+    ResidualCondition {
+        text: format!(r#"{path} == "{value}""#),
+        kind: ResidualKind::ConditionHolds,
+        operator: Some(Operator::Eq),
+        input_path: Some(String::from(path)),
+        value: Some(Value::from(value)),
+        negated: Vec::new(),
+        call: None,
+        rule: None,
+        location: None,
     }
 }
 
