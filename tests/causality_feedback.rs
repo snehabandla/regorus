@@ -7185,3 +7185,155 @@ fn rg9_deep_negation_chains_follow_the_engine_at_any_depth() {
         .join()
         .unwrap();
 }
+
+/// Partial-evaluation residuals of `data.t.deny` in both execution modes,
+/// each disjunct rendered as `kind(input_path)[negated...]` joined by ` AND `.
+fn rgp7_residuals(policy: &str, input: &str, unknowns: &[&str]) -> Vec<Vec<String>> {
+    fn shape(condition: &serde_json::Value) -> String {
+        let inner: Vec<String> = condition["negated_conditions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(shape)
+            .collect();
+        let mut text = format!(
+            "{}({})",
+            condition["kind"].as_str().unwrap_or(""),
+            condition["input_path"].as_str().unwrap_or("")
+        );
+        if !inner.is_empty() {
+            text.push_str(&format!("[{}]", inner.join(", ")));
+        }
+        text
+    }
+    [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ]
+    .into_iter()
+    .map(|execution_mode| {
+        let entry = "data.t.deny";
+        let mut engine = Engine::new();
+        engine.add_policy("t.rego".into(), policy.into()).unwrap();
+        let compiled = engine.compile_with_entrypoint(&Rc::from(entry)).unwrap();
+        let program =
+            languages::rego::compiler::Compiler::compile_from_policy(&compiled, &[entry]).unwrap();
+        let mut vm = rvm::RegoVM::new_with_policy(compiled);
+        vm.load_program(program);
+        vm.set_execution_mode(execution_mode);
+        vm.set_explanation_settings(evaluation_trace::ExplanationSettings {
+            enabled: true,
+            assume_unknown_input: true,
+            eval_mode: evaluation_trace::EvaluationMode::PartialEval,
+            unknowns: unknowns.iter().map(|u| (*u).into()).collect(),
+            ..Default::default()
+        });
+        vm.set_input(Value::from_json_str(input).unwrap());
+        let result = vm.execute_entry_point_by_name(entry).unwrap();
+        let pe: serde_json::Value =
+            serde_json::from_str(&vm.take_partial_eval_result(result).unwrap()).unwrap();
+        pe["residual_queries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|conjunction| {
+                conjunction
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(shape)
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
+            })
+            .collect()
+    })
+    .collect()
+}
+
+#[test]
+fn rgp7_nested_negation_keeps_its_own_conditions() {
+    // The first `not` holds concretely (its nested `not input.r.missing` is
+    // an empty negation); only `not input.u` depends on the unknown. The
+    // residual must say `deny` holds when `input.u` does not exist.
+    let expected = vec!["negation_holds()[exists(input.u)]".to_string()];
+    for policy in [
+        "package t\nimport rego.v1\ndeny contains \"x\" if {\n    not [x | x := 1; not input.r.missing; input.r.k == 1][0]\n    not input.u\n}\n",
+        "package t\nimport rego.v1\n_c if {\n    not input.r.missing\n    input.r.k == 1\n}\ndeny contains \"x\" if {\n    not _c\n    not input.u\n}\n",
+        // Two levels of empty nested negation before the live one.
+        "package t\nimport rego.v1\n_b if {\n    not input.r.missing\n    input.r.k == 1\n}\n_a if {\n    not _b\n    input.r.k == 3\n}\ndeny contains \"x\" if {\n    not _a\n    not input.u\n}\n",
+    ] {
+        assert_eq!(
+            rgp7_residuals(policy, r#"{"r": {"k": 2}}"#, &["input.u"]),
+            [expected.clone(), expected.clone()],
+            "{policy}"
+        );
+    }
+}
+
+#[test]
+fn rgp7_genuine_nested_negations_are_unchanged() {
+    // Control: a real double negation keeps both levels.
+    let double = "package t\nimport rego.v1\n_c if {\n    not input.v\n}\ndeny contains \"x\" if {\n    not _c\n}\n";
+    let expected = vec!["negation_holds()[negation_holds()[exists(input.v)]]".to_string()];
+    assert_eq!(
+        rgp7_residuals(double, "{}", &["input.v"]),
+        [expected.clone(), expected]
+    );
+    // Two live sibling negations inside one `not` keep their own paths.
+    let siblings = "package t\nimport rego.v1\n_c if {\n    not input.v\n    not input.u\n}\ndeny contains \"x\" if {\n    not _c\n}\n";
+    let expected = vec![
+        "negation_holds()[negation_holds()[exists(input.v)], negation_holds()[exists(input.u)]]"
+            .to_string(),
+    ];
+    assert_eq!(
+        rgp7_residuals(siblings, "{}", &["input.u", "input.v"]),
+        [expected.clone(), expected]
+    );
+}
+
+#[test]
+fn rgp7_deep_negation_chain_nests_correctly() {
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            // serde_json parses at most 128 nested levels, two per negation.
+            let links = 30usize;
+            let mut policy = String::from("package t\nimport rego.v1\n");
+            for i in 0..links {
+                policy.push_str(&format!("h{i} if {{ not h{} }}\n", i + 1));
+            }
+            policy.push_str(&format!(
+                "h{links} if {{ not input.u }}\ndeny contains \"x\" if {{\n    not h0\n}}\n"
+            ));
+            // `not h0`, then one `not` per link, then the leaf's `not input.u`.
+            let mut expected = String::from("exists(input.u)");
+            for _ in 0..links.saturating_add(2) {
+                expected = format!("negation_holds()[{expected}]");
+            }
+            let residuals = rgp7_residuals(&policy, "{}", &["input.u"]);
+            assert_eq!(residuals, [vec![expected.clone()], vec![expected]]);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn rgp7_different_negations_in_one_conjunction_are_both_kept() {
+    // Both negations have empty condition text; they differ only in what
+    // they negate, so neither is a duplicate of the other.
+    let two = "package t\nimport rego.v1\ndeny contains \"x\" if {\n    not input.u\n    not input.v\n}\n";
+    let expected =
+        vec!["negation_holds()[exists(input.u)] AND negation_holds()[exists(input.v)]".to_string()];
+    assert_eq!(
+        rgp7_residuals(two, "{}", &["input.u", "input.v"]),
+        [expected.clone(), expected]
+    );
+    // A repeated identical negation is still collapsed.
+    let repeated = "package t\nimport rego.v1\ndeny contains \"x\" if {\n    not input.u\n    not input.u\n}\n";
+    let expected = vec!["negation_holds()[exists(input.u)]".to_string()];
+    assert_eq!(
+        rgp7_residuals(repeated, "{}", &["input.u"]),
+        [expected.clone(), expected]
+    );
+}

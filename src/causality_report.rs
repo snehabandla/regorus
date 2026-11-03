@@ -1180,14 +1180,16 @@ pub fn materialize_pe(
     //    conditions; instead they are attached to the parent NegationHolds
     //    condition that shares the same scope id.
     // -----------------------------------------------------------------------
-    let mut negation_inner: BTreeMap<u32, Vec<ResidualCondition>> = BTreeMap::new();
+    let mut negation_inner: BTreeMap<u32, Vec<(ResidualCondition, Option<u32>)>> = BTreeMap::new();
 
     // Group assumptions by (conjunction_id, iteration_index) to form disjuncts.
     // Each unique combination produces one conjunction (AND) in the DNF output.
     let mut disjunct_map: BTreeMap<(u32, Option<u32>), (GroupMeta, Vec<ResidualCondition>)> =
         BTreeMap::new();
 
-    // First pass: collect inner-negation assumptions into negation_inner.
+    // First pass: collect inner-negation assumptions into negation_inner,
+    // keeping the scope a nested `NegationHolds` owns so its own conditions
+    // can be attached to it.
     for a in &trace.assumptions {
         // An assumption is orphaned when its enclosing definition (or any
         // enclosing definition on the call stack) failed to emit / assign
@@ -1198,8 +1200,32 @@ pub fn materialize_pe(
         }
         if let Some(neg_scope) = a.negation_scope_id {
             let cond = assumption_to_residual(a, program);
-            negation_inner.entry(neg_scope).or_default().push(cond);
+            let owned = (a.kind == AssumptionKind::NegationHolds)
+                .then_some(a.owned_negation_scope_id)
+                .flatten();
+            negation_inner
+                .entry(neg_scope)
+                .or_default()
+                .push((cond, owned));
         }
+    }
+
+    // Build each scope's conditions, attaching to every nested negation the
+    // scope it owns. A nested scope is opened after its parent, so it has a
+    // higher id: building from the highest id down settles every child
+    // before its parent.
+    let mut negation_built: BTreeMap<u32, Vec<ResidualCondition>> = BTreeMap::new();
+    while let Some((scope, entries)) = negation_inner.pop_last() {
+        let conditions = entries
+            .into_iter()
+            .map(|(mut cond, owned)| {
+                if let Some(inner) = owned.and_then(|owned| negation_built.remove(&owned)) {
+                    cond.negated_conditions = inner;
+                }
+                cond
+            })
+            .collect();
+        negation_built.insert(scope, conditions);
     }
 
     // Second pass: build disjuncts from top-level (non-negation-inner) assumptions.
@@ -1219,11 +1245,11 @@ pub fn materialize_pe(
         // For NegationHolds: single condition with inner children.
         if a.kind == AssumptionKind::NegationHolds {
             let mut cond = assumption_to_residual(a, program);
-            if let Some(scope_id) = a.owned_negation_scope_id {
-                if let Some(mut inner) = negation_inner.remove(&scope_id) {
-                    attach_nested_negation_inner(&mut inner, &mut negation_inner);
-                    cond.negated_conditions = inner;
-                }
+            if let Some(inner) = a
+                .owned_negation_scope_id
+                .and_then(|scope_id| negation_built.remove(&scope_id))
+            {
+                cond.negated_conditions = inner;
             }
             disjunct_map
                 .entry(key)
@@ -1266,22 +1292,22 @@ pub fn materialize_pe(
         }
     }
 
-    // Deduplicate conditions within each disjunct.
-    // Also drop empty `negation_holds` placeholders (PE-2): when a rule
-    // fires concretely the recorded NegationHolds assumption may carry no
-    // input path, no operator, and no inner conditions.  Such a placeholder
-    // provides no information to consumers and prevents the disjunct from
-    // collapsing to an empty (always-true) clause.
+    // Drop empty `negation_holds` placeholders (PE-2), then deduplicate
+    // conditions within each disjunct. When a rule fires concretely the
+    // recorded NegationHolds assumption may carry no input path, no
+    // operator, and no inner conditions. Such a placeholder provides no
+    // information to consumers and prevents the disjunct from collapsing to
+    // an empty (always-true) clause.
     //
     // The filter recurses into `negated_conditions[]` so empty placeholders
-    // nested inside another `negation_holds` are also dropped;
-    // `attach_nested_negation_inner` above assigns the inner arrays but
-    // doesn't filter them.
+    // nested inside another `negation_holds` are also dropped; the scope
+    // build above assigns the inner arrays but doesn't filter them. It runs
+    // before deduplication, which compares negations by what they negate.
     let groups: Vec<(GroupMeta, Vec<ResidualCondition>)> = disjunct_map
         .into_values()
         .filter_map(|(meta, mut conds)| {
-            conds.dedup_by(|a, b| a.condition == b.condition && a.operator == b.operator);
             filter_empty_placeholders_recursive(&mut conds);
+            conds.dedup_by(|a, b| same_residual_condition(a, b));
             if conds.is_empty() {
                 None
             } else {
@@ -1671,6 +1697,21 @@ fn is_empty_placeholder(cond: &ResidualCondition) -> bool {
         && cond.negated_conditions.is_empty()
 }
 
+/// Whether two adjacent residual conditions repeat each other: the same
+/// kind, text, operator and input path. A `negation_holds` has no text of its
+/// own, so two negations repeat only when they negate the same conditions.
+fn same_residual_condition(a: &ResidualCondition, b: &ResidualCondition) -> bool {
+    a.kind == b.kind
+        && a.condition == b.condition
+        && a.operator == b.operator
+        && a.input_path == b.input_path
+        && a.negated_conditions.len() == b.negated_conditions.len()
+        && a.negated_conditions
+            .iter()
+            .zip(&b.negated_conditions)
+            .all(|(a, b)| same_residual_condition(a, b))
+}
+
 /// Recursively drop empty `negation_holds` placeholders — both at
 /// the current level and inside any `negated_conditions[]` array of a
 /// nested `negation_holds` frame. Order matters: recurse into children
@@ -1683,30 +1724,6 @@ fn filter_empty_placeholders_recursive(conditions: &mut Vec<ResidualCondition>) 
         }
     }
     conditions.retain(|c| !is_empty_placeholder(c));
-}
-
-/// Recursively attach inner negation conditions to any `negation_holds`
-/// entries within `conditions`.
-fn attach_nested_negation_inner(
-    conditions: &mut [ResidualCondition],
-    negation_inner: &mut alloc::collections::BTreeMap<u32, Vec<ResidualCondition>>,
-) {
-    for cond in conditions.iter_mut() {
-        if cond.kind == "negation_holds" {
-            // The inner conditions for this nested NegationHolds were
-            // collected in the first pass.  We need the owned_negation_scope_id
-            // but ResidualCondition doesn't carry it.  However, since we
-            // consume scopes in order (BTreeMap is sorted), the next available
-            // scope is the correct one for the next NegationHolds encountered.
-            if let Some((&scope_id, _)) = negation_inner.iter().next() {
-                if let Some(mut inner) = negation_inner.remove(&scope_id) {
-                    // Recurse for deeper nesting.
-                    attach_nested_negation_inner(&mut inner, negation_inner);
-                    cond.negated_conditions = inner;
-                }
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
