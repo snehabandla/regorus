@@ -17,7 +17,7 @@ use crate::evaluation_trace::{
     AssumptionKind, ConditionMode, ConditionOutcome, EvaluationTrace, ExplanationDetail,
     ExplanationScope, ExplanationSettings, RuleOutcome, ValueMode,
 };
-use crate::rvm::program::Program;
+use crate::rvm::program::{Program, RuleType};
 use crate::rvm::Instruction;
 use crate::static_provenance::{Provenance, ProvenanceRoot};
 use crate::value::Value;
@@ -2806,17 +2806,141 @@ const fn is_identifier_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
+/// Whether the guard at `guard_pc`, whose outcome is `outcome_idx`, held only
+/// because the `not` just before it was assumed to hold. The `Not` records its
+/// `NegationHolds` assumption immediately before the guard records its
+/// outcome, so the two are linked by the outcome count.
+///
+/// The engine also records an empty `NegationHolds` whenever the negated
+/// value is undefined for any reason; partial evaluation drops those as
+/// trivial wrappers. Like it, only a negation whose own scope recorded an
+/// assumption counts. The guard's outcome is judged on its own, so an
+/// assumption orphaned later because the enclosing definition failed still
+/// counts.
+fn guard_holds_by_assumed_negation(
+    guard_pc: usize,
+    outcome_idx: usize,
+    program: &Program,
+    trace: &EvaluationTrace,
+) -> bool {
+    let Some(not_pc) = guard_pc.checked_sub(1) else {
+        return false;
+    };
+    if !matches!(
+        program.instructions.get(not_pc),
+        Some(Instruction::Not { .. })
+    ) {
+        return false;
+    }
+    let Ok(recorded) = u32::try_from(outcome_idx) else {
+        return false;
+    };
+    // Assumptions are appended in order, so `conditions_recorded` never
+    // decreases: binary-search to the ones recorded just before this guard.
+    let start = trace
+        .assumptions
+        .partition_point(|assumption| assumption.conditions_recorded < recorded);
+    trace
+        .assumptions
+        .get(start..)
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .take_while(|(_, assumption)| assumption.conditions_recorded == recorded)
+        .filter(|(_, assumption)| {
+            assumption.kind == AssumptionKind::NegationHolds
+                && usize::try_from(assumption.pc).is_ok_and(|pc| pc == not_pc)
+        })
+        .any(|(offset, _)| negation_is_live(start.saturating_add(offset), trace))
+}
+
+/// Whether the `NegationHolds` at `index` owns a scope that recorded an
+/// assumption, as partial evaluation decides when it keeps or drops the
+/// negation: any assumption but a nested negation, which counts only when its
+/// own scope did.
+///
+/// Partial evaluation skips orphaned assumptions, so an orphaned inner
+/// assumption counts only when the negation itself was orphaned with it (the
+/// enclosing definition failed after the guard); otherwise the engine decided
+/// the negation concretely.
+///
+/// A negation's body is recorded before the negation, so one forward pass
+/// over the earlier assumptions settles every nested scope, at any depth.
+fn negation_is_live(index: usize, trace: &EvaluationTrace) -> bool {
+    let Some(negation) = trace.assumptions.get(index) else {
+        return false;
+    };
+    let Some(scope) = negation.owned_negation_scope_id else {
+        return false;
+    };
+    // Scope ids increase over time, and the body of scope `scope` is recorded
+    // just before its negation: the window is the run of assumptions back to
+    // the first one outside `scope` and the scopes nested in it.
+    let earlier = trace.assumptions.get(..index).unwrap_or_default();
+    let body_start = earlier
+        .iter()
+        .rposition(|inner| inner.negation_scope_id.is_none_or(|id| id < scope))
+        .map_or(0, |position| position.saturating_add(1));
+    // Scopes holding a live non-orphaned assumption, and a live assumption
+    // of either kind.
+    let mut live_strict = alloc::collections::BTreeSet::new();
+    let mut live_any = alloc::collections::BTreeSet::new();
+    for inner in earlier.get(body_start..).unwrap_or_default() {
+        let Some(inner_scope) = inner.negation_scope_id else {
+            continue;
+        };
+        let live = inner.kind != AssumptionKind::NegationHolds
+            || inner.owned_negation_scope_id.is_some_and(|owned| {
+                if inner.orphaned {
+                    live_any.contains(&owned)
+                } else {
+                    live_strict.contains(&owned)
+                }
+            });
+        if live {
+            live_any.insert(inner_scope);
+            if !inner.orphaned {
+                live_strict.insert(inner_scope);
+            }
+        }
+    }
+    if negation.orphaned {
+        live_any.contains(&scope)
+    } else {
+        live_strict.contains(&scope)
+    }
+}
+
+/// A complete rule or a function: a truthiness check of its result depends on
+/// its value, unlike a partial set or object, which is always truthy.
+fn is_single_valued_rule(rule_index: u16, program: &Program) -> bool {
+    program
+        .rule_infos
+        .get(usize::from(rule_index))
+        .is_some_and(|info| {
+            matches!(info.rule_type, RuleType::Complete) || info.function_info.is_some()
+        })
+}
+
 /// Whether the call to `call`'s helper that finished just before the
 /// condition at `outer_outcome_idx` depended on an assumption at any depth,
 /// as the VM recorded on its summary. In partial evaluation `not` treats such
 /// a result as unknown, so the guard can hold although the helper held.
-/// Fails closed when the summary cannot be found.
+/// A rule with no definitions (only a default) records no summary and never
+/// depends on an assumption. Otherwise fails closed when the summary cannot
+/// be found.
 fn call_depends_on_assumption(
     call: HelperCall,
     outer_outcome_idx: usize,
+    program: &Program,
     trace: &EvaluationTrace,
 ) -> bool {
-    if trace.assumptions.is_empty() {
+    if trace.assumptions.is_empty()
+        || program
+            .rule_infos
+            .get(usize::from(call.rule_index))
+            .is_some_and(|info| info.definitions.is_empty())
+    {
         return false;
     }
     trace
@@ -3150,14 +3274,6 @@ fn materialize_condition_explanations_at_depth(
 
         let location = get_source_location(pc_usize, program);
 
-        let outcome_str = if outcome.assumed {
-            "assumed"
-        } else if outcome.passed {
-            "success"
-        } else {
-            "failure"
-        };
-
         let (left, right) = materialize_operands(outcome, static_info, trace, settings);
         let witness = outcome
             .loop_stat_idx
@@ -3183,6 +3299,25 @@ fn materialize_condition_explanations_at_depth(
                 depth,
             );
 
+        // A guard that held only through an assumption is assumed, not a
+        // concrete success, following the engine's own decision: a check of a
+        // single-valued call whose result depended on an unknown, or a `not`
+        // that recorded a live `NegationHolds` (one that partial evaluation
+        // turns into a residual).
+        let held_by_assumption = outcome.passed
+            && !outcome.assumed
+            && (helper_call.is_some_and(|call| {
+                is_single_valued_rule(call.rule_index, program)
+                    && call_depends_on_assumption(call, *outcome_idx, program, trace)
+            }) || guard_holds_by_assumed_negation(pc_usize, *outcome_idx, program, trace));
+        let outcome_str = if outcome.assumed || held_by_assumption {
+            "assumed"
+        } else if outcome.passed {
+            "success"
+        } else {
+            "failure"
+        };
+
         // Derive outer `left.provenance` from the last failed helper inner
         // condition when the outer condition doesn't already carry one, but
         // only when the helper returned falsy: a helper that held may have
@@ -3190,7 +3325,7 @@ fn materialize_condition_explanations_at_depth(
         // produce its result.
         let left = if helper_call.is_some_and(|call| {
             call.returned_falsy(outcome_str)
-                && !call_depends_on_assumption(call, *outcome_idx, trace)
+                && !call_depends_on_assumption(call, *outcome_idx, program, trace)
         }) {
             derive_left_provenance_from_helper(left, &helper_conditions)
         } else {

@@ -322,6 +322,10 @@ pub struct Assumption {
     /// attributed to the rule that owns it by grouping alone. This chain is
     /// what lets a consumer join it back to the owning rule at any call depth.
     pub call_chain: Vec<CallFrame>,
+    /// Number of condition outcomes recorded when this assumption was made.
+    /// A `NegationHolds` assumption is recorded by the `Not` immediately
+    /// before its guard, so the guard's outcome is the one at this index.
+    pub conditions_recorded: u32,
 }
 
 /// One calling rule frame captured at assumption-record time.
@@ -790,6 +794,7 @@ impl EvaluationTrace {
             data_lookup_context: None,
             orphaned: false,
             call_chain,
+            conditions_recorded: u32::try_from(self.condition_outcomes.len()).unwrap_or(u32::MAX),
         });
     }
 

@@ -6395,6 +6395,8 @@ fn rg10_not_over_calls_and_locals_is_negated() {
                     "{mode:?} pe={partial_eval}: `{text}` must be negated: {condition:#}"
                 );
                 assert_eq!(condition["kind"], "truthiness", "{condition:#}");
+                // None of these values depends on an unknown: any negation
+                // the engine records is empty and produces no residual.
                 assert_eq!(condition["outcome"], "success", "{condition:#}");
             }
         }
@@ -6532,4 +6534,654 @@ fn rg10_controls_keep_their_shape() {
             assert_eq!(condition["left"]["absent"], true, "{condition:#}");
         }
     }
+}
+
+/// Run `data.t.deny` in partial evaluation with `unknowns`, in the given
+/// condition and execution modes, and return the result and causality report.
+fn rg9_run(
+    policy: &str,
+    input: &str,
+    unknowns: &[&str],
+    condition_mode: evaluation_trace::ConditionMode,
+    execution_mode: rvm::vm::ExecutionMode,
+) -> (Value, serde_json::Value) {
+    let entry = "data.t.deny";
+    let mut engine = Engine::new();
+    engine.add_policy("t.rego".into(), policy.into()).unwrap();
+    let compiled = engine.compile_with_entrypoint(&Rc::from(entry)).unwrap();
+    let program =
+        languages::rego::compiler::Compiler::compile_from_policy(&compiled, &[entry]).unwrap();
+    let mut vm = rvm::RegoVM::new_with_policy(compiled);
+    vm.load_program(program);
+    vm.set_execution_mode(execution_mode);
+    vm.set_explanation_settings(evaluation_trace::ExplanationSettings {
+        enabled: true,
+        value_mode: evaluation_trace::ValueMode::Full,
+        condition_mode,
+        detail: evaluation_trace::ExplanationDetail::Full,
+        assume_unknown_input: true,
+        eval_mode: evaluation_trace::EvaluationMode::PartialEval,
+        unknowns: unknowns.iter().map(|u| (*u).into()).collect(),
+        ..Default::default()
+    });
+    vm.set_input(Value::from_json_str(input).unwrap());
+    let result = vm.execute_entry_point_by_name(entry).unwrap();
+    let report = vm.take_causality_report(result.clone()).unwrap();
+    (result, serde_json::from_str(&report).unwrap())
+}
+
+fn rg9_modes() -> Vec<(evaluation_trace::ConditionMode, rvm::vm::ExecutionMode)> {
+    let mut modes = Vec::new();
+    for condition_mode in [
+        evaluation_trace::ConditionMode::PrimaryOnly,
+        evaluation_trace::ConditionMode::AllContributing,
+    ] {
+        for execution_mode in [
+            rvm::vm::ExecutionMode::RunToCompletion,
+            rvm::vm::ExecutionMode::Suspendable,
+        ] {
+            modes.push((condition_mode, execution_mode));
+        }
+    }
+    modes
+}
+
+/// Outcomes of the top-level `data.t.deny` conditions with this text, in
+/// trace order, taken from the rule's definitions.
+fn rg9_outcomes(report: &serde_json::Value, text: &str) -> Vec<String> {
+    let mut outcomes = Vec::new();
+    for rule in report["rules"].as_array().expect("rules") {
+        if rule["name"] != "data.t.deny" {
+            continue;
+        }
+        for definition in rule["definitions"].as_array().into_iter().flatten() {
+            for condition in definition["conditions"].as_array().into_iter().flatten() {
+                if condition["text"] == text {
+                    outcomes.push(condition["outcome"].as_str().unwrap().to_string());
+                }
+            }
+        }
+    }
+    assert!(!outcomes.is_empty(), "no `{text}` condition in {report:#}");
+    outcomes
+}
+
+#[test]
+fn rg9_not_over_an_unknown_is_assumed() {
+    let policy =
+        "package t\nimport rego.v1\ndeny contains \"review\" if {\n    not input.deployment.blocked\n}\n";
+    for (condition_mode, execution_mode) in rg9_modes() {
+        let (result, report) = rg9_run(
+            policy,
+            r#"{"deployment": {}}"#,
+            &["input.deployment.blocked"],
+            condition_mode,
+            execution_mode,
+        );
+        assert_eq!(result.as_set().map(|s| s.len()).ok(), Some(1), "{report:#}");
+        assert_eq!(
+            rg9_outcomes(&report, "not input.deployment.blocked"),
+            ["assumed"],
+            "{condition_mode:?} {execution_mode:?}: {report:#}"
+        );
+        // Control: a known false value holds concretely.
+        let (_, report) = rg9_run(
+            policy,
+            r#"{"deployment": {"blocked": false}}"#,
+            &["input.unrelated"],
+            condition_mode,
+            execution_mode,
+        );
+        assert_eq!(
+            rg9_outcomes(&report, "not input.deployment.blocked"),
+            ["success"],
+            "{condition_mode:?} {execution_mode:?}: {report:#}"
+        );
+    }
+}
+
+#[test]
+fn rg9_negation_is_linked_per_iteration() {
+    // Resource 0's flag is unknown; resource 1's is concretely false.
+    let policy = "package t\nimport rego.v1\ndeny contains r.name if {\n    some r in input.rs\n    not r.blocked\n}\n";
+    let input = r#"{"rs": [{"name": "a"}, {"name": "b", "blocked": false}]}"#;
+    for (condition_mode, execution_mode) in rg9_modes() {
+        if condition_mode == evaluation_trace::ConditionMode::PrimaryOnly {
+            continue; // PrimaryOnly keeps only the last outcome per condition.
+        }
+        let (_, report) = rg9_run(
+            policy,
+            input,
+            &["input.rs[0].blocked"],
+            condition_mode,
+            execution_mode,
+        );
+        assert_eq!(
+            rg9_outcomes(&report, "not r.blocked"),
+            ["assumed", "success"],
+            "{execution_mode:?}: {report:#}"
+        );
+    }
+}
+
+#[test]
+fn rg9_helper_guard_held_by_an_unknown_is_assumed() {
+    let policy =
+        "package t\nimport rego.v1\n_h(r) if r.u == 1\ndeny contains \"x\" if {\n    _h(input)\n}\n";
+    for (condition_mode, execution_mode) in rg9_modes() {
+        let (_, report) = rg9_run(policy, "{}", &["input.u"], condition_mode, execution_mode);
+        assert_eq!(
+            rg9_outcomes(&report, "_h(input)"),
+            ["assumed"],
+            "{condition_mode:?} {execution_mode:?}: {report:#}"
+        );
+        // Control: concretely true.
+        let (_, report) = rg9_run(
+            policy,
+            r#"{"u": 1}"#,
+            &["input.unrelated"],
+            condition_mode,
+            execution_mode,
+        );
+        assert_eq!(
+            rg9_outcomes(&report, "_h(input)"),
+            ["success"],
+            "{condition_mode:?} {execution_mode:?}: {report:#}"
+        );
+    }
+}
+
+#[test]
+fn rg9_unknown_below_the_helper_depth_cut_is_visible_at_the_top() {
+    let mut policy = String::from("package t\nimport rego.v1\n\n");
+    policy.push_str("h10(r) if {\n    r.tls != \"x\"\n    r.u == 1\n}\n");
+    for level in (1..10).rev() {
+        policy.push_str(&format!(
+            "h{level}(r) if {{\n    r.tls != \"x\"\n    h{}(r)\n}}\n",
+            level + 1
+        ));
+    }
+    policy.push_str("deny contains \"x\" if {\n    h1(input)\n}\n");
+    for (condition_mode, execution_mode) in rg9_modes() {
+        let (_, report) = rg9_run(
+            &policy,
+            r#"{"tls": "1.2"}"#,
+            &["input.u"],
+            condition_mode,
+            execution_mode,
+        );
+        assert_eq!(
+            rg9_outcomes(&report, "h1(input)"),
+            ["assumed"],
+            "{condition_mode:?} {execution_mode:?}: {report:#}"
+        );
+    }
+}
+
+#[test]
+fn rg9_default_only_rule_guard_stays_concrete() {
+    let policy = "package t\nimport rego.v1\ndefault _flag := true\ndeny contains \"x\" if {\n    _flag\n    input.u == 1\n}\n";
+    for (condition_mode, execution_mode) in rg9_modes() {
+        if condition_mode == evaluation_trace::ConditionMode::PrimaryOnly {
+            continue;
+        }
+        let (_, report) = rg9_run(policy, "{}", &["input.u"], condition_mode, execution_mode);
+        assert_eq!(
+            rg9_outcomes(&report, "_flag"),
+            ["success"],
+            "{execution_mode:?}: {report:#}"
+        );
+        assert_eq!(
+            rg9_outcomes(&report, "input.u == 1"),
+            ["assumed"],
+            "{report:#}"
+        );
+    }
+}
+
+#[test]
+fn rg9_negation_of_a_concretely_undefined_value_stays_concrete() {
+    // `_secure` fails on concrete input; the `not` records an empty
+    // NegationHolds, which partial evaluation drops, so the guard is concrete.
+    let policy = "package t\nimport rego.v1\n_secure if input.r.httpsOnly == true\ndeny contains \"x\" if {\n    not _secure\n}\n";
+    for (condition_mode, execution_mode) in rg9_modes() {
+        let (result, report) = rg9_run(
+            policy,
+            r#"{"r": {"httpsOnly": false}}"#,
+            &["input.unrelated"],
+            condition_mode,
+            execution_mode,
+        );
+        assert_eq!(result.as_set().map(|s| s.len()).ok(), Some(1));
+        assert_eq!(
+            rg9_outcomes(&report, "not _secure"),
+            ["success"],
+            "{condition_mode:?} {execution_mode:?}: {report:#}"
+        );
+    }
+}
+
+#[test]
+fn rg9_double_negation_of_an_unknown_is_assumed() {
+    // `_clear` holds only because `not input.u` was assumed; `not _clear`
+    // then holds through a nested assumed negation.
+    let policy = "package t\nimport rego.v1\n_clear if {\n    not input.u\n}\ndeny contains \"x\" if {\n    not _clear\n}\n";
+    for (condition_mode, execution_mode) in rg9_modes() {
+        let (_, report) = rg9_run(policy, "{}", &["input.u"], condition_mode, execution_mode);
+        assert_eq!(
+            rg9_outcomes(&report, "not _clear"),
+            ["assumed"],
+            "{condition_mode:?} {execution_mode:?}: {report:#}"
+        );
+    }
+}
+
+#[test]
+fn rg9_guard_on_a_partial_set_call_stays_concrete() {
+    // A partial set is truthy whatever it contains, so the guard does not
+    // depend on the unknown inside it.
+    let policy = "package t\nimport rego.v1\n_items contains x if {\n    x := input.u\n    x == 1\n}\ndeny contains \"x\" if {\n    _items\n    input.a == 1\n}\n";
+    for (condition_mode, execution_mode) in rg9_modes() {
+        if condition_mode == evaluation_trace::ConditionMode::PrimaryOnly {
+            continue;
+        }
+        let (_, report) = rg9_run(
+            policy,
+            r#"{"a": 1}"#,
+            &["input.u"],
+            condition_mode,
+            execution_mode,
+        );
+        assert_eq!(
+            rg9_outcomes(&report, "_items"),
+            ["success"],
+            "{execution_mode:?}: {report:#}"
+        );
+    }
+}
+
+#[test]
+fn rg9_negation_link_does_not_reach_a_later_iteration() {
+    // Resource 0 is concrete; resource 1's flag is unknown. A later
+    // iteration's assumed negation must not mark the earlier guard.
+    let policy = "package t\nimport rego.v1\ndeny contains r.name if {\n    some r in input.rs\n    not r.blocked\n}\n";
+    let input = r#"{"rs": [{"name": "a", "blocked": false}, {"name": "b"}]}"#;
+    for (_, execution_mode) in rg9_modes() {
+        let (_, report) = rg9_run(
+            policy,
+            input,
+            &["input.rs[1].blocked"],
+            evaluation_trace::ConditionMode::AllContributing,
+            execution_mode,
+        );
+        assert_eq!(
+            rg9_outcomes(&report, "not r.blocked"),
+            ["success", "assumed"],
+            "{execution_mode:?}: {report:#}"
+        );
+    }
+}
+
+#[test]
+fn rg9_negation_in_a_failed_definition_is_still_assumed() {
+    // The guard holds only through the assumed negation; the definition then
+    // fails concretely, which orphans the assumption but does not make the
+    // guard's own outcome concrete.
+    let policy = "package t\nimport rego.v1\ndeny contains \"x\" if {\n    not input.u\n    input.a == 2\n}\n";
+    for (_, execution_mode) in rg9_modes() {
+        let (_, report) = rg9_run(
+            policy,
+            r#"{"a": 1}"#,
+            &["input.u"],
+            evaluation_trace::ConditionMode::AllContributing,
+            execution_mode,
+        );
+        assert_eq!(
+            rg9_outcomes(&report, "not input.u"),
+            ["assumed"],
+            "{execution_mode:?}: {report:#}"
+        );
+        assert_eq!(
+            rg9_outcomes(&report, "input.a == 2"),
+            ["failure"],
+            "{report:#}"
+        );
+    }
+}
+
+#[test]
+fn rgp4_failed_helper_keeps_its_assumption_under_not() {
+    // KNOWN DEFECT (RG-P4), pinned so a fix is noticed. `_h` records the
+    // assumption `input.u == 1` and then fails concretely on `input.a == 2`,
+    // so `_h` is undefined whatever `input.u` is and `deny` holds
+    // unconditionally. Partial evaluation keeps the helper's assumption and
+    // reports `deny` as holding only when `not input.u == 1`; the causality
+    // report agrees and marks `not _h` assumed. Correct: no residual, and a
+    // `success` outcome.
+    let policy = "package t\nimport rego.v1\n_h if {\n    input.u == 1\n    input.a == 2\n}\ndeny contains \"x\" if {\n    not _h\n}\n";
+    for (condition_mode, execution_mode) in rg9_modes() {
+        let (result, report) = rg9_run(
+            policy,
+            r#"{"a": 1}"#,
+            &["input.u"],
+            condition_mode,
+            execution_mode,
+        );
+        assert_eq!(result.as_set().map(|s| s.len()).ok(), Some(1));
+        assert_eq!(
+            rg9_outcomes(&report, "not _h"),
+            ["assumed"],
+            "{condition_mode:?} {execution_mode:?}: {report:#}"
+        );
+    }
+}
+
+/// Partial-evaluation result of `entry` in both execution modes.
+fn rg9_pe_results(policy: &str, entry: &str, input: &str, unknowns: &[&str]) -> Vec<String> {
+    [
+        rvm::vm::ExecutionMode::RunToCompletion,
+        rvm::vm::ExecutionMode::Suspendable,
+    ]
+    .into_iter()
+    .map(|execution_mode| {
+        let mut engine = Engine::new();
+        engine.add_policy("t.rego".into(), policy.into()).unwrap();
+        let compiled = engine.compile_with_entrypoint(&Rc::from(entry)).unwrap();
+        let program =
+            languages::rego::compiler::Compiler::compile_from_policy(&compiled, &[entry]).unwrap();
+        let mut vm = rvm::RegoVM::new_with_policy(compiled);
+        vm.load_program(program);
+        vm.set_execution_mode(execution_mode);
+        vm.set_explanation_settings(evaluation_trace::ExplanationSettings {
+            enabled: true,
+            assume_unknown_input: true,
+            eval_mode: evaluation_trace::EvaluationMode::PartialEval,
+            unknowns: unknowns.iter().map(|u| (*u).into()).collect(),
+            ..Default::default()
+        });
+        vm.set_input(Value::from_json_str(input).unwrap());
+        let result = vm.execute_entry_point_by_name(entry).unwrap();
+        let pe: serde_json::Value =
+            serde_json::from_str(&vm.take_partial_eval_result(result).unwrap()).unwrap();
+        format!(
+            "{} residuals={}",
+            pe["result"],
+            pe["residual_queries"].as_array().map_or(0, Vec::len)
+        )
+    })
+    .collect()
+}
+
+#[test]
+fn rg9_possible_conflict_keeps_a_helper_dependent() {
+    // `h` is true, but if `input.u == 1` the second definition gives
+    // `input.u` (1), which conflicts and makes `h` undefined; `not h` then
+    // holds. The assumed definition has no known value, so `h` is not
+    // concrete and the possible violation stays.
+    let policy = "package t\nimport rego.v1\nh := true\nh := input.u if input.u == 1\ndeny contains \"x\" if {\n    not h\n}\n";
+    for (condition_mode, execution_mode) in rg9_modes() {
+        let (result, report) = rg9_run(policy, "{}", &["input.u"], condition_mode, execution_mode);
+        assert_eq!(
+            result.as_set().map(|s| s.len()).ok(),
+            Some(1),
+            "{condition_mode:?} {execution_mode:?}: {report:#}"
+        );
+        assert_eq!(rg9_outcomes(&report, "not h"), ["assumed"], "{report:#}");
+    }
+}
+
+#[test]
+fn rg9_nested_negation_inside_a_negated_comprehension_is_assumed() {
+    // The outer `not` negates a comparison, not a call; the unknown sits in a
+    // `not` inside the comprehension, one negation scope deeper.
+    let policy = "package t\nimport rego.v1\ndeny contains \"x\" if {\n    not count([1 | not input.u]) == 0\n}\n";
+    for (_, execution_mode) in rg9_modes() {
+        let (result, report) = rg9_run(
+            policy,
+            "{}",
+            &["input.u"],
+            evaluation_trace::ConditionMode::AllContributing,
+            execution_mode,
+        );
+        assert_eq!(result.as_set().map(|s| s.len()).ok(), Some(1), "{report:#}");
+        let outcomes = rg9_outcomes(&report, "not count([1 | not input.u]) == 0");
+        assert!(
+            outcomes.iter().all(|outcome| outcome == "assumed"),
+            "{execution_mode:?}: {outcomes:?} {report:#}"
+        );
+    }
+}
+
+#[test]
+fn rg9_body_without_a_value_does_not_resolve_a_call() {
+    // `_ok := input.z` holds with no assumption but `input.z` is absent, so it
+    // gives no value; `_ok` is true only if the assumed first definition
+    // holds. Concretely, `{"b": "no"}` denies.
+    for helper in [
+        "_ok if input.b == \"yes\"\n_ok := input.z\n",
+        "_ok if input.b == \"yes\"\n_ok := input.z if true\n",
+    ] {
+        let policy = format!(
+            "package t\nimport rego.v1\n{helper}deny contains \"x\" if {{\n    not _ok\n}}\n"
+        );
+        for (condition_mode, execution_mode) in rg9_modes() {
+            let (result, report) =
+                rg9_run(&policy, "{}", &["input.b"], condition_mode, execution_mode);
+            assert_eq!(
+                result.as_set().map(|s| s.len()).ok(),
+                Some(1),
+                "{condition_mode:?} {execution_mode:?}: {report:#}"
+            );
+            assert_eq!(rg9_outcomes(&report, "not _ok"), ["assumed"], "{report:#}");
+        }
+    }
+    // A function whose concrete definition gives no value.
+    let function = "package t\nimport rego.v1\n_f(r) if r.b == \"yes\"\n_f(r) := r.z\ndeny contains \"x\" if {\n    not _f(input)\n}\n";
+    for (condition_mode, execution_mode) in rg9_modes() {
+        let (result, _) = rg9_run(function, "{}", &["input.b"], condition_mode, execution_mode);
+        assert_eq!(
+            result.as_set().map(|s| s.len()).ok(),
+            Some(1),
+            "{condition_mode:?} {execution_mode:?}"
+        );
+    }
+}
+
+#[test]
+fn rg9_assumed_definition_with_unknown_value_blocks_resolution() {
+    // Claude's case: `_v` is 1, but if `input.b != "no"` the second definition
+    // gives `input.b`, which may differ and conflict.
+    let policy = "package t\nimport rego.v1\n_v := 1\n_v := input.b if input.b != \"no\"\ndeny contains \"x\" if {\n    not _v == 1\n}\n";
+    for (condition_mode, execution_mode) in rg9_modes() {
+        let (result, _) = rg9_run(policy, "{}", &["input.b"], condition_mode, execution_mode);
+        assert_eq!(
+            result.as_set().map(|s| s.len()).ok(),
+            Some(1),
+            "{condition_mode:?} {execution_mode:?}"
+        );
+    }
+}
+
+#[test]
+fn rgp2_concrete_values_are_treated_as_unknown_without_per_value_tracking() {
+    // KNOWN LIMITATION (RG-P2, deferred to per-value tracking with RG-9b and
+    // RG-P3), pinned so a fix is noticed. Partial evaluation treats a call as
+    // dependent when any assumption was recorded during it, and treats any
+    // undefined value under `not` as possibly unknown. Both are conservative:
+    // telling a concrete value from one derived from an unknown needs
+    // per-value tracking, because reads such as `input.u + 1` or
+    // `_v := input.b` record no assumption.
+    let helper = "_ok(r) if r.a == \"yes\"\n_ok(r) if r.b == \"yes\"\n";
+    let positive = format!(
+        "package t\nimport rego.v1\n{helper}deny contains \"x\" if {{\n    _ok(input)\n}}\n"
+    );
+    let negated = format!(
+        "package t\nimport rego.v1\n{helper}deny contains \"x\" if {{\n    not _ok(input)\n}}\n"
+    );
+    let constant = "package t\nimport rego.v1\nh := false\nh := false if input.u == 1\ndeny contains \"x\" if {\n    not h\n}\n";
+    let absent = "package t\nimport rego.v1\nh if {\n    not input.missing\n}\ndeny contains \"x\" if {\n    h\n}\n";
+    for (condition_mode, execution_mode) in rg9_modes() {
+        // `_ok` holds concretely through its first definition (correct:
+        // `success`, and `not _ok` denies nothing).
+        let (_, report) = rg9_run(
+            &positive,
+            r#"{"a": "yes"}"#,
+            &["input.b"],
+            condition_mode,
+            execution_mode,
+        );
+        assert_eq!(
+            rg9_outcomes(&report, "_ok(input)"),
+            ["assumed"],
+            "{report:#}"
+        );
+        let (result, _) = rg9_run(
+            &negated,
+            r#"{"a": "yes"}"#,
+            &["input.b"],
+            condition_mode,
+            execution_mode,
+        );
+        assert_eq!(
+            result.as_set().map(|s| s.len()).ok(),
+            Some(1),
+            "{condition_mode:?} {execution_mode:?}"
+        );
+        // `h` is false whatever `input.u` is (correct: `success`).
+        let (_, report) = rg9_run(constant, "{}", &["input.u"], condition_mode, execution_mode);
+        assert_eq!(rg9_outcomes(&report, "not h"), ["assumed"], "{report:#}");
+        // `input.missing` is absent and not declared unknown (correct:
+        // `success`).
+        let (_, report) = rg9_run(absent, "{}", &["input.u"], condition_mode, execution_mode);
+        assert_eq!(rg9_outcomes(&report, "h"), ["assumed"], "{report:#}");
+    }
+    // A `default` is withheld for the same reason (correct: `false`).
+    let default = "package t\nimport rego.v1\ndefault allow := false\nallow if {\n    not input.missing\n    input.x == 1\n}\n";
+    assert_eq!(
+        rg9_pe_results(default, "data.t.allow", r#"{"x": 2}"#, &["input.u"]),
+        ["null residuals=0", "null residuals=0"]
+    );
+    // The call-level signal also counts assumptions the engine later
+    // orphans: `_s` records `input.u == 1`, then fails concretely, so it is
+    // empty and partial evaluation keeps no residual (correct: `success`).
+    let s = "_s contains 1 if {\n    input.u == 1\n    input.a == 2\n}\n";
+    let direct = format!("package t\nimport rego.v1\n{s}_h2 if count(_s) == 0\ndeny contains \"x\" if {{\n    _h2\n}}\n");
+    let negated = format!("package t\nimport rego.v1\n{s}_h if count(_s) > 0\ndeny contains \"x\" if {{\n    not _h\n}}\n");
+    for condition_mode in [
+        evaluation_trace::ConditionMode::PrimaryOnly,
+        evaluation_trace::ConditionMode::AllContributing,
+    ] {
+        let (_, report) = rg9_run(
+            &direct,
+            r#"{"a": 1}"#,
+            &["input.u"],
+            condition_mode,
+            rvm::vm::ExecutionMode::RunToCompletion,
+        );
+        assert_eq!(rg9_outcomes(&report, "_h2"), ["assumed"], "{report:#}");
+        let (_, report) = rg9_run(
+            &negated,
+            r#"{"a": 1}"#,
+            &["input.u"],
+            condition_mode,
+            rvm::vm::ExecutionMode::RunToCompletion,
+        );
+        assert_eq!(rg9_outcomes(&report, "not _h"), ["assumed"], "{report:#}");
+    }
+}
+
+#[test]
+fn rg9_not_over_a_call_that_reads_an_unknown_is_assumed() {
+    // `h` reads the unknown by assignment, which records no assumption in the
+    // call, but the `not` records `Exists(input.u)` and a negation residual.
+    for policy in [
+        "package t\nimport rego.v1\nh := input.u\ndeny contains \"x\" if {\n    not h\n}\n",
+        "package t\nimport rego.v1\nh(r) := r.u\ndeny contains \"x\" if {\n    not h(input)\n}\n",
+    ] {
+        let text = if policy.contains("h(r)") {
+            "not h(input)"
+        } else {
+            "not h"
+        };
+        for (condition_mode, execution_mode) in rg9_modes() {
+            let (result, report) =
+                rg9_run(policy, "{}", &["input.u"], condition_mode, execution_mode);
+            assert_eq!(result.as_set().map(|s| s.len()).ok(), Some(1), "{report:#}");
+            assert_eq!(
+                rg9_outcomes(&report, text),
+                ["assumed"],
+                "{condition_mode:?} {execution_mode:?}: {report:#}"
+            );
+        }
+    }
+}
+
+#[test]
+fn rg9_negation_over_an_orphaned_inner_assumption_follows_the_engine() {
+    // `_s` records `input.u == 1`, then fails on `input.a == 2`, so the
+    // assumption is orphaned and `_s` is empty whatever `input.u` is.
+    // Run-to-completion drops the residual: `not _s[1]` holds concretely.
+    // Suspendable mode keeps it (RG-P6, pre-existing); the report follows
+    // each mode's own trace.
+    let policy = "package t\nimport rego.v1\n_s contains 1 if {\n    input.u == 1\n    input.a == 2\n}\ndeny contains \"x\" if {\n    not _s[1]\n}\n";
+    for (condition_mode, execution_mode) in rg9_modes() {
+        let (result, report) = rg9_run(
+            policy,
+            r#"{"a": 1}"#,
+            &["input.u"],
+            condition_mode,
+            execution_mode,
+        );
+        assert_eq!(result.as_set().map(|s| s.len()).ok(), Some(1), "{report:#}");
+        let expected = if execution_mode == rvm::vm::ExecutionMode::RunToCompletion {
+            "success"
+        } else {
+            "assumed"
+        };
+        assert_eq!(
+            rg9_outcomes(&report, "not _s[1]"),
+            [expected],
+            "{condition_mode:?} {execution_mode:?}: {report:#}"
+        );
+    }
+}
+
+#[test]
+fn rg9_deep_negation_chains_follow_the_engine_at_any_depth() {
+    // Long chains of `h{i} if { not h{i+1} }`: liveness is settled exactly
+    // at any depth, whether the leaf negates an unknown or an absent field.
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(|| {
+            for (links, leaf, expected) in [
+                (63usize, "input.u", "assumed"),
+                (64, "input.u", "assumed"),
+                (100, "input.u", "assumed"),
+                (64, "input.missing", "success"),
+                (100, "input.missing", "success"),
+            ] {
+                let mut policy = String::from("package t\nimport rego.v1\n");
+                for i in 0..links {
+                    policy.push_str(&format!("h{i} if {{ not h{} }}\n", i + 1));
+                }
+                policy.push_str(&format!(
+                    "h{links} if {{ not {leaf} }}\ndeny contains \"x\" if {{\n    not h0 == false\n}}\n"
+                ));
+                let (_, report) = rg9_run(
+                    &policy,
+                    "{}",
+                    &["input.u"],
+                    evaluation_trace::ConditionMode::AllContributing,
+                    rvm::vm::ExecutionMode::RunToCompletion,
+                );
+                assert_eq!(
+                    rg9_outcomes(&report, "not h0 == false"),
+                    [expected],
+                    "{links} links over {leaf}"
+                );
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
