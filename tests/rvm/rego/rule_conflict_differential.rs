@@ -217,13 +217,7 @@ fn cases() -> Vec<Case> {
             BOTH,
             Expect::Value("1"),
         ),
-        case(
-            "else twins",
-            ELSE,
-            "data.test.x",
-            BOTH,
-            Expect::Value("1"),
-        ),
+        case("else twins", ELSE, "data.test.x", BOTH, Expect::Value("1")),
         case(
             "else function twins",
             ELSE,
