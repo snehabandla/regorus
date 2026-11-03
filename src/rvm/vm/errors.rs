@@ -87,6 +87,15 @@ pub enum VmError {
         available: usize,
     },
 
+    /// Two definitions of a complete rule, or of a function for the same
+    /// arguments, succeeded with different values.
+    #[error("rule {rule} conflicts: {message} (pc={pc})")]
+    RuleConflict {
+        rule: String,
+        message: String,
+        pc: usize,
+    },
+
     #[error("Invalid object create params index: {index} (pc={pc}, available={available})")]
     InvalidObjectCreateParams {
         index: u16,
