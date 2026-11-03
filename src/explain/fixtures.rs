@@ -7,6 +7,7 @@
 use super::*;
 use crate::value::Value;
 use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::format;
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
@@ -296,6 +297,7 @@ pub fn partial_eval_result() -> PartialEvalResult {
         input_path: Some(String::from("input.role")),
         value: Some(Value::from("admin")),
         negated: Vec::new(),
+        call: None,
         rule: Some(String::from("data.test.allow")),
         location: Some(location(3, 5)),
     };
@@ -306,6 +308,7 @@ pub fn partial_eval_result() -> PartialEvalResult {
         input_path: Some(String::from("input.locked")),
         value: None,
         negated: Vec::new(),
+        call: None,
         rule: None,
         location: None,
     };
@@ -316,6 +319,7 @@ pub fn partial_eval_result() -> PartialEvalResult {
         input_path: None,
         value: None,
         negated: vec![locked],
+        call: None,
         rule: Some(String::from("data.test.allow")),
         location: None,
     };
@@ -328,11 +332,15 @@ pub fn partial_eval_result() -> PartialEvalResult {
                 key: None,
                 value: Value::from(true),
                 conditions: vec![role],
+                status: ResidualAlternativeStatus::Exact,
+                unresolved: None,
             },
             ResidualQuery {
                 key: None,
                 value: Value::from(true),
                 conditions: vec![not_locked],
+                status: ResidualAlternativeStatus::Exact,
+                unresolved: None,
             },
         ],
         warnings: Vec::new(),
@@ -349,6 +357,7 @@ pub fn partial_eval_set_result() -> PartialEvalResult {
         input_path: Some(String::from("input.role")),
         value: Some(Value::from("admin")),
         negated: Vec::new(),
+        call: None,
         rule: None,
         location: None,
     };
@@ -359,6 +368,7 @@ pub fn partial_eval_set_result() -> PartialEvalResult {
         input_path: Some(String::from("input.locked")),
         value: None,
         negated: Vec::new(),
+        call: None,
         rule: None,
         location: None,
     };
@@ -371,11 +381,15 @@ pub fn partial_eval_set_result() -> PartialEvalResult {
                 key: None,
                 value: Value::from("admin"),
                 conditions: vec![role],
+                status: ResidualAlternativeStatus::Exact,
+                unresolved: None,
             },
             ResidualQuery {
                 key: None,
                 value: Value::from("locked"),
                 conditions: vec![locked],
+                status: ResidualAlternativeStatus::Exact,
+                unresolved: None,
             },
         ],
         warnings: Vec::new(),
@@ -399,10 +413,112 @@ pub fn partial_eval_object_result() -> PartialEvalResult {
                 input_path: Some(String::from("input.env")),
                 value: Some(Value::from("prod")),
                 negated: Vec::new(),
+                call: None,
                 rule: None,
                 location: None,
             }],
+            status: ResidualAlternativeStatus::Exact,
+            unresolved: None,
         }],
+        warnings: Vec::new(),
+    }
+}
+
+/// `allow if startswith(input.name, "svc-")` and
+/// `allow if regex.match("^prod-", data.env.name)`, with `input.name` and
+/// `data.env.name` unknown.
+pub fn partial_eval_builtin_call_result() -> PartialEvalResult {
+    fn call(text: &str, name: &str, arguments: Vec<ResidualArgument>) -> ResidualQuery {
+        ResidualQuery {
+            key: None,
+            value: Value::from(true),
+            conditions: vec![ResidualCondition {
+                text: String::from(text),
+                kind: ResidualKind::BuiltinCall,
+                operator: None,
+                input_path: None,
+                value: None,
+                negated: Vec::new(),
+                call: Some(ResidualCall {
+                    name: String::from(name),
+                    arguments,
+                }),
+                rule: None,
+                location: None,
+            }],
+            status: ResidualAlternativeStatus::Exact,
+            unresolved: None,
+        }
+    }
+    PartialEvalResult {
+        kind: RuleKind::Complete,
+        status: ResidualStatus::Exact,
+        result: Value::Undefined,
+        residual_queries: vec![
+            call(
+                r#"startswith(input.name, "svc-")"#,
+                "startswith",
+                vec![
+                    ResidualArgument::InputPath(String::from("input.name")),
+                    ResidualArgument::Value(Value::from("svc-")),
+                ],
+            ),
+            call(
+                r#"regex.match("^prod-", data.env.name)"#,
+                "regex.match",
+                vec![
+                    ResidualArgument::Value(Value::from("^prod-")),
+                    ResidualArgument::InputPath(String::from("data.env.name")),
+                ],
+            ),
+        ],
+        warnings: Vec::new(),
+    }
+}
+
+/// `deny contains "public access" if input.properties.publicNetworkAccess ==
+/// "Enabled"` and `deny contains sprintf("bad sku %s", [input.sku.name]) if
+/// input.sku.tier == "Free"`, with all of `input` unknown. The second
+/// message can't be built, so its alternative is unresolved.
+pub fn partial_eval_partial_result() -> PartialEvalResult {
+    fn equals(path: &str, value: &str) -> ResidualCondition {
+        ResidualCondition {
+            text: format!(r#"{path} == "{value}""#),
+            kind: ResidualKind::ConditionHolds,
+            operator: Some(Operator::Eq),
+            input_path: Some(String::from(path)),
+            value: Some(Value::from(value)),
+            negated: Vec::new(),
+            call: None,
+            rule: None,
+            location: None,
+        }
+    }
+    PartialEvalResult {
+        kind: RuleKind::PartialSet,
+        status: ResidualStatus::Partial,
+        result: Value::Undefined,
+        residual_queries: vec![
+            ResidualQuery {
+                key: None,
+                value: Value::from("public access"),
+                conditions: vec![equals("input.properties.publicNetworkAccess", "Enabled")],
+                status: ResidualAlternativeStatus::Exact,
+                unresolved: None,
+            },
+            ResidualQuery {
+                key: None,
+                value: Value::Undefined,
+                conditions: vec![equals("input.sku.tier", "Free")],
+                status: ResidualAlternativeStatus::Unresolved,
+                unresolved: Some(ResidualUnresolved {
+                    reason: ResidualUnresolvedReason::UnknownValue,
+                    detail: Some(String::from(
+                        r#"sprintf("bad sku %s", [input.sku.name]) depends on unknown input"#,
+                    )),
+                }),
+            },
+        ],
         warnings: Vec::new(),
     }
 }

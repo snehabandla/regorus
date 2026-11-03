@@ -2,8 +2,9 @@
 // Licensed under the MIT License.
 
 use super::fixtures::{
-    attributed_report, complete_rule_report, conflict_report, known, partial_eval_conflict_result,
-    partial_eval_object_result, partial_eval_result, partial_eval_set_result,
+    attributed_report, complete_rule_report, conflict_report, known,
+    partial_eval_builtin_call_result, partial_eval_conflict_result, partial_eval_object_result,
+    partial_eval_partial_result, partial_eval_result, partial_eval_set_result,
     partial_eval_unsupported_result, partial_object_report, partial_set_report, redacted,
 };
 use super::*;
@@ -154,6 +155,89 @@ fn partial_eval_unsupported_result_json() -> Result<(), serde_json::Error> {
         )
     );
     Ok(())
+}
+
+#[test]
+fn partial_eval_builtin_call_result_json() -> Result<(), serde_json::Error> {
+    let expected = concat!(
+        r#"{"kind":"complete","status":"exact","residual_queries":["#,
+        r#"{"value":true,"conditions":[{"text":"startswith(input.name, \"svc-\")","kind":"builtin_call","#,
+        r#""call":{"name":"startswith","arguments":[{"input_path":"input.name"},{"value":"svc-"}]}}]},"#,
+        r#"{"value":true,"conditions":[{"text":"regex.match(\"^prod-\", data.env.name)","kind":"builtin_call","#,
+        r#""call":{"name":"regex.match","arguments":[{"value":"^prod-"},{"input_path":"data.env.name"}]}}]}]}"#,
+    );
+    assert_eq!(
+        serde_json::to_string(&partial_eval_builtin_call_result())?,
+        expected
+    );
+    Ok(())
+}
+
+/// An undefined argument would otherwise serialize as the string
+/// `"<undefined>"`.
+#[test]
+fn undefined_residual_call_argument_fails_to_serialize() {
+    let argument = ResidualArgument::Value(Value::Undefined);
+    assert_eq!(serde_json::to_string(&argument).ok(), None);
+    assert_eq!(
+        serde_json::to_string(&ResidualArgument::Value(Value::Null)).ok(),
+        Some(String::from(r#"{"value":null}"#))
+    );
+}
+
+#[test]
+fn partial_eval_partial_result_json() -> anyhow::Result<()> {
+    let prefix = concat!(
+        r#"{"kind":"partial_set","status":"partial","residual_queries":["#,
+        r#"{"value":"public access","conditions":[{"text":"input.properties.publicNetworkAccess == \"Enabled\"","#,
+        r#""kind":"condition_holds","operator":"==","input_path":"input.properties.publicNetworkAccess","value":"Enabled"}]},"#,
+        r#"{"conditions":[{"text":"input.sku.tier == \"Free\"","#,
+        r#""kind":"condition_holds","operator":"==","input_path":"input.sku.tier","value":"Free"}],"#,
+        r#""status":"unresolved","unresolved":{"reason":"unknown_value""#,
+    );
+    let mut result = partial_eval_partial_result();
+    assert_eq!(
+        serde_json::to_string(&result)?,
+        [
+            prefix,
+            r#","detail":"sprintf(\"bad sku %s\", [input.sku.name]) depends on unknown input"}}]}"#,
+        ]
+        .concat()
+    );
+    result
+        .residual_queries
+        .get_mut(1)
+        .and_then(|query| query.unresolved.as_mut())
+        .context("unresolved alternative")?
+        .detail = None;
+    assert_eq!(serde_json::to_string(&result)?, [prefix, "}}]}"].concat());
+    Ok(())
+}
+
+/// The result status is `partial` if and only if an alternative is
+/// unresolved, and only unresolved alternatives say why.
+#[test]
+fn partial_eval_fixtures_keep_alternative_status_invariants() {
+    for result in [
+        partial_eval_result(),
+        partial_eval_set_result(),
+        partial_eval_object_result(),
+        partial_eval_builtin_call_result(),
+        partial_eval_partial_result(),
+    ] {
+        let unresolved = result
+            .residual_queries
+            .iter()
+            .filter(|query| query.status == ResidualAlternativeStatus::Unresolved)
+            .count();
+        assert_eq!(result.status == ResidualStatus::Partial, unresolved > 0);
+        for query in &result.residual_queries {
+            assert_eq!(
+                query.status == ResidualAlternativeStatus::Unresolved,
+                query.unresolved.is_some()
+            );
+        }
+    }
 }
 
 /// A result that is not exact carries nothing a consumer could apply.
@@ -424,6 +508,7 @@ fn every_enum_variant_serializes_to_its_documented_name() -> Result<(), serde_js
     use Outcome as O;
     use ResidualKind as R;
     use ResidualStatus as S;
+    use ResidualUnresolvedReason as U;
     check(
         &[
             RuleKind::Complete,
@@ -474,6 +559,7 @@ fn every_enum_variant_serializes_to_its_documented_name() -> Result<(), serde_js
             R::ConditionHolds,
             R::CollectionExists,
             R::NegationHolds,
+            R::BuiltinCall,
         ],
         |kind| match kind {
             R::Exists => "exists",
@@ -481,14 +567,40 @@ fn every_enum_variant_serializes_to_its_documented_name() -> Result<(), serde_js
             R::ConditionHolds => "condition_holds",
             R::CollectionExists => "collection_exists",
             R::NegationHolds => "negation_holds",
+            R::BuiltinCall => "builtin_call",
         },
     )?;
     check(
-        &[S::Exact, S::PossibleConflict, S::Unsupported],
+        &[S::Exact, S::Partial, S::PossibleConflict, S::Unsupported],
         |status| match status {
             S::Exact => "exact",
+            S::Partial => "partial",
             S::PossibleConflict => "possible_conflict",
             S::Unsupported => "unsupported",
+        },
+    )?;
+    check(
+        &[
+            ResidualAlternativeStatus::Exact,
+            ResidualAlternativeStatus::Unresolved,
+        ],
+        |status| match status {
+            ResidualAlternativeStatus::Exact => "exact",
+            ResidualAlternativeStatus::Unresolved => "unresolved",
+        },
+    )?;
+    check(
+        &[
+            U::UnknownValue,
+            U::TaintedKey,
+            U::UnsupportedBuiltin,
+            U::UnsupportedConstruct,
+        ],
+        |reason| match reason {
+            U::UnknownValue => "unknown_value",
+            U::TaintedKey => "tainted_key",
+            U::UnsupportedBuiltin => "unsupported_builtin",
+            U::UnsupportedConstruct => "unsupported_construct",
         },
     )?;
     Ok(())
