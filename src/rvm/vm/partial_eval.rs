@@ -834,5 +834,10 @@ fn warning(program: &Program, reason: Option<Reason>, pc: usize) -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::panic_in_result_fn, clippy::indexing_slicing)]
+#[allow(
+    clippy::panic_in_result_fn,
+    clippy::indexing_slicing,
+    clippy::field_reassign_with_default,
+    clippy::shadow_unrelated
+)]
 mod tests;

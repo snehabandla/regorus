@@ -346,7 +346,8 @@ fn calls_fail_closed() -> anyhow::Result<()> {
 #[test]
 fn with_is_rejected_by_the_compiler() {
     let rego = "package test\nallow if { input.u == 1 with input as {} }";
-    assert!(vm(rego).is_err());
+    let err = vm(rego).err().map(|e| format!("{e:?}").to_lowercase());
+    assert!(err.as_ref().is_some_and(|e| e.contains("with")), "{err:?}");
 }
 
 #[test]
@@ -481,7 +482,7 @@ fn invalid_unknowns_are_errors() -> anyhow::Result<()> {
     }
     // Siblings and a supplied sibling value are fine.
     let input = r#"{"user": {"name": "x"}}"#;
-    assert!(pe(TWO_CONDITIONS, input, &["user.role", "user.id", "action"]).is_ok());
+    pe(TWO_CONDITIONS, input, &["user.role", "user.id", "action"])?;
     Ok(())
 }
 
@@ -494,7 +495,7 @@ fn suspendable_mode_is_an_error() -> anyhow::Result<()> {
         Err(ExplainError::PartialEvalSuspendable)
     );
     vm.set_execution_mode(ExecutionMode::RunToCompletion);
-    assert!(vm.partial_eval("data.test.allow").is_ok());
+    vm.partial_eval("data.test.allow")?;
     Ok(())
 }
 
