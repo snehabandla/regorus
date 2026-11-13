@@ -28,8 +28,9 @@
 //! paths drive wildcard classification, element remaps, array base renames,
 //! sub-resource array detection, envelope field classification and casing
 //! restoration; paths outside the grammar fall back to splitting on `.` for
-//! casing. Field reads and writes during normalization and denormalization,
-//! and [`types::ResolvedEntry`] segments, still split on `.`.
+//! casing. Field reads, writes and removals during normalization and
+//! denormalization follow the same grammar; aliases whose short name or
+//! selected ARM path does not parse are left untranslated.
 
 pub mod denormalizer;
 pub mod normalizer;
@@ -39,6 +40,8 @@ pub mod types;
 
 #[cfg(test)]
 mod bracket_tests;
+#[cfg(test)]
+mod path_round_trip_tests;
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString as _};
@@ -342,6 +345,9 @@ impl AliasRegistry {
 
     /// Denormalize a normalized resource back to ARM JSON structure.
     ///
+    /// Every value at a scalar alias short path is moved to its ARM path,
+    /// including raw data stored there.
+    ///
     /// Convenience method that combines alias lookup and denormalization.
     /// The resource type is extracted from the `type` field of `normalized`
     /// automatically.
@@ -555,12 +561,8 @@ fn compute_aggregates_for_version(
                 } else {
                     arm_leaf_raw.without_properties()
                 };
-                // Remaps are applied by splitting on dots, so leaves that
-                // need a bracket subscript are left unaliased.
                 if !short_leaf.is_empty()
                     && !arm_leaf.is_empty()
-                    && path::renders_dotted(short_leaf)
-                    && path::renders_dotted(arm_leaf)
                     && !path::equivalent(short_leaf, arm_leaf)
                 {
                     let arm_leaf = path::render(arm_leaf);
