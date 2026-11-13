@@ -108,6 +108,10 @@ impl RegoVM {
                 self.registers
                     .resize(num_retained_registers, Value::Undefined);
                 self.registers.resize(num_registers, Value::Undefined);
+                #[cfg(feature = "explanations")]
+                if self.pe.is_some() {
+                    self.pe_body_start();
+                }
 
                 if let Some(destructuring_entry_point) =
                     rule_info.destructuring_blocks.get(def_idx).and_then(|x| *x)
@@ -129,6 +133,10 @@ impl RegoVM {
 
                 match self.jump_to(*body_entry_point) {
                     Ok(_) => {
+                        #[cfg(feature = "explanations")]
+                        if self.pe.is_some() {
+                            self.pe_body_succeeded(result_reg);
+                        }
                         if matches!(rule_info.rule_type, RuleType::Complete) || is_function_call {
                             let current_result = self.get_register(result_reg)?.clone();
                             if current_result != Value::Undefined {

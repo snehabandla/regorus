@@ -84,4 +84,7 @@ pub use report::{
     PathSegment, QueryTarget, ReportedValue, ResidualCondition, ResidualKind, ResidualQuery,
     ResidualStatus, ResultExplanation, RuleExplanation, RuleKind, RuleOutcome, SourceLocation,
 };
-pub use settings::{ConditionMode, ExplanationScope, ExplanationSettings, ValueMode};
+pub use settings::{
+    ConditionMode, ExplanationScope, ExplanationSettings, PartialEvalSettings, UnknownPath,
+    UnknownRoot, ValueMode,
+};

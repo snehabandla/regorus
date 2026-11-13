@@ -210,6 +210,14 @@ pub struct RegoVM {
     /// Cached `Value` representation of `program.metadata`, computed once in
     /// `load_program()` and reused by `LoadMetadata` instructions.
     pub(super) metadata_value: Value,
+
+    /// Unknown paths and budget for partial evaluation.
+    #[cfg(feature = "explanations")]
+    pub(super) pe_settings: crate::explain::PartialEvalSettings,
+
+    /// Partial evaluation state; `Some` only during `partial_eval`.
+    #[cfg(feature = "explanations")]
+    pub(super) pe: Option<alloc::boxed::Box<super::partial_eval::PeState>>,
 }
 
 #[cfg(all(feature = "allocator-memory-limits", not(miri)))]
@@ -300,6 +308,10 @@ impl RegoVM {
             cached_builtin_args: Vec::new(),
             virtual_element_on_non_collection: false,
             metadata_value: Value::Undefined,
+            #[cfg(feature = "explanations")]
+            pe_settings: crate::explain::PartialEvalSettings::default(),
+            #[cfg(feature = "explanations")]
+            pe: None,
         }
     }
 
@@ -1050,6 +1062,10 @@ impl RegoVM {
     #[inline]
     #[allow(dead_code)]
     pub(super) fn get_register(&self, index: u8) -> Result<&Value> {
+        #[cfg(feature = "explanations")]
+        if let Some(pe) = self.pe.as_deref() {
+            pe.note_read(index, self.pc, self.register_stack.len());
+        }
         self.registers
             .get(usize::from(index))
             .ok_or(VmError::RegisterIndexOutOfBounds {
@@ -1065,6 +1081,10 @@ impl RegoVM {
     #[inline]
     #[allow(dead_code)]
     pub(super) fn take_register(&mut self, index: u8) -> Result<Value> {
+        #[cfg(feature = "explanations")]
+        if let Some(pe) = self.pe.as_deref() {
+            pe.note_read(index, self.pc, self.register_stack.len());
+        }
         let register_count = self.registers.len();
 
         let slot = self.registers.get_mut(usize::from(index)).ok_or(
@@ -1080,6 +1100,10 @@ impl RegoVM {
     #[inline]
     #[allow(dead_code)]
     pub(super) fn set_register(&mut self, index: u8, value: Value) -> Result<()> {
+        #[cfg(feature = "explanations")]
+        if let Some(pe) = self.pe.as_deref_mut() {
+            pe.note_write(index, self.pc, self.register_stack.len());
+        }
         let register_count = self.registers.len();
 
         let slot = self.registers.get_mut(usize::from(index)).ok_or(

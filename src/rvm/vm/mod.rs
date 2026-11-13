@@ -12,6 +12,8 @@ mod execution_model;
 mod functions;
 mod loops;
 mod machine;
+#[cfg(feature = "explanations")]
+mod partial_eval;
 mod rules;
 mod state;
 mod virtual_data;

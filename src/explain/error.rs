@@ -26,6 +26,27 @@ pub enum ExplainError {
         available: usize,
     },
 
+    /// A declared unknown path is invalid, for example because it overlaps
+    /// another one.
+    #[error("invalid unknown path `{path}`: {reason}")]
+    InvalidUnknownPath {
+        /// The path, rendered as Rego.
+        path: String,
+        /// Why it is invalid.
+        reason: String,
+    },
+
+    /// A value was supplied at or under a declared unknown path.
+    #[error("a value is supplied for unknown path `{path}`")]
+    UnknownValueSupplied {
+        /// The path, rendered as Rego.
+        path: String,
+    },
+
+    /// Partial evaluation does not support suspendable execution yet.
+    #[error("partial evaluation does not support suspendable execution")]
+    PartialEvalSuspendable,
+
     /// The evaluation itself failed.
     #[error(transparent)]
     Vm(#[from] VmError),
