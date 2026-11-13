@@ -557,12 +557,12 @@ impl RegoVM {
         });
     }
 
-    /// Called after `target` was written. Only writes to the executing
-    /// partial rule's result are emissions; `key` is `None` for a set
-    /// element.
+    /// Called after `target` was written with `key` and `value`, as read
+    /// before the write. Only writes to the executing partial rule's result
+    /// are emissions; `key` is `None` for a set element.
     #[cold]
     #[inline(never)]
-    pub(super) fn explain_emission(&mut self, target: u8, key: Option<u8>, value: u8) {
+    pub(super) fn explain_emission(&mut self, target: u8, key: Option<&Value>, value: &Value) {
         let emits = self.call_rule_stack.last().is_some_and(|ctx| {
             ctx.result_reg == target
                 && match ctx.rule_type {
@@ -575,8 +575,6 @@ impl RegoVM {
             return;
         }
         self.explain_deliver(|vm, recorder| {
-            let value = vm.explain_register(value);
-            let key = key.map(|key| vm.explain_register(key));
             if value == &Value::Undefined || key.is_some_and(|key| key == &Value::Undefined) {
                 return;
             }

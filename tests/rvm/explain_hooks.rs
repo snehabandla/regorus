@@ -1537,6 +1537,67 @@ fn retarget(program: &Program, target: impl Fn(&Program, &Instruction) -> Option
     altered
 }
 
+/// An emitted operand that is the partial rule's result itself is reported
+/// as it was before the write. The programs are altered so that `SetAdd`
+/// and `ObjectSet` read an operand from the result register.
+#[test]
+fn emissions_of_the_result_itself_report_its_value_before_the_write() {
+    let set = Value::new_set();
+    let object = Value::new_object();
+    let cases = [
+        (
+            "package t\np contains input.x if true\n",
+            "data.t.p",
+            false,
+            None,
+            set,
+        ),
+        (
+            "package t\no[input.x] := 1 if true\n",
+            "data.t.o",
+            false,
+            Some(v(r#""a""#)),
+            object.clone(),
+        ),
+        (
+            "package t\no[input.x] := 1 if true\n",
+            "data.t.o",
+            true,
+            Some(object),
+            v("1"),
+        ),
+    ];
+    for (policy, query, alias_key, key, value) in cases {
+        let mut altered = compile(policy, query).unwrap().as_ref().clone();
+        for instruction in &mut altered.instructions {
+            match instruction {
+                Instruction::SetAdd { set, value } => *value = *set,
+                Instruction::ObjectSet { obj, key, .. } if alias_key => *key = *obj,
+                Instruction::ObjectSet { obj, value, .. } => *value = *obj,
+                _ => {}
+            }
+        }
+        let altered = Arc::new(altered);
+        let expected = Event::Emission {
+            key: key.clone(),
+            value: value.clone(),
+        };
+        for mode in MODES {
+            let r = run_program(&altered, r#"{"x":"a"}"#, mode, false);
+            let emissions: Vec<_> = r
+                .events()
+                .into_iter()
+                .filter(|e| matches!(e, Event::Emission { .. }))
+                .collect();
+            assert_eq!(
+                emissions,
+                std::slice::from_ref(&expected),
+                "{policy} {mode:?}"
+            );
+        }
+    }
+}
+
 /// A successful write to a collection that is not the executing partial
 /// rule's result is not an emission. The programs are altered so that
 /// `SetAdd` and `ObjectSet` write to the iterated collection instead.
