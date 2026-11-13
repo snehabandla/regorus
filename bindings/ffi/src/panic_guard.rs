@@ -162,7 +162,9 @@ mod location_hook {
     }
 
     fn record(info: &PanicHookInfo<'_>) {
-        let guarded = GUARD_DEPTH.try_with(|depth| depth.get() > 0).unwrap_or(false);
+        let guarded = GUARD_DEPTH
+            .try_with(|depth| depth.get() > 0)
+            .unwrap_or(false);
         if !guarded {
             return;
         }
@@ -284,7 +286,9 @@ fn finalize(outcome: GuardResult<RegorusResult>) -> RegorusResult {
     match outcome {
         GuardResult::Success(result) => result,
         #[cfg(feature = "std")]
-        GuardResult::Panic(message) => RegorusResult::err_with_message(RegorusStatus::Panic, message),
+        GuardResult::Panic(message) => {
+            RegorusResult::err_with_message(RegorusStatus::Panic, message)
+        }
     }
 }
 
