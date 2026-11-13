@@ -344,6 +344,7 @@ impl RegoVM {
                 warnings: Vec::new(),
             });
         };
+        let anchor = conds.first().map_or(usize::MAX, |c| c.pc);
         let single = rule_info.is_some_and(|info| {
             matches!(info.rule_type, RuleType::Complete)
                 && info.function_info.is_none()
@@ -353,16 +354,30 @@ impl RegoVM {
                 && info.destructuring_blocks.iter().all(Option::is_none)
         });
         if !single || !state.committed.is_empty() {
-            return Ok(unsupported(warning(&program, Some(Reason::RuleShape), 0)));
+            return Ok(unsupported(warning(
+                &program,
+                Some(Reason::RuleShape),
+                anchor,
+            )));
         }
         if !is_lossless(&value) {
-            return Ok(unsupported(warning(&program, Some(Reason::NotJson), 0)));
+            return Ok(unsupported(warning(
+                &program,
+                Some(Reason::NotJson),
+                anchor,
+            )));
         }
         let mut conditions = Vec::with_capacity(conds.len());
         for cond in conds {
             match condition(&program, rule_info.map(|i| i.name.clone()), cond) {
                 Some(c) => conditions.push(c),
-                None => return Ok(unsupported(warning(&program, Some(Reason::NotJson), 0))),
+                None => {
+                    return Ok(unsupported(warning(
+                        &program,
+                        Some(Reason::NotJson),
+                        anchor,
+                    )))
+                }
             }
         }
         Ok(PartialEvalResult {
