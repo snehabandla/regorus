@@ -7,11 +7,10 @@
 use crate::Rc;
 use crate::Value;
 
-use super::super::obj_map::remove_element_field;
 use super::super::obj_map::{
-    collision_safe_key, is_root_field_collision, obj_contains, obj_insert, obj_insert_rc,
-    obj_remove, set_nested_lowercased, ObjMap,
+    collision_safe_key, is_root_field_collision, obj_insert_rc, set_nested_lowercased, ObjMap,
 };
+use super::super::path;
 use super::super::types::ResolvedAliases;
 use super::element_remap::apply_element_remap_precomputed;
 use super::flatten::normalize_value;
@@ -31,7 +30,7 @@ pub fn apply_alias_entries(
     let sub_resource_set = &aliases.sub_resource_arrays;
 
     for (lc_key, entry) in entries {
-        if entry.is_wildcard {
+        if entry.is_wildcard || !entry.has_valid_short_name() {
             continue;
         }
 
@@ -40,21 +39,22 @@ pub fn apply_alias_entries(
             continue;
         }
 
-        // Use precomputed segments for all paths (default and versioned).
-        let segments = entry.select_path_segments(api_version);
-        let value = navigate_arm_path_segments(raw, segments);
+        // Use the precomputed parsed path (default or versioned).
+        let Some(value) = entry
+            .select_arm_path(api_version)
+            .and_then(|arm| path::get(raw, &arm.segments, false))
+        else {
+            continue;
+        };
+        let value = normalize_value(value, &entry.short_name, None);
 
-        if let Some(value) = value {
-            let value = normalize_value(&value, &entry.short_name, None);
-
-            if is_root_field_collision(&entry.short_name, &entry.default_path) {
-                let target = collision_safe_key(&entry.short_name);
-                set_nested_lowercased(result, &target, value);
-            } else if entry.short_name.contains('.') {
-                set_nested_lowercased(result, &entry.short_name, value);
-            } else {
-                obj_insert_rc(result, Rc::clone(&entry.short_name_lc), value);
-            }
+        if is_root_field_collision(&entry.short_name, &entry.default_path) {
+            let target = collision_safe_key(&entry.short_name);
+            set_nested_lowercased(result, &target, value);
+        } else if entry.short_name.contains(['.', '[']) {
+            set_nested_lowercased(result, &entry.short_name, value);
+        } else {
+            obj_insert_rc(result, Rc::clone(&entry.short_name_lc), value);
         }
     }
 
@@ -68,30 +68,12 @@ pub fn apply_alias_entries(
     });
 
     for remap in &agg.element_remaps {
+        // Moves the ARM field so the normalized output only has the alias
+        // short name; a stale source would duplicate under restored casing.
         apply_element_remap_precomputed(result, remap);
-        // Remove the original ARM field so the normalized output only has the
-        // alias short name.  Without this, the stale source key survives and
-        // casing restoration during denormalization can produce a duplicate.
-        remove_element_field(result, &remap.array_chain, &remap.source_field);
     }
 
     for (source_lc, target_lc) in &agg.array_renames_normalize {
-        if !obj_contains(result, target_lc.as_str()) {
-            if let Some(val) = obj_remove(result, source_lc.as_str()) {
-                obj_insert(result, target_lc, val);
-            }
-        }
+        path::rename(result, source_lc, target_lc, true);
     }
-}
-
-/// Navigate an ARM path using precomputed segments (avoids per-call split).
-fn navigate_arm_path_segments(value: &Value, segments: &[Rc<str>]) -> Option<Value> {
-    let mut current = value;
-    for segment in segments {
-        current = current
-            .as_object()
-            .ok()?
-            .get(&Value::String(Rc::clone(segment)))?;
-    }
-    Some(current.clone())
 }

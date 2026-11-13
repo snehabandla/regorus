@@ -428,11 +428,13 @@ pub struct ResolvedEntry {
     pub is_wildcard: bool,
     /// Pre-lowercased short name as `Rc<str>` for allocation-free common-case inserts.
     pub(crate) short_name_lc: Rc<str>,
-    /// Precomputed `default_path.split('.').collect()` for fast ARM path navigation.
-    pub(crate) default_path_segments: Vec<Rc<str>>,
-    /// Precomputed path segments for each versioned path, in the same order
-    /// as `versioned_paths`.
-    pub(crate) versioned_path_segments: Vec<Vec<Rc<str>>>,
+    /// Parsed `default_path` for ARM path navigation; `None` if it does not
+    /// parse.
+    pub(super) default_arm_path: Option<super::path::Path>,
+    /// Parsed versioned paths, in the same order as `versioned_paths`.
+    pub(super) versioned_arm_paths: Vec<Option<super::path::Path>>,
+    /// Whether the short name parses.
+    valid_short_name: bool,
 }
 
 impl ResolvedEntry {
@@ -443,7 +445,9 @@ impl ResolvedEntry {
         versioned_paths: Vec<(String, String)>,
         metadata: Option<AliasPathMetadata>,
     ) -> Self {
-        let is_wildcard = super::path::parse(&short_name).map_or_else(
+        let short_path = super::path::parse(&short_name);
+        let valid_short_name = short_path.is_some();
+        let is_wildcard = short_path.map_or_else(
             || short_name.contains("[*]"),
             |path| path.segments.contains(&super::path::Segment::Wildcard),
         );
@@ -452,10 +456,10 @@ impl ResolvedEntry {
         } else {
             Rc::from(short_name.to_ascii_lowercase())
         };
-        let default_path_segments = default_path.split('.').map(Rc::from).collect();
-        let versioned_path_segments = versioned_paths
+        let default_arm_path = super::path::parse(&default_path);
+        let versioned_arm_paths = versioned_paths
             .iter()
-            .map(|(_, p)| p.split('.').map(Rc::from).collect())
+            .map(|(_, p)| super::path::parse(p))
             .collect();
         Self {
             short_name,
@@ -464,9 +468,18 @@ impl ResolvedEntry {
             metadata,
             is_wildcard,
             short_name_lc,
-            default_path_segments,
-            versioned_path_segments,
+            default_arm_path,
+            versioned_arm_paths,
+            valid_short_name,
         }
+    }
+
+    /// Whether the short name parses. Entries with an unparseable short name
+    /// are skipped by scalar normalization and denormalization; an
+    /// unparseable ARM path skips the entry only for the API versions that
+    /// select it.
+    pub(crate) const fn has_valid_short_name(&self) -> bool {
+        self.valid_short_name
     }
 
     /// Select the ARM path for a given API version.
@@ -484,22 +497,20 @@ impl ResolvedEntry {
         &self.default_path
     }
 
-    /// Select pre-tokenized path segments for a given API version.
-    ///
-    /// Returns the versioned segments if `api_version` matches, otherwise
-    /// the default segments.  This avoids per-call `split('.')` for both
-    /// default and versioned scalar alias navigation.
-    pub(crate) fn select_path_segments(&self, api_version: Option<&str>) -> &[Rc<str>] {
+    /// Select the parsed ARM path for a given API version, as
+    /// [`Self::select_path`] selects its text. `None` if that path does not
+    /// parse.
+    pub(super) fn select_arm_path(&self, api_version: Option<&str>) -> Option<&super::path::Path> {
         if let Some(ver) = api_version {
             for (i, (v, _)) in self.versioned_paths.iter().enumerate() {
                 if v.eq_ignore_ascii_case(ver) {
-                    if let Some(segs) = self.versioned_path_segments.get(i) {
-                        return segs;
+                    if let Some(path) = self.versioned_arm_paths.get(i) {
+                        return path.as_ref();
                     }
                 }
             }
         }
-        &self.default_path_segments
+        self.default_arm_path.as_ref()
     }
 }
 
