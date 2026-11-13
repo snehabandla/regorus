@@ -1197,7 +1197,7 @@ fn iteration_text_stops_at_statement_and_grouping_delimiters() -> anyhow::Result
         loops,
         vec![
             ("input.a | input.b", Some(("p.rego", 5, 11))),
-            ("input.a | input.b", Some(("p.rego", 6, 12))),
+            ("(input.a | input.b)", Some(("p.rego", 6, 11))),
         ]
     );
     Ok(())

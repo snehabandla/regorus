@@ -144,7 +144,10 @@ impl Provenance {
                 let (text, location) = span
                     .and_then(|span| Some((sources.get(span.source_index)?, span)))
                     .and_then(|(source, span)| {
-                        let (first, last) = source.expression(span)?;
+                        let (mut first, mut last) = source.expression(span)?;
+                        if shape.kind == ConditionKind::Iteration {
+                            (first, last) = source.include_grouping(first, last);
+                        }
                         Some((source.text(first, last)?, Some(source.location(first)?)))
                     })
                     .unwrap_or_default();
@@ -756,6 +759,21 @@ impl<'a> SourceIndex<'a> {
         {
             first = first.saturating_add(1);
             last = last.saturating_sub(1);
+        }
+        (first, last)
+    }
+
+    /// Include matched source parentheses surrounding an expression. The
+    /// parser drops grouping nodes, but provenance text must retain them.
+    fn include_grouping(&self, mut first: usize, mut last: usize) -> (usize, usize) {
+        while let Some(open) = first.checked_sub(1) {
+            if self.symbol(open) != Some("(")
+                || self.closing(open, self.tokens.len()) != last.checked_add(1)
+            {
+                break;
+            }
+            first = open;
+            last = last.saturating_add(1);
         }
         (first, last)
     }
