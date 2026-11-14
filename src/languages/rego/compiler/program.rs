@@ -40,9 +40,9 @@ impl<'a> Compiler<'a> {
         &mut self,
         dest: super::Register,
         container: super::Register,
-        key: &str,
+        key: Value,
     ) {
-        let literal_idx = self.add_literal(Value::String(key.into()));
+        let literal_idx = self.add_literal(key);
         self.program.instructions.push(Instruction::IndexLiteral {
             dest,
             container,

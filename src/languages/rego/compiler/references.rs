@@ -169,14 +169,8 @@ impl<'a> Compiler<'a> {
             let rule_candidate =
                 format_string_path(&static_prefix[0..=i]).map_err(CompilerError::from)?;
 
-            // Defaults shadowed by a dynamically keyed rule are read through it.
-            if self
-                .policy
-                .inner
-                .shadowed_default_owner(&rule_candidate)
-                .is_some()
-            {
-                continue;
+            if let Some(value) = self.compile_shadowed_default_call(&rule_candidate, span)? {
+                return self.compile_chain_access(value, &chain.components[i..], span);
             }
 
             if let Ok(rule_index) = self.get_or_assign_rule_index(&rule_candidate) {
@@ -210,12 +204,7 @@ impl<'a> Compiler<'a> {
             .rules
             .keys()
             .chain(self.policy.inner.default_rules.keys())
-            .filter(|rule_path| {
-                self.policy
-                    .inner
-                    .shadowed_default_owner(rule_path)
-                    .is_none()
-            })
+            .filter(|rule_path| !self.policy.inner.shadowed_defaults.contains_key(*rule_path))
             .filter(|rule_path| self.matches_path_pattern(rule_path, &path_pattern))
             .cloned()
             .collect();
@@ -325,26 +314,8 @@ impl<'a> Compiler<'a> {
                     append_path_component(&rule_candidate, field).map_err(CompilerError::from)?;
             }
 
-            // Defaults shadowed by a dynamically keyed rule are read through it.
-            if let Some((owner, keys)) = self.policy.inner.shadowed_default_access(&rule_candidate)
-            {
-                let owner = owner.clone();
-                let components: Vec<AccessComponent> = keys
-                    .iter()
-                    .cloned()
-                    .map(AccessComponent::Field)
-                    .chain(chain.components[i..].iter().cloned())
-                    .collect();
-                let rule_index = self.get_or_assign_rule_index(&owner)?;
-                let rule_result_reg = self.alloc_register()?;
-                self.emit_instruction(
-                    Instruction::CallRule {
-                        dest: rule_result_reg,
-                        rule_index,
-                    },
-                    span,
-                );
-                return self.compile_chain_access(rule_result_reg, &components, span);
+            if let Some(value) = self.compile_shadowed_default_call(&rule_candidate, span)? {
+                return self.compile_chain_access(value, &chain.components[i..], span);
             }
 
             if let Ok(rule_index) = self.get_or_assign_rule_index(&rule_candidate) {
@@ -385,6 +356,41 @@ impl<'a> Compiler<'a> {
             name: root.to_string(),
         }
         .at(span))
+    }
+
+    /// Calls a shadowed default `path` (see `ShadowedDefault`), i.e. the rules
+    /// that can produce it, and selects the path in their value. Returns `None`
+    /// if those rules cannot be compiled as one rule, so that the path is
+    /// compiled as if it had no default.
+    fn compile_shadowed_default_call(
+        &mut self,
+        path: &str,
+        span: &Span,
+    ) -> Result<Option<Register>> {
+        let Some(shadowed) = self.policy.inner.shadowed_defaults.get(path) else {
+            return Ok(None);
+        };
+        let Ok(rule_index) = self.get_or_assign_rule_index(path) else {
+            return Ok(None);
+        };
+        let mut value = self.alloc_register()?;
+        let call = Instruction::CallRule {
+            dest: value,
+            rule_index,
+        };
+        self.emit_instruction(call, span);
+        for key in &shadowed.keys {
+            let dest = self.alloc_register()?;
+            let literal_idx = self.add_literal(key.clone());
+            let index = Instruction::IndexLiteral {
+                dest,
+                container: value,
+                literal_idx,
+            };
+            self.emit_instruction(index, span);
+            value = dest;
+        }
+        Ok(Some(value))
     }
 
     /// Compile chain access using appropriate instructions based on chain length and complexity

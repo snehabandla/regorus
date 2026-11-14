@@ -38,7 +38,10 @@ impl<'a> Compiler<'a> {
     }
 
     pub(super) fn compute_rule_type(&self, rule_path: &str) -> Result<RuleType> {
-        let Some(definitions) = self.policy.inner.rules.get(rule_path) else {
+        let inner = &self.policy.inner;
+        let Some(definitions) =
+            (inner.rules.get(rule_path)).or_else(|| inner.shadowed_default_rules(rule_path))
+        else {
             // Default-only rules (e.g., `default deny := true`) have no regular definitions
             // in the `rules` map — they only exist in `default_rules`. Treat them as Complete.
             if self.policy.inner.default_rules.contains_key(rule_path) {
@@ -196,7 +199,9 @@ impl<'a> Compiler<'a> {
         rule_path: &str,
         rules: &Map<String, Vec<crate::ast::NodeRef<Rule>>>,
     ) -> Result<(String, u32)> {
-        if let Some(rule_definitions) = rules.get(rule_path) {
+        if let Some(rule_definitions) =
+            (rules.get(rule_path)).or_else(|| self.policy.inner.shadowed_default_rules(rule_path))
+        {
             if let Some(first_rule_ref) = rule_definitions.first() {
                 let rule = first_rule_ref.as_ref();
 
@@ -300,19 +305,19 @@ impl<'a> Compiler<'a> {
                     entry_point_name.to_string()
                 }
             };
-            // A default shadowed by a dynamically keyed rule is read through that rule.
-            let (call_path, keys) = match policy.inner.shadowed_default_access(&rule_path) {
-                Some((owner, keys)) => (owner.clone(), keys.to_vec()),
-                None => (rule_path, Vec::new()),
-            };
-            let rule_idx = compiler.get_or_assign_rule_index(&call_path)?;
+            // A shadowed default is read from the value of the rules producing it.
+            let keys = policy.inner.shadowed_defaults.get(&rule_path);
+            let keys = keys
+                .map(|shadowed| shadowed.keys.clone())
+                .unwrap_or_default();
+            let rule_idx = compiler.get_or_assign_rule_index(&rule_path)?;
             compiler
                 .entry_points
                 .insert(entry_point_name.to_string(), instruction_index);
             compiler.emit_call_rule(result_reg, rule_idx);
 
             let mut value_reg = result_reg;
-            for key in &keys {
+            for key in keys {
                 let dest = compiler.alloc_register()?;
                 compiler.emit_index_literal(dest, value_reg, key);
                 value_reg = dest;
@@ -412,7 +417,9 @@ impl<'a> Compiler<'a> {
         self.current_module_index = module_index;
 
         let saved_register_counter = self.register_counter;
-        if let Some(rule_definitions) = rules.get(rule_path) {
+        if let Some(rule_definitions) =
+            (rules.get(rule_path)).or_else(|| self.policy.inner.shadowed_default_rules(rule_path))
+        {
             let Some(rule_index) = self.rule_index_map.get(rule_path).copied() else {
                 return Err(CompilerError::General {
                     message: format!(
@@ -745,7 +752,9 @@ impl<'a> Compiler<'a> {
 
             self.rule_function_param_count[rule_index as usize] = rule_param_count;
 
-            if rule_param_count.is_none() {
+            // A shadowed default's rule produces its owner's value, not the path's.
+            let shadowed = self.policy.inner.shadowed_defaults.contains_key(rule_path);
+            if rule_param_count.is_none() && !shadowed {
                 let components = self
                     .policy
                     .inner

@@ -19,7 +19,10 @@ struct Case {
     name: &'static str,
     v0: bool,
     modules: &'static [&'static str],
-    /// Query, then input and the expected result (JSON or `undefined`).
+    /// Query, then input and the expected result (JSON or `undefined`) from
+    /// OPA, optionally followed by `; <engine prefix>=<value>` pins that record
+    /// a divergence of that engine which predates this behavior (e.g. the RVM
+    /// does not support nested dynamic keys such as `p.q[k].s`).
     queries: &'static [(&'static str, &'static [(&'static str, &'static str)])],
 }
 
@@ -142,7 +145,6 @@ default r := 0
         modules: &[
             r#"package probe
 p[k] := 1 if { some k in input.ks }
-parent := p
 child := p.r
 "#,
             r#"package probe
@@ -164,7 +166,6 @@ default p.r := 0
         modules: &[
             r#"package probe
 default p.r := 0
-parent := p
 child := p.r
 "#,
             r#"package probe
@@ -223,7 +224,6 @@ child := p.r
         modules: &[r#"package probe
 p.q[k] := 1 if { some k in input.ks }
 default p.q.r := 0
-parent := p
 child := p.q.r
 "#],
         queries: &[(
@@ -359,7 +359,6 @@ child := data.probe.p.r
 p[k] := 1 if { some k in input.ks }
 p.r := 2 if input.x
 default p.r := 0
-parent := p
 child := p.r
 "#],
         queries: &[(
@@ -378,17 +377,26 @@ child := p.r
         modules: &[r#"package probe
 p.a := 1 if { "a" in input.ks }
 default p.r := 0
-parent := p
 child := p.r
 "#],
-        queries: &[(
-            "data.probe.child",
-            &[
-                (r#"{"ks":[]}"#, r#"0"#),
-                (r#"{"ks":["a"]}"#, r#"0"#),
-                (r#"{"ks":["r"]}"#, r#"0"#),
-            ],
-        )],
+        queries: &[
+            (
+                "data.probe.child",
+                &[
+                    (r#"{"ks":[]}"#, r#"0"#),
+                    (r#"{"ks":["a"]}"#, r#"0"#),
+                    (r#"{"ks":["r"]}"#, r#"0"#),
+                ],
+            ),
+            (
+                "data.probe.p.r",
+                &[
+                    (r#"{"ks":[]}"#, r#"0"#),
+                    (r#"{"ks":["a"]}"#, r#"0"#),
+                    (r#"{"ks":["r"]}"#, r#"0"#),
+                ],
+            ),
+        ],
     },
     Case {
         name: "dyn_sibling_deeper",
@@ -396,17 +404,26 @@ child := p.r
         modules: &[r#"package probe
 p.q[k] := 1 if { some k in input.ks }
 default p.r := 0
-parent := p
 child := p.r
 "#],
-        queries: &[(
-            "data.probe.child",
-            &[
-                (r#"{"ks":[]}"#, r#"0"#),
-                (r#"{"ks":["a"]}"#, r#"0"#),
-                (r#"{"ks":["r"]}"#, r#"0"#),
-            ],
-        )],
+        queries: &[
+            (
+                "data.probe.child",
+                &[
+                    (r#"{"ks":[]}"#, r#"0"#),
+                    (r#"{"ks":["a"]}"#, r#"0"#),
+                    (r#"{"ks":["r"]}"#, r#"0"#),
+                ],
+            ),
+            (
+                "data.probe.p.r",
+                &[
+                    (r#"{"ks":[]}"#, r#"0"#),
+                    (r#"{"ks":["a"]}"#, r#"0"#),
+                    (r#"{"ks":["r"]}"#, r#"0"#),
+                ],
+            ),
+        ],
     },
     Case {
         name: "static_key_rule_sibling_default",
@@ -414,17 +431,26 @@ child := p.r
         modules: &[r#"package probe
 p["a"] := 1 if { "a" in input.ks }
 default p.r := 0
-parent := p
 child := p.r
 "#],
-        queries: &[(
-            "data.probe.child",
-            &[
-                (r#"{"ks":[]}"#, r#"0"#),
-                (r#"{"ks":["a"]}"#, r#"0"#),
-                (r#"{"ks":["r"]}"#, r#"0"#),
-            ],
-        )],
+        queries: &[
+            (
+                "data.probe.child",
+                &[
+                    (r#"{"ks":[]}"#, r#"0"#),
+                    (r#"{"ks":["a"]}"#, r#"0"#),
+                    (r#"{"ks":["r"]}"#, r#"0"#),
+                ],
+            ),
+            (
+                "data.probe.p.r",
+                &[
+                    (r#"{"ks":[]}"#, r#"0"#),
+                    (r#"{"ks":["a"]}"#, r#"0"#),
+                    (r#"{"ks":["r"]}"#, r#"0"#),
+                ],
+            ),
+        ],
     },
     Case {
         name: "contains_sibling",
@@ -432,17 +458,26 @@ child := p.r
         modules: &[r#"package probe
 p.q contains k if { some k in input.ks }
 default p.r := 0
-parent := p
 child := p.r
 "#],
-        queries: &[(
-            "data.probe.child",
-            &[
-                (r#"{"ks":[]}"#, r#"0"#),
-                (r#"{"ks":["a"]}"#, r#"0"#),
-                (r#"{"ks":["r"]}"#, r#"0"#),
-            ],
-        )],
+        queries: &[
+            (
+                "data.probe.child",
+                &[
+                    (r#"{"ks":[]}"#, r#"0"#),
+                    (r#"{"ks":["a"]}"#, r#"0"#),
+                    (r#"{"ks":["r"]}"#, r#"0"#),
+                ],
+            ),
+            (
+                "data.probe.p.r",
+                &[
+                    (r#"{"ks":[]}"#, r#"0"#),
+                    (r#"{"ks":["a"]}"#, r#"0"#),
+                    (r#"{"ks":["r"]}"#, r#"0"#),
+                ],
+            ),
+        ],
     },
     Case {
         name: "v0_partial_set_sibling",
@@ -450,17 +485,26 @@ child := p.r
         modules: &[r#"package probe
 p.q[x] { x := input.ks[_] }
 default p.r = 0
-parent := p
 child := p.r
 "#],
-        queries: &[(
-            "data.probe.child",
-            &[
-                (r#"{"ks":[]}"#, r#"0"#),
-                (r#"{"ks":["a"]}"#, r#"0"#),
-                (r#"{"ks":["r"]}"#, r#"0"#),
-            ],
-        )],
+        queries: &[
+            (
+                "data.probe.child",
+                &[
+                    (r#"{"ks":[]}"#, r#"0"#),
+                    (r#"{"ks":["a"]}"#, r#"0"#),
+                    (r#"{"ks":["r"]}"#, r#"0"#),
+                ],
+            ),
+            (
+                "data.probe.p.r",
+                &[
+                    (r#"{"ks":[]}"#, r#"0"#),
+                    (r#"{"ks":["a"]}"#, r#"0"#),
+                    (r#"{"ks":["r"]}"#, r#"0"#),
+                ],
+            ),
+        ],
     },
     Case {
         name: "dyn_two_levels_default_mid",
@@ -469,8 +513,6 @@ child := p.r
 p.q[k].s := 1 if { some k in input.ks }
 default p.q.r.s := 0
 default p.t := 2
-parent := p
-child := p.q.r.s
 t := p.t
 "#],
         queries: &[(
@@ -491,18 +533,27 @@ q[k] := 1 if { some k in input.ks }
 "#,
             r#"package probe
 default p.r := 0
-parent := p
 child := p.r
 "#,
         ],
-        queries: &[(
-            "data.probe.child",
-            &[
-                (r#"{"ks":[]}"#, r#"0"#),
-                (r#"{"ks":["a"]}"#, r#"0"#),
-                (r#"{"ks":["r"]}"#, r#"0"#),
-            ],
-        )],
+        queries: &[
+            (
+                "data.probe.child",
+                &[
+                    (r#"{"ks":[]}"#, r#"0"#),
+                    (r#"{"ks":["a"]}"#, r#"0"#),
+                    (r#"{"ks":["r"]}"#, r#"0"#),
+                ],
+            ),
+            (
+                "data.probe.p.r",
+                &[
+                    (r#"{"ks":[]}"#, r#"0"#),
+                    (r#"{"ks":["a"]}"#, r#"0"#),
+                    (r#"{"ks":["r"]}"#, r#"0"#),
+                ],
+            ),
+        ],
     },
     Case {
         name: "sibling_defaults_no_dyn",
@@ -511,7 +562,6 @@ child := p.r
 p.r := 5 if input.x
 default p.r := 0
 default p.s := 1
-parent := p
 child := p.r
 "#],
         queries: &[
@@ -525,9 +575,327 @@ child := p.r
             ),
         ],
     },
+    Case {
+        name: "r1_rule_reads_shadowed_default",
+        v0: false,
+        modules: &[r#"package probe
+p[k] := 1 if some k in input.ks
+default p.r := 0
+p.s := x if { x := p.r }
+"#],
+        queries: &[(
+            "data.probe.p.s",
+            &[
+                (r#"{"ks":[]}"#, r#"undefined"#),
+                (r#"{"ks":["a"]}"#, r#"undefined"#),
+                (r#"{"ks":["r"]}"#, r#"1"#),
+            ],
+        )],
+    },
+    Case {
+        name: "r2_rule_tests_shadowed_default",
+        v0: false,
+        modules: &[r#"package probe
+p[k] := 1 if { some k in input.ks; k != "s" }
+default p.r := 0
+p.s := 7 if { p.r }
+"#],
+        queries: &[(
+            "data.probe.p.s",
+            &[
+                (r#"{"ks":[]}"#, r#"undefined"#),
+                (r#"{"ks":["r"]}"#, r#"7"#),
+            ],
+        )],
+    },
+    Case {
+        name: "t1_dyn_two_levels_default_mid",
+        v0: false,
+        modules: &[r#"package probe
+p.q[k].s := 1 if { some k in input.ks }
+default p.q.r.s := 0
+default p.t := 2
+parent := p
+child := p.q.r.s
+t := p.t
+"#],
+        queries: &[
+            (
+                "data.probe.child",
+                &[
+                    (r#"{"ks":[]}"#, r#"undefined"#),
+                    (r#"{"ks":["a"]}"#, r#"undefined"#),
+                    (r#"{"ks":["r"]}"#, r#"1; rvm=undefined"#),
+                ],
+            ),
+            (
+                "data.probe.parent",
+                &[
+                    (
+                        r#"{"ks":[]}"#,
+                        r#"{"q":{},"t":2}; interpreter={"t":2}; rvm=undefined"#,
+                    ),
+                    (r#"{"ks":["a"]}"#, r#"{"q":{"a":{"s":1}},"t":2}; rvm=1"#),
+                    (r#"{"ks":["r"]}"#, r#"{"q":{"r":{"s":1}},"t":2}; rvm=1"#),
+                ],
+            ),
+            (
+                "data.probe.p.q.r.s",
+                &[
+                    (r#"{"ks":[]}"#, r#"undefined"#),
+                    (r#"{"ks":["a"]}"#, r#"undefined"#),
+                    (r#"{"ks":["r"]}"#, r#"1; rvm=undefined"#),
+                ],
+            ),
+        ],
+    },
+    Case {
+        name: "t2_virtual_lookup",
+        v0: false,
+        modules: &[
+            r#"package probe
+p[k] := 1 if some k in input.ks
+default p.r := 0
+"#,
+            r#"package q
+y := data.probe[input.n].r
+all := data.probe
+"#,
+        ],
+        queries: &[(
+            "data.q.y",
+            &[
+                (r#"{"ks":[],"n":"p"}"#, r#"undefined"#),
+                (r#"{"ks":["r"],"n":"p"}"#, r#"1; rvm=undefined"#),
+            ],
+        )],
+    },
+    Case {
+        name: "t3_data_chain_via_static_rule",
+        v0: false,
+        modules: &[r#"package probe
+p[x] := {"t": 1} if some x in input.ks
+p.r.s := 2 if input.y
+default p.r.t := 0
+a := data.probe.p.r.t
+b := p.r.t
+"#],
+        queries: &[
+            (
+                "data.probe.a",
+                &[
+                    (r#"{"ks":[]}"#, r#"undefined"#),
+                    (r#"{"ks":["r"]}"#, r#"1"#),
+                ],
+            ),
+            (
+                "data.probe.b",
+                &[
+                    (r#"{"ks":[]}"#, r#"undefined"#),
+                    (r#"{"ks":["r"]}"#, r#"1"#),
+                ],
+            ),
+        ],
+    },
+    Case {
+        name: "t4_number_owner_string_default",
+        v0: false,
+        modules: &[r#"package probe
+p[1][k] := 1 if some k in input.ks
+default p["1"].s := 0
+a := p["1"].s
+b := p[1]
+"#],
+        queries: &[(
+            "data.probe.a",
+            &[(r#"{"ks":[]}"#, r#"0"#), (r#"{"ks":["s"]}"#, r#"0"#)],
+        )],
+    },
+    Case {
+        name: "t4b_bool_owner_string_default",
+        v0: false,
+        modules: &[r#"package probe
+p[true][k] := 1 if some k in input.ks
+default p["true"].s := 0
+a := p["true"].s
+"#],
+        queries: &[(
+            "data.probe.a",
+            &[(r#"{"ks":[]}"#, r#"0"#), (r#"{"ks":["s"]}"#, r#"0"#)],
+        )],
+    },
+    Case {
+        name: "t5_number_key_redirect",
+        v0: false,
+        modules: &[r#"package probe
+p[k] := {"s": 9} if some k in input.ks
+default p[1].s := 0
+a := p[1].s
+"#],
+        queries: &[
+            (
+                "data.probe.a",
+                &[
+                    (r#"{"ks":[]}"#, r#"undefined"#),
+                    (r#"{"ks":[1]}"#, r#"9"#),
+                    (r#"{"ks":["1"]}"#, r#"undefined"#),
+                ],
+            ),
+            (
+                "data.probe.p.1.s",
+                &[
+                    (r#"{"ks":[]}"#, r#"undefined"#),
+                    (r#"{"ks":[1]}"#, r#"9; interpreter=undefined"#),
+                    (r#"{"ks":["1"]}"#, r#"undefined; interpreter=9"#),
+                ],
+            ),
+        ],
+    },
+    Case {
+        name: "t6_mixed_owner",
+        v0: false,
+        modules: &[r#"package probe
+p[k] := 1 if some k in input.ks
+p.q := 2 if input.x
+default p.r := 0
+a := p.r
+"#],
+        queries: &[
+            (
+                "data.probe.a",
+                &[
+                    (r#"{"ks":[]}"#, r#"undefined"#),
+                    (r#"{"ks":["r"]}"#, r#"1"#),
+                    (r#"{"ks":["r"],"x":true}"#, r#"1"#),
+                ],
+            ),
+            (
+                "data.probe.p.r",
+                &[
+                    (r#"{"ks":[]}"#, r#"undefined"#),
+                    (r#"{"ks":["r"]}"#, r#"1"#),
+                    (r#"{"ks":["r"],"x":true}"#, r#"1"#),
+                ],
+            ),
+        ],
+    },
+    Case {
+        name: "t7_phantom_var_path",
+        v0: false,
+        modules: &[r#"package probe
+p[k].s := 1 if some k in input.ks
+default p.k := 0
+a := p.k
+"#],
+        queries: &[
+            (
+                "data.probe.a",
+                &[
+                    (r#"{"ks":[]}"#, r#"undefined"#),
+                    (r#"{"ks":["k"]}"#, r#"{"s":1}; rvm=1"#),
+                    (r#"{"ks":["a"]}"#, r#"undefined; rvm=1"#),
+                ],
+            ),
+            (
+                "data.probe.p.k",
+                &[
+                    (r#"{"ks":[]}"#, r#"undefined"#),
+                    (r#"{"ks":["k"]}"#, r#"{"s":1}; rvm=1"#),
+                    (r#"{"ks":["a"]}"#, r#"undefined; rvm=1"#),
+                ],
+            ),
+        ],
+    },
+    Case {
+        name: "t8_import_alias",
+        v0: false,
+        modules: &[
+            r#"package probe
+p[k] := 1 if some k in input.ks
+default p.r := 0
+"#,
+            r#"package q
+import data.probe.p.r as pr
+y := pr
+"#,
+        ],
+        queries: &[(
+            "data.q.y",
+            &[
+                (r#"{"ks":[]}"#, r#"undefined"#),
+                (r#"{"ks":["r"]}"#, r#"1"#),
+            ],
+        )],
+    },
+    Case {
+        name: "t9_order_twin",
+        v0: false,
+        modules: &[r#"package probe
+default p.t := 2
+default p.q.r.s := 0
+p.q[k].s := 1 if { some k in input.ks }
+t := p.t
+child := p.q.r.s
+"#],
+        queries: &[
+            (
+                "data.probe.t",
+                &[(r#"{"ks":[]}"#, r#"2"#), (r#"{"ks":["r"]}"#, r#"2"#)],
+            ),
+            (
+                "data.probe.child",
+                &[
+                    (r#"{"ks":[]}"#, r#"undefined"#),
+                    (r#"{"ks":["r"]}"#, r#"1; rvm=undefined"#),
+                ],
+            ),
+            (
+                "data.probe.p.t",
+                &[(r#"{"ks":[]}"#, r#"2"#), (r#"{"ks":["r"]}"#, r#"2"#)],
+            ),
+        ],
+    },
+    // OPA rejects this policy (`p.q` conflicts with `p.q.r`); the expected
+    // values are those without the default, which regorus falls back to.
+    Case {
+        name: "p3_mixed_subset",
+        v0: false,
+        modules: &[r#"package probe
+p[k] := 1 if { some k in input.ks }
+p.q := {"r": 5} if input.x
+default p.q.r := 0
+a := p.q.r
+b := data.probe.p.q.r
+"#],
+        queries: &[
+            (
+                "data.probe.a",
+                &[
+                    (r#"{"ks":[]}"#, r#"undefined"#),
+                    (r#"{"ks":["a"],"x":true}"#, r#"5"#),
+                ],
+            ),
+            (
+                "data.probe.b",
+                &[
+                    (r#"{"ks":[]}"#, r#"undefined"#),
+                    (r#"{"ks":["a"],"x":true}"#, r#"5"#),
+                ],
+            ),
+        ],
+    },
 ];
 
-fn expected(text: &str) -> Result<Value> {
+fn expected(text: &str, engine: &str) -> Result<Value> {
+    let mut parts = text.split("; ");
+    let mut text = parts.next().unwrap_or_default();
+    for pin in parts {
+        if let Some((prefix, value)) = pin.split_once('=') {
+            if engine.starts_with(prefix) {
+                text = value;
+            }
+        }
+    }
     if text == "undefined" {
         Ok(Value::Undefined)
     } else {
@@ -564,7 +932,6 @@ fn default_beneath_dynamic_key_matches_opa() -> Result<()> {
     for case in CASES {
         for (query, rows) in case.queries {
             for (input, want) in *rows {
-                let want = expected(want)?;
                 let results = match eval_all(case, query, &Value::from_json_str(input)?) {
                     Ok(results) => results,
                     Err(e) => {
@@ -573,6 +940,7 @@ fn default_beneath_dynamic_key_matches_opa() -> Result<()> {
                     }
                 };
                 for (engine, got) in results {
+                    let want = expected(want, engine)?;
                     if got != want {
                         failures.push(format!(
                             "{} {query} input={input} {engine}: got {got}, want {want}",

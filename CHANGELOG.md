@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Ignore a `default` rule at or beneath a rule with a dynamic key (`default p.r := 0` beside `p[k] := 1`), as OPA does: `p.r` is read through `p[k]` and is undefined unless `p[k]` produces `r`, and the default no longer appears in `p`. Applies to the interpreter and the RVM.
+- [**breaking**] Ignore a `default` rule at or beneath a rule with a dynamic key (`default p.r := 0` beside `p[k] := 1`), as OPA does: `p.r` is read through `p[k]` and is undefined unless `p[k]` produces `r`, and the default no longer appears in `p`. Applies to the interpreter and the RVM. Migration: such defaults are now Undefined, as in OPA; to keep a fallback, give it a name outside the dynamic rule's extent (e.g. `default r := 0` with `r := p.r`).
 
 ## [0.15.0](https://github.com/microsoft/regorus/compare/regorus-v0.14.1...regorus-v0.15.0) - 2026-11-07
 

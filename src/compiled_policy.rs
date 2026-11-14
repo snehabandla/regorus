@@ -15,7 +15,7 @@ use crate::scheduler::*;
 use crate::utils::*;
 use crate::*;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use anyhow::Result;
 
 #[cfg(feature = "azure_policy")]
@@ -221,9 +221,11 @@ pub(crate) struct CompiledPolicyData {
     pub(crate) imports: BTreeMap<String, Ref<Expr>>,
     pub(crate) functions: FunctionTable,
     pub(crate) rule_paths: MapSet<String>,
-    /// Ground prefixes (components and registered path) of rules whose head
-    /// has a dynamic key, such as `data.pkg.p` for `p[k] := 1`.
-    pub(crate) dynamic_rule_owners: Map<Vec<String>, String>,
+    /// Keys of the ground prefixes of rules whose head has a dynamic key, such
+    /// as `["data", "pkg", "p"]` for `p[k] := 1`.
+    pub(crate) dynamic_rule_owners: BTreeSet<Vec<Value>>,
+    /// Paths registered only through `default` rules that such a rule shadows.
+    pub(crate) shadowed_defaults: Map<String, ShadowedDefault>,
     #[cfg(feature = "azure_policy")]
     pub(crate) target_info: Option<TargetInfo>,
     #[cfg(feature = "azure_policy")]
@@ -245,35 +247,41 @@ pub(crate) struct CompiledPolicyData {
     pub(crate) loop_hoisting_table: HoistedLoopsLookup,
 }
 
+/// A path such as `data.pkg.p.r` that is registered only through `default`
+/// rules (`default p.r := 0`) which a dynamically keyed rule (`p[k] := 1`)
+/// shadows. Like OPA, such defaults are ignored and the path is read from the
+/// owner's document.
+#[derive(Debug, Clone)]
+pub(crate) struct ShadowedDefault {
+    /// Keys that select the path within the owner's value.
+    #[cfg_attr(not(feature = "rvm"), allow(dead_code))]
+    pub(crate) keys: Vec<Value>,
+    /// The owner's rules whose heads can produce the path.
+    pub(crate) rules: Vec<Ref<Rule>>,
+}
+
 impl CompiledPolicyData {
-    /// Returns the path of the dynamically keyed rule that owns `components`,
-    /// i.e. whose ground prefix is a prefix of (or equal to) `components`.
-    ///
-    /// Like OPA, rules in such an owner's extent are evaluated through the
-    /// owner, and `default` rules in it are ignored.
-    pub(crate) fn dynamic_rule_owner(&self, components: &[String]) -> Option<&String> {
+    /// Returns how many leading `components` form the ground prefix of a rule
+    /// whose head has a dynamic key, if any does.
+    pub(crate) fn dynamic_rule_owner_len(&self, components: &[PathComponent]) -> Option<usize> {
         if self.dynamic_rule_owners.is_empty() {
             return None;
         }
-        (1..=components.len()).find_map(|len| self.dynamic_rule_owners.get(components.get(..len)?))
-    }
-
-    /// Returns the owner of `path` when it is registered only through `default`
-    /// rules that a dynamically keyed rule shadows.
-    pub(crate) fn shadowed_default_owner(&self, path: &str) -> Option<&String> {
-        if self.rules.contains_key(path) {
-            return None;
+        let mut prefix = vec![];
+        for component in components {
+            prefix.push(component.to_value());
+            if self.dynamic_rule_owners.contains(&prefix) {
+                return Some(prefix.len());
+            }
         }
-        self.dynamic_rule_owner(self.rule_path_components.get(path)?)
+        None
     }
 
-    /// Returns the owner of a shadowed default `path` together with the keys
-    /// that select `path` within the owner's value.
+    /// Returns the rules that define `path` when it is a shadowed default.
     #[cfg(feature = "rvm")]
-    pub(crate) fn shadowed_default_access(&self, path: &str) -> Option<(&String, &[String])> {
-        let owner = self.shadowed_default_owner(path)?;
-        let skip = self.rule_path_components.get(owner).map_or(0, Vec::len);
-        let keys = self.rule_path_components.get(path)?.get(skip..)?;
-        Some((owner, keys))
+    pub(crate) fn shadowed_default_rules(&self, path: &str) -> Option<&Vec<Ref<Rule>>> {
+        self.shadowed_defaults
+            .get(path)
+            .map(|shadowed| &shadowed.rules)
     }
 }
