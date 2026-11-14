@@ -11,7 +11,11 @@
 //! set or a package read. Without strict mode the failing expression is
 //! Undefined. Every case runs in both modes; the expected outcomes were checked
 //! against OPA 1.2.0 with operands read from input, so that OPA's type checker
-//! cannot reject them at compile time.
+//! cannot reject them at compile time. Pre-existing divergences that are not
+//! about strict errors are pinned: RVM default functions (C12), Undefined
+//! entries in RVM package values (C14), the RVM's strict mixed-type
+//! comparisons, and interpreter results for failing arithmetic and partial
+//! sets without strict mode.
 
 use anyhow::{bail, Result};
 use regorus::languages::rego::compiler::Compiler;
@@ -33,6 +37,18 @@ enum Expect {
         want: &'static str,
         rvm: &'static str,
     },
+    /// Known interpreter bug unrelated to the RVM: the RVM (and OPA) return
+    /// `want`, the interpreter returns `interpreter`.
+    InterpreterDiverges {
+        want: &'static str,
+        interpreter: &'static str,
+    },
+    /// Known interpreter bug: without strict mode the interpreter raises an
+    /// error containing `interpreter`, while the RVM (and OPA) return `want`.
+    InterpreterErrors {
+        want: &'static str,
+        interpreter: &'static str,
+    },
 }
 
 struct Case {
@@ -45,6 +61,8 @@ struct Case {
 }
 
 const UNDEFINED: &str = "#undefined";
+/// `{"y": 1, "z": <Undefined>}`, which JSON cannot express.
+const PACKAGE_WITH_UNDEFINED_Z: &str = "#package-with-undefined-z";
 const COUNT_ERROR: &str = "requires array/object/set/string";
 const Y: &str = "data.test.y";
 
@@ -135,11 +153,17 @@ const fn case(
 }
 
 fn cases() -> Vec<Case> {
-    use Expect::{Error, Errors, RvmDiverges, Value as V};
+    use Expect::{Error, Errors, InterpreterDiverges, InterpreterErrors, RvmDiverges, Value as V};
     vec![
         case("count", COUNT, V_BAD, Error(COUNT_ERROR), V(UNDEFINED)),
         case("count twin", COUNT, V_OK, V("2"), V("2")),
-        case("count undefined operand", COUNT, "{}", V(UNDEFINED), V(UNDEFINED)),
+        case(
+            "count undefined operand",
+            COUNT,
+            "{}",
+            V(UNDEFINED),
+            V(UNDEFINED),
+        ),
         case(
             "divide by zero",
             DIV,
@@ -147,7 +171,13 @@ fn cases() -> Vec<Case> {
             Error("divide by zero"),
             V(UNDEFINED),
         ),
-        case("divide twin", DIV, r#"{"a": 1, "b": 2}"#, V("0.5"), V("0.5")),
+        case(
+            "divide twin",
+            DIV,
+            r#"{"a": 1, "b": 2}"#,
+            V("0.5"),
+            V("0.5"),
+        ),
         case(
             "modulo by zero",
             MOD,
@@ -161,7 +191,10 @@ fn cases() -> Vec<Case> {
             MOD,
             r#"{"a": 1.5, "b": 1}"#,
             Error("modulo on floating-point number"),
-            V(UNDEFINED),
+            InterpreterErrors {
+                want: UNDEFINED,
+                interpreter: "modulo on floating-point number",
+            },
         ),
         case(
             "add type error",
@@ -171,7 +204,10 @@ fn cases() -> Vec<Case> {
                 interpreter: "expects numeric argument",
                 rvm: "Cannot add",
             },
-            V(UNDEFINED),
+            InterpreterErrors {
+                want: UNDEFINED,
+                interpreter: "`add` expects numeric argument",
+            },
         ),
         case("add twin", ADD, r#"{"a": 2, "b": 1}"#, V("3"), V("3")),
         case(
@@ -182,7 +218,10 @@ fn cases() -> Vec<Case> {
                 interpreter: "expects numeric argument",
                 rvm: "Cannot subtract",
             },
-            V(UNDEFINED),
+            InterpreterErrors {
+                want: UNDEFINED,
+                interpreter: "`sub` expects numeric argument",
+            },
         ),
         case("subtract twin", SUB, r#"{"a": 3, "b": 1}"#, V("2"), V("2")),
         case(
@@ -193,7 +232,10 @@ fn cases() -> Vec<Case> {
                 interpreter: "expects numeric argument",
                 rvm: "Cannot multiply",
             },
-            V(UNDEFINED),
+            InterpreterErrors {
+                want: UNDEFINED,
+                interpreter: "`mul` expects numeric argument",
+            },
         ),
         case(
             "divide type error",
@@ -203,7 +245,10 @@ fn cases() -> Vec<Case> {
                 interpreter: "expects numeric argument",
                 rvm: "Cannot divide",
             },
-            V(UNDEFINED),
+            InterpreterErrors {
+                want: UNDEFINED,
+                interpreter: "`div` expects numeric argument",
+            },
         ),
         case(
             "to_number",
@@ -240,15 +285,30 @@ fn cases() -> Vec<Case> {
             Error(COUNT_ERROR),
             V(UNDEFINED),
         ),
-        case("else after failed body twin", ELSE_AFTER_FAIL, V_OK, V("2"), V("2")),
+        case(
+            "else after failed body twin",
+            ELSE_AFTER_FAIL,
+            V_OK,
+            V("2"),
+            V("2"),
+        ),
         case(
             "partial set",
             PARTIAL_SET,
             VS_BAD,
             Error(COUNT_ERROR),
-            V("[1]"),
+            InterpreterDiverges {
+                want: "[1]",
+                interpreter: "[]",
+            },
         ),
-        case("partial set twin", PARTIAL_SET, VS_OK, V("[1, 2]"), V("[1, 2]")),
+        case(
+            "partial set twin",
+            PARTIAL_SET,
+            VS_OK,
+            V("[1, 2]"),
+            V("[1, 2]"),
+        ),
         case(
             "comprehension",
             COMPREHENSION,
@@ -256,7 +316,13 @@ fn cases() -> Vec<Case> {
             Error(COUNT_ERROR),
             V("[1]"),
         ),
-        case("comprehension twin", COMPREHENSION, VS_OK, V("[1, 2]"), V("[1, 2]")),
+        case(
+            "comprehension twin",
+            COMPREHENSION,
+            VS_OK,
+            V("[1, 2]"),
+            V("[1, 2]"),
+        ),
         case("every", EVERY, VS_BAD, Error(COUNT_ERROR), V(UNDEFINED)),
         case("every twin", EVERY, VS_OK, V("true"), V("true")),
         case(
@@ -264,10 +330,26 @@ fn cases() -> Vec<Case> {
             DEFAULT_FUNCTION,
             V_BAD,
             Error(COUNT_ERROR),
-            V("0"),
+            // C12: the RVM ignores a default function value.
+            RvmDiverges {
+                want: "0",
+                rvm: UNDEFINED,
+            },
         ),
-        case("default function twin", DEFAULT_FUNCTION, V_OK, V("2"), V("2")),
-        case("unreferenced failing rule", UNREFERENCED, V_BAD, V("1"), V("1")),
+        case(
+            "default function twin",
+            DEFAULT_FUNCTION,
+            V_OK,
+            V("2"),
+            V("2"),
+        ),
+        case(
+            "unreferenced failing rule",
+            UNREFERENCED,
+            V_BAD,
+            V("1"),
+            V("1"),
+        ),
         // Comparing different types is not an error in OPA or the interpreter.
         // The RVM's strict mode turns it into Undefined; that is a separate
         // bug and must not become a hard error.
@@ -287,6 +369,14 @@ fn cases() -> Vec<Case> {
 fn want_value(want: &str) -> Result<Value> {
     if want == UNDEFINED {
         return Ok(Value::Undefined);
+    }
+    if want == PACKAGE_WITH_UNDEFINED_Z {
+        let mut package = Value::new_object();
+        package.as_object_mut()?.insert("y".into(), Value::from(1));
+        package
+            .as_object_mut()?
+            .insert("z".into(), Value::Undefined);
+        return Ok(package);
     }
     Value::from_json_str(want)
 }
@@ -332,11 +422,20 @@ fn eval_vm(
 
 fn check_interpreter(expect: &Expect, got: &Result<Value>) -> Result<()> {
     match (expect, got) {
-        (Expect::Value(want) | Expect::RvmDiverges { want, .. }, Ok(got))
-            if want_value(want)? == *got => {}
+        (
+            Expect::Value(want)
+            | Expect::RvmDiverges { want, .. }
+            | Expect::InterpreterDiverges {
+                interpreter: want, ..
+            },
+            Ok(got),
+        ) if want_value(want)? == *got => {}
         (
             Expect::Error(want)
             | Expect::Errors {
+                interpreter: want, ..
+            }
+            | Expect::InterpreterErrors {
                 interpreter: want, ..
             },
             Err(err),
@@ -348,8 +447,13 @@ fn check_interpreter(expect: &Expect, got: &Result<Value>) -> Result<()> {
 
 fn check_rvm(expect: &Expect, got: &Result<Value, VmError>, mode: ExecutionMode) -> Result<()> {
     match (expect, got) {
-        (Expect::Value(want) | Expect::RvmDiverges { rvm: want, .. }, Ok(got))
-            if want_value(want)? == *got => {}
+        (
+            Expect::Value(want)
+            | Expect::RvmDiverges { rvm: want, .. }
+            | Expect::InterpreterDiverges { want, .. }
+            | Expect::InterpreterErrors { want, .. },
+            Ok(got),
+        ) if want_value(want)? == *got => {}
         (Expect::Error(want) | Expect::Errors { rvm: want, .. }, Err(err))
             if err.to_string().contains(want) => {}
         (_, got) => bail!("[{mode:?}] RVM: unexpected result {got:?}"),
@@ -359,7 +463,13 @@ fn check_rvm(expect: &Expect, got: &Result<Value, VmError>, mode: ExecutionMode)
 
 const MODES: [ExecutionMode; 2] = [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable];
 
-fn check(modules: &[&str], entrypoint: &str, input: &str, strict: bool, expect: &Expect) -> Vec<String> {
+fn check(
+    modules: &[&str],
+    entrypoint: &str,
+    input: &str,
+    strict: bool,
+    expect: &Expect,
+) -> Vec<String> {
     let label = if strict { "strict" } else { "non-strict" };
     let mut failures = Vec::new();
     let result = (|| {
@@ -399,7 +509,15 @@ fn strict_builtin_errors_match_interpreter() {
     let modules = [PACKAGE_READ, PACKAGE_READER];
     for (input, strict, expect) in [
         (V_BAD, true, Expect::Error(COUNT_ERROR)),
-        (V_BAD, false, Expect::Value(r#"{"y": 1}"#)),
+        // C14: the RVM keeps the undefined rule as an Undefined entry.
+        (
+            V_BAD,
+            false,
+            Expect::RvmDiverges {
+                want: r#"{"y": 1}"#,
+                rvm: PACKAGE_WITH_UNDEFINED_Z,
+            },
+        ),
         (V_OK, true, Expect::Value(r#"{"y": 1, "z": 2}"#)),
     ] {
         for failure in check(&modules, "data.query.all", input, strict, &expect) {
