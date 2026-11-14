@@ -1068,6 +1068,10 @@ impl RegoVM {
     #[inline]
     #[allow(dead_code)]
     pub(super) fn get_register(&self, index: u8) -> Result<&Value> {
+        #[cfg(feature = "explanations")]
+        if let Some(pe) = self.pe.as_deref() {
+            pe.note_read(index, self.pc, self.register_stack.len());
+        }
         self.registers
             .get(usize::from(index))
             .ok_or(VmError::RegisterIndexOutOfBounds {
@@ -1083,6 +1087,10 @@ impl RegoVM {
     #[inline]
     #[allow(dead_code)]
     pub(super) fn take_register(&mut self, index: u8) -> Result<Value> {
+        #[cfg(feature = "explanations")]
+        if let Some(pe) = self.pe.as_deref() {
+            pe.note_read(index, self.pc, self.register_stack.len());
+        }
         let register_count = self.registers.len();
 
         let slot = self.registers.get_mut(usize::from(index)).ok_or(
@@ -1098,6 +1106,10 @@ impl RegoVM {
     #[inline]
     #[allow(dead_code)]
     pub(super) fn set_register(&mut self, index: u8, value: Value) -> Result<()> {
+        #[cfg(feature = "explanations")]
+        if let Some(pe) = self.pe.as_deref_mut() {
+            pe.note_write(index, self.pc, self.register_stack.len());
+        }
         let register_count = self.registers.len();
 
         let slot = self.registers.get_mut(usize::from(index)).ok_or(
