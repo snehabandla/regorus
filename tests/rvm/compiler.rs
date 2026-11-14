@@ -753,7 +753,9 @@ fn observe_strict_probe(result: Result<Value, VmError>) -> StrictProbeOutcome {
     match result {
         Ok(value) => StrictProbeOutcome::Value(value),
         Err(VmError::InvalidDivision { .. }) => StrictProbeOutcome::DivisionError,
-        Err(VmError::ArithmeticError { message, .. }) if message.contains("Cannot divide") => {
+        Err(VmError::ArithmeticError { message, .. })
+            if message.contains("Cannot divide") || message.contains("divide by zero") =>
+        {
             StrictProbeOutcome::DivisionError
         }
         Err(error) => panic!("expected strict divide-by-zero outcome, got {error:?}"),
@@ -999,9 +1001,10 @@ fn registered_host_await_strict_output_division_matches_explicit_control_in_both
     let mut strict_vm = RegoVM::new();
     strict_vm.set_strict_builtin_errors(true);
     strict_vm.load_program(division_program);
-    assert!(
-        matches!(strict_vm.execute(), Err(VmError::InvalidDivision { .. })),
-        "strict divide-by-zero control must produce InvalidDivision"
+    assert_eq!(
+        observe_strict_probe(strict_vm.execute()),
+        StrictProbeOutcome::DivisionError,
+        "strict divide-by-zero control must produce a division error"
     );
 
     for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
@@ -1011,10 +1014,12 @@ fn registered_host_await_strict_output_division_matches_explicit_control_in_both
             registered, explicit,
             "registered/explicit mismatch in {mode:?}"
         );
+        // OPA 1.2.0 with --strict-builtin-errors aborts with "div: divide
+        // by zero" here; the default does not apply.
         assert_eq!(
             registered.0,
-            StrictProbeOutcome::Value(Value::Bool(false)),
-            "the default-false rule should absorb the output-expression failure"
+            StrictProbeOutcome::DivisionError,
+            "a strict output-expression failure must abort, not fall back to the default"
         );
         assert_eq!(
             registered.1,
