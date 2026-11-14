@@ -22,6 +22,7 @@ mod every_binding_differential;
 #[path = "../../native_depth_support/mod.rs"]
 mod native_depth_support;
 mod rule_conflict_differential;
+mod strict_builtin_errors_differential;
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]
 struct TestCase {
