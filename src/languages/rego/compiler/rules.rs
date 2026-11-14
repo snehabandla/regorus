@@ -300,13 +300,24 @@ impl<'a> Compiler<'a> {
                     entry_point_name.to_string()
                 }
             };
-            let rule_idx = compiler.get_or_assign_rule_index(&rule_path)?;
+            // A default shadowed by a dynamically keyed rule is read through that rule.
+            let (call_path, keys) = match policy.inner.shadowed_default_access(&rule_path) {
+                Some((owner, keys)) => (owner.clone(), keys.to_vec()),
+                None => (rule_path, Vec::new()),
+            };
+            let rule_idx = compiler.get_or_assign_rule_index(&call_path)?;
             compiler
                 .entry_points
                 .insert(entry_point_name.to_string(), instruction_index);
             compiler.emit_call_rule(result_reg, rule_idx);
 
-            compiler.emit_return(result_reg);
+            let mut value_reg = result_reg;
+            for key in &keys {
+                let dest = compiler.alloc_register()?;
+                compiler.emit_index_literal(dest, value_reg, key);
+                value_reg = dest;
+            }
+            compiler.emit_return(value_reg);
         }
 
         compiler.compile_worklist_rules(rules)?;

@@ -221,6 +221,9 @@ pub(crate) struct CompiledPolicyData {
     pub(crate) imports: BTreeMap<String, Ref<Expr>>,
     pub(crate) functions: FunctionTable,
     pub(crate) rule_paths: MapSet<String>,
+    /// Ground prefixes (components and registered path) of rules whose head
+    /// has a dynamic key, such as `data.pkg.p` for `p[k] := 1`.
+    pub(crate) dynamic_rule_owners: Map<Vec<String>, String>,
     #[cfg(feature = "azure_policy")]
     pub(crate) target_info: Option<TargetInfo>,
     #[cfg(feature = "azure_policy")]
@@ -240,4 +243,36 @@ pub(crate) struct CompiledPolicyData {
 
     // Pre-computed loop hoisting information
     pub(crate) loop_hoisting_table: HoistedLoopsLookup,
+}
+
+impl CompiledPolicyData {
+    /// Returns the path of the dynamically keyed rule that owns `components`,
+    /// i.e. whose ground prefix is a prefix of (or equal to) `components`.
+    ///
+    /// Like OPA, rules in such an owner's extent are evaluated through the
+    /// owner, and `default` rules in it are ignored.
+    pub(crate) fn dynamic_rule_owner(&self, components: &[String]) -> Option<&String> {
+        if self.dynamic_rule_owners.is_empty() {
+            return None;
+        }
+        (1..=components.len()).find_map(|len| self.dynamic_rule_owners.get(&components[..len]))
+    }
+
+    /// Returns the owner of `path` when it is registered only through `default`
+    /// rules that a dynamically keyed rule shadows.
+    pub(crate) fn shadowed_default_owner(&self, path: &str) -> Option<&String> {
+        if self.rules.contains_key(path) {
+            return None;
+        }
+        self.dynamic_rule_owner(self.rule_path_components.get(path)?)
+    }
+
+    /// Returns the owner of a shadowed default `path` together with the keys
+    /// that select `path` within the owner's value.
+    pub(crate) fn shadowed_default_access(&self, path: &str) -> Option<(&String, &[String])> {
+        let owner = self.shadowed_default_owner(path)?;
+        let skip = self.rule_path_components.get(owner).map_or(0, Vec::len);
+        let keys = self.rule_path_components.get(path)?.get(skip..)?;
+        Some((owner, keys))
+    }
 }

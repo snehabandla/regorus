@@ -36,6 +36,21 @@ impl<'a> Compiler<'a> {
         self.spans.push(SpanInfo::new(0, 0, 0, 0));
     }
 
+    pub(super) fn emit_index_literal(
+        &mut self,
+        dest: super::Register,
+        container: super::Register,
+        key: &str,
+    ) {
+        let literal_idx = self.add_literal(Value::String(key.into()));
+        self.program.instructions.push(Instruction::IndexLiteral {
+            dest,
+            container,
+            literal_idx,
+        });
+        self.spans.push(SpanInfo::new(0, 0, 0, 0));
+    }
+
     pub(super) fn finish(mut self) -> Result<Program> {
         self.program.main_entry_point = 0;
 

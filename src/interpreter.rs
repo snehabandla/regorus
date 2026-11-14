@@ -3316,6 +3316,12 @@ impl Interpreter {
 
     fn ensure_rule_evaluated(&mut self, path: String) -> Result<()> {
         self.check_execution_time()?;
+        // A path defined only by defaults that a dynamically keyed rule shadows
+        // is part of that rule's document (OPA ignores such defaults).
+        if let Some(owner) = self.compiled_policy.shadowed_default_owner(&path) {
+            let owner = owner.clone();
+            return self.ensure_rule_evaluated(owner);
+        }
         let mut matched = false;
         if let Some(rules) = self.compiled_policy.rules.get(&path) {
             matched = true;
@@ -4051,6 +4057,20 @@ impl Interpreter {
                 path.extend(get_rule_path_components(refr)?);
                 let paths: Vec<&str> = path.iter().map(PathComponent::value).collect();
 
+                // Like OPA, ignore a default within the document of a rule with
+                // a dynamic key, e.g. `default p.r := 0` beside `p[k] := 1`.
+                let components: Vec<String> = core::iter::once("data")
+                    .chain(paths.iter().copied())
+                    .map(String::from)
+                    .collect();
+                if self
+                    .compiled_policy
+                    .dynamic_rule_owner(&components)
+                    .is_some()
+                {
+                    return Ok(());
+                }
+
                 Self::check_default_value(value)?;
                 let value = self.eval_expr(value)?;
 
@@ -4607,6 +4627,53 @@ impl Interpreter {
         Ok(())
     }
 
+    /// Records the ground prefix of a rule whose head has a dynamic key, e.g.
+    /// `data.pkg.p` for `p[k] := 1` or `p[k].s := 1`.
+    fn record_dynamic_rule_owner(&mut self, rule: &Ref<Rule>) -> Result<()> {
+        let Rule::Spec {
+            head: RuleHead::Compr { refr, .. } | RuleHead::Set { refr, .. },
+            ..
+        } = rule.as_ref()
+        else {
+            return Ok(());
+        };
+        let mut ground_prefix = None;
+        let mut expr = refr;
+        loop {
+            match expr.as_ref() {
+                Expr::RefBrack { refr, index, .. } => {
+                    if !matches!(
+                        index.as_ref(),
+                        Expr::String { .. }
+                            | Expr::RawString { .. }
+                            | Expr::Number { .. }
+                            | Expr::Bool { .. }
+                            | Expr::Null { .. }
+                    ) {
+                        ground_prefix = Some(refr);
+                    }
+                    expr = refr;
+                }
+                Expr::RefDot { refr, .. } => expr = refr,
+                _ => break,
+            }
+        }
+        let Some(ground_prefix) = ground_prefix else {
+            return Ok(());
+        };
+        let mut path_components = self.current_module_data_path_components()?;
+        path_components.extend(get_rule_path_components(ground_prefix)?);
+        let path = format_path_components(&path_components)?;
+        let components = path_components
+            .iter()
+            .map(|component| component.value().to_string())
+            .collect();
+        self.compiled_policy_mut()
+            .dynamic_rule_owners
+            .insert(components, path);
+        Ok(())
+    }
+
     fn record_default_rule(
         &mut self,
         refr: &Ref<Expr>,
@@ -4660,6 +4727,7 @@ impl Interpreter {
         compiled_policy.default_rules.clear();
         compiled_policy.rule_paths.clear();
         compiled_policy.rule_path_components.clear();
+        compiled_policy.dynamic_rule_owners.clear();
     }
 
     pub fn process_imports(&mut self) -> Result<()> {
@@ -4726,6 +4794,7 @@ impl Interpreter {
                                 _ => refr,
                             };
                             self.record_rule(refr, rule.clone())?;
+                            self.record_dynamic_rule_owner(rule)?;
                             self.memory_check()?;
                         } else if let Rule::Default { .. } = rule.as_ref() {
                             let (refr, index) = match refr.as_ref() {

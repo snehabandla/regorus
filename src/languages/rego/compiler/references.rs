@@ -169,6 +169,16 @@ impl<'a> Compiler<'a> {
             let rule_candidate =
                 format_string_path(&static_prefix[0..=i]).map_err(CompilerError::from)?;
 
+            // Defaults shadowed by a dynamically keyed rule are read through it.
+            if self
+                .policy
+                .inner
+                .shadowed_default_owner(&rule_candidate)
+                .is_some()
+            {
+                continue;
+            }
+
             if let Ok(rule_index) = self.get_or_assign_rule_index(&rule_candidate) {
                 // Found a rule match! Call the rule
                 let rule_result_reg = self.alloc_register()?;
@@ -200,6 +210,12 @@ impl<'a> Compiler<'a> {
             .rules
             .keys()
             .chain(self.policy.inner.default_rules.keys())
+            .filter(|rule_path| {
+                self.policy
+                    .inner
+                    .shadowed_default_owner(rule_path)
+                    .is_none()
+            })
             .filter(|rule_path| self.matches_path_pattern(rule_path, &path_pattern))
             .cloned()
             .collect();
@@ -307,6 +323,28 @@ impl<'a> Compiler<'a> {
             for field in static_fields.iter().take(i) {
                 rule_candidate =
                     append_path_component(&rule_candidate, field).map_err(CompilerError::from)?;
+            }
+
+            // Defaults shadowed by a dynamically keyed rule are read through it.
+            if let Some((owner, keys)) = self.policy.inner.shadowed_default_access(&rule_candidate)
+            {
+                let owner = owner.clone();
+                let components: Vec<AccessComponent> = keys
+                    .iter()
+                    .cloned()
+                    .map(AccessComponent::Field)
+                    .chain(chain.components[i..].iter().cloned())
+                    .collect();
+                let rule_index = self.get_or_assign_rule_index(&owner)?;
+                let rule_result_reg = self.alloc_register()?;
+                self.emit_instruction(
+                    Instruction::CallRule {
+                        dest: rule_result_reg,
+                        rule_index,
+                    },
+                    span,
+                );
+                return self.compile_chain_access(rule_result_reg, &components, span);
             }
 
             if let Ok(rule_index) = self.get_or_assign_rule_index(&rule_candidate) {
