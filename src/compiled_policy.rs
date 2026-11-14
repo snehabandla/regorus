@@ -255,7 +255,7 @@ impl CompiledPolicyData {
         if self.dynamic_rule_owners.is_empty() {
             return None;
         }
-        (1..=components.len()).find_map(|len| self.dynamic_rule_owners.get(&components[..len]))
+        (1..=components.len()).find_map(|len| self.dynamic_rule_owners.get(components.get(..len)?))
     }
 
     /// Returns the owner of `path` when it is registered only through `default`
@@ -269,6 +269,7 @@ impl CompiledPolicyData {
 
     /// Returns the owner of a shadowed default `path` together with the keys
     /// that select `path` within the owner's value.
+    #[cfg(feature = "rvm")]
     pub(crate) fn shadowed_default_access(&self, path: &str) -> Option<(&String, &[String])> {
         let owner = self.shadowed_default_owner(path)?;
         let skip = self.rule_path_components.get(owner).map_or(0, Vec::len);

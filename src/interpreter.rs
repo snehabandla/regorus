@@ -4631,14 +4631,14 @@ impl Interpreter {
     /// `data.pkg.p` for `p[k] := 1` or `p[k].s := 1`.
     fn record_dynamic_rule_owner(&mut self, rule: &Ref<Rule>) -> Result<()> {
         let Rule::Spec {
-            head: RuleHead::Compr { refr, .. } | RuleHead::Set { refr, .. },
+            head: RuleHead::Compr { refr: head, .. } | RuleHead::Set { refr: head, .. },
             ..
         } = rule.as_ref()
         else {
             return Ok(());
         };
         let mut ground_prefix = None;
-        let mut expr = refr;
+        let mut expr = head;
         loop {
             match expr.as_ref() {
                 Expr::RefBrack { refr, index, .. } => {
