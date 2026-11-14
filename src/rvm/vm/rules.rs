@@ -167,7 +167,13 @@ impl RegoVM {
                     Ok(_) => {
                         #[cfg(feature = "explanations")]
                         if self.pe.is_some() {
-                            self.pe_body_succeeded(result_reg);
+                            if let Err(error) = self.pe_body_succeeded(result_reg) {
+                                self.restore_rule_state(
+                                    &mut previous_loop_stack,
+                                    &mut previous_comprehension_stack,
+                                );
+                                return Err(error);
+                            }
                         }
                         if matches!(rule_info.rule_type, RuleType::Complete) || is_function_call {
                             let current_result = self.get_register(result_reg)?.clone();
