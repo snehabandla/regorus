@@ -54,7 +54,11 @@ fields to responsibilities.
   FIFO order when `HostAwait` executes in run-to-completion mode. A registered
   call with an undefined input skips `HostAwait` and leaves the queue untouched.
 - `set_strict_builtin_errors`: toggles builtin failure semantics between
-  `VmError::ArithmeticError` and returning `Value::Undefined`.
+  an error and returning `Value::Undefined`. In strict mode a failing builtin
+  call (`VmError::ArithmeticError`) or arithmetic operator (for example divide
+  by zero) aborts the whole evaluation, like a resource-limit error, matching
+  OPA's `--strict-builtin-errors`: it is not absorbed as a body failure, so
+  `default`, `else` and `not` do not apply.
 - Accessors (`get_pc`, `get_registers`, `get_loop_stack`, etc.) aid debugging
   and visualisation tooling.
 - `get_host_await_argument`: when the VM is suspended on a `HostAwait`, returns

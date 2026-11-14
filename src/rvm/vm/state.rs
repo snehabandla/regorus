@@ -116,7 +116,7 @@ impl RegoVM {
     }
 
     pub(super) fn initialize_execution_state(&mut self) {
-        self.builtin_limit_exceeded = false;
+        self.fatal_builtin_error = false;
         // Reset basic execution state
         self.executed_instructions = 0;
         self.pc = 0;

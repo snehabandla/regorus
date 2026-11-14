@@ -116,7 +116,8 @@ impl RegoVM {
                     return Ok(InstructionOutcome::Continue);
                 }
 
-                let result = self.add_values(a, b)?;
+                let result = self.add_values(a, b);
+                let result = self.mark_strict_arithmetic_error(result)?;
                 self.set_register(dest, result)?;
                 Ok(InstructionOutcome::Continue)
             }
@@ -129,7 +130,8 @@ impl RegoVM {
                     return Ok(InstructionOutcome::Continue);
                 }
 
-                let result = self.sub_values(a, b)?;
+                let result = self.sub_values(a, b);
+                let result = self.mark_strict_arithmetic_error(result)?;
                 self.set_register(dest, result)?;
                 Ok(InstructionOutcome::Continue)
             }
@@ -142,7 +144,8 @@ impl RegoVM {
                     return Ok(InstructionOutcome::Continue);
                 }
 
-                let result = self.mul_values(a, b)?;
+                let result = self.mul_values(a, b);
+                let result = self.mark_strict_arithmetic_error(result)?;
                 self.set_register(dest, result)?;
                 Ok(InstructionOutcome::Continue)
             }
@@ -155,7 +158,8 @@ impl RegoVM {
                     return Ok(InstructionOutcome::Continue);
                 }
 
-                let result = self.div_values(a, b)?;
+                let result = self.div_values(a, b);
+                let result = self.mark_strict_arithmetic_error(result)?;
                 self.set_register(dest, result)?;
                 Ok(InstructionOutcome::Continue)
             }
@@ -168,7 +172,8 @@ impl RegoVM {
                     return Ok(InstructionOutcome::Continue);
                 }
 
-                let result = self.mod_values(a, b)?;
+                let result = self.mod_values(a, b);
+                let result = self.mark_strict_arithmetic_error(result)?;
                 self.set_register(dest, result)?;
                 Ok(InstructionOutcome::Continue)
             }

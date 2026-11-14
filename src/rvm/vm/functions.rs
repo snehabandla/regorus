@@ -133,13 +133,14 @@ impl RegoVM {
             // Resource-limit errors must always propagate, even in non-strict
             // mode, to prevent `not builtin(...)` from silently flipping to true.
             Err(e) if crate::interpreter::is_evaluation_limit_error(&e) => {
-                self.builtin_limit_exceeded = true;
+                self.fatal_builtin_error = true;
                 self.dummy_exprs = dummy_exprs;
                 self.cached_builtin_args = args;
                 return Err(e.into());
             }
             Err(_) if !self.strict_builtin_errors => Value::Undefined,
             Err(err) => {
+                self.fatal_builtin_error = true;
                 self.dummy_exprs = dummy_exprs;
                 self.cached_builtin_args = args;
                 return Err(err.into());

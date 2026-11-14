@@ -53,7 +53,10 @@ pub struct RegoVM {
     /// The compiled program containing instructions, literals, and metadata
     pub(super) program: Arc<Program>,
     pub(super) program_tree_error: Option<crate::utils::depth::DepthCheckError>,
-    pub(super) builtin_limit_exceeded: bool,
+    /// Set when a builtin or arithmetic error must abort the evaluation instead
+    /// of failing the enclosing body: a resource limit, or any such error in
+    /// strict mode. Checked by `is_fatal_vm_error`.
+    pub(super) fatal_builtin_error: bool,
 
     /// Reference to the compiled policy for default rule access
     pub(super) compiled_policy: Option<CompiledPolicy>,
@@ -247,7 +250,7 @@ impl RegoVM {
             pc: 0,
             program: Arc::new(Program::default()),
             program_tree_error: None,
-            builtin_limit_exceeded: false,
+            fatal_builtin_error: false,
             compiled_policy: None,
             rule_cache: Vec::new(),
             data: Value::Null,

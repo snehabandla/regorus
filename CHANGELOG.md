@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - *(rvm)* [**breaking**] Conflicting complete-rule or function definitions (two definitions that succeed with different values) now raise the new `VmError::RuleConflict` error in both execution modes instead of evaluating to Undefined, matching OPA. The error aborts the whole evaluation, including when the rule is reached through `not`, a comprehension or `every`.
+- *(rvm)* With `set_strict_builtin_errors(true)`, a failing builtin call or arithmetic operator (for example `count(5)` or division by zero) now aborts the evaluation with an error, matching OPA's `--strict-builtin-errors` and the interpreter. It used to make the enclosing rule body fail, so the rule evaluated to Undefined or to its `default`/`else` value. Strict division and modulo by zero report `VmError::ArithmeticError` ("divide by zero" / "modulo by zero") instead of `InvalidDivision`/`InvalidModulo`. Non-strict behavior is unchanged.
 - *(parser)* [**breaking**] Reject direct negated assignment (`not x := value`) and negated unification (`not x = value`), including previously accepted OPA-compatible policies. For negated equality, migrate `not input.kind = "Pod"` to `not input.kind == "Pod"`. Positive bindings inside nested comprehensions and `every` bodies remain supported. See the [grammar restriction](docs/grammar.md).
 
 ## [0.15.0](https://github.com/microsoft/regorus/compare/regorus-v0.14.1...regorus-v0.15.0) - 2026-11-07

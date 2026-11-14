@@ -70,7 +70,7 @@ cases:
       - "Div { dest: 2, left: 0, right: 1 }"
       - "Return { value: 2 }"
     want_result: "#undefined"
-    want_error_strict: "Cannot divide"
+    want_error_strict: "divide by zero"
 
   - note: arithmetic_mod
     description: Test Mod instruction
@@ -97,7 +97,7 @@ cases:
       - "Mod { dest: 2, left: 0, right: 1 }"
       - "Return { value: 2 }"
     want_result: "#undefined"
-    want_error_strict: "Cannot modulo"
+    want_error_strict: "modulo by zero"
 
   - note: arithmetic_mod_negative_operands
     description: Test Mod with negative operands

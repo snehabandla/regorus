@@ -18,10 +18,11 @@ use super::machine::RegoVM;
 
 impl RegoVM {
     /// Returns true if the error must never be silently absorbed by rule
-    /// evaluation: resource-limit violations and rule conflicts abort the
-    /// whole evaluation instead of failing the enclosing body.
+    /// evaluation: resource-limit violations, rule conflicts and, in strict
+    /// mode, builtin and arithmetic errors abort the whole evaluation instead
+    /// of failing the enclosing body.
     pub(super) const fn is_fatal_vm_error(&self, err: &VmError) -> bool {
-        self.builtin_limit_exceeded
+        self.fatal_builtin_error
             || matches!(
                 err,
                 VmError::TimeLimitExceeded { .. }

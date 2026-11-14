@@ -58,9 +58,8 @@ impl RegoVM {
             (&Value::Number(ref x), &Value::Number(ref y)) => {
                 if *y == Number::from(0_u64) {
                     if self.strict_builtin_errors {
-                        return Err(VmError::InvalidDivision {
-                            left: a.clone().into(),
-                            right: b.clone().into(),
+                        return Err(VmError::ArithmeticError {
+                            message: "divide by zero".into(),
                             pc: self.pc,
                         });
                     }
@@ -83,9 +82,8 @@ impl RegoVM {
             (&Value::Number(ref x), &Value::Number(ref y)) => {
                 if *y == Number::from(0_u64) {
                     if self.strict_builtin_errors {
-                        return Err(VmError::InvalidModulo {
-                            left: a.clone().into(),
-                            right: b.clone().into(),
+                        return Err(VmError::ArithmeticError {
+                            message: "modulo by zero".into(),
                             pc: self.pc,
                         });
                     }
@@ -108,6 +106,15 @@ impl RegoVM {
                 pc: self.pc,
             }),
         }
+    }
+
+    /// In strict mode an arithmetic error aborts the evaluation, like a failing
+    /// builtin call, instead of failing the enclosing body.
+    pub(super) fn mark_strict_arithmetic_error(&mut self, result: Result<Value>) -> Result<Value> {
+        if result.is_err() && self.strict_builtin_errors {
+            self.fatal_builtin_error = true;
+        }
+        result
     }
 
     pub(super) const fn to_bool(&self, value: &Value) -> Option<bool> {
