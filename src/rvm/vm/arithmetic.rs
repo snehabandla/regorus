@@ -110,7 +110,10 @@ impl RegoVM {
 
     /// In strict mode an arithmetic error aborts the evaluation, like a failing
     /// builtin call, instead of failing the enclosing body.
-    pub(super) fn mark_strict_arithmetic_error(&mut self, result: Result<Value>) -> Result<Value> {
+    pub(super) const fn mark_strict_arithmetic_error(
+        &mut self,
+        result: Result<Value>,
+    ) -> Result<Value> {
         if result.is_err() && self.strict_builtin_errors {
             self.fatal_builtin_error = true;
         }
