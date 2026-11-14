@@ -38,6 +38,14 @@ fn pe(rego: &str, input: &str, unknowns: &[&str]) -> anyhow::Result<PartialEvalR
     Ok(vm.partial_eval("data.test.allow")?)
 }
 
+fn texts(result: &PartialEvalResult) -> Vec<Vec<&str>> {
+    result
+        .residual_queries
+        .iter()
+        .map(|q| q.conditions.iter().map(|c| c.text.as_str()).collect())
+        .collect()
+}
+
 const TWO_CONDITIONS: &str = r#"package test
 allow if {
   input.user.role == "admin"
@@ -45,155 +53,121 @@ allow if {
 }"#;
 
 #[test]
-fn reading_an_unknown_is_unsupported() -> anyhow::Result<()> {
-    let result = pe("package test\nallow if input.u + 1 > 2", "{}", &["u"])?;
-    assert_eq!(result.status, ResidualStatus::Unsupported);
+fn two_conditions_residual() -> anyhow::Result<()> {
+    let result = pe(TWO_CONDITIONS, "{}", &["user", "action"])?;
+    assert_eq!(result.status, ResidualStatus::Exact);
+    assert_eq!(result.result, Value::Undefined);
+    assert_eq!(
+        texts(&result),
+        vec![vec![
+            r#"input.user.role == "admin""#,
+            r#"input.action == "delete""#
+        ]]
+    );
+    let query = &result.residual_queries[0];
+    assert_eq!(query.value, Value::from(true));
+    let role = &query.conditions[0];
+    assert_eq!(role.kind, ResidualKind::ConditionHolds);
+    assert_eq!(role.operator, Some(Operator::Eq));
+    assert_eq!(role.input_path.as_deref(), Some("input.user.role"));
+    assert_eq!(role.value, Some(Value::from("admin")));
+    assert_eq!(role.rule.as_deref(), Some("data.test.allow"));
+    let location = role.location.as_ref().map(|l| (l.file.as_str(), l.line));
+    assert_eq!(location, Some(("p.rego", 3)));
+    Ok(())
+}
+
+#[test]
+fn known_checks_eliminate_or_drop_out() -> anyhow::Result<()> {
+    let result = pe(TWO_CONDITIONS, r#"{"action": "read"}"#, &["user"])?;
+    assert_eq!(result.status, ResidualStatus::Exact);
     assert_eq!(result.result, Value::Undefined);
     assert!(result.residual_queries.is_empty());
-    assert_eq!(
-        result.warnings,
-        vec![String::from(
-            "partial evaluation unsupported: `Add` reads a value that depends on unknown input at p.rego:2:18"
-        )]
-    );
-    // Without a read of the unknown path the concrete result is exact.
-    let rego = "package test\nallow if input.k + 1 > 1";
-    for (input, want) in [
-        (r#"{"k": 1}"#, Value::from(true)),
-        (r#"{"k": -1}"#, Value::Undefined),
-    ] {
-        let result = pe(rego, input, &["u"])?;
-        assert_eq!(result.status, ResidualStatus::Exact, "{input}");
-        assert_eq!(result.kind, RuleKind::Complete);
-        assert_eq!(result.result, want, "{input}");
-        assert!(result.residual_queries.is_empty());
-        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
-    }
+    let result = pe(TWO_CONDITIONS, r#"{"action": "delete"}"#, &["user"])?;
+    assert_eq!(texts(&result), vec![vec![r#"input.user.role == "admin""#]]);
+    let input = r#"{"user": {"role": "admin"}, "action": "delete"}"#;
+    let result = pe(TWO_CONDITIONS, input, &[])?;
+    assert_eq!(result.status, ResidualStatus::Exact);
+    assert_eq!(result.result, Value::from(true));
+    assert!(result.residual_queries.is_empty());
     Ok(())
 }
 
 #[test]
-fn checks_on_unknowns_are_unsupported() -> anyhow::Result<()> {
-    for (body, instruction) in [
-        ("input.u", "Guard"),
-        ("input.u == 1", "Eq"),
-        ("1 < input.u", "Lt"),
-    ] {
-        let rego = format!("package test\nallow if {body}");
-        let result = pe(&rego, "{}", &["u"])?;
-        assert_eq!(result.status, ResidualStatus::Unsupported, "{body}");
-        let want = format!("`{instruction}` reads a value that depends on unknown input");
-        assert!(
-            result.warnings.len() == 1 && result.warnings[0].contains(&want),
-            "{body}: {:?}",
-            result.warnings
-        );
-        // The same check on known input is exact.
-        let rego = rego.replace("input.u", "input.k");
-        let result = pe(&rego, r#"{"k": 2}"#, &["u"])?;
-        assert_eq!(result.status, ResidualStatus::Exact, "{body}");
-        assert!(result.warnings.is_empty(), "{body}");
-    }
-    Ok(())
-}
-
-#[test]
-fn unchecked_unknowns_are_unsupported() -> anyhow::Result<()> {
-    let input = r#"{"k": 1, "user": {"name": "a"}}"#;
-    let unknowns = &["u", "user.role"];
+fn operators_are_mirrored_onto_the_input_path() -> anyhow::Result<()> {
     let cases = [
-        (
-            "allow if { _v := input.u }",
-            "a value that depends on unknown input is not checked",
-        ),
-        // The supplied part of `input.user` is incomplete.
-        (
-            "allow := input.user",
-            "the rule value depends on unknown input",
-        ),
+        ("18 < input.age", "input.age > 18"),
+        ("18 <= input.age", "input.age >= 18"),
+        ("18 > input.age", "input.age < 18"),
+        ("18 >= input.age", "input.age <= 18"),
+        ("18 == input.age", "input.age == 18"),
+        ("18 != input.age", "input.age != 18"),
+        ("input.age < 18", "input.age < 18"),
+        ("input.age >= 18", "input.age >= 18"),
     ];
-    for (rules, want) in cases {
-        let result = pe(&format!("package test\n{rules}"), input, unknowns)?;
-        assert_eq!(result.status, ResidualStatus::Unsupported, "{rules}");
-        let want = format!("partial evaluation unsupported: {want} at p.rego:2:");
-        assert!(
-            result.warnings.len() == 1 && result.warnings[0].starts_with(&want),
-            "{rules}: {:?}",
-            result.warnings
-        );
+    for (body, want) in cases {
+        let result = pe(&format!("package test\nallow if {body}"), "{}", &["age"])?;
+        assert_eq!(texts(&result), vec![vec![want]], "{body}");
     }
-    let twins = [
-        ("allow if { _v := input.k }", Value::from(true)),
-        ("allow := input.user.name", Value::from("a")),
-    ];
-    for (rules, want) in twins {
-        let result = pe(&format!("package test\n{rules}"), input, unknowns)?;
-        assert_eq!(result.status, ResidualStatus::Exact, "{rules}");
-        assert_eq!(result.result, want, "{rules}");
-    }
+    let result = pe("package test\nallow if 18 < input.age", "{}", &["age"])?;
+    let condition = &result.residual_queries[0].conditions[0];
+    assert_eq!(condition.operator, Some(Operator::Gt));
+    assert_eq!(condition.value, Some(Value::from(18_u64)));
     Ok(())
 }
 
 #[test]
-fn repeated_evaluations_are_isolated() -> anyhow::Result<()> {
-    let mut vm = vm(TWO_CONDITIONS)?;
+fn keys_are_segments_not_dotted_text() -> anyhow::Result<()> {
+    let rego = "package test\nallow if input[\"a.b\"] == 1";
     let mut settings = PartialEvalSettings::default();
-    settings.unknowns = keys(&["user", "action"]);
-    vm.set_partial_eval_settings(settings.clone());
-    let first = vm.partial_eval("data.test.allow")?;
-    assert_eq!(first.status, ResidualStatus::Unsupported);
-    // An unsupported evaluation leaves nothing behind.
-    vm.set_input(Value::from_json_str(
-        r#"{"user": {"role": "admin"}, "action": "delete"}"#,
-    )?);
-    vm.set_partial_eval_settings(PartialEvalSettings::default());
-    let concrete = vm.partial_eval("data.test.allow")?;
-    assert_eq!(concrete.status, ResidualStatus::Exact);
-    assert_eq!(concrete.result, Value::from(true));
-    assert!(concrete.warnings.is_empty());
-    assert_eq!(
-        vm.execute_entry_point_by_name("data.test.allow")?,
-        Value::from(true)
-    );
-    vm.set_input(Value::new_object());
+    settings.unknowns = vec![UnknownPath::input_keys(["a.b"])];
+    let mut vm = vm(rego)?;
     vm.set_partial_eval_settings(settings);
-    assert_eq!(vm.partial_eval("data.test.allow")?, first);
-    Ok(())
-}
-
-#[test]
-fn whole_input_unknown() -> anyhow::Result<()> {
-    let mut vm = vm("package test\nallow if input.role == \"admin\"")?;
-    let mut settings = PartialEvalSettings::default();
-    settings.unknowns = vec![UnknownPath::new(UnknownRoot::Input, [])];
-    vm.set_partial_eval_settings(settings);
-    // Comparisons with unknown input are not supported yet.
     let result = vm.partial_eval("data.test.allow")?;
-    assert_eq!(result.status, ResidualStatus::Unsupported);
-    vm.set_input(Value::new_object());
-    assert!(matches!(
-        vm.partial_eval("data.test.allow"),
-        Err(ExplainError::UnknownValueSupplied { .. })
-    ));
+    assert_eq!(texts(&result), vec![vec![r#"input["a.b"] == 1"#]]);
+    let condition = &result.residual_queries[0].conditions[0];
+    assert_eq!(condition.input_path.as_deref(), Some(r#"input["a.b"]"#));
+    // `input.a.b` is a different path.
+    let result = pe(rego, r#"{"a.b": 1}"#, &["a.b"])?;
+    assert_eq!(result.status, ResidualStatus::Exact);
+    assert_eq!(result.result, Value::from(true));
     Ok(())
 }
 
 #[test]
-fn invalid_unknown_messages_render_paths() {
-    let message = |unknowns: &[&str], input: &str| {
-        pe(TWO_CONDITIONS, input, unknowns)
-            .err()
-            .map(|e| e.to_string())
-    };
-    assert_eq!(
-        message(&["user", "user.role"], "{}").as_deref(),
-        Some(r#"invalid unknown path `input["user"]["role"]`: overlaps `input["user"]`"#)
-    );
-    assert_eq!(
-        message(&["a.b"], r#"{"a": {"b": 1}}"#).as_deref(),
-        Some(r#"a value is supplied for unknown path `input["a"]["b"]`"#)
-    );
-    assert_eq!(message(&["a.b"], r#"{"a.b": 1}"#), None);
+fn array_indices_and_keywords_render_as_rego() -> anyhow::Result<()> {
+    let mut settings = PartialEvalSettings::default();
+    settings.unknowns = vec![UnknownPath::new(
+        UnknownRoot::Input,
+        [
+            PathSegment::Key("xs".into()),
+            PathSegment::Index(1),
+            PathSegment::Key("not".into()),
+        ],
+    )];
+    let mut vm = vm("package test\nallow if input.xs[1][\"not\"] == true")?;
+    vm.set_input(Value::from_json_str(r#"{"xs": [{}, {}]}"#)?);
+    vm.set_partial_eval_settings(settings);
+    let result = vm.partial_eval("data.test.allow")?;
+    assert_eq!(texts(&result), vec![vec![r#"input.xs[1]["not"] == true"#]]);
+    Ok(())
+}
+
+#[test]
+fn truthiness_guard() -> anyhow::Result<()> {
+    let result = pe("package test\nallow if input.enabled", "{}", &["enabled"])?;
+    assert_eq!(texts(&result), vec![vec!["input.enabled"]]);
+    let condition = &result.residual_queries[0].conditions[0];
+    assert_eq!(condition.kind, ResidualKind::Truthy);
+    assert_eq!(condition.operator, None);
+    let result = pe(
+        "package test\nallow if input.enabled",
+        r#"{"enabled": false}"#,
+        &[],
+    )?;
+    assert_eq!(result.status, ResidualStatus::Exact);
+    assert_eq!(result.result, Value::Undefined);
+    Ok(())
 }
 
 #[test]
@@ -210,6 +184,63 @@ fn parent_of_unknown_is_unsupported() -> anyhow::Result<()> {
     let result = pe(rego, r#"{"user": {"name": "a"}}"#, unknowns)?;
     assert_eq!(result.status, ResidualStatus::Exact);
     assert_eq!(result.result, Value::from(true));
+    Ok(())
+}
+
+#[test]
+fn budget_overflow_is_unsupported() -> anyhow::Result<()> {
+    for (max, want) in [
+        (3, ResidualStatus::Exact),
+        (2, ResidualStatus::Exact),
+        (1, ResidualStatus::Unsupported),
+    ] {
+        let mut vm = vm(TWO_CONDITIONS)?;
+        let mut settings = PartialEvalSettings::default();
+        settings.unknowns = keys(&["user", "action"]);
+        settings.max_conditions = max;
+        vm.set_partial_eval_settings(settings);
+        let result = vm.partial_eval("data.test.allow")?;
+        assert_eq!(result.status, want, "{max}");
+        if want == ResidualStatus::Unsupported {
+            assert_eq!(
+                result.warnings,
+                vec![String::from("residual budget exceeded")]
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn repeated_evaluations_are_isolated() -> anyhow::Result<()> {
+    let mut vm = vm(TWO_CONDITIONS)?;
+    let mut settings = PartialEvalSettings::default();
+    settings.unknowns = keys(&["user", "action"]);
+    vm.set_partial_eval_settings(settings.clone());
+    let first = vm.partial_eval("data.test.allow")?;
+    assert_eq!(texts(&first).len(), 1);
+    // An unsupported evaluation leaves nothing behind.
+    let mut over_budget = settings.clone();
+    over_budget.max_conditions = 0;
+    vm.set_partial_eval_settings(over_budget);
+    assert_eq!(
+        vm.partial_eval("data.test.allow")?.status,
+        ResidualStatus::Unsupported
+    );
+    vm.set_input(Value::from_json_str(
+        r#"{"user": {"role": "admin"}, "action": "delete"}"#,
+    )?);
+    vm.set_partial_eval_settings(PartialEvalSettings::default());
+    let concrete = vm.partial_eval("data.test.allow")?;
+    assert_eq!(concrete.result, Value::from(true));
+    assert!(concrete.residual_queries.is_empty());
+    assert_eq!(
+        vm.execute_entry_point_by_name("data.test.allow")?,
+        Value::from(true)
+    );
+    vm.set_input(Value::new_object());
+    vm.set_partial_eval_settings(settings);
+    assert_eq!(vm.partial_eval("data.test.allow")?, first);
     Ok(())
 }
 
@@ -273,14 +304,13 @@ fn unchecked_reads_fail_closed() -> anyhow::Result<()> {
             "{body}"
         );
     }
-    // A checked assignment reads the unknown in a comparison, which is not
-    // supported yet.
+    // A checked assignment is a residual on the input path.
     let result = pe(
         "package test\nallow if { _v := input.u; _v == 1 }",
         "{}",
         &["u"],
     )?;
-    assert_eq!(result.status, ResidualStatus::Unsupported);
+    assert_eq!(texts(&result), vec![vec!["input.u == 1"]]);
     Ok(())
 }
 
@@ -318,6 +348,118 @@ fn with_is_rejected_by_the_compiler() {
     let rego = "package test\nallow if { input.u == 1 with input as {} }";
     let err = vm(rego).err().map(|e| format!("{e:?}").to_lowercase());
     assert!(err.as_ref().is_some_and(|e| e.contains("with")), "{err:?}");
+}
+
+#[test]
+fn only_a_single_complete_body_gets_conditions() -> anyhow::Result<()> {
+    let cases = [
+        (
+            "allow if input.u == 1\nallow if input.k == 1",
+            ResidualStatus::Unsupported,
+        ),
+        (
+            "allow if input.u == 1 else := false",
+            ResidualStatus::Unsupported,
+        ),
+        (
+            "default allow := false\nallow if input.u == 1",
+            ResidualStatus::Unsupported,
+        ),
+        (
+            "allow := input.u if input.k == 1",
+            ResidualStatus::Unsupported,
+        ),
+        ("allow := {1} if input.u == 1", ResidualStatus::Unsupported),
+        ("allow if input.u == {1}", ResidualStatus::Unsupported),
+        ("allow := [1] if input.u == [1]", ResidualStatus::Exact),
+        // No dependency on unknown input: the concrete result is exact.
+        (
+            "allow if input.k == 1\nallow if input.k == 1",
+            ResidualStatus::Exact,
+        ),
+        (
+            "default allow := false\nallow if input.k == 2",
+            ResidualStatus::Exact,
+        ),
+        ("allow := {1} if input.k == 1", ResidualStatus::Exact),
+    ];
+    for (rules, want) in cases {
+        let rego = format!("package test\n{rules}");
+        let r = pe(&rego, r#"{"k": 1}"#, &["u"])?;
+        assert_eq!(r.status, want, "{rules}");
+        // Warnings point at the policy, not at the entry stub.
+        assert!(
+            r.warnings
+                .iter()
+                .all(|w| w.contains(" at p.rego:") && !w.ends_with(":0:0")),
+            "{rules}: {:?}",
+            r.warnings
+        );
+    }
+    let result = pe("package test\nallow := [1] if input.u == [1]", "{}", &["u"])?;
+    assert_eq!(
+        result.residual_queries[0].value,
+        Value::from_json_str("[1]")?
+    );
+    assert_eq!(texts(&result), vec![vec!["input.u == [1]"]]);
+    Ok(())
+}
+
+#[test]
+fn strict_ordering_may_raise_so_is_unsupported() -> anyhow::Result<()> {
+    for (body, want) in [
+        ("input.u < 1", ResidualStatus::Unsupported),
+        ("input.u == 1", ResidualStatus::Exact),
+    ] {
+        let mut vm = vm(&format!("package test\nallow if {body}"))?;
+        vm.set_strict_builtin_errors(true);
+        let mut settings = PartialEvalSettings::default();
+        settings.unknowns = keys(&["u"]);
+        vm.set_partial_eval_settings(settings);
+        assert_eq!(vm.partial_eval("data.test.allow")?.status, want, "{body}");
+    }
+    Ok(())
+}
+
+#[test]
+fn deployment_unknowns() -> anyhow::Result<()> {
+    let rego = r#"package test
+allow if {
+  input.resource.type == "vm"
+  input.deployment.location != "eastus"
+  input.deployment.targetScope == "resourceGroup"
+}"#;
+    let unknowns = &["deployment.location", "deployment.targetScope"];
+    let input = r#"{"resource": {"type": "vm"}, "deployment": {"tenantId": "t"}}"#;
+    let result = pe(rego, input, unknowns)?;
+    assert_eq!(
+        texts(&result),
+        vec![vec![
+            r#"input.deployment.location != "eastus""#,
+            r#"input.deployment.targetScope == "resourceGroup""#
+        ]]
+    );
+    let input = r#"{"resource": {"type": "storage"}}"#;
+    let result = pe(rego, input, unknowns)?;
+    assert_eq!(result.status, ResidualStatus::Exact);
+    assert!(result.residual_queries.is_empty());
+    Ok(())
+}
+
+#[test]
+fn whole_input_unknown() -> anyhow::Result<()> {
+    let mut vm = vm("package test\nallow if input.role == \"admin\"")?;
+    let mut settings = PartialEvalSettings::default();
+    settings.unknowns = vec![UnknownPath::new(UnknownRoot::Input, [])];
+    vm.set_partial_eval_settings(settings);
+    let result = vm.partial_eval("data.test.allow")?;
+    assert_eq!(texts(&result), vec![vec![r#"input.role == "admin""#]]);
+    vm.set_input(Value::new_object());
+    assert!(matches!(
+        vm.partial_eval("data.test.allow"),
+        Err(ExplainError::UnknownValueSupplied { .. })
+    ));
+    Ok(())
 }
 
 #[test]
@@ -391,5 +533,103 @@ fn context_unknowns_fail_closed() -> anyhow::Result<()> {
     let location = r#"{"value": "[resourceGroup().location]", "equals": "eastus"}"#;
     let result = run(location)?;
     assert_eq!(result.status, ResidualStatus::Exact);
+    Ok(())
+}
+
+#[test]
+fn reading_an_unknown_is_unsupported() -> anyhow::Result<()> {
+    let result = pe("package test\nallow if input.u + 1 > 2", "{}", &["u"])?;
+    assert_eq!(result.status, ResidualStatus::Unsupported);
+    assert_eq!(result.result, Value::Undefined);
+    assert!(result.residual_queries.is_empty());
+    assert_eq!(
+        result.warnings,
+        vec![String::from(
+            "partial evaluation unsupported: `Add` reads a value that depends on unknown input at p.rego:2:18"
+        )]
+    );
+    // Without a read of the unknown path the concrete result is exact.
+    let rego = "package test\nallow if input.k + 1 > 1";
+    for (input, want) in [
+        (r#"{"k": 1}"#, Value::from(true)),
+        (r#"{"k": -1}"#, Value::Undefined),
+    ] {
+        let result = pe(rego, input, &["u"])?;
+        assert_eq!(result.status, ResidualStatus::Exact, "{input}");
+        assert_eq!(result.kind, RuleKind::Complete);
+        assert_eq!(result.result, want, "{input}");
+        assert!(result.residual_queries.is_empty());
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    }
+    Ok(())
+}
+
+#[test]
+fn unchecked_unknowns_are_unsupported() -> anyhow::Result<()> {
+    let input = r#"{"k": 1, "user": {"name": "a"}}"#;
+    let unknowns = &["u", "user.role"];
+    let cases = [
+        (
+            "allow if { _v := input.u }",
+            "a value that depends on unknown input is not checked",
+        ),
+        // The supplied part of `input.user` is incomplete.
+        (
+            "allow := input.user",
+            "the rule value depends on unknown input",
+        ),
+    ];
+    for (rules, want) in cases {
+        let result = pe(&format!("package test\n{rules}"), input, unknowns)?;
+        assert_eq!(result.status, ResidualStatus::Unsupported, "{rules}");
+        let want = format!("partial evaluation unsupported: {want} at p.rego:2:");
+        assert!(
+            result.warnings.len() == 1 && result.warnings[0].starts_with(&want),
+            "{rules}: {:?}",
+            result.warnings
+        );
+    }
+    let twins = [
+        ("allow if { _v := input.k }", Value::from(true)),
+        ("allow := input.user.name", Value::from("a")),
+    ];
+    for (rules, want) in twins {
+        let result = pe(&format!("package test\n{rules}"), input, unknowns)?;
+        assert_eq!(result.status, ResidualStatus::Exact, "{rules}");
+        assert_eq!(result.result, want, "{rules}");
+    }
+    Ok(())
+}
+
+#[test]
+fn invalid_unknown_messages_render_paths() -> anyhow::Result<()> {
+    let message = |unknowns: &[&str], input: &str| {
+        pe(TWO_CONDITIONS, input, unknowns)
+            .err()
+            .map(|e| e.to_string())
+    };
+    assert_eq!(
+        message(&["user", "user.role"], "{}").as_deref(),
+        Some("invalid unknown path `input.user.role`: overlaps `input.user`")
+    );
+    assert_eq!(
+        message(&["a.b"], r#"{"a": {"b": 1}}"#).as_deref(),
+        Some("a value is supplied for unknown path `input.a.b`")
+    );
+    assert_eq!(message(&["a.b"], r#"{"a.b": 1}"#), None);
+    // A key that is not an identifier is quoted.
+    let mut vm = vm(TWO_CONDITIONS)?;
+    vm.set_input(Value::from_json_str(r#"{"a.b": {"in": 1}}"#)?);
+    let mut settings = PartialEvalSettings::default();
+    settings.unknowns = vec![UnknownPath::input_keys(["a.b", "in"])];
+    vm.set_partial_eval_settings(settings);
+    assert_eq!(
+        vm.partial_eval("data.test.allow")
+            .err()
+            .map(|e| e.to_string()),
+        Some(String::from(
+            r#"a value is supplied for unknown path `input["a.b"]["in"]`"#
+        ))
+    );
     Ok(())
 }

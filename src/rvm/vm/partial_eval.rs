@@ -6,20 +6,21 @@
 //!
 //! The shadow covers the registers of one frame: the bodies of the queried
 //! rule, or the entry code when the query is not a single rule reference.
-//! Only indexing and `Move` understand tainted registers. Any other read of
-//! a tainted register, or a read of an unknown root outside the frame, makes
-//! the result `Unsupported`, so constructs not handled here fail closed.
+//! A few sites (indexing, `Move`, comparisons with a known value, guards)
+//! understand tainted registers. Any other read of a tainted register, or a
+//! read of an unknown root outside the frame, makes the result
+//! `Unsupported`, so constructs not handled here fail closed.
 
 use super::dispatch::InstructionOutcome;
 use super::errors::Result;
 use super::execution_model::ExecutionMode;
 use super::machine::RegoVM;
 use crate::explain::{
-    ExplainError, PartialEvalResult, PartialEvalSettings, PathSegment, ResidualStatus, RuleKind,
-    SourceLocation, UnknownRoot,
+    ExplainError, Operator, PartialEvalResult, PartialEvalSettings, PathSegment, ResidualCondition,
+    ResidualKind, ResidualQuery, ResidualStatus, RuleKind, SourceLocation, UnknownRoot,
 };
-use crate::rvm::instructions::{Instruction, LiteralOrRegister};
-use crate::rvm::program::Program;
+use crate::rvm::instructions::{GuardMode, Instruction, LiteralOrRegister};
+use crate::rvm::program::{Program, RuleType};
 use crate::value::Value;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -38,28 +39,48 @@ enum Class {
 }
 
 #[derive(Debug, Clone)]
+struct Cond {
+    kind: ResidualKind,
+    op: Option<Operator>,
+    path: Path,
+    value: Option<Value>,
+    pc: usize,
+}
+
+#[derive(Debug, Clone)]
 enum Taint {
     /// A strict prefix of an unknown path: the register holds the supplied
     /// part, which is incomplete.
     Prefix(Path),
     /// At or under an unknown path. `used` is set when a site consumes it.
     Unknown { path: Path, used: bool },
+    /// The outcome of a supported comparison; the register holds `true`.
+    Cond { cond: Box<Cond>, used: bool },
 }
 
 #[derive(Debug, Clone, Copy)]
 enum Reason {
     OutsideFrame,
     Unconstrained,
+    NotJson,
+    StrictCompare,
+    ContextResidual,
+    NotRuleQuery,
+    RuleShape,
     RuleValue,
+    Budget,
 }
 
 /// Partial evaluation state for one evaluation.
 #[derive(Debug)]
 pub(super) struct PeState {
     unknowns: Vec<Path>,
+    max_conditions: usize,
     /// Register stack depth of the shadowed frame.
     frame_depth: usize,
     shadow: BTreeMap<u8, Taint>,
+    attempt: Vec<Cond>,
+    committed: Vec<(Vec<Cond>, Value)>,
     unsupported: Option<(Reason, usize)>,
     /// `pc + 1` of the first other read of a tainted register, or 0.
     read_pc: AtomicUsize,
@@ -112,8 +133,25 @@ impl PeState {
     }
 
     fn mark_used(&mut self, reg: u8) {
-        if let Some(&mut Taint::Unknown { ref mut used, .. }) = self.shadow.get_mut(&reg) {
-            *used = true;
+        if let Some(taint) = self.shadow.get_mut(&reg) {
+            match *taint {
+                Taint::Unknown { ref mut used, .. } | Taint::Cond { ref mut used, .. } => {
+                    *used = true;
+                }
+                Taint::Prefix(_) => {}
+            }
+        }
+    }
+
+    fn record(&mut self, cond: Cond) {
+        if self.frame_depth == 0 {
+            self.flag(Reason::NotRuleQuery, cond.pc);
+        } else if cond.path.0 != UnknownRoot::Input {
+            self.flag(Reason::ContextResidual, cond.pc);
+        }
+        self.attempt.push(cond);
+        if self.attempt.len() > self.max_conditions {
+            self.flag(Reason::Budget, self.attempt.last().map_or(0, |c| c.pc));
         }
     }
 
@@ -125,16 +163,20 @@ impl PeState {
 }
 
 impl Taint {
-    fn path(&self) -> (Class, Path) {
+    fn path(&self) -> Option<(Class, Path)> {
         match *self {
-            Self::Prefix(ref path) => (Class::Prefix, path.clone()),
-            Self::Unknown { ref path, .. } => (Class::Unknown, path.clone()),
+            Self::Prefix(ref path) => Some((Class::Prefix, path.clone())),
+            Self::Unknown { ref path, .. } => Some((Class::Unknown, path.clone())),
+            Self::Cond { .. } => None,
         }
     }
 }
 
 const fn is_unused(taint: &Taint) -> bool {
-    matches!(*taint, Taint::Unknown { used: false, .. })
+    matches!(
+        *taint,
+        Taint::Unknown { used: false, .. } | Taint::Cond { used: false, .. }
+    )
 }
 
 fn segment(key: &Value) -> Option<PathSegment> {
@@ -152,8 +194,47 @@ fn index(value: &Value, segment: &PathSegment) -> Value {
     }
 }
 
-/// Renders a path as Rego, such as `input["user"]["role"]` or
-/// `input["xs"][0]`.
+/// Whether JSON represents the value without loss: no sets and no
+/// non-string object keys.
+fn is_lossless(value: &Value) -> bool {
+    match *value {
+        Value::Set(_) => false,
+        Value::Array(ref items) => items.iter().all(is_lossless),
+        Value::Object(ref fields) => fields
+            .iter()
+            .all(|(k, v)| matches!(*k, Value::String(_)) && is_lossless(v)),
+        _ => true,
+    }
+}
+
+const fn mirror(op: Operator) -> Operator {
+    match op {
+        Operator::Lt => Operator::Gt,
+        Operator::Le => Operator::Ge,
+        Operator::Gt => Operator::Lt,
+        Operator::Ge => Operator::Le,
+        other => other,
+    }
+}
+
+const fn op_text(op: Operator) -> &'static str {
+    match op {
+        Operator::Eq => "==",
+        Operator::Ne => "!=",
+        Operator::Lt => "<",
+        Operator::Le => "<=",
+        Operator::Gt => ">",
+        Operator::Ge => ">=",
+        _ => "in",
+    }
+}
+
+const KEYWORDS: &[&str] = &[
+    "as", "contains", "default", "else", "every", "false", "if", "import", "in", "not", "null",
+    "package", "some", "true", "with",
+];
+
+/// Renders a path as Rego, such as `input.user.role` or `input["a.b"][0]`.
 fn render_path(root: UnknownRoot, segments: &[PathSegment]) -> String {
     let mut text = String::from(match root {
         UnknownRoot::Context => "context",
@@ -162,10 +243,21 @@ fn render_path(root: UnknownRoot, segments: &[PathSegment]) -> String {
     for segment in segments {
         match *segment {
             PathSegment::Key(ref key) => {
-                let quoted = Value::from(key.as_str())
-                    .to_json_str_compact()
-                    .unwrap_or_default();
-                text.push_str(&format!("[{quoted}]"));
+                let ident = key
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                    && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    && !KEYWORDS.contains(&key.as_str());
+                if ident {
+                    text.push('.');
+                    text.push_str(key);
+                } else {
+                    let quoted = Value::from(key.as_str())
+                        .to_json_str_compact()
+                        .unwrap_or_default();
+                    text.push_str(&format!("[{quoted}]"));
+                }
             }
             PathSegment::Index(i) => text.push_str(&format!("[{i}]")),
         }
@@ -174,7 +266,7 @@ fn render_path(root: UnknownRoot, segments: &[PathSegment]) -> String {
 }
 
 impl RegoVM {
-    /// Sets the unknown paths for [`partial_eval`](Self::partial_eval).
+    /// Sets the unknown paths and budget for [`partial_eval`](Self::partial_eval).
     pub fn set_partial_eval_settings(&mut self, settings: PartialEvalSettings) {
         self.pe_settings = settings;
     }
@@ -205,8 +297,11 @@ impl RegoVM {
         });
         self.pe = Some(Box::new(PeState {
             unknowns,
+            max_conditions: self.pe_settings.max_conditions,
             frame_depth: usize::from(rule.is_some()),
             shadow: BTreeMap::new(),
+            attempt: Vec::new(),
+            committed: Vec::new(),
             unsupported: None,
             read_pc: AtomicUsize::new(0),
         }));
@@ -240,11 +335,60 @@ impl RegoVM {
             return Ok(unsupported(warning(&program, None, pc)));
         }
         let result = run?;
+        let Some((conds, value)) = state.committed.pop() else {
+            return Ok(PartialEvalResult {
+                kind,
+                status: ResidualStatus::Exact,
+                result,
+                residual_queries: Vec::new(),
+                warnings: Vec::new(),
+            });
+        };
+        let anchor = conds.first().map_or(usize::MAX, |c| c.pc);
+        let single = rule_info.is_some_and(|info| {
+            matches!(info.rule_type, RuleType::Complete)
+                && info.function_info.is_none()
+                && info.default_literal_index.is_none()
+                && info.definitions.len() == 1
+                && info.definitions.iter().all(|bodies| bodies.len() == 1)
+                && info.destructuring_blocks.iter().all(Option::is_none)
+        });
+        if !single || !state.committed.is_empty() {
+            return Ok(unsupported(warning(
+                &program,
+                Some(Reason::RuleShape),
+                anchor,
+            )));
+        }
+        if !is_lossless(&value) {
+            return Ok(unsupported(warning(
+                &program,
+                Some(Reason::NotJson),
+                anchor,
+            )));
+        }
+        let mut conditions = Vec::with_capacity(conds.len());
+        for cond in conds {
+            match condition(&program, rule_info.map(|i| i.name.clone()), cond) {
+                Some(c) => conditions.push(c),
+                None => {
+                    return Ok(unsupported(warning(
+                        &program,
+                        Some(Reason::NotJson),
+                        anchor,
+                    )))
+                }
+            }
+        }
         Ok(PartialEvalResult {
             kind,
             status: ResidualStatus::Exact,
-            result,
-            residual_queries: Vec::new(),
+            result: Value::Undefined,
+            residual_queries: alloc::vec![ResidualQuery {
+                key: None,
+                value,
+                conditions,
+            }],
             warnings: Vec::new(),
         })
     }
@@ -283,6 +427,10 @@ impl RegoVM {
 
     const fn pe_depth(&self) -> usize {
         self.register_stack.len()
+    }
+
+    const fn pe_sites_allowed(&self) -> bool {
+        self.loop_stack.is_empty() && self.comprehension_stack.is_empty()
     }
 
     fn pe_taint(&self, reg: u8) -> Option<&Taint> {
@@ -333,6 +481,7 @@ impl RegoVM {
                     }
                     let taint = match taint {
                         Taint::Unknown { path, .. } => Taint::Unknown { path, used: false },
+                        Taint::Cond { cond, .. } => Taint::Cond { cond, used: false },
                         prefix @ Taint::Prefix(_) => prefix,
                     };
                     let value = self.pe_raw(src);
@@ -370,6 +519,28 @@ impl RegoVM {
                 };
                 self.pe_index(program, params.dest, params.root, &params.path_components)
             }
+            Instruction::Eq { dest, left, right } => {
+                self.pe_compare(Some(dest), left, right, Operator::Eq)
+            }
+            Instruction::Ne { dest, left, right } => {
+                self.pe_compare(Some(dest), left, right, Operator::Ne)
+            }
+            Instruction::Lt { dest, left, right } => {
+                self.pe_compare(Some(dest), left, right, Operator::Lt)
+            }
+            Instruction::Le { dest, left, right } => {
+                self.pe_compare(Some(dest), left, right, Operator::Le)
+            }
+            Instruction::Gt { dest, left, right } => {
+                self.pe_compare(Some(dest), left, right, Operator::Gt)
+            }
+            Instruction::Ge { dest, left, right } => {
+                self.pe_compare(Some(dest), left, right, Operator::Ge)
+            }
+            Instruction::AssertEq { left, right } => {
+                self.pe_compare(None, left, right, Operator::Eq)
+            }
+            Instruction::Guard { register, mode } => self.pe_guard(register, mode),
             _ => Ok(None),
         }
     }
@@ -406,7 +577,8 @@ impl RegoVM {
         container: u8,
         keys: &[LiteralOrRegister],
     ) -> Result<Option<InstructionOutcome>> {
-        let Some((mut class, (root, mut segments))) = self.pe_taint(container).map(Taint::path)
+        let Some((mut class, (root, mut segments))) =
+            self.pe_taint(container).and_then(Taint::path)
         else {
             return Ok(None);
         };
@@ -452,6 +624,100 @@ impl RegoVM {
         Ok(Some(InstructionOutcome::Continue))
     }
 
+    /// A comparison (`dest` set) or unification (`AssertEq`) between one
+    /// unknown path and a known value.
+    fn pe_compare(
+        &mut self,
+        dest: Option<u8>,
+        left: u8,
+        right: u8,
+        op: Operator,
+    ) -> Result<Option<InstructionOutcome>> {
+        let left_taint = self.pe_taint(left).map(Taint::path);
+        let right_taint = self.pe_taint(right).map(Taint::path);
+        let (unknown, known, op, path) = match (left_taint, right_taint) {
+            (Some(Some((Class::Unknown, path))), None) => (left, right, op, path),
+            (None, Some(Some((Class::Unknown, path)))) => (right, left, mirror(op), path),
+            _ => return Ok(None),
+        };
+        if !self.pe_sites_allowed() {
+            return Ok(None);
+        }
+        let value = self.pe_raw(known);
+        let pc = self.pc;
+        let strict = self.strict_builtin_errors && !matches!(op, Operator::Eq | Operator::Ne);
+        if let Some(pe) = self.pe_mut() {
+            pe.mark_used(unknown);
+            if !matches!(value, Value::Undefined) && !is_lossless(&value) {
+                pe.flag(Reason::NotJson, pc);
+            }
+            if strict {
+                pe.flag(Reason::StrictCompare, pc);
+            }
+        }
+        let defined = !matches!(value, Value::Undefined);
+        let cond = Cond {
+            kind: ResidualKind::ConditionHolds,
+            op: Some(op),
+            path,
+            value: Some(value),
+            pc,
+        };
+        match dest {
+            Some(dest) if defined => {
+                let taint = Taint::Cond {
+                    cond: Box::new(cond),
+                    used: false,
+                };
+                self.pe_set(dest, Value::Bool(true), Some(taint))?;
+            }
+            Some(dest) => self.set_register(dest, Value::Undefined)?,
+            None => {
+                if defined {
+                    if let Some(pe) = self.pe_mut() {
+                        pe.record(cond);
+                    }
+                }
+                self.handle_condition(defined)?;
+            }
+        }
+        Ok(Some(InstructionOutcome::Continue))
+    }
+
+    fn pe_guard(&mut self, register: u8, mode: GuardMode) -> Result<Option<InstructionOutcome>> {
+        let pc = self.pc;
+        let kind = match mode {
+            GuardMode::Condition => ResidualKind::Truthy,
+            GuardMode::NotUndefined => ResidualKind::Exists,
+            GuardMode::Not => return Ok(None),
+        };
+        let cond = match self.pe_taint(register) {
+            Some(taint) => match *taint {
+                Taint::Unknown { ref path, .. } => Cond {
+                    kind,
+                    op: None,
+                    path: path.clone(),
+                    value: None,
+                    pc,
+                },
+                Taint::Cond { ref cond, .. } if matches!(kind, ResidualKind::Truthy) => {
+                    (**cond).clone()
+                }
+                _ => return Ok(None),
+            },
+            None => return Ok(None),
+        };
+        if !self.pe_sites_allowed() {
+            return Ok(None);
+        }
+        if let Some(pe) = self.pe_mut() {
+            pe.mark_used(register);
+            pe.record(cond);
+        }
+        self.handle_condition(true)?;
+        Ok(Some(InstructionOutcome::Continue))
+    }
+
     /// Starts a body of the shadowed frame.
     #[cold]
     #[inline(never)]
@@ -459,15 +725,17 @@ impl RegoVM {
         let depth = self.pe_depth();
         if let Some(pe) = self.pe_mut().filter(|pe| pe.in_frame(depth)) {
             pe.shadow.clear();
+            pe.attempt.clear();
         }
     }
 
-    /// A body of the shadowed frame completed: its value and every unknown
-    /// it read must be accounted for.
+    /// A body of the shadowed frame completed: keep its conditions if it
+    /// produced a value.
     #[cold]
     #[inline(never)]
     pub(super) fn pe_body_succeeded(&mut self, result_reg: u8) {
         let (depth, pc) = (self.pe_depth(), self.pc);
+        let value = self.pe_raw(result_reg);
         let Some(pe) = self.pe.as_deref_mut().filter(|pe| pe.in_frame(depth)) else {
             return;
         };
@@ -475,6 +743,10 @@ impl RegoVM {
             pe.flag(Reason::RuleValue, pc);
         }
         pe.flag_unused(pc);
+        let attempt = core::mem::take(&mut pe.attempt);
+        if !attempt.is_empty() && !matches!(value, Value::Undefined) {
+            pe.committed.push((attempt, value));
+        }
     }
 }
 
@@ -484,6 +756,33 @@ fn location(program: &Program, pc: usize) -> Option<SourceLocation> {
         file: program.sources.get(span.source_index)?.name.clone(),
         line: span.line,
         column: span.column,
+    })
+}
+
+fn condition(program: &Program, rule: Option<String>, cond: Cond) -> Option<ResidualCondition> {
+    let path = render_path(cond.path.0, &cond.path.1);
+    let text = match (cond.op, cond.value.as_ref()) {
+        (Some(op), Some(value)) => {
+            if !is_lossless(value) {
+                return None;
+            }
+            format!(
+                "{path} {} {}",
+                op_text(op),
+                value.to_json_str_compact().ok()?
+            )
+        }
+        _ => path.clone(),
+    };
+    Some(ResidualCondition {
+        text,
+        kind: cond.kind,
+        operator: cond.op,
+        input_path: Some(path),
+        value: cond.value,
+        negated: Vec::new(),
+        rule,
+        location: location(program, cond.pc),
     })
 }
 
@@ -507,12 +806,28 @@ fn warning(program: &Program, reason: Option<Reason>, pc: usize) -> String {
                 .unwrap_or_default();
             format!("`{kind}` reads a value that depends on unknown input")
         }
+        Some(Reason::Budget) => return String::from("residual budget exceeded"),
         Some(Reason::OutsideFrame) => {
             String::from("unknown input is read outside the queried rule's body")
         }
         Some(Reason::Unconstrained) => {
             String::from("a value that depends on unknown input is not checked")
         }
+        Some(Reason::NotJson) => {
+            String::from("a residual value contains a set or a non-string object key")
+        }
+        Some(Reason::StrictCompare) => {
+            String::from("an ordering comparison of unknown input may raise a type error")
+        }
+        Some(Reason::ContextResidual) => {
+            String::from("conditions on the `context` root can't be reported yet")
+        }
+        Some(Reason::NotRuleQuery) => {
+            String::from("conditions are reported only for a query that names one rule")
+        }
+        Some(Reason::RuleShape) => String::from(
+            "conditions are reported only for a complete rule with one body and no default",
+        ),
         Some(Reason::RuleValue) => String::from("the rule value depends on unknown input"),
     };
     format!("partial evaluation unsupported: {text}{at}")

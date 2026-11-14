@@ -215,7 +215,7 @@ pub struct RegoVM {
     #[cfg(feature = "explanations")]
     pub(super) explain: super::explain::ExplainHooks,
 
-    /// Unknown paths for partial evaluation.
+    /// Unknown paths and budget for partial evaluation.
     #[cfg(feature = "explanations")]
     pub(super) pe_settings: crate::explain::PartialEvalSettings,
 

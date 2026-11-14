@@ -146,9 +146,21 @@ impl UnknownPath {
 /// Settings for partial evaluation.
 ///
 /// Start from [`PartialEvalSettings::default`] and set the fields you need.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PartialEvalSettings {
     /// Paths whose values are unknown. They must not overlap.
     pub unknowns: alloc::vec::Vec<UnknownPath>,
+    /// Maximum conditions in one residual query. Above it the result is
+    /// [`Unsupported`](super::ResidualStatus::Unsupported). Default: 64.
+    pub max_conditions: usize,
+}
+
+impl Default for PartialEvalSettings {
+    fn default() -> Self {
+        Self {
+            unknowns: alloc::vec::Vec::new(),
+            max_conditions: 64,
+        }
+    }
 }
