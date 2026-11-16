@@ -202,6 +202,7 @@ pub fn denormalize_with_aliases(
     if let Some(aliases) = aliases {
         if !aliases.sub_resource_arrays.is_empty() {
             sub_resource::rewrap_sub_resource_arrays(
+                &mut result,
                 &mut properties,
                 &aliases.sub_resource_arrays,
                 &aliases.entries,
