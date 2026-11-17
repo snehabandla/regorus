@@ -7,7 +7,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString as _};
 use alloc::vec::Vec;
 
-use crate::Value;
+use crate::{Rc, Value};
 
 use super::super::obj_map::{make_array, make_value, new_map, obj_insert, val_str, ROOT_FIELDS};
 use super::super::path::{self, Segment};
@@ -103,6 +103,22 @@ pub fn restore_casing(key: &str, casing_map: &BTreeMap<String, String>) -> Strin
         .get(&key.to_ascii_lowercase())
         .cloned()
         .unwrap_or_else(|| key.to_string())
+}
+
+/// Restore the casing of every key in a rendered path. Text outside the
+/// grammar is returned unchanged.
+pub fn restore_path_casing(text: &str, casing_map: &BTreeMap<String, String>) -> String {
+    let Some(segments) = path::scalar_segments(text) else {
+        return text.to_string();
+    };
+    let restored: Vec<Segment> = segments
+        .into_iter()
+        .map(|segment| match segment {
+            Segment::Key(key) => Segment::Key(Rc::from(restore_casing(&key, casing_map))),
+            other => other,
+        })
+        .collect();
+    path::render(&restored)
 }
 
 /// Recursively restore key casing in a JSON value.

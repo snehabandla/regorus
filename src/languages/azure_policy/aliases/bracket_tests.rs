@@ -7,14 +7,14 @@
 
 use super::{
     denormalizer, normalizer, path,
-    types::{ResolvedEntry, VersionedAggregates},
+    types::{PrecomputedRemap, PrecomputedReverseRemap, ResolvedEntry, VersionedAggregates},
     AliasRegistry,
 };
 use crate::Value;
 use alloc::string::{String, ToString as _};
 use alloc::vec;
 use alloc::vec::Vec;
-use serde_json::json;
+use serde_json::{json, Value as Json};
 
 fn registry(aliases: &[(&str, &str)]) -> AliasRegistry {
     let entries: Vec<_> = aliases
@@ -207,35 +207,69 @@ fn bracket_alias_wildcard_classification() {
 }
 
 #[test]
-fn bracket_rendered_leaves_are_not_remapped() {
-    // Element remaps are navigated by splitting on dots, so a leaf that needs
-    // a bracket subscript would be written as a garbled key.
-    for aliases in [
-        [("rules[*]['a.b']", "properties.rules[*]['X.y']")],
-        [("rules[*]['a.b']", "properties.rules[*].xy")],
-        [("rules[*].xy", "properties.rules[*]['a.b']")],
-        [("rules[*]['a[b]']", "properties.rules[*].xy")],
-        [("rules[*].xs[0]", "properties.rules[*].ys[0]")],
+fn bracket_rendered_leaves_are_remapped() {
+    // Element remaps navigate parsed paths, so leaves that need a bracket
+    // subscript move like dotted ones.
+    let registry = registry(&[("rules[*]['a.b']", "properties.rules[*]['X.y']")]);
+    let aggregates = &registry.get("Test/widgets").unwrap().default_aggregates;
+    assert_eq!(
+        aggregates.element_remaps,
+        vec![PrecomputedRemap {
+            array_chain: vec![vec!["rules".into()]],
+            source_field: "['x.y']".into(),
+            target_field: "['a.b']".into(),
+        }]
+    );
+    assert_eq!(
+        aggregates.reverse_element_remaps,
+        vec![PrecomputedReverseRemap {
+            array_chain: vec![vec!["rules".into()]],
+            source_field: "['a.b']".into(),
+            target_field: "['X.y']".into(),
+            cleanup_field: "['a.b']".into(),
+        }]
+    );
+
+    for (alias, arm, short) in [
+        (
+            ("rules[*]['a.b']", "properties.rules[*]['X.y']"),
+            json!({"X.y": 1}),
+            json!({"a.b": 1}),
+        ),
+        (
+            ("rules[*]['a.b']", "properties.rules[*].xy"),
+            json!({"xy": 1}),
+            json!({"a.b": 1}),
+        ),
+        (
+            ("rules[*].xy", "properties.rules[*]['a.b']"),
+            json!({"a.b": 1}),
+            json!({"xy": 1}),
+        ),
+        (
+            ("rules[*]['a[b]']", "properties.rules[*].xy"),
+            json!({"xy": 1}),
+            json!({"a[b]": 1}),
+        ),
+        (
+            ("rules[*].xs[0]", "properties.rules[*].ys[0]"),
+            json!({"ys": [1]}),
+            // An indexed source is copied: other aliases may read the array.
+            json!({"ys": [1], "xs": [1]}),
+        ),
     ] {
+        let aliases = [alias];
         assert_eq!(
-            registry(&aliases)
-                .get("Test/widgets")
-                .unwrap()
-                .default_aggregates,
-            VersionedAggregates::default(),
-            "{aliases:?}"
+            normalized(&aliases, json!({"rules": [arm.clone(), {"other": 2}]})),
+            Value::from(json!({"type": "Test/widgets", "rules": [short.clone(), {"other": 2}]})),
+            "{alias:?}"
+        );
+        assert_eq!(
+            denormalized(&aliases, json!({"rules": [short, {"other": 2}]})),
+            Value::from(json!({"properties": {"rules": [arm, {"other": 2}]}})),
+            "{alias:?}"
         );
     }
-    let bracket_short = [("rules[*]['a.b']", "properties.rules[*].xy")];
-    assert_eq!(
-        normalized(&bracket_short, json!({"rules": [{"xy": 1}]})),
-        Value::from(json!({"type": "Test/widgets", "rules": [{"xy": 1}]}))
-    );
-    let bracket_arm = [("rules[*].xy", "properties.rules[*]['a.b']")];
-    assert_eq!(
-        denormalized(&bracket_arm, json!({"rules": [{"xy": 1}]})),
-        Value::from(json!({"properties": {"rules": [{"xy": 1}]}}))
-    );
 }
 
 #[test]
@@ -578,7 +612,7 @@ fn slash_wrapper_must_be_unquoted() {
         ),
         Value::from(json!({
             "type": "Test/widgets",
-            "rules": [{"properties": {"kept": 1}, "foo": {}, "x": 2}]
+            "rules": [{"properties": {"kept": 1}, "x": 2}]
         }))
     );
     // The quoted key is an ordinary element field: the leaf is remapped as
@@ -588,7 +622,7 @@ fn slash_wrapper_must_be_unquoted() {
         normalized(&quoted, json!({"rules": [element]})),
         Value::from(json!({
             "type": "Test/widgets",
-            "rules": [{"properties": {"kept": 1}, "properties/foo": {}, "x": 2}]
+            "rules": [{"properties": {"kept": 1}, "x": 2}]
         }))
     );
 }
@@ -710,9 +744,15 @@ fn unparseable_path_casing_beats_quoted_keys() {
 fn indexed_properties_is_not_a_wrapper() {
     let indexed = [("a[*].x", "properties.a[*].properties[0].x")];
     assert!(sub_resource_arrays(&indexed).is_empty());
+    // The indexed `properties` is an ordinary element field: its value is
+    // copied to the alias leaf and written back by index.
     assert_eq!(
         normalized(&indexed, json!({"a": [{"properties": [{"x": 1}]}]})),
-        Value::from(json!({"type": "Test/widgets", "a": [{"properties": [{"x": 1}]}]}))
+        Value::from(json!({"type": "Test/widgets", "a": [{"properties": [{"x": 1}], "x": 1}]}))
+    );
+    assert_eq!(
+        denormalized(&indexed, json!({"a": [{"x": 1}]})),
+        Value::from(json!({"properties": {"a": [{"properties": [{"x": 1}]}]}}))
     );
 
     let wrapped = [("a[*].x", "properties.a[*].properties.x")];
@@ -787,4 +827,336 @@ fn arm_properties_wrapper_never_supplies_casing() {
             "{arm} {versioned}"
         );
     }
+}
+
+fn nest(keys: &[&str], value: Json) -> Json {
+    keys.iter()
+        .rev()
+        .fold(value, |value, key| json!({*key: value}))
+}
+
+fn suffix_registry(suffix: &str) -> AliasRegistry {
+    let mut registry = AliasRegistry::new();
+    registry
+        .load_from_json(
+            &json!([{
+                "namespace": "Test",
+                "resourceTypes": [{
+                    "resourceType": "widgets",
+                    "aliases": [{
+                        "name": alloc::format!("Test/widgets/renamed{suffix}"),
+                        "defaultPath": alloc::format!("properties.original{suffix}"),
+                        "paths": [{
+                            "path": alloc::format!("properties.versioned{suffix}"),
+                            "apiVersions": ["V2"]
+                        }]
+                    }]
+                }]
+            }])
+            .to_string(),
+        )
+        .unwrap();
+    registry
+}
+
+fn lookup(value: &Value, keys: &[&str]) -> Value {
+    let mut current = value;
+    for key in keys {
+        let Some(next) = current
+            .as_object()
+            .ok()
+            .and_then(|object| object.get(&Value::from(*key)))
+        else {
+            return Value::Undefined;
+        };
+        current = next;
+    }
+    current.clone()
+}
+
+#[test]
+fn bracket_alias_normalizer_match() {
+    let mut failures = Vec::new();
+    for (suffix, keys) in cases() {
+        let registry = suffix_registry(suffix);
+        for (version, source) in [(None, "original"), (Some("v2"), "versioned")] {
+            let raw = Value::from_json_str(
+                &json!({"type": "Test/widgets", "properties": {source: nest(&keys, json!(42))}})
+                    .to_string(),
+            )
+            .unwrap();
+            let normalized = normalizer::normalize(&raw, Some(&registry), version);
+            let lowercase: Vec<_> = keys.iter().map(|key| key.to_ascii_lowercase()).collect();
+            let mut target = vec!["renamed"];
+            target.extend(lowercase.iter().map(|key| key.as_str()));
+            let actual = lookup(&normalized, &target);
+            if actual != Value::from(42) {
+                failures.push(alloc::format!("{suffix} {version:?}: {actual:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn bracket_alias_normalizer_nonmatch() {
+    for (suffix, keys) in cases() {
+        let registry = suffix_registry(suffix);
+        let raw = Value::from_json_str(
+            &json!({"type": "Test/widgets", "properties": {"original": {"different": 42}}})
+                .to_string(),
+        )
+        .unwrap();
+        let normalized = normalizer::normalize(&raw, Some(&registry), None);
+        let lowercase: Vec<_> = keys.iter().map(|key| key.to_ascii_lowercase()).collect();
+        let mut target = vec!["renamed"];
+        target.extend(lowercase.iter().map(|key| key.as_str()));
+        assert_eq!(lookup(&normalized, &target), Value::Undefined, "{suffix}");
+    }
+    // Raw ARM navigation remains case-sensitive, even for quoted keys.
+    let raw =
+        Value::from_json_str(r#"{"type":"Test/widgets","properties":{"original":{"aB":42}}}"#)
+            .unwrap();
+    let normalized = normalizer::normalize(&raw, Some(&suffix_registry("['Ab']")), None);
+    assert_eq!(lookup(&normalized, &["renamed", "ab"]), Value::Undefined);
+}
+
+#[test]
+fn bracket_alias_denormalizer_match() {
+    let mut failures = Vec::new();
+    for (suffix, keys) in cases() {
+        let registry = suffix_registry(suffix);
+        for version in [None, Some("v2")] {
+            let lowercase: Vec<_> = keys.iter().map(|key| key.to_ascii_lowercase()).collect();
+            let refs: Vec<_> = lowercase.iter().map(|key| key.as_str()).collect();
+            let normalized = Value::from_json_str(
+                &json!({"type": "Test/widgets", "renamed": nest(&refs, json!(42))}).to_string(),
+            )
+            .unwrap();
+            let actual = denormalizer::denormalize(&normalized, Some(&registry), version);
+            let source = if version.is_some() {
+                "versioned"
+            } else {
+                "original"
+            };
+            let mut target = vec!["properties", source];
+            target.extend(keys.iter().copied());
+            if lookup(&actual, &target) != Value::from(42) {
+                failures.push(alloc::format!("{suffix} {version:?}: {actual:?}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn bracket_alias_denormalizer_nonmatch() {
+    for (suffix, keys) in cases() {
+        let registry = suffix_registry(suffix);
+        let normalized =
+            Value::from_json_str(r#"{"type":"Test/widgets","renamed":{"different":42}}"#).unwrap();
+        let actual = denormalizer::denormalize(&normalized, Some(&registry), None);
+        let mut target = vec!["properties", "original"];
+        target.extend(keys);
+        assert_eq!(lookup(&actual, &target), Value::Undefined, "{suffix}");
+    }
+}
+
+#[test]
+fn bracket_alias_denormalizer_preserves_siblings_and_casing() {
+    let registry = suffix_registry("['A.B']");
+    for (input, expected) in [
+        (
+            json!({"ReNaMeD": {"A.B": 42, "sibling": 7}}),
+            json!({"properties": {"original": {"A.B": 42}, "renamed": {"sibling": 7}}}),
+        ),
+        (
+            json!({"ReNaMeD": {"different": 42, "sibling": 7}}),
+            json!({"properties": {"renamed": {"different": 42, "sibling": 7}}}),
+        ),
+    ] {
+        let aliases = registry.get("Test/widgets");
+        let actual = denormalizer::denormalize_with_aliases(&Value::from(input), aliases, None);
+        assert_eq!(actual, Value::from(expected));
+    }
+}
+
+#[test]
+fn bracket_alias_true_wildcard_with_quoted_leaf() {
+    for (suffix, keys) in [
+        ("['A.B']", vec!["A.B"]),
+        ("['a[*].properties.fake']", vec!["a[*].properties.fake"]),
+        ("[outer]['a[b]']", vec!["outer", "a[b]"]),
+    ] {
+        let mut registry = AliasRegistry::new();
+        registry
+            .load_from_json(
+                &json!([{
+                    "namespace": "Test",
+                    "resourceTypes": [{
+                        "resourceType": "widgets",
+                        "aliases": [{
+                            "name": alloc::format!("Test/widgets/items[*].renamed{suffix}"),
+                            "defaultPath": alloc::format!("properties.items[*].original{suffix}")
+                        }]
+                    }]
+                }])
+                .to_string(),
+            )
+            .unwrap();
+        let raw = Value::from(json!({
+            "type": "Test/widgets",
+            "properties": {"items": [
+                {"original": nest(&keys, json!(42))},
+                {"original": {"different": 7}}
+            ]}
+        }));
+        let normalized = normalizer::normalize(&raw, Some(&registry), None);
+        let items = lookup(&normalized, &["items"]);
+        let items = items.as_array().unwrap();
+        let lowercase: Vec<_> = keys.iter().map(|key| key.to_ascii_lowercase()).collect();
+        let mut target = vec!["renamed"];
+        target.extend(lowercase.iter().map(|key| key.as_str()));
+        assert_eq!(
+            lookup(items.get(0).unwrap(), &target),
+            Value::from(42),
+            "{suffix}"
+        );
+        assert_eq!(
+            lookup(items.get(1).unwrap(), &target),
+            Value::Undefined,
+            "{suffix}"
+        );
+        let mut source = vec!["original"];
+        source.extend(lowercase.iter().map(|key| key.as_str()));
+        assert_eq!(
+            lookup(items.get(0).unwrap(), &source),
+            Value::Undefined,
+            "{suffix}"
+        );
+
+        let alias_input = Value::from(json!({
+            "type": "Test/widgets",
+            "items": [
+                {"renamed": nest(&lowercase.iter().map(|key| key.as_str()).collect::<Vec<_>>(), json!(42))},
+                {"renamed": {"different": 7}}
+            ]
+        }));
+        let arm = registry.denormalize(&alias_input, None);
+        let arm_items_value = lookup(&arm, &["properties", "items"]);
+        let arm_items = arm_items_value.as_array().unwrap();
+        let mut arm_source = vec!["original"];
+        arm_source.extend(keys);
+        assert_eq!(
+            lookup(arm_items.get(0).unwrap(), &arm_source),
+            Value::from(42),
+            "{suffix}"
+        );
+        assert_eq!(
+            lookup(arm_items.get(1).unwrap(), &arm_source),
+            Value::Undefined,
+            "{suffix}"
+        );
+        assert_eq!(
+            lookup(arm_items.get(0).unwrap(), &target),
+            Value::Undefined,
+            "{suffix}"
+        );
+    }
+}
+
+#[test]
+fn bracket_alias_array_indices_are_not_quoted_keys() {
+    let registry = suffix_registry("[0].leaf");
+    for (input_value, expected) in [
+        (json!([{"leaf": 42}]), Value::from(42)),
+        (json!({"0": {"leaf": 42}}), Value::Undefined),
+    ] {
+        let input = Value::from(json!({"type": "Test/widgets", "renamed": input_value}));
+        let raw =
+            Value::from(json!({"type": "Test/widgets", "properties": {"original": input_value}}));
+        let normalized = normalizer::normalize(&raw, Some(&registry), None);
+        let normalized_value = lookup(&normalized, &["renamed"]);
+        let actual = normalized_value
+            .as_array()
+            .ok()
+            .and_then(|array| array.get(0))
+            .map_or(Value::Undefined, |value| lookup(value, &["leaf"]));
+        assert_eq!(actual, expected);
+
+        let arm = registry.denormalize(&input, None);
+        let arm_value = lookup(&arm, &["properties", "original"]);
+        let arm_actual = arm_value
+            .as_array()
+            .ok()
+            .and_then(|array| array.get(0))
+            .map_or(Value::Undefined, |value| lookup(value, &["leaf"]));
+        assert_eq!(arm_actual, expected);
+    }
+}
+
+#[test]
+fn bracket_alias_malformed_paths_do_not_project_whole_resources() {
+    for suffix in ["[]", "['']", "[ab", "['ab'].", "[ab]junk"] {
+        let registry = suffix_registry(suffix);
+        let raw =
+            Value::from(json!({"type": "Test/widgets", "properties": {"original": {"ab": 42}}}));
+        let normalized = normalizer::normalize(&raw, Some(&registry), None);
+        assert_eq!(
+            lookup(&normalized, &["renamed"]),
+            Value::Undefined,
+            "{suffix}"
+        );
+        let input = Value::from(json!({"type": "Test/widgets", "renamed": {"ab": 42}}));
+        let arm = registry.denormalize(&input, None);
+        assert_eq!(
+            lookup(&arm, &["properties", "original"]),
+            Value::Undefined,
+            "{suffix}"
+        );
+    }
+}
+
+#[test]
+fn bracket_array_base_renames_round_trip() {
+    // The base rename's rendered `['my.arr']` names one key, not two.
+    let aliases = [("myArr[*].x", "properties['my.arr'][*].x")];
+    assert_eq!(
+        normalized(&aliases, json!({"my.arr": [{"x": 1}]})),
+        Value::from(json!({"type": "Test/widgets", "myarr": [{"x": 1}]}))
+    );
+    assert_eq!(
+        denormalized(&aliases, json!({"myarr": [{"x": 1}]})),
+        Value::from(json!({"properties": {"my.arr": [{"x": 1}]}}))
+    );
+    // The dotted twin names a nested array, which is renamed as before.
+    let dotted = [("myArr[*].x", "properties.my.arr[*].x")];
+    assert_eq!(
+        normalized(
+            &dotted,
+            json!({"my.arr": [{"x": 1}], "my": {"arr": [{"x": 2}]}})
+        ),
+        Value::from(json!({"type": "Test/widgets", "my.arr": [{"x": 1}], "myarr": [{"x": 2}]}))
+    );
+    assert_eq!(
+        denormalized(&dotted, json!({"myarr": [{"x": 2}]})),
+        Value::from(json!({"properties": {"my": {"arr": [{"x": 2}]}}}))
+    );
+}
+
+#[test]
+fn indexed_root_properties_write_keeps_short_value() {
+    // ARM `properties` is an object, so a scalar alias that indexes it is not
+    // written: the value stays at its short path instead of being dropped
+    // when the properties object is attached.
+    let aliases = [("x", "properties[0].x"), ("z", "properties.z")];
+    assert_eq!(
+        denormalized(&aliases, json!({"x": 1, "z": 2})),
+        Value::from(json!({"properties": {"x": 1, "z": 2}}))
+    );
+    let keyed = [("x", "properties.y.x"), ("z", "properties.z")];
+    assert_eq!(
+        denormalized(&keyed, json!({"x": 1, "z": 2})),
+        Value::from(json!({"properties": {"y": {"x": 1}, "z": 2}}))
+    );
 }
