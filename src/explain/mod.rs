@@ -62,6 +62,13 @@
 //! ([`DistinctElements`]). Concrete operand paths are independently opt-in;
 //! [`ConcretePath`] distinguishes not captured, unrepresentable, and a
 //! captured absence of a direct path.
+//! [`AttemptExplanation`] and call-local [`ScopeExplanation`] distinguish
+//! producing attempts from failed alternatives. [`CallUse`] preserves caller
+//! context for cached results used under different polarities.
+//! Per-result and per-proof [`Conditionality`] is unknown when not captured;
+//! bounded proofs cannot establish that omitted evidence was concrete.
+//! Computed operands can name [`CausalOrigins`] without claiming that their
+//! input sources held the computed value.
 //!
 //! A report for a successful evaluation is complete: it explains every rule
 //! within the selected scope. A report accompanying a failed evaluation
@@ -87,12 +94,13 @@ pub use recorder::{
     NotCapturedEvent, UncapturedConstruct,
 };
 pub use report::{
-    ConcretePath, ConditionExplanation, ConditionKind, ConditionOwner, ConditionSite, Count,
-    DefinitionExplanation, Derivation, DistinctElements, EmissionExplanation, ExplanationReport,
-    IterationBinding, LoopWitness, Operand, Operator, Outcome, PartialEvalResult, PathRoot,
-    PathSegment, QueryTarget, ReportedValue, ResidualAlternativeStatus, ResidualArgument,
-    ResidualCall, ResidualCondition, ResidualKind, ResidualQuery, ResidualStatus,
-    ResidualUnresolved, ResidualUnresolvedReason, ResultExplanation, RuleExplanation, RuleKind,
-    RuleOutcome, SourceLocation,
+    AttemptExplanation, CallUse, CausalOrigins, ConcretePath, ConditionExplanation, ConditionKind,
+    ConditionOwner, ConditionSite, Conditionality, Count, DefinitionExplanation, Derivation,
+    DistinctElements, EmissionExplanation, ExplanationReport, IterationBinding, LoopWitness,
+    Operand, Operator, Outcome, PartialEvalResult, PathRoot, PathSegment, QueryTarget,
+    ReportedValue, ResidualAlternativeStatus, ResidualArgument, ResidualCall, ResidualCondition,
+    ResidualKind, ResidualQuery, ResidualStatus, ResidualUnresolved, ResidualUnresolvedReason,
+    ResultExplanation, RuleExplanation, RuleKind, RuleOutcome, ScopeExplanation, ScopeKind,
+    SourceLocation,
 };
 pub use settings::{ConditionMode, ExplanationScope, ExplanationSettings, ValueMode};
