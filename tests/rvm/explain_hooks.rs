@@ -833,11 +833,13 @@ fn comprehension_yields_handle_raw_undefined_keys_values_and_result_aliases() {
         ComprehensionMode::Set,
         ComprehensionMode::Object,
     ] {
-        for (key, value, alias) in [
-            (v(r#""k""#), v("7"), false),
-            (Value::Undefined, v("7"), false),
-            (v(r#""k""#), Value::Undefined, false),
-            (v(r#""k""#), v("7"), true),
+        for (key, value, alias, key_override) in [
+            (v(r#""k""#), v("7"), false, None),
+            (Value::Undefined, v("7"), false, None),
+            (v(r#""k""#), Value::Undefined, false, None),
+            (v(r#""k""#), v("7"), true, None),
+            (v(r#""k""#), v("7"), false, Some(0)),
+            (Value::Undefined, v("7"), false, Some(2)),
         ] {
             let mut program = Program::new();
             program.literals = vec![key.clone(), value.clone()];
@@ -862,7 +864,7 @@ fn comprehension_yields_handle_raw_undefined_keys_values_and_result_aliases() {
                 Instruction::ComprehensionBegin { params_index },
                 Instruction::ComprehensionYield {
                     value_reg: if alias { 0 } else { 2 },
-                    key_reg: None,
+                    key_reg: key_override,
                 },
                 Instruction::ComprehensionEnd {},
                 Instruction::Return { value: 0 },
@@ -875,6 +877,11 @@ fn comprehension_yields_handle_raw_undefined_keys_values_and_result_aliases() {
                 ComprehensionMode::Object => v("{}"),
             };
             let yielded = if alias { empty.clone() } else { value.clone() };
+            let key = match key_override {
+                Some(0) => empty.clone(),
+                Some(2) => value.clone(),
+                _ => key,
+            };
             let defined = yielded != Value::Undefined
                 && (!matches!(mode, ComprehensionMode::Object) || key != Value::Undefined);
             let program = Arc::new(program);
@@ -925,6 +932,111 @@ fn comprehension_yields_handle_raw_undefined_keys_values_and_result_aliases() {
                 vm.load_program(program.clone());
                 vm.set_execution_mode(execution_mode);
                 assert_eq!(execute(&mut vm, execution_mode).unwrap(), expected);
+            }
+        }
+    }
+}
+
+#[test]
+fn comprehension_yields_follow_auto_iteration_and_skip_failed_writes() {
+    use regorus::rvm::instructions::{ComprehensionBeginParams, ComprehensionMode};
+    for mode in [
+        ComprehensionMode::Array,
+        ComprehensionMode::Set,
+        ComprehensionMode::Object,
+    ] {
+        for invalid_result in [false, true] {
+            let mut program = Program::new();
+            program.literals = vec![v("[10,20]"), v("7")];
+            let params_index = program.add_comprehension_begin_params(ComprehensionBeginParams {
+                mode: mode.clone(),
+                collection_reg: 3,
+                result_reg: 0,
+                key_reg: 1,
+                value_reg: 2,
+                body_start: 2,
+                comprehension_end: if invalid_result { 5 } else { 4 },
+            });
+            program.add_instruction(
+                Instruction::Load {
+                    dest: 3,
+                    literal_idx: 0,
+                },
+                None,
+            );
+            program.add_instruction(Instruction::ComprehensionBegin { params_index }, None);
+            if invalid_result {
+                program.add_instruction(
+                    Instruction::Load {
+                        dest: 0,
+                        literal_idx: 1,
+                    },
+                    None,
+                );
+            }
+            program.add_instruction(
+                Instruction::ComprehensionYield {
+                    value_reg: 2,
+                    key_reg: None,
+                },
+                None,
+            );
+            program.add_instruction(Instruction::ComprehensionEnd {}, None);
+            program.add_instruction(Instruction::Return { value: 0 }, None);
+            program.max_rule_window_size = 8;
+            program.dispatch_window_size = 8;
+            let program = Arc::new(program);
+            for execution_mode in MODES {
+                let r = run_program(&program, "{}", execution_mode, false);
+                let emissions: Vec<_> = r
+                    .events
+                    .iter()
+                    .filter_map(|e| match &e.event {
+                        Event::ComprehensionEmission {
+                            begin_pc,
+                            key,
+                            value,
+                            ..
+                        } => {
+                            assert!(e.context.unwrap().in_comprehension);
+                            Some((*begin_pc, key.clone(), value.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                if invalid_result {
+                    assert!(r.result.is_err());
+                    assert!(emissions.is_empty());
+                } else {
+                    let is_object = matches!(mode, ComprehensionMode::Object);
+                    assert_eq!(
+                        emissions,
+                        [
+                            (1, is_object.then(|| v("0")), v("10")),
+                            (1, is_object.then(|| v("1")), v("20")),
+                        ]
+                    );
+                    let expected = match mode {
+                        ComprehensionMode::Array => v("[10,20]"),
+                        ComprehensionMode::Set => {
+                            Value::from(std::collections::BTreeSet::from([v("10"), v("20")]))
+                        }
+                        ComprehensionMode::Object => {
+                            Value::from(std::collections::BTreeMap::from([
+                                (v("0"), v("10")),
+                                (v("1"), v("20")),
+                            ]))
+                        }
+                    };
+                    assert_eq!(r.result.as_ref().unwrap(), &expected);
+                }
+                let mut vm = RegoVM::new();
+                vm.load_program(program.clone());
+                vm.set_execution_mode(execution_mode);
+                assert_eq!(
+                    format!("{:?}", execute(&mut vm, execution_mode)),
+                    format!("{:?}", r.result),
+                );
             }
         }
     }
