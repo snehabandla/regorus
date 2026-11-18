@@ -79,6 +79,7 @@ enum Reason {
     NotRuleQuery,
     RuleShape,
     RuleValue,
+    BodyError,
     Budget,
 }
 
@@ -216,20 +217,20 @@ const fn root_name(root: UnknownRoot) -> &'static str {
 }
 
 /// Reject values whose JSON encoding changes their Rego type.
-fn is_lossless(value: &Value, checkpoint: &mut impl FnMut() -> Result<()>) -> Result<bool> {
-    let mut pending = alloc::vec![value];
+fn is_lossless(root: &Value, checkpoint: &mut impl FnMut() -> Result<()>) -> Result<bool> {
+    let mut pending = alloc::vec![root];
     checkpoint()?;
-    while let Some(value) = pending.pop() {
-        match *value {
+    while let Some(node) = pending.pop() {
+        match *node {
             Value::Undefined | Value::Set(_) => return Ok(false),
             Value::Array(ref items) => pending.extend(items.iter()),
             Value::Object(ref fields) => {
-                for (key, value) in fields.iter() {
+                for (key, child) in fields.iter() {
                     if !matches!(*key, Value::String(_)) {
                         checkpoint()?;
                         return Ok(false);
                     }
-                    pending.push(value);
+                    pending.push(child);
                 }
             }
             _ => {}
@@ -511,7 +512,7 @@ impl RegoVM {
                 anchor,
             )));
         }
-        if !is_lossless(&value, &mut || self.check_initial_memory_limit())? {
+        if !is_lossless(&value, &mut || self.pe_checkpoint())? {
             return Ok(unsupported(warning(
                 &program,
                 Some(Reason::NotJson),
@@ -524,7 +525,7 @@ impl RegoVM {
                 &program,
                 rule_info.map(|i| i.name.clone()),
                 cond,
-                &mut || self.check_initial_memory_limit(),
+                &mut || self.pe_checkpoint(),
             )? {
                 Some(c) => conditions.push(c),
                 None => {
@@ -613,6 +614,11 @@ impl RegoVM {
 
     const fn pe_depth(&self) -> usize {
         self.register_stack.len()
+    }
+
+    fn pe_checkpoint(&mut self) -> Result<()> {
+        self.execution_timer_tick(1)?;
+        self.check_initial_memory_limit()
     }
 
     const fn pe_sites_allowed(&self) -> bool {
@@ -845,8 +851,8 @@ impl RegoVM {
         let value = self.pe_raw(known)?;
         let pc = self.pc;
         let strict = self.strict_builtin_errors && !matches!(op, Operator::Eq | Operator::Ne);
-        let json = matches!(value, Value::Undefined)
-            || is_lossless(&value, &mut || self.check_initial_memory_limit())?;
+        let json =
+            matches!(value, Value::Undefined) || is_lossless(&value, &mut || self.pe_checkpoint())?;
         if let Some(pe) = self.pe_mut() {
             pe.mark_used(unknown);
             if !json {
@@ -931,16 +937,21 @@ impl RegoVM {
         }
     }
 
-    /// A body of the shadowed frame completed: keep its conditions if it
-    /// produced a value.
+    /// Keep a successful body's conditions; a failed body may retain loop output.
     #[cold]
     #[inline(never)]
-    pub(super) fn pe_body_succeeded(&mut self, result_reg: u8) -> Result<()> {
+    pub(super) fn pe_body_finished(&mut self, result_reg: u8, succeeded: bool) -> Result<()> {
         let (depth, pc) = (self.pe_depth(), self.pc);
         let value = self.pe_raw(result_reg)?;
         let Some(pe) = self.pe.as_deref_mut().filter(|pe| pe.in_frame(depth)) else {
             return Ok(());
         };
+        if !succeeded {
+            if !pe.attempt.is_empty() && value != Value::Undefined {
+                pe.flag(Reason::BodyError, pc);
+            }
+            return Ok(());
+        }
         if pe.shadow.remove(&result_reg).is_some() {
             pe.flag(Reason::RuleValue, pc);
         }
@@ -974,9 +985,10 @@ fn condition(
             if !is_lossless(value, checkpoint)? {
                 return Ok(None);
             }
-            let value = value.to_json_str_compact().map_err(super::VmError::from)?;
+            let value = value.json_string_with_checkpoint(false, checkpoint)?;
+            let rendered = format!("{path} {} {}", op_text(op), value);
             checkpoint()?;
-            format!("{path} {} {}", op_text(op), value)
+            rendered
         }
         _ => path.clone(),
     };
@@ -1023,6 +1035,9 @@ fn warning(program: &Program, reason: Option<Reason>, pc: usize) -> String {
         }
         Some(Reason::StrictCompare) => {
             String::from("an ordering comparison of unknown input may raise a type error")
+        }
+        Some(Reason::BodyError) => {
+            String::from("a failed rule body retains output that depends on unknown input")
         }
         Some(Reason::ContextResidual) => {
             String::from("conditions on the `context` root can't be reported yet")

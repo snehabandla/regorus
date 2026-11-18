@@ -522,10 +522,13 @@ fn residual_value_scan_checks_the_execution_timer() -> anyhow::Result<()> {
         known = Value::from(vec![known.clone(), known]);
     }
     let mut state = machine.validate_unknowns()?;
-    state.shadow.insert(0, Taint::Unknown {
-        path: (UnknownRoot::Input, vec![PathSegment::Key("u".into())]),
-        used: false,
-    });
+    state.shadow.insert(
+        0,
+        Taint::Unknown {
+            path: (UnknownRoot::Input, vec![PathSegment::Key("u".into())]),
+            used: false,
+        },
+    );
     machine.pe = Some(Box::new(state));
     machine.registers = vec![Value::Undefined, known, Value::Undefined];
     machine.set_execution_timer_config(Some(ExecutionTimerConfig {

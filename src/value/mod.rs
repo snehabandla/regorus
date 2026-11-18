@@ -531,7 +531,7 @@ impl Value {
         })
     }
 
-    fn json_string_with_checkpoint<E: From<anyhow::Error>>(
+    pub(crate) fn json_string_with_checkpoint<E: From<anyhow::Error>>(
         &self,
         pretty: bool,
         checkpoint: &mut dyn FnMut() -> core::result::Result<(), E>,
