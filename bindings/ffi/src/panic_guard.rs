@@ -377,17 +377,76 @@ mod tests {
             })
             .collect();
 
-        let unguarded = format!("{TEST_PANIC_PREFIX} unguarded");
-        let expected = unguarded.clone();
+        // An unguarded panic on another thread while a guarded call is in progress.
+        let (entered_sender, entered_receiver) = mpsc::channel();
+        let (release_sender, release_receiver) = mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let outcome = catch_panic(move || {
+                let _ = entered_sender.send(());
+                let _ = release_receiver.recv_timeout(Duration::from_secs(5));
+                RegorusResult::ok_void()
+            });
+            if let GuardResult::Success(result) = outcome {
+                regorus_result_drop(result);
+            }
+        });
+        if entered_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .is_err()
+        {
+            problems.push("guarded call on the holder thread did not start".into());
+        }
+        let during = format!("{TEST_PANIC_PREFIX} during a guarded call");
+        let expected = during.clone();
         let _ = std::thread::spawn(move || panic!("{expected}")).join();
+        let _ = release_sender.send(());
+        let _ = holder.join();
+
+        // Nested and earlier guarded calls on a thread, then an unguarded panic on it.
+        let after = format!("{TEST_PANIC_PREFIX} after guarded calls");
+        let expected = after.clone();
+        let same_thread = std::thread::spawn(move || {
+            let mut problems = Vec::new();
+            let nested = catch_panic(|| {
+                if let GuardResult::Success(result) = catch_panic(RegorusResult::ok_void) {
+                    regorus_result_drop(result);
+                }
+                panic!("{TEST_PANIC_PREFIX} outer after inner")
+            });
+            match nested {
+                GuardResult::Panic(message) if message.contains("panic hook observed: ") => {}
+                _ => problems.push("panic after a nested guarded call lost its details".into()),
+            }
+            let inner_caught = catch_panic(|| {
+                let _ = panic::catch_unwind(|| panic!("{TEST_PANIC_PREFIX} caught inside"));
+                RegorusResult::ok_void()
+            });
+            if let GuardResult::Success(result) = inner_caught {
+                regorus_result_drop(result);
+            }
+            // `resume_unwind` skips the hook, so this call has no details of its own.
+            let resumed = catch_panic(|| panic::resume_unwind(Box::new(String::from("resumed"))));
+            match resumed {
+                GuardResult::Panic(message) if message == "resumed" => {}
+                _ => problems.push("a later guarded call showed stale panic details".into()),
+            }
+            let _ = panic::catch_unwind(|| panic!("{expected}"));
+            problems
+        });
+        problems.extend(
+            same_thread
+                .join()
+                .unwrap_or_else(|_| vec!["same-thread checks panicked".into()]),
+        );
+
         let host_panics = core::mem::take(
             &mut *HOST_HOOK_PANICS
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         );
-        if host_panics != [unguarded] {
+        if host_panics != [during, after] {
             problems.push(format!(
-                "host hook must see only the unguarded panic, saw {} panics: {:?}",
+                "host hook must see only the unguarded panics, saw {} panics: {:?}",
                 host_panics.len(),
                 host_panics.iter().take(5).collect::<Vec<_>>()
             ));
