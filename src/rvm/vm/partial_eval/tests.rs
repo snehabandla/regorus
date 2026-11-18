@@ -368,6 +368,36 @@ fn suspendable_mode_is_an_error() -> anyhow::Result<()> {
 
 #[cfg(feature = "azure_policy")]
 #[test]
+fn known_azure_entry_returns_do_not_consume_cached_input() -> anyhow::Result<()> {
+    use crate::languages::azure_policy::{compiler, parser};
+
+    let source = crate::lexer::Source::from_contents(
+        "policy.json".into(),
+        r#"{"if":{"field":"type","equals":"wanted"},"then":{"effect":"deny"}}"#.into(),
+    )?;
+    let rule = parser::parse_policy_rule(&source).map_err(|error| anyhow::anyhow!("{error}"))?;
+    let program = compiler::compile_policy_rule(&rule)?;
+    let mut machine = RegoVM::new();
+    machine.load_program(Arc::new((*program).clone()));
+    for resource_type in ["other", "wanted"] {
+        machine.set_input(Value::from_json_str(&format!(
+            r#"{{"resource":{{"type":"{resource_type}"}}}}"#
+        ))?);
+        let expected = machine.execute_entry_point_by_name("main")?;
+        for unknowns in [vec![], keys(&["resource.u"])] {
+            let mut settings = PartialEvalSettings::default();
+            settings.unknowns = unknowns;
+            machine.set_partial_eval_settings(settings);
+            let result = machine.partial_eval("main")?;
+            assert_eq!(result.status, ResidualStatus::Exact, "{resource_type}");
+            assert_eq!(result.result, expected);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "azure_policy")]
+#[test]
 fn context_unknowns_fail_closed() -> anyhow::Result<()> {
     use crate::languages::azure_policy::{compiler, parser};
     let run = |condition: &str| -> anyhow::Result<PartialEvalResult> {
