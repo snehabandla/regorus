@@ -6,7 +6,8 @@
 //! A rule that is undefined contributes no key to the document of its package:
 //! `data.probe.sub` omits it, so `count`, `object.keys`, iteration, equality and
 //! serialization never see it. Rules that are defined (including `false`,
-//! defaults and empty partial sets/objects) and empty subpackages are kept.
+//! defaults and empty partial sets/objects) are kept, and subpackages read as
+//! objects even when all their rules are undefined or they have no rules.
 //! Expected values were checked against OPA 1.2.0. Each query is evaluated in
 //! the interpreter and in both RVM execution modes.
 

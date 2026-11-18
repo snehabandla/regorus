@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- *(rvm)* Omit undefined rules from package values such as `data.pkg` (previously present as `Undefined` entries), matching OPA and the interpreter for `count`, `object.keys`, iteration, equality and serialization; subpackages whose rules are all undefined read as `{}`.
+- *(rvm)* Package values such as `data.pkg` omit undefined rules and include subpackages that have no rules (as `{}`), matching OPA and the interpreter.
 
 ## [0.15.0](https://github.com/microsoft/regorus/compare/regorus-v0.14.1...regorus-v0.15.0) - 2026-11-07
 
