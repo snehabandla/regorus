@@ -161,7 +161,12 @@ fn cases() -> Vec<Case> {
             V(UNDEFINED),
             error(COUNT_ERROR, UNDEFINED),
         ),
-        same("set operand twin", NOT_SET_OPERAND, r#"{"v": [1, 2]}"#, "true"),
+        same(
+            "set operand twin",
+            NOT_SET_OPERAND,
+            r#"{"v": [1, 2]}"#,
+            "true",
+        ),
         // The negated call itself is not lifted: its failure makes `not`
         // succeed.
         case(

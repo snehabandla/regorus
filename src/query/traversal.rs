@@ -116,7 +116,11 @@ pub fn negation_lifted_calls(expr: &ExprRef) -> Result<Vec<ExprRef>> {
             OrExpr { .. } => false,
             _ if e == expr => true,
             _ if lazy_key == Some(e) => false,
-            Call { .. } | BinExpr { .. } | BoolExpr { .. } | ArithExpr { .. } | Membership { .. } => {
+            Call { .. }
+            | BinExpr { .. }
+            | BoolExpr { .. }
+            | ArithExpr { .. }
+            | Membership { .. } => {
                 calls.push(e.clone());
                 false
             }
