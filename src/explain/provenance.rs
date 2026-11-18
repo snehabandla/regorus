@@ -11,10 +11,12 @@
 //!
 //! Programs compiled from Rego or Azure Policy are decoded, as identified by
 //! [`ProgramMetadata::language`](crate::rvm::program::ProgramMetadata::language)
-//! (`"rego"`, or empty for the Rego compiler's programs). Programs from any
+//! (`"rego"` or empty for Rego, `"azure_policy"` for Azure Policy). Programs from any
 //! other language have no sites. Azure Policy sites retain JSON conditions,
 //! native operators and normalized input/context path templates. This is
-//! static metadata, not runtime capture or a report producer.
+//! static metadata, not runtime capture or a report producer. Azure Policy
+//! includes collection-count operations and native checks within templates;
+//! sites do not assert that the VM currently delivers events for them.
 
 mod azure_policy;
 
@@ -102,7 +104,7 @@ pub struct CheckSite {
 #[non_exhaustive]
 pub struct AzurePolicySite {
     /// Native operator, including its Azure Policy casing and null semantics.
-    /// `None` for a collection loop. Internal value guards are not sites.
+    /// `None` for a collection loop or count. Internal value guards are not sites.
     pub operator: Option<PolicyOp>,
     /// Authored JSON operator, if source metadata is available. This can
     /// differ from `operator` after count optimization or within a template.

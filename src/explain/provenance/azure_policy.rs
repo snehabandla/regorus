@@ -40,6 +40,9 @@ pub(super) fn decode(program: &Program) -> Provenance {
                 .instruction_data
                 .get_loop_params(params_index)
                 .map(|p| (ConditionKind::Iteration, None, p.collection, None)),
+            Instruction::Count { collection, .. } => {
+                Some((ConditionKind::Iteration, None, collection, None))
+            }
             _ => None,
         };
         if let Some((kind, operator, left, right)) = shape {
@@ -48,7 +51,7 @@ pub(super) fn decode(program: &Program) -> Provenance {
                 .get(pc)
                 .and_then(Option::as_ref)
                 .and_then(|span| sources.get(span.source_index)?.condition(span));
-            let (text, location, field) = source.unwrap_or_default();
+            let (text, location, field, source_operator) = source.unwrap_or_default();
             sites.push(CheckSite {
                 id: SiteId(u32::try_from(sites.len()).unwrap_or(u32::MAX)),
                 pc,
@@ -64,7 +67,11 @@ pub(super) fn decode(program: &Program) -> Provenance {
                 location,
                 left_path: paths.get(usize::from(left)).cloned().flatten(),
                 right_path: right.and_then(|r| paths.get(usize::from(r)).cloned().flatten()),
-                azure_policy: Some(AzurePolicySite { operator, source_operator: None, field }),
+                azure_policy: Some(AzurePolicySite {
+                    operator,
+                    source_operator,
+                    field,
+                }),
             });
         }
         track(program, instruction, &mut paths, &mut literals);
@@ -151,6 +158,7 @@ struct JsonSource<'a> {
     objects: Vec<Option<usize>>,
     ends: Vec<Option<usize>>,
     fields: Vec<Option<usize>>,
+    operators: Vec<Option<PolicyOp>>,
 }
 
 impl<'a> JsonSource<'a> {
@@ -174,12 +182,19 @@ impl<'a> JsonSource<'a> {
             }
         }
         let mut fields = alloc::vec![None; source.tokens.len()];
+        let mut operators = alloc::vec![None; source.tokens.len()];
         for (index, object) in objects.iter().enumerate() {
-            if source.symbol(index.saturating_add(1)) == Some(":")
-                && Self::string_at(&source, index).is_some_and(|s| s.eq_ignore_ascii_case("field"))
-            {
-                if let Some(slot) = object.and_then(|open| fields.get_mut(open)) {
-                    *slot = Some(index.saturating_add(2));
+            if source.symbol(index.saturating_add(1)) == Some(":") {
+                if let Some(key) = Self::string_at(&source, index) {
+                    if key.eq_ignore_ascii_case("field") {
+                        if let Some(slot) = object.and_then(|open| fields.get_mut(open)) {
+                            *slot = Some(index.saturating_add(2));
+                        }
+                    } else if let Some(slot) = object.and_then(|open| operators.get_mut(open)) {
+                        if let Some(operator) = Self::source_operator(&key) {
+                            *slot = Some(operator);
+                        }
+                    }
                 }
             }
         }
@@ -188,6 +203,7 @@ impl<'a> JsonSource<'a> {
             objects,
             ends,
             fields,
+            operators,
         }
     }
 
@@ -200,28 +216,66 @@ impl<'a> JsonSource<'a> {
     fn condition(
         &self,
         span: &SpanInfo,
-    ) -> Option<(String, Option<SourceLocation>, Option<String>)> {
+    ) -> Option<(
+        String,
+        Option<SourceLocation>,
+        Option<String>,
+        Option<PolicyOp>,
+    )> {
         let anchor = self
             .source
             .tokens
             .binary_search_by(|t| (t.line, t.column).cmp(&(span.line, span.column)))
             .ok()?;
-        let open = if self.source.symbol(anchor) == Some("{") {
+        let mut open = if self.source.symbol(anchor) == Some("{") {
             anchor
         } else {
             self.objects.get(anchor).copied().flatten()?
         };
-        let close = self.ends.get(open).copied().flatten()?;
         let field = self
             .fields
             .get(open)
             .copied()
             .flatten()
             .and_then(|index| Self::string_at(&self.source, index));
+        while self.operators.get(open).copied().flatten().is_none() {
+            let Some(parent) = self.objects.get(open).copied().flatten() else {
+                break;
+            };
+            open = parent;
+        }
+        let close = self.ends.get(open).copied().flatten()?;
         Some((
             self.source.text(open, close)?,
             self.source.location(open),
             field,
+            self.operators.get(open).copied().flatten(),
         ))
+    }
+
+    fn source_operator(name: &str) -> Option<PolicyOp> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "equals" => PolicyOp::Equals,
+            "notequals" => PolicyOp::NotEquals,
+            "greater" => PolicyOp::Greater,
+            "greaterorequals" => PolicyOp::GreaterOrEquals,
+            "less" => PolicyOp::Less,
+            "lessorequals" => PolicyOp::LessOrEquals,
+            "in" => PolicyOp::In,
+            "notin" => PolicyOp::NotIn,
+            "contains" => PolicyOp::Contains,
+            "notcontains" => PolicyOp::NotContains,
+            "containskey" => PolicyOp::ContainsKey,
+            "notcontainskey" => PolicyOp::NotContainsKey,
+            "like" => PolicyOp::Like,
+            "notlike" => PolicyOp::NotLike,
+            "match" => PolicyOp::Match,
+            "notmatch" => PolicyOp::NotMatch,
+            "matchinsensitively" => PolicyOp::MatchInsensitively,
+            "notmatchinsensitively" => PolicyOp::NotMatchInsensitively,
+            "exists" => PolicyOp::Exists,
+            "not" => PolicyOp::Not,
+            _ => return None,
+        })
     }
 }
