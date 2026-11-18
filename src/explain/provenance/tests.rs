@@ -813,11 +813,13 @@ fn azure_policy_count_where_tracks_elements_not_counts() -> anyhow::Result<()> {
                 .and_then(|p| p.field.as_deref()),
             Some("items[*].state")
         );
-        for site in provenance
+        let comparisons: Vec<_> = provenance
             .sites()
             .iter()
             .filter(|s| s.azure_policy.as_ref().and_then(|p| p.operator) == Some(PolicyOp::Greater))
-        {
+            .collect();
+        assert_eq!(comparisons.len(), usize::from(comparison == r#""greater": 1"#));
+        for site in comparisons {
             assert_eq!(
                 site.left_path, None,
                 "a computed count is not its collection"
@@ -993,9 +995,10 @@ fn azure_policy_aliases_keep_declared_and_normalized_names() -> anyhow::Result<(
 #[cfg(feature = "azure_policy")]
 #[test]
 fn azure_policy_native_template_checks_keep_their_json_owner() -> anyhow::Result<()> {
+    use crate::rvm::instructions::PolicyOp;
     let first = r#"{ "field": "[if(equals(resourceGroup().name, 'rg'), 'type', 'name')]", "equals": "vm" }"#;
     let second =
-        r#"{ "field": "name", "equals": "[if(equals(resourceGroup().name, 'rg'), 'x', 'y')]" }"#;
+        r#"{ "field": "name", "notEquals": "[if(equals(resourceGroup().name, 'rg'), 'x', 'y')]" }"#;
     let json = alloc::format!(
         r#"{{
   "if": {{ "allOf": [
@@ -1013,6 +1016,54 @@ fn azure_policy_native_template_checks_keep_their_json_owner() -> anyhow::Result
         assert_eq!(site.text, expected, "native template check {index}");
         assert_eq!(at(site), Some(("policy.json", line, 5)));
     }
+    let associations: Vec<_> = provenance.sites().iter().skip(2).map(|site|
+        (site.azure_policy.as_ref().and_then(|p| p.operator),
+         site.azure_policy.as_ref().and_then(|p| p.source_operator),
+         site.left_path.as_deref(), site.right_path.as_deref())).collect();
+    assert_eq!(associations, vec![
+        (Some(PolicyOp::Equals), Some(PolicyOp::NotEquals),
+         Some(r#"context["resourceGroup"]["name"]"#), None),
+        (Some(PolicyOp::NotEquals), Some(PolicyOp::NotEquals),
+         Some(r#"input["resource"]["name"]"#), None),
+    ]);
+    Ok(())
+}
+
+#[cfg(feature = "azure_policy")]
+#[test]
+fn azure_policy_count_restores_its_parent_template_owner() -> anyhow::Result<()> {
+    use crate::rvm::instructions::PolicyOp;
+    let inner = r#"{"field":"items[*].state","equals":"open"}"#;
+    let outer = alloc::format!(r#"{{"count":{{"field":"items[*]","where":{inner}}},"greater":"[if(equals(resourceGroup().name, 'rg'), 1, 2)]"}}"#);
+    let json = alloc::format!(r#"{{"if":{outer},"then":{{"effect":"deny"}}}}"#);
+    let program = compile_azure(&json)?;
+    let provenance = Provenance::new(&program);
+    let comparisons: Vec<_> = provenance.sites().iter().filter(|s|
+        s.azure_policy.as_ref().and_then(|p| p.operator) == Some(PolicyOp::Equals)).collect();
+    assert_eq!(comparisons.len(), 2);
+    assert_eq!(comparisons.first().map(|s| s.text.as_str()), Some(inner));
+    let restored = comparisons.get(1).ok_or_else(|| anyhow::anyhow!("parent template"))?;
+    assert_eq!(restored.text, outer);
+    assert_eq!(restored.azure_policy.as_ref().and_then(|p| p.source_operator), Some(PolicyOp::Greater));
+    assert_eq!(restored.left_path.as_deref(), Some(r#"context["resourceGroup"]["name"]"#));
+    Ok(())
+}
+
+#[cfg(feature = "azure_policy")]
+#[test]
+fn azure_policy_effect_templates_keep_their_json_owner() -> anyhow::Result<()> {
+    use crate::rvm::instructions::PolicyOp;
+    let then = r#"{"effect":"[if(equals(resourceGroup().location, 'eastus'), 'deny', 'audit')]"}"#;
+    let json = alloc::format!(r#"{{"if":{{"field":"type","equals":"vm"}},"then":{then}}}"#);
+    let program = compile_azure(&json)?;
+    let provenance = Provenance::new(&program);
+    let site = provenance.sites().iter().find(|s|
+        s.left_path.as_deref() == Some(r#"context["resourceGroup"]["location"]"#))
+        .ok_or_else(|| anyhow::anyhow!("effect template"))?;
+    assert_eq!(site.text, then);
+    assert_eq!(site.azure_policy.as_ref().and_then(|p| p.operator), Some(PolicyOp::Equals));
+    assert_eq!(site.azure_policy.as_ref().and_then(|p| p.source_operator), None);
+    assert_eq!(site.azure_policy.as_ref().and_then(|p| p.field.as_deref()), None);
     Ok(())
 }
 
