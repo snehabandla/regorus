@@ -22,8 +22,8 @@ defined := 1
 f := false
 default d := "dflt"
 d := "x" if input.x == 1
-s contains x if some x in input.missing
-o[k] := 1 if some k in input.missing
+s contains x if x := input.missing[0]
+o[k] := 1 if k := input.missing[0]
 undefined_body if input.x == 1
 undefined_value := input.missing
 "#;
@@ -41,7 +41,7 @@ result := data.probe.sub
 n := count(data.probe.sub)
 keys := object.keys(data.probe.sub)
 pairs contains k if some k, _ in data.probe.sub
-eq_check := object.remove(data.probe.sub, ["s"]) == json.unmarshal(`{"defined": 1, "f": false, "d": "dflt", "o": {}, "inner": {}}`)
+eq_check := data.probe.sub == {"defined": 1, "f": false, "d": "dflt", "o": {}, "s": set(), "inner": {}}
 has_undefined_body if "undefined_body" in object.keys(data.probe.sub)
 ser := json.marshal(data.probe.sub)
 "#;
@@ -66,9 +66,11 @@ n := count(data.probe.sub)
 
 const EMPTY: &str = r#"{}"#;
 const X1: &str = r#"{"x": 1}"#;
+const ALL_DEFINED: &str = r#"{"x": 1, "missing": ["a"]}"#;
 
 const SUB_EMPTY: &str = r#"{"d": "dflt", "defined": 1, "f": false, "inner": {}, "o": {}, "s": []}"#;
 const SUB_X1: &str = r#"{"d": "x", "defined": 1, "f": false, "inner": {"u": true}, "o": {}, "s": [], "undefined_body": true}"#;
+const SUB_ALL_DEFINED: &str = r#"{"d": "x", "defined": 1, "f": false, "inner": {"u": true}, "o": {"a": 1}, "s": ["a"], "undefined_body": true, "undefined_value": ["a"]}"#;
 const KEYS_EMPTY: &str = r#"["d", "defined", "f", "inner", "o", "s"]"#;
 const KEYS_X1: &str = r#"["d", "defined", "f", "inner", "o", "s", "undefined_body"]"#;
 
@@ -99,13 +101,13 @@ fn eval_rvm(engine: &mut Engine, query: &str, input: &Value, mode: ExecutionMode
 /// Requires `query` on `input` to produce `want` (`None` for undefined) in the
 /// interpreter and in both RVM modes.
 fn check(modules: &[&str], cases: &[(&str, &str, Option<&str>)]) -> Result<()> {
+    let mut engine = Engine::new();
+    for (idx, module) in modules.iter().enumerate() {
+        engine.add_policy(format!("p{idx}.rego"), module.to_string())?;
+    }
     let mut failures = Vec::new();
     for &(query, input, want) in cases {
         let want = want.map(Value::from_json_str).transpose()?;
-        let mut engine = Engine::new();
-        for (idx, module) in modules.iter().enumerate() {
-            engine.add_policy(format!("p{idx}.rego"), module.to_string())?;
-        }
         let input_value = Value::from_json_str(input)?;
         engine.set_input(input_value.clone());
 
@@ -136,8 +138,10 @@ fn package_value_omits_undefined_rules() -> Result<()> {
         &[
             ("data.probe.result", EMPTY, Some(SUB_EMPTY)),
             ("data.probe.result", X1, Some(SUB_X1)),
+            ("data.probe.result", ALL_DEFINED, Some(SUB_ALL_DEFINED)),
             ("data.probe.n", EMPTY, Some("6")),
             ("data.probe.n", X1, Some("7")),
+            ("data.probe.n", ALL_DEFINED, Some("8")),
             ("data.probe.keys", EMPTY, Some(KEYS_EMPTY)),
             ("data.probe.keys", X1, Some(KEYS_X1)),
             ("data.probe.pairs", EMPTY, Some(KEYS_EMPTY)),
@@ -151,6 +155,13 @@ fn package_value_omits_undefined_rules() -> Result<()> {
                 EMPTY,
                 Some(
                     r#""{\"d\":\"dflt\",\"defined\":1,\"f\":false,\"inner\":{},\"o\":{},\"s\":[]}""#,
+                ),
+            ),
+            (
+                "data.probe.ser",
+                X1,
+                Some(
+                    r#""{\"d\":\"x\",\"defined\":1,\"f\":false,\"inner\":{\"u\":true},\"o\":{},\"s\":[],\"undefined_body\":true}""#,
                 ),
             ),
         ],
@@ -171,6 +182,11 @@ fn parent_package_value_omits_undefined_rules_of_subpackages() -> Result<()> {
                 "data.top.whole",
                 X1,
                 Some(&format!(r#"{{"sub": {SUB_X1}}}"#)),
+            ),
+            (
+                "data.top.whole",
+                ALL_DEFINED,
+                Some(&format!(r#"{{"sub": {SUB_ALL_DEFINED}}}"#)),
             ),
         ],
     )
