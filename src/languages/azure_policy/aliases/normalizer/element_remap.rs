@@ -19,6 +19,8 @@ use super::super::obj_map::{
 ///
 /// Each source is taken in turn, but all targets are written afterwards, so
 /// pairs that swap or chain field names don't read each other's results.
+/// If a target lies inside or around another pair's source, the pairs are
+/// moved one at a time instead, since they may rely on that order.
 ///
 /// When `lowercase` is `true` (normalizer), target path segments are
 /// lowercased.  When `false` (denormalizer), they are written verbatim
@@ -150,6 +152,30 @@ fn remap_at_depth_in_btree(
     }
 }
 
+/// Split `fields` into the runs whose sources are all taken before their
+/// targets are written: one run, or one per pair when a target lies inside
+/// or around another pair's source.
+fn move_runs<'f, 'a>(
+    fields: &'f [(&'a str, &'a str)],
+) -> core::slice::Chunks<'f, (&'a str, &'a str)> {
+    let nested = fields.iter().any(|&(_, target)| {
+        fields.iter().any(|&(source, _)| {
+            is_strictly_nested(source, target) || is_strictly_nested(target, source)
+        })
+    });
+    fields.chunks(if nested { 1 } else { fields.len().max(1) })
+}
+
+/// Whether dotted path `inner` lies strictly inside `outer` (ignoring case).
+fn is_strictly_nested(inner: &str, outer: &str) -> bool {
+    inner
+        .get(..outer.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(outer))
+        && inner
+            .get(outer.len()..)
+            .is_some_and(|rest| rest.starts_with('.'))
+}
+
 /// Take each pair's source value in turn, as moving them one by one would,
 /// but leave the targets for the caller to write afterwards so no move reads
 /// another's result.
@@ -165,20 +191,22 @@ fn take_sources<'a>(
 
 /// Move each `(source, target)` pair's value directly in a BTreeMap.
 fn remap_fields_in_btree(btree: &mut Object, fields: &[(&str, &str)], lowercase: bool) {
-    let moved = take_sources(fields, |source| {
-        let val = read_dotted_path_btree(btree, source)?;
-        let segments: Vec<&str> = source.split('.').collect();
-        remove_at_dotted_path_obj(btree, &segments);
-        Some(val)
-    });
-    for (target, val) in moved {
-        let segments: Vec<&str> = target.split('.').collect();
-        match segments.as_slice() {
-            [] => {}
-            [seg] => {
-                btree.insert(Value::String(crate::Rc::from(*seg)), val);
+    for run in move_runs(fields) {
+        let moved = take_sources(run, |source| {
+            let val = read_dotted_path_btree(btree, source)?;
+            let segments: Vec<&str> = source.split('.').collect();
+            remove_at_dotted_path_obj(btree, &segments);
+            Some(val)
+        });
+        for (target, val) in moved {
+            let segments: Vec<&str> = target.split('.').collect();
+            match segments.as_slice() {
+                [] => {}
+                [seg] => {
+                    btree.insert(Value::String(crate::Rc::from(*seg)), val);
+                }
+                _ => set_nested(btree, &segments, val, lowercase),
             }
-            _ => set_nested(btree, &segments, val, lowercase),
         }
     }
 }
@@ -197,18 +225,20 @@ fn read_dotted_path_btree(btree: &Object, path: &str) -> Option<Value> {
 /// Move each `(source, target)` pair's value in an ObjMap.  Used only at
 /// the top level when `depth >= array_chain.len()`.
 fn remap_fields(obj: &mut ObjMap, fields: &[(&str, &str)], lowercase: bool) {
-    let moved = take_sources(fields, |source| {
-        let val = read_dotted_path(obj, source)?;
-        remove_element_field(obj, &[], source);
-        Some(val)
-    });
-    for (target, val) in moved {
-        if !target.contains('.') {
-            obj_insert(obj, target, val);
-        } else if lowercase {
-            set_nested_lowercased(obj, target, val);
-        } else {
-            set_nested_verbatim(obj, target, val);
+    for run in move_runs(fields) {
+        let moved = take_sources(run, |source| {
+            let val = read_dotted_path(obj, source)?;
+            remove_element_field(obj, &[], source);
+            Some(val)
+        });
+        for (target, val) in moved {
+            if !target.contains('.') {
+                obj_insert(obj, target, val);
+            } else if lowercase {
+                set_nested_lowercased(obj, target, val);
+            } else {
+                set_nested_verbatim(obj, target, val);
+            }
         }
     }
 }

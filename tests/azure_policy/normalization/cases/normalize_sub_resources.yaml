@@ -1523,3 +1523,41 @@ cases:
         - a:
             z: 7
     round_trip: true
+
+  - note: "element aliases whose fields nest inside each other's ARM fields are moved one at a time"
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                {
+                  "name": "Test/widgets/rules[*].a.x",
+                  "defaultPath": "properties.rules[*].rawone",
+                  "paths": []
+                },
+                {
+                  "name": "Test/widgets/rules[*].b",
+                  "defaultPath": "properties.rules[*].a",
+                  "paths": []
+                },
+                {
+                  "name": "Test/widgets/rules[*]['a']",
+                  "defaultPath": "properties.rules[*].rawtwo",
+                  "paths": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    input:
+      type: Test/widgets
+      properties:
+        rules:
+          - rawone: 1
+            rawtwo:
+              x: 1
+    round_trip: true
