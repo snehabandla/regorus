@@ -444,11 +444,14 @@ impl RegoVM {
         self.pe.as_deref().and_then(|pe| pe.shadow.get(&reg))
     }
 
-    fn pe_raw(&self, reg: u8) -> Value {
-        self.registers
-            .get(usize::from(reg))
-            .cloned()
-            .unwrap_or(Value::Undefined)
+    fn pe_raw(&self, reg: u8) -> Result<Value> {
+        self.registers.get(usize::from(reg)).cloned().ok_or(
+            super::VmError::RegisterIndexOutOfBounds {
+                index: reg,
+                pc: self.pc,
+                register_count: self.registers.len(),
+            },
+        )
     }
 
     fn pe_mut(&mut self) -> Option<&mut PeState> {
@@ -490,7 +493,7 @@ impl RegoVM {
                         Taint::Unknown { path, .. } => Taint::Unknown { path, used: false },
                         prefix @ Taint::Prefix(_) => prefix,
                     };
-                    let value = self.pe_raw(src);
+                    let value = self.pe_raw(src)?;
                     self.pe_set(dest, value, Some(taint))?;
                     Ok(Some(InstructionOutcome::Continue))
                 }
@@ -568,7 +571,7 @@ impl RegoVM {
         else {
             return Ok(None);
         };
-        let mut value = self.pe_raw(container);
+        let mut value = self.pe_raw(container)?;
         for component in keys {
             let key = match *component {
                 LiteralOrRegister::Literal(idx) => match program.literals.get(usize::from(idx)) {
@@ -576,7 +579,7 @@ impl RegoVM {
                     None => return Ok(None),
                 },
                 LiteralOrRegister::Register(reg) if self.pe_taint(reg).is_none() => {
-                    self.pe_raw(reg)
+                    self.pe_raw(reg)?
                 }
                 LiteralOrRegister::Register(_) => return Ok(None),
             };
