@@ -870,48 +870,46 @@ fn assert_invocation_subtree_cache_reuse(mode: ExecutionMode) {
             "package framework\nr := [data.target[input.a],data.target[input.b]]\n",
         ),
     ] {
-        engine.add_policy(name.to_string(), policy.to_string()).unwrap();
+        engine
+            .add_policy(name.to_string(), policy.to_string())
+            .unwrap();
     }
     let entrypoint: Rc<str> = "data.framework.r".into();
     let compiled = engine.compile_with_entrypoint(&entrypoint).unwrap();
     let program = Compiler::compile_from_policy(&compiled, &["data.framework.r"]).unwrap();
     let expected = v(r#"[{"p":1},{"p":1}]"#);
 
-    let distinct = run_program(
-        &program,
-        r#"{"a":"dept","b":"other","x":1}"#,
-        mode,
-        false,
-    );
+    let distinct = run_program(&program, r#"{"a":"dept","b":"other","x":1}"#, mode, false);
     assert_eq!(distinct.result.as_ref().unwrap(), &expected);
     let first = distinct.call_ids("data.target.dept.p");
     let second = distinct.call_ids("data.target.other.p");
     assert_eq!(first.len(), 1);
     assert_eq!(second.len(), 1);
     assert_ne!(first[0], second[0]);
-    assert!(!distinct.calls.iter().any(|record| matches!(
-        record, CallRecord::Reused(_, _)
-    )));
+    assert!(!distinct
+        .calls
+        .iter()
+        .any(|record| matches!(record, CallRecord::Reused(_, _))));
 
-    let repeated = run_program(
-        &program,
-        r#"{"a":"dept","b":"dept","x":1}"#,
-        mode,
-        false,
-    );
+    let repeated = run_program(&program, r#"{"a":"dept","b":"dept","x":1}"#, mode, false);
     assert_eq!(repeated.result.as_ref().unwrap(), &expected);
     let target = repeated.call_ids("data.target.dept.p");
     assert_eq!(target.len(), 1, "{mode:?}: {:?}", repeated.calls);
     assert!(repeated.call_ids("data.target.other.p").is_empty());
     let root = repeated.call_ids("data.framework.r")[0];
-    let uses: Vec<_> = repeated.calls.iter().filter_map(|record| match record {
-        CallRecord::Reused(caller, event)
-            if program.rule_infos[usize::from(event.rule_index)].name == "data.target.dept.p" =>
-        {
-            Some((caller.call_instance, event.call_instance))
-        }
-        _ => None,
-    }).collect();
+    let uses: Vec<_> = repeated
+        .calls
+        .iter()
+        .filter_map(|record| match record {
+            CallRecord::Reused(caller, event)
+                if program.rule_infos[usize::from(event.rule_index)].name
+                    == "data.target.dept.p" =>
+            {
+                Some((caller.call_instance, event.call_instance))
+            }
+            _ => None,
+        })
+        .collect();
     assert_eq!(
         uses,
         [(Some(root), Some(target[0]))],
@@ -950,7 +948,10 @@ fn invocation_subtree_cache_reuse_late_recorder_preserves_unknown_identity() {
     vm.set_execution_mode(ExecutionMode::Suspendable);
     vm.set_input(v(r#"{"a":"dept","b":"dept","x":1}"#));
     vm.execute().unwrap();
-    assert!(matches!(vm.execution_state(), ExecutionState::Suspended { .. }));
+    assert!(matches!(
+        vm.execution_state(),
+        ExecutionState::Suspended { .. }
+    ));
     let fixture = Fixture::default();
     vm.set_explanation_recorder(Box::new(fixture.clone()));
     vm.resume(Some(Value::Bool(true))).unwrap();
@@ -959,26 +960,37 @@ fn invocation_subtree_cache_reuse_late_recorder_preserves_unknown_identity() {
         ExecutionState::Completed { result } if result == &v(r#"[{"p":1},true,{"p":1}]"#)
     ));
     let calls = fixture.calls();
-    let uses: Vec<_> = calls.iter().filter_map(|record| match record {
-        CallRecord::Reused(caller, event)
-            if program.rule_infos[usize::from(event.rule_index)].name == "data.target.dept.p" =>
-        {
-            Some((caller.call_instance, event.call_instance))
-        }
-        _ => None,
-    }).collect();
+    let uses: Vec<_> = calls
+        .iter()
+        .filter_map(|record| match record {
+            CallRecord::Reused(caller, event)
+                if program.rule_infos[usize::from(event.rule_index)].name
+                    == "data.target.dept.p" =>
+            {
+                Some((caller.call_instance, event.call_instance))
+            }
+            _ => None,
+        })
+        .collect();
     assert_eq!(uses, [(None, None)], "{calls:?}");
-    assert!(!calls.iter().any(|record| matches!(record, CallRecord::Start(_, _))));
+    assert!(!calls
+        .iter()
+        .any(|record| matches!(record, CallRecord::Start(_, _))));
 }
 
 #[test]
 fn invocation_mixed_mode_error_keeps_terminal_events_for_every_started_call() {
     let mut engine = Engine::new();
     for (name, policy) in [
-        ("helpers.rego", "package helpers\nf(x) := x\np := f(input.x)\n"),
+        (
+            "helpers.rego",
+            "package helpers\nf(x) := x\np := f(input.x)\n",
+        ),
         ("t.rego", "package t\nr := data[input.ns].p\n"),
     ] {
-        engine.add_policy(name.to_string(), policy.to_string()).unwrap();
+        engine
+            .add_policy(name.to_string(), policy.to_string())
+            .unwrap();
     }
     let entrypoint: Rc<str> = "data.t.r".into();
     let compiled = engine.compile_with_entrypoint(&entrypoint).unwrap();
@@ -997,7 +1009,8 @@ fn invocation_mixed_mode_error_keeps_terminal_events_for_every_started_call() {
         vm.set_explanation_recorder(Box::new(fixture.clone()));
         let result = execute(&mut vm, mode);
         assert_eq!(
-            format!("{result:?}"), format!("{baseline:?}"),
+            format!("{result:?}"),
+            format!("{baseline:?}"),
             "{mode:?}: invocation bookkeeping changed evaluation behavior"
         );
         if mode == ExecutionMode::RunToCompletion {
@@ -1007,19 +1020,28 @@ fn invocation_mixed_mode_error_keeps_terminal_events_for_every_started_call() {
         // terminate any remaining captured invocations without losing one.
         vm.load_program(program.clone());
         let calls = fixture.calls();
-        assert!(calls.iter().any(|record| matches!(
-            record,
-            CallRecord::Start(_, event)
-                if program.rule_infos[usize::from(event.rule_index)].name == "data.helpers.f"
-        )), "{mode:?}: helper invocation was not reached: {calls:?}");
-        let mut started: Vec<_> = calls.iter().filter_map(|record| match record {
-            CallRecord::Start(_, event) => Some(event.call_instance),
-            _ => None,
-        }).collect();
-        let mut ended: Vec<_> = calls.iter().filter_map(|record| match record {
-            CallRecord::End(context, _, _) => context.call_instance,
-            _ => None,
-        }).collect();
+        assert!(
+            calls.iter().any(|record| matches!(
+                record,
+                CallRecord::Start(_, event)
+                    if program.rule_infos[usize::from(event.rule_index)].name == "data.helpers.f"
+            )),
+            "{mode:?}: helper invocation was not reached: {calls:?}"
+        );
+        let mut started: Vec<_> = calls
+            .iter()
+            .filter_map(|record| match record {
+                CallRecord::Start(_, event) => Some(event.call_instance),
+                _ => None,
+            })
+            .collect();
+        let mut ended: Vec<_> = calls
+            .iter()
+            .filter_map(|record| match record {
+                CallRecord::End(context, _, _) => context.call_instance,
+                _ => None,
+            })
+            .collect();
         started.sort_unstable();
         ended.sort_unstable();
         assert_eq!(
@@ -1027,18 +1049,25 @@ fn invocation_mixed_mode_error_keeps_terminal_events_for_every_started_call() {
             "{mode:?}: invocation events were lost before error/reset cleanup; result={result:?}, calls={calls:?}"
         );
         if mode == ExecutionMode::Suspendable {
-            let child = calls.iter().find_map(|record| match record {
-                CallRecord::Start(_, event)
-                    if program.rule_infos[usize::from(event.rule_index)].name == "data.helpers.f" =>
-                {
-                    Some(event.call_instance)
-                }
-                _ => None,
-            }).unwrap();
-            assert!(calls.iter().any(|record| matches!(
-                record, CallRecord::End(context, None, None)
-                    if context.call_instance == Some(child)
-            )), "pending helper must abort, not fabricate completion: {calls:?}");
+            let child = calls
+                .iter()
+                .find_map(|record| match record {
+                    CallRecord::Start(_, event)
+                        if program.rule_infos[usize::from(event.rule_index)].name
+                            == "data.helpers.f" =>
+                    {
+                        Some(event.call_instance)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert!(
+                calls.iter().any(|record| matches!(
+                    record, CallRecord::End(context, None, None)
+                        if context.call_instance == Some(child)
+                )),
+                "pending helper must abort, not fabricate completion: {calls:?}"
+            );
         }
     }
 }

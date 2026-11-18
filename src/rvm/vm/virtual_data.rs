@@ -129,12 +129,13 @@ impl RegoVM {
                                     self.checked_add_one(self.cache_hits, "cache hits counter")?;
                                 #[cfg(feature = "explanations")]
                                 if self.explain_enabled() {
-                                    let rule_index_u16 = u16::try_from(rule_index).map_err(|_| {
-                                        VmError::InvalidRuleIndex {
-                                            rule_index: Value::Number(rule_idx.clone()).into(),
-                                            pc: self.pc,
-                                        }
-                                    })?;
+                                    let rule_index_u16 =
+                                        u16::try_from(rule_index).map_err(|_| {
+                                            VmError::InvalidRuleIndex {
+                                                rule_index: Value::Number(rule_idx.clone()).into(),
+                                                pc: self.pc,
+                                            }
+                                        })?;
                                     self.explain_reuse_call(rule_index_u16);
                                 }
                                 cached
