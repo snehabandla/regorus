@@ -403,6 +403,10 @@ pub struct PrecomputedReverseRemap {
     pub target_field: String,
     /// The forward target field to remove after remapping.
     pub cleanup_field: String,
+    /// Whether the alias's arrays sit at the resource root rather than under
+    /// `properties` (any ASCII case, quoted or not), with the same names as
+    /// in its normalized short name once sub-resource elements are flattened.
+    pub at_root: bool,
 }
 
 /// A resolved alias entry with its default path and optional versioned paths.
