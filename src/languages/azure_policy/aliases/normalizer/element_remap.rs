@@ -17,9 +17,8 @@ use super::super::obj_map::{
 /// Move fields within each element of a (possibly nested) array: each
 /// `(source, target)` pair moves the dot-separated `source` path to `target`.
 ///
-/// All sources are read before any is removed or written, so pairs that swap
-/// or chain field names see the element as it was rather than each other's
-/// results.
+/// Each source is taken in turn, but all targets are written afterwards, so
+/// pairs that swap or chain field names don't read each other's results.
 ///
 /// When `lowercase` is `true` (normalizer), target path segments are
 /// lowercased.  When `false` (denormalizer), they are written verbatim
@@ -151,25 +150,28 @@ fn remap_at_depth_in_btree(
     }
 }
 
-/// Read each pair's source, paired with its target. A source inside one an
-/// earlier pair already moved is skipped, as moving them in turn would.
-fn read_sources<'a>(
-    fields: &[(&str, &'a str)],
-    read: impl Fn(&str) -> Option<Value>,
+/// Take each pair's source value in turn, as moving them one by one would,
+/// but leave the targets for the caller to write afterwards so no move reads
+/// another's result. A source repeated from an earlier pair gets the same
+/// value.
+fn take_sources<'a>(
+    fields: &[(&'a str, &'a str)],
+    mut take: impl FnMut(&str) -> Option<Value>,
 ) -> Vec<(&'a str, Value)> {
-    let mut read_from: Vec<&str> = Vec::new();
+    let mut taken: Vec<(&str, Value)> = Vec::new();
     let mut moved = Vec::new();
     for &(source, target) in fields {
-        let inside_moved = read_from.iter().any(|outer| {
-            source
-                .strip_prefix(outer)
-                .is_some_and(|rest| rest.starts_with('.'))
-        });
-        if inside_moved {
-            continue;
-        }
-        if let Some(val) = read(source) {
-            read_from.push(source);
+        let val = match taken.iter().find(|(earlier, _)| *earlier == source) {
+            Some((_, val)) => Some(val.clone()),
+            None => {
+                let val = take(source);
+                if let Some(val) = &val {
+                    taken.push((source, val.clone()));
+                }
+                val
+            }
+        };
+        if let Some(val) = val {
             moved.push((target, val));
         }
     }
@@ -178,14 +180,12 @@ fn read_sources<'a>(
 
 /// Move each `(source, target)` pair's value directly in a BTreeMap.
 fn remap_fields_in_btree(btree: &mut Object, fields: &[(&str, &str)], lowercase: bool) {
-    let moved = read_sources(fields, |source| read_dotted_path_btree(btree, source));
-    if moved.is_empty() {
-        return;
-    }
-    for &(source, _) in fields {
+    let moved = take_sources(fields, |source| {
+        let val = read_dotted_path_btree(btree, source)?;
         let segments: Vec<&str> = source.split('.').collect();
         remove_at_dotted_path_obj(btree, &segments);
-    }
+        Some(val)
+    });
     for (target, val) in moved {
         let segments: Vec<&str> = target.split('.').collect();
         match segments.as_slice() {
@@ -212,13 +212,11 @@ fn read_dotted_path_btree(btree: &Object, path: &str) -> Option<Value> {
 /// Move each `(source, target)` pair's value in an ObjMap.  Used only at
 /// the top level when `depth >= array_chain.len()`.
 fn remap_fields(obj: &mut ObjMap, fields: &[(&str, &str)], lowercase: bool) {
-    let moved = read_sources(fields, |source| read_dotted_path(obj, source));
-    if moved.is_empty() {
-        return;
-    }
-    for &(source, _) in fields {
+    let moved = take_sources(fields, |source| {
+        let val = read_dotted_path(obj, source)?;
         remove_element_field(obj, &[], source);
-    }
+        Some(val)
+    });
     for (target, val) in moved {
         if !target.contains('.') {
             obj_insert(obj, target, val);

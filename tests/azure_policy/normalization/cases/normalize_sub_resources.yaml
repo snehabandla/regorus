@@ -1397,7 +1397,7 @@ cases:
             mode: strict
     round_trip: true
 
-  - note: "an alias over an ARM object keeps a field another alias also reads"
+  - note: "an alias nested under another alias's short name keeps that alias's value"
     aliases_json: |
       [
         {
@@ -1407,13 +1407,13 @@ cases:
               "resourceType": "widgets",
               "aliases": [
                 {
-                  "name": "Test/widgets/rules[*].a",
-                  "defaultPath": "properties.rules[*].x.y",
+                  "name": "Test/widgets/rules[*].settings.profile",
+                  "defaultPath": "properties.rules[*].configuration",
                   "paths": []
                 },
                 {
-                  "name": "Test/widgets/rules[*].b",
-                  "defaultPath": "properties.rules[*].x",
+                  "name": "Test/widgets/rules[*]['settings']",
+                  "defaultPath": "properties.rules[*].configuration.defaults",
                   "paths": []
                 }
               ]
@@ -1425,14 +1425,14 @@ cases:
       type: Test/widgets
       properties:
         rules:
-          - x:
-              y: 1
-              z: 2
+          - configuration:
+              defaults: {}
+              enabled: true
     expected_normalized:
       type: Test/widgets
       rules:
-        - a: 1
-          b:
-            y: 1
-            z: 2
+        - settings:
+            profile:
+              defaults: {}
+              enabled: true
     round_trip: true
