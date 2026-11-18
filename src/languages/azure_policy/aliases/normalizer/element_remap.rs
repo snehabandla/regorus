@@ -19,8 +19,9 @@ use super::super::obj_map::{
 ///
 /// Each source is taken in turn, but all targets are written afterwards, so
 /// pairs that swap or chain field names don't read each other's results.
-/// If a target lies inside or around another pair's source, the pairs are
-/// moved one at a time instead, since they may rely on that order.
+/// If a target lies inside or around another pair's source, the pairs may
+/// rely on the old order, so each is instead copied and then its source
+/// removed, one pair at a time.
 ///
 /// When `lowercase` is `true` (normalizer), target path segments are
 /// lowercased.  When `false` (denormalizer), they are written verbatim
@@ -152,18 +153,13 @@ fn remap_at_depth_in_btree(
     }
 }
 
-/// Split `fields` into the runs whose sources are all taken before their
-/// targets are written: one run, or one per pair when a target lies inside
-/// or around another pair's source.
-fn move_runs<'f, 'a>(
-    fields: &'f [(&'a str, &'a str)],
-) -> core::slice::Chunks<'f, (&'a str, &'a str)> {
-    let nested = fields.iter().any(|&(_, target)| {
+/// Whether some pair's target lies inside or around some pair's source.
+fn has_nested_pairs(fields: &[(&str, &str)]) -> bool {
+    fields.iter().any(|&(_, target)| {
         fields.iter().any(|&(source, _)| {
             is_strictly_nested(source, target) || is_strictly_nested(target, source)
         })
-    });
-    fields.chunks(if nested { 1 } else { fields.len().max(1) })
+    })
 }
 
 /// Whether dotted path `inner` lies strictly inside `outer` (ignoring case).
@@ -176,38 +172,40 @@ fn is_strictly_nested(inner: &str, outer: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('.'))
 }
 
-/// Take each pair's source value in turn, as moving them one by one would,
-/// but leave the targets for the caller to write afterwards so no move reads
-/// another's result.
-fn take_sources<'a>(
-    fields: &[(&'a str, &'a str)],
-    mut take: impl FnMut(&str) -> Option<Value>,
-) -> Vec<(&'a str, Value)> {
-    fields
-        .iter()
-        .filter_map(|&(source, target)| take(source).map(|val| (target, val)))
-        .collect()
-}
-
 /// Move each `(source, target)` pair's value directly in a BTreeMap.
 fn remap_fields_in_btree(btree: &mut Object, fields: &[(&str, &str)], lowercase: bool) {
-    for run in move_runs(fields) {
-        let moved = take_sources(run, |source| {
-            let val = read_dotted_path_btree(btree, source)?;
+    if has_nested_pairs(fields) {
+        for &(source, target) in fields {
+            if let Some(val) = read_dotted_path_btree(btree, source) {
+                write_btree(btree, target, val, lowercase);
+            }
             let segments: Vec<&str> = source.split('.').collect();
             remove_at_dotted_path_obj(btree, &segments);
-            Some(val)
-        });
-        for (target, val) in moved {
-            let segments: Vec<&str> = target.split('.').collect();
-            match segments.as_slice() {
-                [] => {}
-                [seg] => {
-                    btree.insert(Value::String(crate::Rc::from(*seg)), val);
-                }
-                _ => set_nested(btree, &segments, val, lowercase),
-            }
         }
+        return;
+    }
+    let mut moved = Vec::new();
+    for &(source, target) in fields {
+        if let Some(val) = read_dotted_path_btree(btree, source) {
+            let segments: Vec<&str> = source.split('.').collect();
+            remove_at_dotted_path_obj(btree, &segments);
+            moved.push((target, val));
+        }
+    }
+    for (target, val) in moved {
+        write_btree(btree, target, val, lowercase);
+    }
+}
+
+/// Write `val` at dotted path `target` in a BTreeMap.
+fn write_btree(btree: &mut Object, target: &str, val: Value, lowercase: bool) {
+    let segments: Vec<&str> = target.split('.').collect();
+    match segments.as_slice() {
+        [] => {}
+        [seg] => {
+            btree.insert(Value::String(crate::Rc::from(*seg)), val);
+        }
+        _ => set_nested(btree, &segments, val, lowercase),
     }
 }
 
@@ -225,21 +223,35 @@ fn read_dotted_path_btree(btree: &Object, path: &str) -> Option<Value> {
 /// Move each `(source, target)` pair's value in an ObjMap.  Used only at
 /// the top level when `depth >= array_chain.len()`.
 fn remap_fields(obj: &mut ObjMap, fields: &[(&str, &str)], lowercase: bool) {
-    for run in move_runs(fields) {
-        let moved = take_sources(run, |source| {
-            let val = read_dotted_path(obj, source)?;
-            remove_element_field(obj, &[], source);
-            Some(val)
-        });
-        for (target, val) in moved {
-            if !target.contains('.') {
-                obj_insert(obj, target, val);
-            } else if lowercase {
-                set_nested_lowercased(obj, target, val);
-            } else {
-                set_nested_verbatim(obj, target, val);
+    if has_nested_pairs(fields) {
+        for &(source, target) in fields {
+            if let Some(val) = read_dotted_path(obj, source) {
+                write_obj(obj, target, val, lowercase);
             }
+            remove_element_field(obj, &[], source);
         }
+        return;
+    }
+    let mut moved = Vec::new();
+    for &(source, target) in fields {
+        if let Some(val) = read_dotted_path(obj, source) {
+            remove_element_field(obj, &[], source);
+            moved.push((target, val));
+        }
+    }
+    for (target, val) in moved {
+        write_obj(obj, target, val, lowercase);
+    }
+}
+
+/// Write `val` at dotted path `target` in an ObjMap.
+fn write_obj(obj: &mut ObjMap, target: &str, val: Value, lowercase: bool) {
+    if !target.contains('.') {
+        obj_insert(obj, target, val);
+    } else if lowercase {
+        set_nested_lowercased(obj, target, val);
+    } else {
+        set_nested_verbatim(obj, target, val);
     }
 }
 
