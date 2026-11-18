@@ -2717,7 +2717,8 @@ fn partial_eval_warning_is_in_the_memory_budget() {
         let mut vm = partial_eval_vm(source, "p".repeat(filename_len));
         vm.set_input(Value::new_object());
         let mut settings = PartialEvalSettings::default();
-        settings.unknowns = vec![UnknownPath::input_keys(["foo"])];
+        // A prefix guard remains unsupported when direct guards become residuals.
+        settings.unknowns = vec![UnknownPath::input_keys(["foo", "bar"])];
         vm.set_partial_eval_settings(settings);
         vm.set_memory_budget_config(Some(MemoryBudgetConfig {
             limit: NonZeroU64::new(64 * 1024).unwrap(),
