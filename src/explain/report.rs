@@ -549,6 +549,13 @@ pub struct AttemptExplanation {
     /// Absent when not captured; captured empty can represent a parameter
     /// match rejected before any body checks. These remain context unless
     /// they belong to the successful producing path.
+    ///
+    /// Captured parameter bindings can use [`ConditionKind::Binding`] at
+    /// the parameter's source site: `binding` names the parameter and `left`
+    /// holds the actual argument, including its concrete path or causal
+    /// origins. The owner is the callee attempt. This records a real binding,
+    /// not a fabricated body predicate: binding a defined `false` succeeds.
+    /// It also works for a value-only function with no body checks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conditions: Option<Vec<ConditionExplanation>>,
 }
@@ -638,7 +645,8 @@ pub struct ConditionExplanation {
     /// Iteration summary of a loop-backed condition.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub witness: Option<LoopWitness>,
-    /// Variable bound by a binding condition, such as `x` in `x := ...`.
+    /// Variable bound by a binding condition, such as `x` in `x := ...`,
+    /// or a parameter binding in [`AttemptExplanation::conditions`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding: Option<String>,
 }
@@ -662,7 +670,7 @@ pub enum ConditionKind {
     Existence,
     /// A negated expression, `not ...`.
     Negation,
-    /// A variable binding, `x := ...`.
+    /// A variable binding, `x := ...`, or captured parameter-binding evidence.
     Binding,
 }
 
@@ -877,6 +885,9 @@ pub struct Derivation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub conditionality: Option<Conditionality>,
     /// Evaluated checks on this producing path, in evaluation order.
+    /// Contributing parameter bindings may be copied from callee attempts,
+    /// retaining their callee owners. An argument's presence alone does not
+    /// establish that it contributed to the result.
     pub conditions: Vec<ConditionExplanation>,
     /// The loop iteration that produced this proof at each loop on its
     /// path, outermost first, unlike a condition's loop-wide

@@ -455,7 +455,13 @@ fn redacted_rule_result_and_emission_json() -> Result<(), serde_json::Error> {
     assert!(rule.is_some());
     if let Some(rule) = rule {
         rule.result = ReportedValue::Redacted;
-        rule.definitions.clear();
+        rule.definitions = vec![DefinitionExplanation {
+            index: 0,
+            body: 0,
+            outcome: Outcome::Success,
+            location: None,
+            conditions: Vec::new(),
+        }];
         for emission in &mut rule.emissions {
             emission.key = Some(ReportedValue::Redacted);
             emission.value = ReportedValue::Redacted;
@@ -1802,6 +1808,312 @@ fn conditionality_is_independent_of_bounded_proofs() -> anyhow::Result<()> {
     assert_eq!(
         serde_json::to_value(&result)?.get("conditionality"),
         Some(&serde_json::json!("assumed"))
+    );
+    Ok(())
+}
+
+#[test]
+fn nested_comprehension_conditions_do_not_replace_the_finding_subject() -> anyhow::Result<()> {
+    // deny contains name if { some name in input.users; not count([tag |
+    // some tag in input.tags; tag == "public"]) == 0 }
+    let mut report = partial_set_report();
+    report.query.call_instance = Some(1);
+    let rule = report.rules.first_mut().context("queried rule")?;
+    rule.call_instance = 1;
+    let owner = |scope| ConditionOwner {
+        rule: String::from("data.test.deny"),
+        call_instance: 1,
+        attempt: Some(1),
+        scope,
+    };
+    let subject = rule.definitions[0]
+        .conditions
+        .first_mut()
+        .context("subject loop")?;
+    subject.owner = owner(None);
+    subject.witness = None;
+    let local = ConditionExplanation {
+        site_id: 3,
+        owner: owner(Some(2)),
+        outcome: Outcome::Success,
+        left: None,
+        right: None,
+        witness: Some(LoopWitness {
+            iterations: 1,
+            successes: 1,
+            sample_key: Some(known(Value::from(0), None)),
+            sample_value: Some(known(Value::from("public"), Some("input.tags"))),
+        }),
+        binding: Some(String::from("tag")),
+    };
+    let predicate = ConditionExplanation {
+        site_id: 4,
+        owner: owner(Some(2)),
+        outcome: Outcome::Success,
+        left: Some(known(Value::from("public"), Some("tag"))),
+        right: Some(known(Value::from("public"), None)),
+        witness: None,
+        binding: None,
+    };
+    let negation = ConditionExplanation {
+        site_id: 1,
+        owner: owner(Some(1)),
+        outcome: Outcome::Success,
+        left: Some(known(Value::from(1), None)),
+        right: Some(known(Value::from(0), None)),
+        witness: None,
+        binding: None,
+    };
+    let conditions = vec![subject.clone(), local, predicate, negation];
+    rule.definitions[0].conditions = conditions.clone();
+    rule.emissions[0].conditions = conditions.clone();
+    rule.attempts = Some(vec![AttemptExplanation {
+        attempt: 1,
+        definition: 0,
+        body: 0,
+        outcome: Some(Outcome::Success),
+        conditions: Some(conditions.clone()),
+    }]);
+    rule.scopes = Some(vec![
+        ScopeExplanation {
+            scope: 1,
+            kind: ScopeKind::Negation,
+            parent: None,
+            attempt: 1,
+            site_id: 1,
+            outcome: Some(Outcome::Success),
+        },
+        ScopeExplanation {
+            scope: 2,
+            kind: ScopeKind::ArrayComprehension,
+            parent: Some(1),
+            attempt: 1,
+            site_id: 2,
+            outcome: Some(Outcome::Success),
+        },
+    ]);
+    rule.results = Some(vec![ResultExplanation::new(
+        None,
+        ReportedValue::Known(Value::from("bob")),
+        Count::Exact(1),
+        vec![DistinctElements {
+            site_id: 0,
+            loop_name: String::from("input.users[_]"),
+            collection: 1,
+            count: Some(Count::Exact(1)),
+        }],
+        vec![Derivation {
+            definition: 0,
+            body: 0,
+            attempt: Some(1),
+            conditionality: Some(Conditionality::Concrete),
+            conditions,
+            bindings: Some(vec![IterationBinding {
+                site_id: 0,
+                collection: 1,
+                key: ReportedValue::Known(Value::from(0)),
+                value: ReportedValue::Known(Value::from("bob")),
+            }]),
+        }],
+    )
+    .context("valid proof count")?]);
+    for (site_id, text, kind, operator) in [
+        (
+            1,
+            r#"not count([tag | some tag in input.tags; tag == "public"]) == 0"#,
+            ConditionKind::Negation,
+            Some(Operator::Eq),
+        ),
+        (
+            2,
+            r#"[tag | some tag in input.tags; tag == "public"]"#,
+            ConditionKind::Binding,
+            None,
+        ),
+        (3, "some tag in input.tags", ConditionKind::Iteration, None),
+        (
+            4,
+            r#"tag == "public""#,
+            ConditionKind::Comparison,
+            Some(Operator::Eq),
+        ),
+    ] {
+        report.checks.push(ConditionSite {
+            site_id,
+            text: String::from(text),
+            kind,
+            location: None,
+            operator,
+        });
+    }
+    let json = serde_json::to_value(&report)?;
+    let proof = json
+        .pointer("/rules/0/results/0/proofs/0")
+        .context("proof")?;
+    assert_eq!(
+        proof.get("bindings"),
+        Some(&serde_json::json!([
+            {"site_id":0,"collection":1,"key":0,"value":"bob"}
+        ]))
+    );
+    assert_eq!(
+        proof.pointer("/conditions/1"),
+        Some(&serde_json::json!({
+            "site_id":3,"owner":{"rule":"data.test.deny","call_instance":1,"attempt":1,"scope":2},
+            "outcome":"success","binding":"tag",
+            "witness":{"iterations":1,"successes":1,
+                "sample_key":{"concrete_path":{"status":"not_captured"},"value":0},
+                "sample_value":{"path":"input.tags","concrete_path":{"status":"not_captured"},"value":"public"}}
+        }))
+    );
+    assert_eq!(
+        proof.pointer("/conditions/2/owner/scope"),
+        Some(&serde_json::json!(2))
+    );
+    assert_eq!(
+        proof.pointer("/conditions/3/owner/scope"),
+        Some(&serde_json::json!(1))
+    );
+    assert_eq!(proof.pointer("/conditions/0/owner/scope"), None);
+    assert_eq!(
+        json.pointer("/rules/0/scopes"),
+        Some(&serde_json::json!([
+            {"scope":1,"kind":"negation","attempt":1,"site_id":1,"outcome":"success"},
+            {"scope":2,"kind":"array_comprehension","parent":1,"attempt":1,"site_id":2,"outcome":"success"}
+        ]))
+    );
+    Ok(())
+}
+
+#[test]
+fn value_only_helpers_keep_argument_origins_without_body_predicates() -> anyhow::Result<()> {
+    // identity(x) := x; allow := [identity(input.a > 0), identity(input.b > 0)].
+    let mut report = complete_rule_report();
+    report.query.call_instance = Some(1);
+    report.query_result = Value::from(vec![Value::from(false), Value::from(false)]);
+    report.checks = vec![ConditionSite {
+        site_id: 0,
+        text: String::from("x"),
+        kind: ConditionKind::Binding,
+        location: Some(SourceLocation {
+            file: String::from("p.rego"),
+            line: 2,
+            column: 10,
+        }),
+        operator: None,
+    }];
+    let rule = report.rules.first_mut().context("queried rule")?;
+    rule.call_instance = 1;
+    rule.result = ReportedValue::Known(report.query_result.clone());
+    rule.definitions.clear();
+    rule.attempts = Some(vec![AttemptExplanation {
+        attempt: 1,
+        definition: 0,
+        body: 0,
+        outcome: Some(Outcome::Success),
+        conditions: Some(Vec::new()),
+    }]);
+    rule.scopes = Some(Vec::new());
+    rule.calls = Some(vec![
+        CallUse {
+            call_instance: 2,
+            attempt: Some(1),
+            scope: None,
+        },
+        CallUse {
+            call_instance: 3,
+            attempt: Some(1),
+            scope: None,
+        },
+    ]);
+    let template = rule.clone();
+    let mut contributions = Vec::new();
+    for (call_instance, key) in [(2, "a"), (3, "b")] {
+        let mut argument = known(Value::from(false), None);
+        argument.concrete_path = ConcretePath::NoPath;
+        argument.origins = Some(CausalOrigins {
+            paths: vec![ConcretePath::Captured {
+                root: PathRoot::Input,
+                segments: vec![PathSegment::Key(String::from(key))],
+            }],
+            complete: true,
+        });
+        let binding = ConditionExplanation {
+            site_id: 0,
+            owner: ConditionOwner {
+                rule: String::from("data.test.identity"),
+                call_instance,
+                attempt: Some(call_instance),
+                scope: None,
+            },
+            outcome: Outcome::Success,
+            left: Some(argument),
+            right: None,
+            witness: None,
+            binding: Some(String::from("x")),
+        };
+        let mut helper = template.clone();
+        helper.name = String::from("data.test.identity");
+        helper.call_instance = call_instance;
+        helper.kind = RuleKind::Function;
+        helper.result = ReportedValue::Known(Value::from(false));
+        helper.attempts = Some(vec![AttemptExplanation {
+            attempt: call_instance,
+            definition: 0,
+            body: 0,
+            outcome: Some(Outcome::Success),
+            conditions: Some(vec![binding.clone()]),
+        }]);
+        helper.calls = Some(Vec::new());
+        contributions.push(binding);
+        report.rules.push(helper);
+    }
+    report.rules[0].results = Some(vec![ResultExplanation::new(
+        None,
+        ReportedValue::Known(report.query_result.clone()),
+        Count::Exact(1),
+        Vec::new(),
+        vec![Derivation {
+            definition: 0,
+            body: 0,
+            attempt: Some(1),
+            conditionality: Some(Conditionality::Concrete),
+            conditions: contributions,
+            bindings: Some(Vec::new()),
+        }],
+    )
+    .context("valid proof count")?]);
+    let json = serde_json::to_value(&report)?;
+    for (index, call_instance, key) in [(1, 2, "a"), (2, 3, "b")] {
+        let helper = json.pointer(&format!("/rules/{index}")).context("helper")?;
+        assert_eq!(helper.get("result"), Some(&serde_json::json!(false)));
+        assert_eq!(
+            helper.pointer("/definitions/0/conditions"),
+            Some(&serde_json::json!([]))
+        );
+        assert_eq!(
+            helper.pointer("/attempts/0/conditions"),
+            Some(&serde_json::json!([{
+                "site_id":0,
+                "owner":{"rule":"data.test.identity","call_instance":call_instance,"attempt":call_instance},
+                "outcome":"success","binding":"x",
+                "left":{"concrete_path":{"status":"no_path"},"value":false,
+                    "origins":{"paths":[{"status":"captured","root":"input","segments":[{"key":key}]}],"complete":true}}
+            }]))
+        );
+        assert_eq!(
+            json.pointer(&format!(
+                "/rules/0/results/0/proofs/0/conditions/{}",
+                index - 1
+            )),
+            helper.pointer("/attempts/0/conditions/0"),
+        );
+    }
+    assert_eq!(
+        json.pointer("/rules/0/calls"),
+        Some(&serde_json::json!([
+            {"call_instance":2,"attempt":1},{"call_instance":3,"attempt":1}
+        ]))
     );
     Ok(())
 }
