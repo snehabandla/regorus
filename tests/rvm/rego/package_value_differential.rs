@@ -226,7 +226,7 @@ fn subpackages_without_rules_are_empty_objects() -> Result<()> {
             "package a.b\nf(v) := v",
             "package a.z",
             "package a.c.d.e\ny if false",
-            "package q\nr := data.a\nb := data.a.b\nz := data.a.z\nn := count(data.a)",
+            "package q\nr := data.a\nb := data.a.b\nz := data.a.z\nn := count(data.a)\ndyn := data.a[input.k]",
         ],
         &[
             (
@@ -237,6 +237,11 @@ fn subpackages_without_rules_are_empty_objects() -> Result<()> {
             ("data.q.b", EMPTY, Some("{}")),
             ("data.q.z", EMPTY, Some("{}")),
             ("data.q.n", EMPTY, Some("4")),
+            ("data.q.dyn", r#"{"k": "b"}"#, Some("{}")),
+            ("data.q.dyn", r#"{"k": "z"}"#, Some("{}")),
+            ("data.q.dyn", r#"{"k": "x"}"#, Some("1")),
+            ("data.q.dyn", r#"{"k": "c"}"#, Some(r#"{"d": {"e": {}}}"#)),
+            ("data.q.dyn", r#"{"k": "nope"}"#, None),
         ],
     )
 }
