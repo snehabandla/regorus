@@ -92,6 +92,8 @@ const NOT_DIV: &str = "y if not input.a / input.b == 1";
 const NOT_OBJECT_GET: &str = r#"y if not object.get(input.v, "k", 0) == 1"#;
 const NOT_NESTED_ARG: &str = r#"y if not startswith(upper(input.s), "a")"#;
 const NOT_FAILING_CALL: &str = r#"y if not startswith(input.s, "a")"#;
+const NOT_CALL_CHAIN: &str = "y if not abs(to_number(input.v)) == 1";
+const NOT_FUNCTION_ARG: &str = "f(_) := 1\ny if not f(count(input.v)) == 2";
 const NOT_INDEX: &str = "y if not input.x[count(input.v)] == 1";
 const NOT_FUNCTION: &str = "f(x) := 1 if x > 0\ny if not f(input.v) == 2";
 const NOT_IN_BODY: &str = "y if {\n  input.w == 1\n  not count(input.v) == 1\n  input.w > 0\n}";
@@ -206,6 +208,27 @@ fn cases() -> Vec<Case> {
             "nested call argument twin",
             NOT_NESTED_ARG,
             r#"{"s": "b"}"#,
+            "true",
+        ),
+        case(
+            "call chain",
+            NOT_CALL_CHAIN,
+            r#"{"v": "x"}"#,
+            V(UNDEFINED),
+            error("could not parse", UNDEFINED),
+        ),
+        same("call chain twin", NOT_CALL_CHAIN, r#"{"v": "2"}"#, "true"),
+        case(
+            "function argument",
+            NOT_FUNCTION_ARG,
+            r#"{"v": 5}"#,
+            V(UNDEFINED),
+            error(COUNT_ERROR, UNDEFINED),
+        ),
+        same(
+            "function argument twin",
+            NOT_FUNCTION_ARG,
+            r#"{"v": [1]}"#,
             "true",
         ),
         case(

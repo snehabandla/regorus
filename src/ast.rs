@@ -672,6 +672,47 @@ impl Expr {
             Self::OrExpr { eidx, .. } => eidx,
         }
     }
+
+    /// The outermost calls (including operators) nested in the operands of
+    /// this negated expression. OPA evaluates them before the negation, so an
+    /// Undefined one fails the enclosing body instead of satisfying `not`.
+    /// Comprehensions are evaluated as a whole and are not searched.
+    pub(crate) fn negation_lifted_calls(&self) -> Vec<Ref<Expr>> {
+        fn operands(expr: &Expr) -> Vec<&Ref<Expr>> {
+            match expr {
+                Expr::Call { params, .. } => params.iter().collect(),
+                Expr::Array { items, .. } | Expr::Set { items, .. } => items.iter().collect(),
+                Expr::Object { fields, .. } => fields.iter().flat_map(|(_, k, v)| [k, v]).collect(),
+                Expr::UnaryExpr { expr, .. } | Expr::RefDot { refr: expr, .. } => vec![expr],
+                Expr::RefBrack { refr, index, .. } => vec![refr, index],
+                Expr::BinExpr { lhs, rhs, .. }
+                | Expr::BoolExpr { lhs, rhs, .. }
+                | Expr::ArithExpr { lhs, rhs, .. } => vec![lhs, rhs],
+                Expr::Membership {
+                    key,
+                    value,
+                    collection,
+                    ..
+                } => key.iter().chain([value, collection]).collect(),
+                _ => Vec::new(),
+            }
+        }
+        fn collect(expr: &Ref<Expr>, calls: &mut Vec<Ref<Expr>>) {
+            match expr.as_ref() {
+                Expr::Call { .. }
+                | Expr::BinExpr { .. }
+                | Expr::BoolExpr { .. }
+                | Expr::ArithExpr { .. }
+                | Expr::Membership { .. } => calls.push(expr.clone()),
+                other => operands(other).into_iter().for_each(|e| collect(e, calls)),
+            }
+        }
+        let mut calls = Vec::new();
+        operands(self)
+            .into_iter()
+            .for_each(|e| collect(e, &mut calls));
+        calls
+    }
 }
 
 #[cfg(test)]

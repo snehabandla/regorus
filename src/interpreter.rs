@@ -1227,6 +1227,16 @@ impl Interpreter {
                     }
                 }
 
+                // An Undefined call nested in the operands fails the body
+                // instead of satisfying `not` (see `negation_lifted_calls`).
+                if value == Value::Undefined {
+                    for call in expr.negation_lifted_calls() {
+                        if self.eval_expr(&call)? == Value::Undefined {
+                            return Ok(false);
+                        }
+                    }
+                }
+
                 // https://github.com/open-policy-agent/opa/issues/1622#issuecomment-520547385
                 matches!(value, Value::Bool(false) | Value::Undefined)
             }
