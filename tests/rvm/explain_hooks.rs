@@ -860,6 +860,76 @@ fn invocation_with_undefined_arguments_still_has_start_and_end() {
     }
 }
 
+fn assert_invocation_subtree_cache_reuse(mode: ExecutionMode) {
+    let mut engine = Engine::new();
+    for (name, policy) in [
+        ("target.rego", "package target\np := input.x\n"),
+        ("other.rego", "package other\np := input.x\n"),
+        (
+            "framework.rego",
+            "package framework\nr := [data[input.a],data[input.b]]\n",
+        ),
+    ] {
+        engine.add_policy(name.to_string(), policy.to_string()).unwrap();
+    }
+    let entrypoint: Rc<str> = "data.framework.r".into();
+    let compiled = engine.compile_with_entrypoint(&entrypoint).unwrap();
+    let program = Compiler::compile_from_policy(&compiled, &["data.framework.r"]).unwrap();
+    let expected = v(r#"[{"p":1},{"p":1}]"#);
+
+    let distinct = run_program(
+        &program,
+        r#"{"a":"target","b":"other","x":1}"#,
+        mode,
+        false,
+    );
+    assert_eq!(distinct.result.as_ref().unwrap(), &expected);
+    let first = distinct.call_ids("data.target.p");
+    let second = distinct.call_ids("data.other.p");
+    assert_eq!(first.len(), 1);
+    assert_eq!(second.len(), 1);
+    assert_ne!(first[0], second[0]);
+    assert!(!distinct.calls.iter().any(|record| matches!(
+        record, CallRecord::Reused(_, _)
+    )));
+
+    let repeated = run_program(
+        &program,
+        r#"{"a":"target","b":"target","x":1}"#,
+        mode,
+        false,
+    );
+    assert_eq!(repeated.result.as_ref().unwrap(), &expected);
+    let target = repeated.call_ids("data.target.p");
+    assert_eq!(target.len(), 1, "{mode:?}: {:?}", repeated.calls);
+    assert!(repeated.call_ids("data.other.p").is_empty());
+    let root = repeated.call_ids("data.framework.r")[0];
+    let uses: Vec<_> = repeated.calls.iter().filter_map(|record| match record {
+        CallRecord::Reused(caller, event)
+            if program.rule_infos[usize::from(event.rule_index)].name == "data.target.p" =>
+        {
+            Some((caller.call_instance, event.call_instance))
+        }
+        _ => None,
+    }).collect();
+    assert_eq!(
+        uses,
+        [(Some(root), Some(target[0]))],
+        "{mode:?}: second subtree materialization lost its cached invocation use: {:?}",
+        repeated.calls
+    );
+}
+
+#[test]
+fn invocation_subtree_cache_reuse_run_to_completion() {
+    assert_invocation_subtree_cache_reuse(ExecutionMode::RunToCompletion);
+}
+
+#[test]
+fn invocation_subtree_cache_reuse_suspendable() {
+    assert_invocation_subtree_cache_reuse(ExecutionMode::Suspendable);
+}
+
 #[test]
 fn invocation_abort_is_not_undefined_and_fresh_evaluation_restarts_ids() {
     let program = compile(
