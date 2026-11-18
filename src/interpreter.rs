@@ -801,7 +801,24 @@ impl Interpreter {
                             let index = index.to_string();
                             v = obj[index].clone();
                         }
-                        return Ok(Self::get_value_chained(v, &path[..]));
+                        let v = Self::get_value_chained(v, &path[..]);
+                        if v == Value::Undefined && get_root_var(refr)?.text() == "data" {
+                            let key = match &index {
+                                Value::String(key) => Some(key.as_ref().to_string()),
+                                Value::Number(_) => Some(index.to_string()),
+                                _ => None,
+                            };
+                            if let (Some(key), Ok(mut fields)) =
+                                (key, Parser::get_static_string_path_components(refr))
+                            {
+                                fields.push(key);
+                                fields.extend(path.iter().map(|field| (*field).to_string()));
+                                let fields: Vec<&str> =
+                                    fields.iter().skip(1).map(String::as_str).collect();
+                                return self.lookup_data(&fields);
+                            }
+                        }
+                        return Ok(v);
                     }
                 },
                 _ => {

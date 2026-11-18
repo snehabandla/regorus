@@ -38,6 +38,69 @@ cases:
       r: str
       c: {}
 
+  - note: packages without rules below a string in base data merge when read
+    data:
+      a: str
+    modules:
+      - |
+        package a.b.c
+      - |
+        package a.b.d
+      - |
+        package q
+        import rego.v1
+
+        r := data.a.b
+        k := v if {
+          x := "b"
+          v := data.a[x]
+        }
+        w := v if {
+          v := data.a.b with data.a as "x"
+        }
+        n := data.a.b.c.e
+    query: data.q
+    want_result:
+      r:
+        c: {}
+        d: {}
+      k:
+        c: {}
+        d: {}
+
+  - note: package without rules below a string in base data, read via data
+    data:
+      a: str
+    modules:
+      - |
+        package a.b.c
+    query: data
+    want_result:
+      a: str
+
+  - note: package without rules three levels below a string in base data
+    data:
+      a:
+        b: str
+    modules:
+      - |
+        package a.b.c.d
+      - |
+        package q
+
+        p := data.a
+        r := data.a.b
+        c := data.a.b.c
+        d := data.a.b.c.d
+    query: data.q
+    want_result:
+      p:
+        b: str
+      r: str
+      c:
+        d: {}
+      d: {}
+
   - note: package without rules below an array in base data, read from query
     data:
       a: [1]
