@@ -13,8 +13,9 @@ use regorus::explain::{
     HookContext, NotCapturedEvent, Operator, Outcome, Provenance, UncapturedConstruct,
 };
 use regorus::languages::rego::compiler::Compiler;
+use regorus::rvm::instructions::FunctionCallParams;
 use regorus::rvm::program::Program;
-use regorus::rvm::vm::{ExecutionMode, ExecutionState, RegoVM};
+use regorus::rvm::vm::{ExecutionMode, ExecutionState, RegoVM, VmError};
 use regorus::rvm::Instruction;
 use regorus::{Engine, Rc, Value};
 use std::sync::{Arc, Mutex};
@@ -1241,6 +1242,74 @@ fn invocation_late_recorder_does_not_assign_uncaptured_default_to_caller() {
 }
 
 #[test]
+fn invocation_malformed_rule_index_preserves_recorder_off_error() {
+    let mut program = Program::new();
+    program.dispatch_window_size = 2;
+    program.max_rule_window_size = 2;
+    program.instructions = vec![
+        Instruction::CallRule { dest: 0, rule_index: 0 },
+        Instruction::Return { value: 0 },
+    ];
+    let program = Arc::new(program);
+    let outcomes = MODES.map(|mode| {
+        [false, true].map(|recording| {
+            let mut vm = RegoVM::new();
+            vm.load_program(program.clone());
+            vm.set_execution_mode(mode);
+            if recording {
+                vm.set_explanation_recorder(Box::new(Fixture::default()));
+            }
+            vm.execute()
+        })
+    });
+    for (mode, [baseline, recorded]) in MODES.into_iter().zip(outcomes) {
+        let expected = Err(VmError::RuleIndexOutOfBounds {
+            index: 0,
+            pc: 0,
+            available: 0,
+        });
+        assert_eq!(baseline, expected, "{mode:?}: recorder-off baseline");
+        assert_eq!(recorded, expected, "{mode:?}: recording changed the typed error");
+    }
+}
+
+#[test]
+fn invocation_malformed_undefined_argument_preserves_recorder_off_result() {
+    let mut program = Program::new();
+    program.dispatch_window_size = 2;
+    program.max_rule_window_size = 2;
+    let params_index = program.add_function_call_params(FunctionCallParams {
+        dest: 0,
+        func_rule_index: 0,
+        num_args: 1,
+        args: [1, 0, 0, 0, 0, 0, 0, 0],
+    });
+    program.instructions = vec![
+        Instruction::FunctionCall { params_index },
+        Instruction::Return { value: 0 },
+    ];
+    let program = Arc::new(program);
+    let outcomes = MODES.map(|mode| {
+        [false, true].map(|recording| {
+            let mut vm = RegoVM::new();
+            vm.load_program(program.clone());
+            vm.set_execution_mode(mode);
+            if recording {
+                vm.set_explanation_recorder(Box::new(Fixture::default()));
+            }
+            vm.execute()
+        })
+    });
+    for (mode, [baseline, recorded]) in MODES.into_iter().zip(outcomes) {
+        assert_eq!(baseline, Ok(Value::Undefined), "{mode:?}: recorder-off baseline");
+        assert_eq!(
+            recorded, Ok(Value::Undefined),
+            "{mode:?}: recording changed undefined-argument short-circuit semantics"
+        );
+    }
+}
+
+#[test]
 fn assert_eq_is_reported_as_an_equality() {
     let mut program = Program::new();
     program.literals = vec![Value::from(1), Value::from(2)];
@@ -2414,6 +2483,60 @@ fn failed_writes_to_a_partial_rule_result_are_not_emitted() {
             );
         }
     }
+}
+
+struct SlowCallStart(Fixture);
+
+impl ExplanationRecorder for SlowCallStart {
+    fn reset(&mut self) {
+        self.0.reset();
+    }
+
+    fn call_start(&mut self, context: &HookContext, event: &CallStartEvent) {
+        self.0.call_start(context, event);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    fn call_end(&mut self, context: &HookContext, event: &CallEndEvent<'_>) {
+        self.0.call_end(context, event);
+    }
+}
+
+#[test]
+fn invocation_deadline_abort_terminates_the_active_call() -> Result<()> {
+    use regorus::utils::limits::ExecutionTimerConfig;
+    use std::num::NonZeroU32;
+
+    let program = compile("package t\nallow if input.a\n", "data.t.allow")?;
+    for mode in MODES {
+        let fixture = Fixture::default();
+        let mut vm = RegoVM::new();
+        vm.load_program(program.clone());
+        vm.set_execution_mode(mode);
+        vm.set_input(v(r#"{"a":true}"#));
+        vm.set_execution_timer_config(Some(ExecutionTimerConfig {
+            limit: std::time::Duration::from_millis(20),
+            check_interval: NonZeroU32::MIN,
+        }));
+        vm.set_explanation_recorder(Box::new(SlowCallStart(fixture.clone())));
+        let outcome = vm.execute();
+        assert!(
+            matches!(&outcome, Err(VmError::TimeLimitExceeded { .. })),
+            "{mode:?}: expected a typed deadline error, got {outcome:?}"
+        );
+        let calls = fixture.calls();
+        let [
+            CallRecord::Start(caller, start),
+            CallRecord::End(owner, None, None),
+        ] = calls.as_slice() else {
+            bail!("{mode:?}: expected one started invocation and one abort: {calls:?}");
+        };
+        assert_eq!(caller.call_instance, None);
+        assert_eq!(owner.call_instance, Some(start.call_instance));
+        assert_eq!(owner.rule_index, Some(start.rule_index));
+        assert_eq!(owner.call_depth, caller.call_depth + 1);
+    }
+    Ok(())
 }
 
 struct SlowReset;
