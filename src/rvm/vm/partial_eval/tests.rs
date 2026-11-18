@@ -522,7 +522,7 @@ fn lossy_numeric_residuals_fail_closed() -> anyhow::Result<()> {
         let value = result.residual_queries[0].conditions[0]
             .value
             .as_ref()
-            .unwrap();
+            .ok_or_else(|| anyhow::anyhow!("numeric condition has no value"))?;
         assert_eq!(Value::from_json_str(&value.to_json_str_compact()?)?, *value);
     }
     let policy = "package test\nallow if input.u == 100000000000000000000000.0";
