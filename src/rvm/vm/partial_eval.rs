@@ -496,6 +496,7 @@ impl RegoVM {
             _ if !in_frame => Ok(None),
             Instruction::Move { dest, src } => match self.pe_taint(src).cloned() {
                 Some(taint) => {
+                    self.check_initial_memory_limit()?;
                     if let Some(pe) = self.pe_mut() {
                         pe.mark_used(src);
                     }
