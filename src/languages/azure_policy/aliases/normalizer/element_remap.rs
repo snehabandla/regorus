@@ -153,29 +153,37 @@ fn remap_at_depth_in_btree(
 /// Take each pair's source value in turn, as moving them one by one would,
 /// but leave the targets for the caller to write afterwards so no move reads
 /// another's result. A source repeated from an earlier pair gets the same
-/// value.
+/// value, unless its target overlaps a target already given that value
+/// (writing both would nest one copy inside the other); then it gets
+/// nothing, as when the first move consumed the source.
 fn take_sources<'a>(
     fields: &[(&'a str, &'a str)],
     mut take: impl FnMut(&str) -> Option<Value>,
 ) -> Vec<(&'a str, Value)> {
-    let mut taken: Vec<(&str, Value)> = Vec::new();
+    let mut taken: Vec<(&str, Value, Vec<&str>)> = Vec::new();
     let mut moved = Vec::new();
     for &(source, target) in fields {
-        let val = match taken.iter().find(|(earlier, _)| *earlier == source) {
-            Some((_, val)) => Some(val.clone()),
-            None => {
-                let val = take(source);
-                if let Some(val) = &val {
-                    taken.push((source, val.clone()));
-                }
-                val
+        if let Some((_, val, targets)) = taken.iter_mut().find(|(earlier, ..)| *earlier == source) {
+            if !targets.iter().any(|earlier| paths_overlap(earlier, target)) {
+                targets.push(target);
+                moved.push((target, val.clone()));
             }
-        };
-        if let Some(val) = val {
+        } else if let Some(val) = take(source) {
+            taken.push((source, val.clone(), alloc::vec![target]));
             moved.push((target, val));
         }
     }
     moved
+}
+
+/// Whether one dotted path equals or contains the other (ignoring case).
+fn paths_overlap(a: &str, b: &str) -> bool {
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    long.get(..short.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(short))
+        && long
+            .get(short.len()..)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
 }
 
 /// Move each `(source, target)` pair's value directly in a BTreeMap.

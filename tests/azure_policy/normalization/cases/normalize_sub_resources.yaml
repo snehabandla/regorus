@@ -1480,3 +1480,40 @@ cases:
           conditions:
             - rawstate: ready
     round_trip: true
+
+  - note: "an alias nested under another alias of the same ARM field is not filled with a copy"
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                {
+                  "name": "Test/widgets/rules[*].a",
+                  "defaultPath": "properties.rules[*].raw",
+                  "paths": []
+                },
+                {
+                  "name": "Test/widgets/rules[*].a.b",
+                  "defaultPath": "properties.rules[*].raw",
+                  "paths": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    input:
+      type: Test/widgets
+      properties:
+        rules:
+          - raw:
+              x: 1
+    expected_normalized:
+      type: Test/widgets
+      rules:
+        - a:
+            x: 1
+    round_trip: true
