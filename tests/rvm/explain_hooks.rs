@@ -863,11 +863,11 @@ fn invocation_with_undefined_arguments_still_has_start_and_end() {
 fn assert_invocation_subtree_cache_reuse(mode: ExecutionMode) {
     let mut engine = Engine::new();
     for (name, policy) in [
-        ("target.rego", "package target\np := input.x\n"),
-        ("other.rego", "package other\np := input.x\n"),
+        ("target.rego", "package target.dept\np := input.x\n"),
+        ("other.rego", "package target.other\np := input.x\n"),
         (
             "framework.rego",
-            "package framework\nr := [data[input.a],data[input.b]]\n",
+            "package framework\nr := [data.target[input.a],data.target[input.b]]\n",
         ),
     ] {
         engine.add_policy(name.to_string(), policy.to_string()).unwrap();
@@ -879,13 +879,13 @@ fn assert_invocation_subtree_cache_reuse(mode: ExecutionMode) {
 
     let distinct = run_program(
         &program,
-        r#"{"a":"target","b":"other","x":1}"#,
+        r#"{"a":"dept","b":"other","x":1}"#,
         mode,
         false,
     );
     assert_eq!(distinct.result.as_ref().unwrap(), &expected);
-    let first = distinct.call_ids("data.target.p");
-    let second = distinct.call_ids("data.other.p");
+    let first = distinct.call_ids("data.target.dept.p");
+    let second = distinct.call_ids("data.target.other.p");
     assert_eq!(first.len(), 1);
     assert_eq!(second.len(), 1);
     assert_ne!(first[0], second[0]);
@@ -895,18 +895,18 @@ fn assert_invocation_subtree_cache_reuse(mode: ExecutionMode) {
 
     let repeated = run_program(
         &program,
-        r#"{"a":"target","b":"target","x":1}"#,
+        r#"{"a":"dept","b":"dept","x":1}"#,
         mode,
         false,
     );
     assert_eq!(repeated.result.as_ref().unwrap(), &expected);
-    let target = repeated.call_ids("data.target.p");
+    let target = repeated.call_ids("data.target.dept.p");
     assert_eq!(target.len(), 1, "{mode:?}: {:?}", repeated.calls);
-    assert!(repeated.call_ids("data.other.p").is_empty());
+    assert!(repeated.call_ids("data.target.other.p").is_empty());
     let root = repeated.call_ids("data.framework.r")[0];
     let uses: Vec<_> = repeated.calls.iter().filter_map(|record| match record {
         CallRecord::Reused(caller, event)
-            if program.rule_infos[usize::from(event.rule_index)].name == "data.target.p" =>
+            if program.rule_infos[usize::from(event.rule_index)].name == "data.target.dept.p" =>
         {
             Some((caller.call_instance, event.call_instance))
         }
@@ -943,6 +943,11 @@ fn invocation_mixed_mode_error_keeps_terminal_events_for_every_started_call() {
     let compiled = engine.compile_with_entrypoint(&entrypoint).unwrap();
     let program = Compiler::compile_from_policy(&compiled, &["data.t.r"]).unwrap();
     for mode in MODES {
+        let mut unrecorded = RegoVM::new();
+        unrecorded.load_program(program.clone());
+        unrecorded.set_execution_mode(mode);
+        unrecorded.set_input(v(r#"{"ns":"helpers","x":1}"#));
+        let baseline = execute(&mut unrecorded, mode);
         let fixture = Fixture::default();
         let mut vm = RegoVM::new();
         vm.load_program(program.clone());
@@ -950,6 +955,10 @@ fn invocation_mixed_mode_error_keeps_terminal_events_for_every_started_call() {
         vm.set_input(v(r#"{"ns":"helpers","x":1}"#));
         vm.set_explanation_recorder(Box::new(fixture.clone()));
         let result = execute(&mut vm, mode);
+        assert_eq!(
+            format!("{result:?}"), format!("{baseline:?}"),
+            "{mode:?}: invocation bookkeeping changed evaluation behavior"
+        );
         if mode == ExecutionMode::RunToCompletion {
             assert_eq!(result.as_ref().unwrap(), &v("1"));
         }
@@ -976,6 +985,20 @@ fn invocation_mixed_mode_error_keeps_terminal_events_for_every_started_call() {
             ended, started,
             "{mode:?}: invocation events were lost before error/reset cleanup; result={result:?}, calls={calls:?}"
         );
+        if mode == ExecutionMode::Suspendable {
+            let child = calls.iter().find_map(|record| match record {
+                CallRecord::Start(_, event)
+                    if program.rule_infos[usize::from(event.rule_index)].name == "data.helpers.f" =>
+                {
+                    Some(event.call_instance)
+                }
+                _ => None,
+            }).unwrap();
+            assert!(calls.iter().any(|record| matches!(
+                record, CallRecord::End(context, None, None)
+                    if context.call_instance == Some(child)
+            )), "pending helper must abort, not fabricate completion: {calls:?}");
+        }
     }
 }
 
