@@ -64,7 +64,7 @@ pub(super) fn decode(program: &Program) -> Provenance {
                 location,
                 left_path: paths.get(usize::from(left)).cloned().flatten(),
                 right_path: right.and_then(|r| paths.get(usize::from(r)).cloned().flatten()),
-                azure_policy: Some(AzurePolicySite { operator, field }),
+                azure_policy: Some(AzurePolicySite { operator, source_operator: None, field }),
             });
         }
         track(program, instruction, &mut paths, &mut literals);

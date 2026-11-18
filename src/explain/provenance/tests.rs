@@ -698,6 +698,7 @@ fn azure_policy_conditions_keep_json_and_context_paths() -> anyhow::Result<()> {
         first.azure_policy,
         Some(AzurePolicySite {
             operator: Some(crate::rvm::instructions::PolicyOp::NotEquals),
+            source_operator: Some(crate::rvm::instructions::PolicyOp::NotEquals),
             field: Some("location".into()),
         })
     );
@@ -971,6 +972,58 @@ fn azure_policy_aliases_keep_declared_and_normalized_names() -> anyhow::Result<(
         site.azure_policy.as_ref().and_then(|p| p.field.as_deref()),
         Some("Contoso/widgets/skuAlias")
     );
+    Ok(())
+}
+
+#[cfg(feature = "azure_policy")]
+#[test]
+fn azure_policy_native_template_checks_keep_their_json_owner() -> anyhow::Result<()> {
+    let first = r#"{ "field": "[if(equals(resourceGroup().name, 'rg'), 'type', 'name')]", "equals": "vm" }"#;
+    let second = r#"{ "field": "name", "equals": "[if(equals(resourceGroup().name, 'rg'), 'x', 'y')]" }"#;
+    let json = alloc::format!(r#"{{
+  "if": {{ "allOf": [
+    {first},
+    {second}
+  ] }},
+  "then": {{ "effect": "deny" }}
+}}"#);
+    let program = compile_azure(&json)?;
+    let provenance = Provenance::new(&program);
+    assert_eq!(provenance.sites().len(), 4);
+    for (index, site) in provenance.sites().iter().enumerate() {
+        let (expected, line) = if index < 2 { (first, 3) } else { (second, 4) };
+        assert_eq!(site.text, expected, "native template check {index}");
+        assert_eq!(at(site), Some(("policy.json", line, 5)));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "azure_policy")]
+#[test]
+fn azure_policy_optimized_counts_preserve_authored_operators() -> anyhow::Result<()> {
+    use crate::rvm::instructions::PolicyOp;
+    for (operator, expected) in [("greater", PolicyOp::Greater), ("equals", PolicyOp::Equals)] {
+        let condition = alloc::format!(r#"{{"count":{{"field":"items[*]"}},"{operator}":0}}"#);
+        let json = alloc::format!(r#"{{"if":{condition},"then":{{"effect":"deny"}}}}"#);
+        let program = compile_azure(&json)?;
+        let provenance = Provenance::new(&program);
+        let site = provenance.sites().iter().find(|s| s.kind == ConditionKind::Iteration)
+            .ok_or_else(|| anyhow::anyhow!("optimized count"))?;
+        assert_eq!(site.text, condition);
+        assert_eq!(site.azure_policy.as_ref().and_then(|p| p.source_operator), Some(expected));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "azure_policy")]
+#[test]
+fn azure_policy_nested_counts_keep_inner_collection_sites() -> anyhow::Result<()> {
+    let program = compile_azure(r#"{"if":{"count":{"field":"a[*].b[*]"},"greater":1},"then":{"effect":"deny"}}"#)?;
+    let provenance = Provenance::new(&program);
+    let collections: Vec<_> = provenance.sites().iter()
+        .filter(|s| s.kind == ConditionKind::Iteration)
+        .map(|s| s.left_path.as_deref()).collect();
+    assert_eq!(collections, vec![Some(r#"input["resource"]["a"]"#), Some(r#"input["resource"]["a"][_]["b"]"#)]);
     Ok(())
 }
 

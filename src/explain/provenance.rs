@@ -104,6 +104,9 @@ pub struct AzurePolicySite {
     /// Native operator, including its Azure Policy casing and null semantics.
     /// `None` for a collection loop. Internal value guards are not sites.
     pub operator: Option<PolicyOp>,
+    /// Authored JSON operator, if source metadata is available. This can
+    /// differ from `operator` after count optimization or within a template.
+    pub source_operator: Option<PolicyOp>,
     /// The enclosing JSON condition's declared `field`, preserving aliases
     /// and dynamic selector expressions. Not a captured concrete input path.
     pub field: Option<String>,
