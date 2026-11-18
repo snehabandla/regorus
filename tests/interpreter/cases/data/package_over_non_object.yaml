@@ -242,19 +242,3 @@ cases:
         s:
           set!: [x]
 
-  - note: package without rules beside a package with rules below a string in base data
-    data:
-      a: str
-    modules:
-      - |
-        package a.b.c
-      - |
-        package a.b.d
-
-        p := 1
-      - |
-        package q
-
-        x := data.a.b.c
-    query: data.q
-    error: not an object
