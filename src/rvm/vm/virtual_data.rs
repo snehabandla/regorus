@@ -77,11 +77,9 @@ impl RegoVM {
     fn ensure_object_at(target: &mut Value, path: &[Value]) -> Result<()> {
         let mut node = target;
         for key in path {
+            // Base data that is not an object wins over a package without rules.
             let Value::Object(ref mut map) = *node else {
-                return Err(VmError::InvalidRuleTreeEntry {
-                    value: node.clone().into(),
-                    pc: 0,
-                });
+                return Ok(());
             };
             node = crate::Rc::make_mut(map).get_or_insert_with(key.clone(), Value::new_object);
         }

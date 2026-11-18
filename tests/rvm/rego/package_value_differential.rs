@@ -99,10 +99,20 @@ fn eval_rvm(engine: &mut Engine, query: &str, input: &Value, mode: ExecutionMode
     Ok(vm.execute_entry_point_by_name(query)?)
 }
 
-/// Requires `query` on `input` to produce `want` (`None` for undefined) in the
-/// interpreter and in both RVM modes.
 fn check(modules: &[&str], cases: &[(&str, &str, Option<&str>)]) -> Result<()> {
+    check_with_data(modules, "{}", true, cases)
+}
+
+/// Requires `query` on `input` with base `data` to produce `want` (`None` for
+/// undefined) in both RVM modes and, if `interpreter` is set, in the interpreter.
+fn check_with_data(
+    modules: &[&str],
+    data: &str,
+    interpreter: bool,
+    cases: &[(&str, &str, Option<&str>)],
+) -> Result<()> {
     let mut engine = Engine::new();
+    engine.add_data(Value::from_json_str(data)?)?;
     for (idx, module) in modules.iter().enumerate() {
         engine.add_policy(format!("p{idx}.rego"), module.to_string())?;
     }
@@ -112,7 +122,10 @@ fn check(modules: &[&str], cases: &[(&str, &str, Option<&str>)]) -> Result<()> {
         let input_value = Value::from_json_str(input)?;
         engine.set_input(input_value.clone());
 
-        let mut results = vec![("interpreter", engine.eval_rule(query.to_string()))];
+        let mut results = Vec::new();
+        if interpreter {
+            results.push(("interpreter", engine.eval_rule(query.to_string())));
+        }
         for (name, mode) in [
             ("run-to-completion", ExecutionMode::RunToCompletion),
             ("suspendable", ExecutionMode::Suspendable),
@@ -225,5 +238,48 @@ fn subpackages_without_rules_are_empty_objects() -> Result<()> {
             ("data.q.z", EMPTY, Some("{}")),
             ("data.q.n", EMPTY, Some("4")),
         ],
+    )
+}
+
+#[test]
+fn base_data_merges_with_packages_without_rules() -> Result<()> {
+    let reads = "package q\np := data.a\nr := data.a.b\nc := data.a.b.c";
+    let str_ab = r#"{"a": {"b": "str"}}"#;
+    let p_str_ab = ("data.q.p", EMPTY, Some(r#"{"b": "str"}"#));
+    let r_str = ("data.q.r", EMPTY, Some(r#""str""#));
+    check_with_data(&["package a.b", reads], str_ab, true, &[p_str_ab, r_str])?;
+    check_with_data(
+        &[
+            "package a\nx := 1",
+            "package a.b\nf(v) := v",
+            "package a.z",
+            reads,
+        ],
+        r#"{"a": {"b": {"k": 1}}}"#,
+        true,
+        &[
+            (
+                "data.q.p",
+                EMPTY,
+                Some(r#"{"b": {"k": 1}, "x": 1, "z": {}}"#),
+            ),
+            ("data.q.r", EMPTY, Some(r#"{"k": 1}"#)),
+        ],
+    )?;
+    // The interpreter fails on these ("make: not an object").
+    check_with_data(
+        &["package a.b", reads],
+        r#"{"a": "str"}"#,
+        false,
+        &[
+            ("data.q.p", EMPTY, Some(r#""str""#)),
+            ("data.q.r", EMPTY, Some("{}")),
+        ],
+    )?;
+    check_with_data(
+        &["package a.b.c", reads],
+        str_ab,
+        false,
+        &[p_str_ab, r_str, ("data.q.c", EMPTY, Some("{}"))],
     )
 }
