@@ -338,9 +338,9 @@ impl RegoVM {
         // Only the entry result consumes an implicit register-zero return;
         // nested rule/destructuring jump results are discarded by the caller.
         if run.is_ok()
-            && !matches!(
+            && matches!(
                 program.instructions.get(self.pc),
-                Some(Instruction::Return { .. })
+                None | Some(Instruction::DestructuringSuccess {} | Instruction::RuleReturn {})
             )
         {
             state.note_read(0, self.pc, self.register_stack.len());
