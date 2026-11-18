@@ -1167,3 +1167,75 @@ cases:
                 z: 1
         "config.items": []
     round_trip: true
+
+  - note: "aliases that swap element field names round-trip"
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                {
+                  "name": "Test/widgets/rules[*].state",
+                  "defaultPath": "properties.rules[*].status",
+                  "paths": []
+                },
+                {
+                  "name": "Test/widgets/rules[*].status",
+                  "defaultPath": "properties.rules[*].state",
+                  "paths": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    input:
+      type: Test/widgets
+      properties:
+        rules:
+          - status: ready
+    expected_normalized:
+      type: Test/widgets
+      rules:
+        - state: ready
+    round_trip: true
+
+  - note: "an alias named after another alias's ARM field keeps both values"
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                {
+                  "name": "Test/widgets/rules[*].a",
+                  "defaultPath": "properties.rules[*].b",
+                  "paths": []
+                },
+                {
+                  "name": "Test/widgets/rules[*].b",
+                  "defaultPath": "properties.rules[*].c",
+                  "paths": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    input:
+      type: Test/widgets
+      properties:
+        rules:
+          - b: 1
+            c: 2
+    expected_normalized:
+      type: Test/widgets
+      rules:
+        - a: 1
+          b: 2
+    round_trip: true

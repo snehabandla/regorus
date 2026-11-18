@@ -10,49 +10,27 @@ use crate::value::Object;
 use crate::Value;
 
 use super::super::obj_map::{
-    obj_get, obj_get_mut, obj_insert, set_nested, set_nested_lowercased, set_nested_verbatim,
-    ObjMap,
+    obj_get, obj_get_mut, obj_insert, remove_at_dotted_path_obj, remove_element_field, set_nested,
+    set_nested_lowercased, set_nested_verbatim, ObjMap,
 };
-use super::super::types::PrecomputedRemap;
 
-/// Describes a field remapping inside each element of a (possibly nested) array.
-pub struct ElementRemap {
-    /// Chain of array navigations for nested `[*]` levels.
-    pub(crate) array_chain: Vec<Vec<String>>,
-    /// Dot-separated path to read within the innermost array element.
-    pub(crate) source_field: String,
-    /// Dot-separated path to write within the innermost array element.
-    pub(crate) target_field: String,
-}
-
-/// Apply an element-level field remap to each element of an array (or nested
-/// array chain).
+/// Move fields within each element of a (possibly nested) array: each
+/// `(source, target)` pair moves the dot-separated `source` path to `target`.
+///
+/// All sources are read before any is removed or written, so pairs that swap
+/// or chain field names see the element as it was rather than each other's
+/// results.
 ///
 /// When `lowercase` is `true` (normalizer), target path segments are
 /// lowercased.  When `false` (denormalizer), they are written verbatim
 /// so that restored casing is preserved.
-pub fn apply_element_remap(result: &mut ObjMap, remap: &ElementRemap, lowercase: bool) {
-    apply_remap_at_depth(
-        result,
-        &remap.array_chain,
-        0,
-        &remap.source_field,
-        &remap.target_field,
-        lowercase,
-    );
-}
-
-/// Apply a precomputed element remap (from [`PrecomputedRemap`]) without
-/// any per-call string splitting or allocation.
-pub fn apply_element_remap_precomputed(result: &mut ObjMap, remap: &PrecomputedRemap) {
-    apply_remap_at_depth(
-        result,
-        &remap.array_chain,
-        0,
-        &remap.source_field,
-        &remap.target_field,
-        true,
-    );
+pub fn apply_element_remaps(
+    result: &mut ObjMap,
+    array_chain: &[Vec<String>],
+    fields: &[(&str, &str)],
+    lowercase: bool,
+) {
+    apply_remap_at_depth(result, array_chain, 0, fields, lowercase);
 }
 
 /// Recursively navigate nested arrays via `array_chain` and apply a field
@@ -61,12 +39,11 @@ fn apply_remap_at_depth(
     obj: &mut ObjMap,
     array_chain: &[Vec<String>],
     depth: usize,
-    source_field: &str,
-    target_field: &str,
+    fields: &[(&str, &str)],
     lowercase: bool,
 ) {
     let Some(nav) = array_chain.get(depth) else {
-        remap_deep_field(obj, source_field, target_field, lowercase);
+        remap_fields(obj, fields, lowercase);
         return;
     };
 
@@ -107,8 +84,7 @@ fn apply_remap_at_depth(
                     inner_btree,
                     array_chain,
                     depth.saturating_add(1),
-                    source_field,
-                    target_field,
+                    fields,
                     lowercase,
                 );
             }
@@ -122,12 +98,11 @@ fn remap_at_depth_in_btree(
     btree: &mut Object,
     array_chain: &[Vec<String>],
     depth: usize,
-    source_field: &str,
-    target_field: &str,
+    fields: &[(&str, &str)],
     lowercase: bool,
 ) {
     let Some(nav) = array_chain.get(depth) else {
-        remap_deep_field_in_btree(btree, source_field, target_field, lowercase);
+        remap_fields_in_btree(btree, fields, lowercase);
         return;
     };
 
@@ -168,8 +143,7 @@ fn remap_at_depth_in_btree(
                     inner_btree,
                     array_chain,
                     depth.saturating_add(1),
-                    source_field,
-                    target_field,
+                    fields,
                     lowercase,
                 );
             }
@@ -177,24 +151,31 @@ fn remap_at_depth_in_btree(
     }
 }
 
-/// Remap a value between dotted paths directly in a BTreeMap.
-fn remap_deep_field_in_btree(btree: &mut Object, source: &str, target: &str, lowercase: bool) {
-    let val = match read_dotted_path_btree(btree, source) {
-        Some(v) => v,
-        None => return,
-    };
-
-    let segments: Vec<&str> = target.split('.').collect();
-    if segments.is_empty() {
+/// Move each `(source, target)` pair's value directly in a BTreeMap.
+fn remap_fields_in_btree(btree: &mut Object, fields: &[(&str, &str)], lowercase: bool) {
+    let moved: Vec<(&str, Value)> = fields
+        .iter()
+        .filter_map(|&(source, target)| {
+            read_dotted_path_btree(btree, source).map(|val| (target, val))
+        })
+        .collect();
+    if moved.is_empty() {
         return;
     }
-    if segments.len() == 1 {
-        if let Some(seg) = segments.first() {
-            btree.insert(Value::String(crate::Rc::from(*seg)), val);
+    for &(source, _) in fields {
+        let segments: Vec<&str> = source.split('.').collect();
+        remove_at_dotted_path_obj(btree, &segments);
+    }
+    for (target, val) in moved {
+        let segments: Vec<&str> = target.split('.').collect();
+        match segments.as_slice() {
+            [] => {}
+            [seg] => {
+                btree.insert(Value::String(crate::Rc::from(*seg)), val);
+            }
+            _ => set_nested(btree, &segments, val, lowercase),
         }
-        return;
     }
-    set_nested(btree, &segments, val, lowercase);
 }
 
 /// Read a value at a dotted path from a BTreeMap.
@@ -208,28 +189,27 @@ fn read_dotted_path_btree(btree: &Object, path: &str) -> Option<Value> {
     Some(cur.clone())
 }
 
-/// Remap a value from one (possibly nested) dot-separated path to another
-/// in an ObjMap.  Used only at the top level when `depth >= array_chain.len()`.
-fn remap_deep_field(obj: &mut ObjMap, source: &str, target: &str, lowercase: bool) {
-    let val = match read_dotted_path(obj, source) {
-        Some(v) => v,
-        None => return,
-    };
-
-    let segments: Vec<&str> = target.split('.').collect();
-    if segments.is_empty() {
+/// Move each `(source, target)` pair's value in an ObjMap.  Used only at
+/// the top level when `depth >= array_chain.len()`.
+fn remap_fields(obj: &mut ObjMap, fields: &[(&str, &str)], lowercase: bool) {
+    let moved: Vec<(&str, Value)> = fields
+        .iter()
+        .filter_map(|&(source, target)| read_dotted_path(obj, source).map(|val| (target, val)))
+        .collect();
+    if moved.is_empty() {
         return;
     }
-    if segments.len() == 1 {
-        if let Some(seg) = segments.first() {
-            obj_insert(obj, seg, val);
+    for &(source, _) in fields {
+        remove_element_field(obj, &[], source);
+    }
+    for (target, val) in moved {
+        if !target.contains('.') {
+            obj_insert(obj, target, val);
+        } else if lowercase {
+            set_nested_lowercased(obj, target, val);
+        } else {
+            set_nested_verbatim(obj, target, val);
         }
-        return;
-    }
-    if lowercase {
-        set_nested_lowercased(obj, target, val);
-    } else {
-        set_nested_verbatim(obj, target, val);
     }
 }
 

@@ -191,3 +191,39 @@ cases:
             y:
               - rawz: 1
     round_trip: true
+
+  - note: "root-level aliases that swap element field names round-trip"
+    aliases_json: |
+      [
+        {
+          "namespace": "Test.Data",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                {
+                  "name": "Test.Data/widgets/rules[*].state",
+                  "defaultPath": "rules[*].status",
+                  "paths": []
+                },
+                {
+                  "name": "Test.Data/widgets/rules[*].status",
+                  "defaultPath": "rules[*].state",
+                  "paths": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    input:
+      type: Test.Data/widgets
+      rules:
+        - status: ready
+          state: on
+    expected_normalized:
+      type: Test.Data/widgets
+      rules:
+        - state: ready
+          status: on
+    round_trip: true

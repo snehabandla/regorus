@@ -412,7 +412,7 @@ fn remove_field_at_depth_obj(
 }
 
 /// Remove the leaf segment at a dotted path directly in an Object.
-fn remove_at_dotted_path_obj(obj: &mut Object, segments: &[&str]) {
+pub fn remove_at_dotted_path_obj(obj: &mut Object, segments: &[&str]) {
     let Some((&leaf, parent_segs)) = segments.split_last() else {
         return;
     };

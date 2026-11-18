@@ -4,16 +4,18 @@
 //! Per-alias path resolution: reads values from versioned ARM paths and places
 //! them at alias short name paths in the normalized output.
 
+use alloc::string::String;
+use alloc::vec::Vec;
+
 use crate::Rc;
 use crate::Value;
 
-use super::super::obj_map::remove_element_field;
 use super::super::obj_map::{
     collision_safe_key, is_root_field_collision, obj_contains, obj_insert, obj_insert_rc,
     obj_remove, set_nested_lowercased, ObjMap,
 };
 use super::super::types::ResolvedAliases;
-use super::element_remap::apply_element_remap_precomputed;
+use super::element_remap::apply_element_remaps;
 use super::flatten::normalize_value;
 
 /// Apply per-alias path resolution to the normalized result.
@@ -69,12 +71,25 @@ pub fn apply_alias_entries(
             .unwrap_or(&aliases.default_aggregates)
     });
 
+    // Remaps of the same array move their fields together, so aliases that
+    // swap field names don't consume each other's results. Each removes the
+    // original ARM field so the normalized output only has the alias short
+    // name; a stale source key could otherwise collide with restored casing
+    // during denormalization.
+    type Group<'a> = (&'a [Vec<String>], Vec<(&'a str, &'a str)>);
+    let mut groups: Vec<Group<'_>> = Vec::new();
     for remap in &agg.element_remaps {
-        apply_element_remap_precomputed(result, remap);
-        // Remove the original ARM field so the normalized output only has the
-        // alias short name.  Without this, the stale source key survives and
-        // casing restoration during denormalization can produce a duplicate.
-        remove_element_field(result, &remap.array_chain, &remap.source_field);
+        let field = (remap.source_field.as_str(), remap.target_field.as_str());
+        match groups
+            .iter_mut()
+            .find(|(chain, _)| *chain == remap.array_chain.as_slice())
+        {
+            Some((_, fields)) => fields.push(field),
+            None => groups.push((&remap.array_chain, alloc::vec![field])),
+        }
+    }
+    for (chain, fields) in &groups {
+        apply_element_remaps(result, chain, fields, true);
     }
 
     for (source_lc, target_lc) in &agg.array_renames_normalize {

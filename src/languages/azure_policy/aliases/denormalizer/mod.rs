@@ -11,6 +11,8 @@ mod sub_resource;
 mod tests;
 
 use alloc::collections::BTreeSet;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 use crate::Value;
 
@@ -23,12 +25,10 @@ use super::obj_map::{
 use super::types::ResolvedAliases;
 use super::AliasRegistry;
 
-use super::normalizer::{apply_element_remap, ElementRemap};
+use super::normalizer::apply_element_remaps;
 
 use casing::{build_casing_map, default_casing_map, denormalize_value, restore_casing};
 use helpers::find_key_ci;
-
-use super::obj_map::remove_element_field;
 
 /// Denormalize a normalized resource back to ARM JSON structure.
 pub fn denormalize(
@@ -189,48 +189,54 @@ pub fn denormalize_with_aliases(
             }
 
             // Phase 2d: Precomputed reverse element-level field remaps.
+            // Remaps of the same array move their fields together, so aliases
+            // that swap field names don't consume each other's results.
+            type Group = (bool, Vec<Vec<String>>, Vec<(String, String)>);
+            let mut groups: Vec<Group> = Vec::new();
             for rev in &agg.reverse_element_remaps {
-                let remap = ElementRemap {
-                    array_chain: rev.array_chain.clone(),
-                    source_field: rev.source_field.clone(),
-                    target_field: if rev.target_field.contains('.') {
-                        rev.target_field
-                            .split('.')
-                            .map(|segment| restore_casing(segment, &casing_map))
-                            .collect::<alloc::vec::Vec<_>>()
-                            .join(".")
-                    } else {
-                        restore_casing(&rev.target_field, &casing_map)
-                    },
+                let target_field = if rev.target_field.contains('.') {
+                    rev.target_field
+                        .split('.')
+                        .map(|segment| restore_casing(segment, &casing_map))
+                        .collect::<Vec<_>>()
+                        .join(".")
+                } else {
+                    restore_casing(&rev.target_field, &casing_map)
                 };
                 // Follow an outer array phase 2b moved to its ARM path.
                 // Otherwise phase 2a wrote it: at the root of a data-plane
                 // resource when the alias's arrays are there under the same
                 // names, else in `properties`.
                 let (at_root, array_chain) =
-                    sub_resource::redirect_chain(&remap.array_chain, entries, api_version, &writes)
-                        .unwrap_or_else(|| {
-                            (is_data_plane && rev.at_root, remap.array_chain.clone())
-                        });
+                    sub_resource::redirect_chain(&rev.array_chain, entries, api_version, &writes)
+                        .unwrap_or_else(|| (is_data_plane && rev.at_root, rev.array_chain.clone()));
                 // Another alias's value replaced this one there; it was not
                 // remapped with this alias's names.
-                if let (Some(outer), Some(name)) = (array_chain.first(), remap.array_chain.first())
-                {
+                if let (Some(outer), Some(name)) = (array_chain.first(), rev.array_chain.first()) {
                     if writes.replaced(at_root, outer, name) {
                         continue;
                     }
                 }
-                let map = if at_root {
+                let field = (rev.source_field.clone(), target_field);
+                match groups
+                    .iter_mut()
+                    .find(|(root, chain, _)| *root == at_root && *chain == array_chain)
+                {
+                    Some((_, _, fields)) => fields.push(field),
+                    None => groups.push((at_root, array_chain, alloc::vec![field])),
+                }
+            }
+            for (at_root, array_chain, fields) in &groups {
+                let map = if *at_root {
                     &mut result
                 } else {
                     &mut properties
                 };
-                let remap = ElementRemap {
-                    array_chain,
-                    ..remap
-                };
-                apply_element_remap(map, &remap, false);
-                remove_element_field(map, &remap.array_chain, &rev.cleanup_field);
+                let fields: Vec<(&str, &str)> = fields
+                    .iter()
+                    .map(|(source, target)| (source.as_str(), target.as_str()))
+                    .collect();
+                apply_element_remaps(map, array_chain, &fields, false);
             }
         }
     }
