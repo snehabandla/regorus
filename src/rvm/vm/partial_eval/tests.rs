@@ -486,17 +486,28 @@ fn nested_undefined_residual_values_fail_closed() -> anyhow::Result<()> {
 }
 
 #[test]
-fn lossy_large_integer_residuals_fail_closed() -> anyhow::Result<()> {
+fn lossy_numeric_residuals_fail_closed() -> anyhow::Result<()> {
     for rule in [
         "allow if input.u == 18446744073709551617",
         "allow := 18446744073709551617 if input.u == 1",
         "allow if input.u == [18446744073709551617]",
+        "allow if input.u == 1000000000000000128.0",
     ] {
         let result = pe(&format!("package test\n{rule}"), "{}", &["u"])?;
-        assert_eq!(result.status, ResidualStatus::Unsupported, "{rule}");
+        assert_eq!(
+            result.status,
+            ResidualStatus::Unsupported,
+            "{rule}: {:?}",
+            texts(&result)
+        );
         assert!(result.residual_queries.is_empty());
     }
-    for number in ["18446744073709551615", "-9223372036854775808", "0.1"] {
+    for number in [
+        "18446744073709551615",
+        "-9223372036854775808",
+        "0.1",
+        "9007199254740994.0",
+    ] {
         let result = pe(
             &format!("package test\nallow if input.u == {number}"),
             "{}",
