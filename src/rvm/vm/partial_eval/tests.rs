@@ -497,7 +497,11 @@ fn lossy_large_integer_residuals_fail_closed() -> anyhow::Result<()> {
         assert!(result.residual_queries.is_empty());
     }
     for number in ["18446744073709551615", "-9223372036854775808", "0.1"] {
-        let result = pe(&format!("package test\nallow if input.u == {number}"), "{}", &["u"])?;
+        let result = pe(
+            &format!("package test\nallow if input.u == {number}"),
+            "{}",
+            &["u"],
+        )?;
         assert_eq!(result.status, ResidualStatus::Exact, "{number}");
         assert_eq!(
             result.residual_queries[0].conditions[0].value,
