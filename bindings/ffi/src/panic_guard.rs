@@ -170,20 +170,26 @@ where
     // We therefore use AssertUnwindSafe to get the compiler to accept the closure.
     // Upon unwind, we mark regorus as poisoned and disallow further use.
     #[cfg(feature = "std")]
-    {
-        let outcome = {
-            let _hook_guard = PanicHookGuard::install();
-            match panic::catch_unwind(AssertUnwindSafe(f)) {
-                Ok(value) => GuardResult::Success(value),
-                Err(payload) => GuardResult::Panic(panic_message_to_string(payload)),
-            }
-        };
-        finalize(outcome)
-    }
+    return finalize(catch_panic(f));
 
     #[cfg(not(feature = "std"))]
     return finalize(GuardResult::Success(f()));
 }
+
+#[cfg(feature = "std")]
+fn catch_panic<F>(f: F) -> GuardResult<RegorusResult>
+where
+    F: FnOnce() -> RegorusResult,
+{
+    let _hook_guard = PanicHookGuard::install();
+    match panic::catch_unwind(AssertUnwindSafe(f)) {
+        Ok(value) => GuardResult::Success(value),
+        Err(payload) => GuardResult::Panic(panic_message_to_string(payload)),
+    }
+}
+
+#[cfg(all(test, feature = "std"))]
+fn forget_hook_installation() {}
 
 fn finalize(outcome: GuardResult<RegorusResult>) -> RegorusResult {
     match outcome {
@@ -239,10 +245,120 @@ pub(crate) fn reset_poison() {
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
-    use super::with_unwind_guard;
+    use super::{catch_panic, forget_hook_installation, with_unwind_guard, GuardResult};
     use crate::common::{regorus_result_drop, RegorusResult, RegorusStatus};
-    use std::sync::mpsc;
+    use std::panic;
+    use std::sync::{mpsc, Mutex};
     use std::time::Duration;
+
+    const TEST_PANIC_PREFIX: &str = "panic_guard_test:";
+    static HOST_HOOK_PANICS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    fn host_hook(info: &panic::PanicHookInfo<'_>) {
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        if payload.starts_with(TEST_PANIC_PREFIX) {
+            HOST_HOOK_PANICS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(payload);
+        }
+    }
+
+    #[test]
+    fn concurrent_guarded_panics_keep_their_messages_and_the_host_hook() {
+        const THREADS: usize = 8;
+        const ITERATIONS: usize = 40;
+
+        // Serializes against every other guarded call in the test binary.
+        let _poison_test_lock = super::lock_poison_test_state();
+        HOST_HOOK_PANICS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        let previous_hook = panic::take_hook();
+        panic::set_hook(Box::new(host_hook));
+        forget_hook_installation();
+
+        let workers: Vec<_> = (0..THREADS)
+            .map(|thread| {
+                std::thread::spawn(move || {
+                    let mut problems = Vec::new();
+                    for iteration in 0..ITERATIONS {
+                        let payload = format!("{TEST_PANIC_PREFIX} t{thread} i{iteration}");
+                        let panics = (thread + iteration) % 2 == 0;
+                        let expected = payload.clone();
+                        let outcome = catch_panic(move || {
+                            if panics {
+                                panic!("{expected}");
+                            }
+                            RegorusResult::ok_void()
+                        });
+                        match (panics, outcome) {
+                            (true, GuardResult::Panic(message)) => {
+                                let observed = message.split_once("panic hook observed: ");
+                                let own_location = observed.is_some_and(|(head, hook)| {
+                                    head.starts_with(&payload)
+                                        && hook.contains(&payload)
+                                        && hook.contains(file!())
+                                });
+                                if !own_location {
+                                    problems.push(format!("{payload}: message {message:?}"));
+                                }
+                            }
+                            (false, GuardResult::Success(result)) => regorus_result_drop(result),
+                            (true, GuardResult::Success(result)) => {
+                                regorus_result_drop(result);
+                                problems.push(format!("{payload}: panic not caught"));
+                            }
+                            (false, GuardResult::Panic(message)) => {
+                                problems.push(format!("{payload}: unexpected panic {message:?}"));
+                            }
+                        }
+                    }
+                    problems
+                })
+            })
+            .collect();
+        let mut problems: Vec<String> = workers
+            .into_iter()
+            .flat_map(|worker| {
+                worker
+                    .join()
+                    .unwrap_or_else(|_| vec!["worker panicked".into()])
+            })
+            .collect();
+
+        let unguarded = format!("{TEST_PANIC_PREFIX} unguarded");
+        let expected = unguarded.clone();
+        let _ = std::thread::spawn(move || panic!("{expected}")).join();
+        let host_panics = core::mem::take(
+            &mut *HOST_HOOK_PANICS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        if host_panics != [unguarded] {
+            problems.push(format!(
+                "host hook must see only the unguarded panic, saw {} panics: {:?}",
+                host_panics.len(),
+                host_panics.iter().take(5).collect::<Vec<_>>()
+            ));
+        }
+
+        // Restore before asserting: the hook cannot be changed while unwinding.
+        panic::set_hook(previous_hook);
+        forget_hook_installation();
+        assert!(
+            problems.is_empty(),
+            "{} problems: {:#?}",
+            problems.len(),
+            &problems[..problems.len().min(10)]
+        );
+    }
 
     #[test]
     fn ordinary_guarded_calls_are_not_serialized_by_the_poison_test_gate() {
