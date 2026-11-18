@@ -544,6 +544,13 @@ pub struct AttemptExplanation {
     /// Absent if evaluation aborted before this attempt completed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<Outcome>,
+    /// Checks evaluated in this attempt, including failed pre-`else` bodies
+    /// not retained by the deciding-body [`DefinitionExplanation`] summary.
+    /// Absent when not captured; captured empty can represent a parameter
+    /// match rejected before any body checks. These remain context unless
+    /// they belong to the successful producing path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conditions: Option<Vec<ConditionExplanation>>,
 }
 
 /// Logical construct enclosing checks, emissions or nested scopes.

@@ -19,8 +19,9 @@
 //!   location, kind, operand references and owning rule of each check.
 //! - [`ExplanationRecorder`] receives the RVM's evaluation events.
 //!
-//! The report types are `#[non_exhaustive]` so that fields and variants can
-//! be added without breaking callers. They implement [`serde::Serialize`];
+//! The report types are `#[non_exhaustive]` to permit new struct fields and
+//! enum variants. This does not protect changes to existing field types or
+//! fields of an exhaustive enum variant. They implement [`serde::Serialize`];
 //! JSON is produced only by the language bindings. Consumers of an
 //! [`ExplanationReport`] should accept unknown fields and enum values.
 //! Consumers that enforce a [`PartialEvalResult`] must instead fail closed:
@@ -74,6 +75,17 @@
 //! within the selected scope. A report accompanying a failed evaluation
 //! covers rules only up to the error.
 //! Signalling a report that was cut short will come with bounded tracing.
+//!
+//! # WIP contract migration
+//!
+//! This contract update requires Rust callers to wrap captured
+//! [`Derivation::bindings`] in `Some`, using `None` when capture was unavailable.
+//! [`RuleOutcome::Conflict`] constructions now supply `key: None` when no
+//! object key was captured; exact variant patterns must account for `key`.
+//! These are source-breaking changes despite the outer `non_exhaustive`.
+//! JSON schema version 2 is retained: omitted bindings remain unknown, including
+//! older reports that omitted either empty or uncaptured bindings. Only an
+//! explicit empty array certifies that no contributing loop bindings exist.
 
 mod error;
 mod provenance;

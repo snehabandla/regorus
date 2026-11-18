@@ -1554,18 +1554,31 @@ fn attempts_scopes_and_cached_uses_keep_ownership() -> anyhow::Result<()> {
     let mut report = complete_rule_report();
     let rule = report.rules.first_mut().context("queried rule")?;
     rule.call_instance = 1;
+    let mut failed_conditions = rule
+        .definitions
+        .first()
+        .context("failed primary body")?
+        .conditions
+        .clone();
+    for condition in &mut failed_conditions {
+        condition.owner.call_instance = 1;
+        condition.owner.attempt = Some(1);
+    }
+    let failed_context = serde_json::to_value(&failed_conditions)?;
     rule.attempts = Some(alloc::vec![
         AttemptExplanation {
             attempt: 1,
             definition: 0,
             body: 0,
-            outcome: Some(Outcome::Failure)
+            outcome: Some(Outcome::Failure),
+            conditions: Some(failed_conditions),
         },
         AttemptExplanation {
             attempt: 2,
             definition: 0,
             body: 1,
-            outcome: Some(Outcome::Success)
+            outcome: Some(Outcome::Success),
+            conditions: None,
         },
     ]);
     rule.scopes = Some(alloc::vec![
@@ -1607,13 +1620,15 @@ fn attempts_scopes_and_cached_uses_keep_ownership() -> anyhow::Result<()> {
             attempt: 3,
             definition: 0,
             body: 0,
-            outcome: Some(Outcome::Undefined)
+            outcome: Some(Outcome::Undefined),
+            conditions: Some(Vec::new()),
         },
         AttemptExplanation {
             attempt: 4,
             definition: 1,
             body: 0,
-            outcome: Some(Outcome::Success)
+            outcome: Some(Outcome::Success),
+            conditions: None,
         },
     ]);
     helper.scopes = Some(Vec::new());
@@ -1643,13 +1658,13 @@ fn attempts_scopes_and_cached_uses_keep_ownership() -> anyhow::Result<()> {
         }),
         conditions: alloc::vec![helper_condition],
     });
-    rule.definitions.get_mut(1).context("else body")?.index = 0;
-    for (definition, attempt) in rule.definitions.iter_mut().zip([1, 2]) {
-        for condition in &mut definition.conditions {
-            condition.owner.call_instance = 1;
-            condition.owner.attempt = Some(attempt);
-        }
+    let mut deciding_body = rule.definitions.get(1).context("else body")?.clone();
+    deciding_body.index = 0;
+    for condition in &mut deciding_body.conditions {
+        condition.owner.call_instance = 1;
+        condition.owner.attempt = Some(2);
     }
+    rule.definitions = alloc::vec![deciding_body];
     report.query.call_instance = Some(1);
     for (site_id, kind) in [(2, ConditionKind::Negation), (3, ConditionKind::Binding)] {
         report.checks.push(ConditionSite {
@@ -1665,9 +1680,34 @@ fn attempts_scopes_and_cached_uses_keep_ownership() -> anyhow::Result<()> {
     assert_eq!(
         json.pointer("/rules/0/attempts"),
         Some(&serde_json::json!([
-            {"attempt":1,"definition":0,"body":0,"outcome":"failure"},
+            {"attempt":1,"definition":0,"body":0,"outcome":"failure","conditions":failed_context},
             {"attempt":2,"definition":0,"body":1,"outcome":"success"}
         ]))
+    );
+    assert_eq!(
+        json.pointer("/rules/0/definitions/0/body"),
+        Some(&serde_json::json!(1))
+    );
+    assert_eq!(
+        report
+            .rules
+            .first()
+            .context("queried rule")?
+            .definitions
+            .len(),
+        1
+    );
+    assert_eq!(
+        json.pointer("/rules/0/attempts/0/conditions/0/outcome"),
+        Some(&serde_json::json!("failure"))
+    );
+    assert_eq!(
+        json.pointer("/rules/0/attempts/0/conditions/0/owner/attempt"),
+        Some(&serde_json::json!(1))
+    );
+    assert_eq!(
+        json.pointer("/rules/1/attempts/0/conditions"),
+        Some(&serde_json::json!([]))
     );
     assert_eq!(
         json.pointer("/rules/0/scopes"),
