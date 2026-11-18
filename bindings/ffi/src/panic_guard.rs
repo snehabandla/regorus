@@ -3,8 +3,14 @@
 
 //! Minimal helpers for catching panics inside the FFI layer.
 //!
-//! These are not yet wired into the exported functions; they will
-//! be used once the integration work is complete.
+//! A panic inside a guarded call is caught, marks regorus as poisoned, and is
+//! returned as a `Panic` result whose message includes the panic location and a
+//! backtrace. The process-global panic hook is never swapped per call, because
+//! concurrent calls would race on it and could leave a stale hook installed.
+//! Instead, the first guarded call installs one hook that records panics on
+//! threads inside a guarded call and forwards every other panic to the hook
+//! that was installed before it. A hook the host installs afterwards replaces
+//! it; guarded panics are then still caught, only without the extra details.
 
 extern crate alloc;
 
@@ -13,57 +19,98 @@ use crate::common::{RegorusResult, RegorusStatus};
 use alloc::string::String;
 use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(feature = "std")]
-use std::{
-    backtrace::Backtrace,
-    cell::RefCell,
-    panic::{self, AssertUnwindSafe},
-};
+use std::panic::{self, AssertUnwindSafe};
 
 #[cfg(feature = "std")]
-thread_local! {
-    // Stashes the formatted panic + backtrace for whichever call last panicked on this thread.
-    static PANIC_BACKTRACE: RefCell<Option<String>> = const { RefCell::new(None) };
-}
+mod hook {
+    use alloc::boxed::Box;
+    use alloc::string::String;
+    use core::cell::{Cell, RefCell};
+    use core::sync::atomic::{AtomicBool, Ordering};
+    use std::backtrace::Backtrace;
+    use std::panic::{self, PanicHookInfo};
+    use std::sync::{Mutex, PoisonError};
 
-#[cfg(feature = "std")]
-type PanicHook = dyn Fn(&panic::PanicHookInfo<'_>) + Sync + Send + 'static;
+    static INSTALLED: AtomicBool = AtomicBool::new(false);
+    static INSTALL_LOCK: Mutex<()> = Mutex::new(());
 
-#[cfg(feature = "std")]
-/// RAII helper that installs a per-call panic hook and restores the prior hook on drop.
-struct PanicHookGuard {
-    previous: Option<Box<PanicHook>>,
-}
+    std::thread_local! {
+        // Number of guarded calls active on this thread (guards can nest).
+        static GUARD_DEPTH: Cell<usize> = const { Cell::new(0) };
+        // Formatted panic + backtrace for whichever guarded call last panicked on this thread.
+        static PANIC_BACKTRACE: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
 
-#[cfg(feature = "std")]
-impl PanicHookGuard {
-    fn install() -> Self {
-        // Remember whatever hook the embedding application already registered.
+    /// Installs the recording hook once per process, chaining to the current hook.
+    fn ensure_installed() {
+        // The hook cannot be changed while this thread is unwinding.
+        if INSTALLED.load(Ordering::Acquire) || std::thread::panicking() {
+            return;
+        }
+        let _install = INSTALL_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        if INSTALLED.load(Ordering::Acquire) {
+            return;
+        }
         let previous = panic::take_hook();
-        PANIC_BACKTRACE.with(|slot| {
-            slot.replace(None);
-        });
-        // Install our temporary hook so we can capture a backtrace for this invocation.
-        panic::set_hook(Box::new(|info| {
-            let backtrace = Backtrace::force_capture();
-            PANIC_BACKTRACE.with(|slot| {
-                slot.replace(Some(format!(
-                    "panic hook observed: {}\nbacktrace:\n{:#?}",
-                    info, backtrace
-                )));
-            });
+        panic::set_hook(Box::new(move |info| {
+            if !record(info) {
+                previous(info);
+            }
         }));
-        Self {
-            previous: Some(previous),
+        INSTALLED.store(true, Ordering::Release);
+    }
+
+    /// Lets a test that replaced the process hook have it installed again.
+    #[cfg(test)]
+    pub(super) fn forget_installation() {
+        INSTALLED.store(false, Ordering::Release);
+    }
+
+    /// Records a panic raised inside a guarded call; returns false for any other panic.
+    fn record(info: &PanicHookInfo<'_>) -> bool {
+        // `try_with`: thread-locals may already be destroyed on this thread.
+        if !GUARD_DEPTH
+            .try_with(|depth| depth.get() > 0)
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        let backtrace = Backtrace::force_capture();
+        let details = alloc::format!("panic hook observed: {info}\nbacktrace:\n{backtrace:#?}");
+        let _ = PANIC_BACKTRACE.try_with(|slot| {
+            if let Ok(mut slot) = slot.try_borrow_mut() {
+                *slot = Some(details);
+            }
+        });
+        true
+    }
+
+    pub(super) fn take_panic_backtrace() -> Option<String> {
+        PANIC_BACKTRACE
+            .try_with(|slot| slot.try_borrow_mut().ok().and_then(|mut slot| slot.take()))
+            .ok()
+            .flatten()
+    }
+
+    /// Marks the current thread as inside a guarded call for the scope's lifetime.
+    pub(super) struct GuardScope(());
+
+    impl GuardScope {
+        pub(super) fn enter() -> Self {
+            ensure_installed();
+            let _ = GUARD_DEPTH.try_with(|depth| depth.set(depth.get().saturating_add(1)));
+            let _ = PANIC_BACKTRACE.try_with(|slot| {
+                if let Ok(mut slot) = slot.try_borrow_mut() {
+                    *slot = None;
+                }
+            });
+            GuardScope(())
         }
     }
-}
 
-#[cfg(feature = "std")]
-impl Drop for PanicHookGuard {
-    fn drop(&mut self) {
-        if let Some(previous) = self.previous.take() {
-            // Restore the original panic hook before we return control to the host.
-            panic::set_hook(previous);
+    impl Drop for GuardScope {
+        fn drop(&mut self) {
+            let _ = GUARD_DEPTH.try_with(|depth| depth.set(depth.get().saturating_sub(1)));
         }
     }
 }
@@ -181,15 +228,12 @@ fn catch_panic<F>(f: F) -> GuardResult<RegorusResult>
 where
     F: FnOnce() -> RegorusResult,
 {
-    let _hook_guard = PanicHookGuard::install();
+    let _guard_scope = hook::GuardScope::enter();
     match panic::catch_unwind(AssertUnwindSafe(f)) {
         Ok(value) => GuardResult::Success(value),
         Err(payload) => GuardResult::Panic(panic_message_to_string(payload)),
     }
 }
-
-#[cfg(all(test, feature = "std"))]
-fn forget_hook_installation() {}
 
 fn finalize(outcome: GuardResult<RegorusResult>) -> RegorusResult {
     match outcome {
@@ -211,17 +255,12 @@ fn panic_message_to_string(payload: Box<dyn core::any::Any + Send + 'static>) ->
         String::from("regorus encountered panic")
     };
 
-    if let Some(backtrace) = take_panic_backtrace() {
+    if let Some(backtrace) = hook::take_panic_backtrace() {
         message.push('\n');
         message.push_str(&backtrace);
     }
 
     message
-}
-
-#[cfg(feature = "std")]
-fn take_panic_backtrace() -> Option<String> {
-    PANIC_BACKTRACE.with(|slot| slot.borrow_mut().take())
 }
 
 fn poisoned_result() -> RegorusResult {
@@ -245,7 +284,8 @@ pub(crate) fn reset_poison() {
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
-    use super::{catch_panic, forget_hook_installation, with_unwind_guard, GuardResult};
+    use super::hook::forget_installation as forget_hook_installation;
+    use super::{catch_panic, with_unwind_guard, GuardResult};
     use crate::common::{regorus_result_drop, RegorusResult, RegorusStatus};
     use std::panic;
     use std::sync::{mpsc, Mutex};
@@ -274,8 +314,8 @@ mod tests {
         const THREADS: usize = 8;
         const ITERATIONS: usize = 40;
 
-        // Serializes against every other guarded call in the test binary.
-        let _poison_test_lock = super::lock_poison_test_state();
+        // `catch_panic` never touches the poison flag, so this test does not take the
+        // poison test gate; it is the only test that replaces the process hook.
         HOST_HOOK_PANICS
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
