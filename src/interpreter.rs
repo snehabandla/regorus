@@ -732,6 +732,7 @@ impl Interpreter {
                         let index = self.eval_expr(index)?;
 
                         // Handle indexing into data.
+                        let mut data_path = None;
                         if index != Value::Undefined {
                             if let Ok(ref_components) =
                                 Parser::get_static_string_path_components(refr)
@@ -782,6 +783,7 @@ impl Interpreter {
                                                     .map(|component| (*component).to_string()),
                                             );
                                             self.ensure_module_evaluated(&module_path)?;
+                                            data_path = Some(module_path);
                                         }
                                     }
                                 }
@@ -802,21 +804,10 @@ impl Interpreter {
                             v = obj[index].clone();
                         }
                         let v = Self::get_value_chained(v, &path[..]);
-                        if v == Value::Undefined && get_root_var(refr)?.text() == "data" {
-                            let key = match &index {
-                                Value::String(key) => Some(key.as_ref().to_string()),
-                                Value::Number(_) => Some(index.to_string()),
-                                _ => None,
-                            };
-                            if let (Some(key), Ok(mut fields)) =
-                                (key, Parser::get_static_string_path_components(refr))
-                            {
-                                fields.push(key);
-                                fields.extend(path.iter().map(|field| (*field).to_string()));
-                                let fields: Vec<&str> =
-                                    fields.iter().skip(1).map(String::as_str).collect();
-                                return self.lookup_data(&fields);
-                            }
+                        if let (Value::Undefined, Some(data_path)) = (&v, data_path) {
+                            return self.package_value_below_non_object(
+                                data_path.get(1..).unwrap_or_default(),
+                            );
                         }
                         return Ok(v);
                     }
@@ -3439,35 +3430,46 @@ impl Interpreter {
         Ok(false)
     }
 
-    /// Looks up `fields` in `data`. A package without rules below a non-object value in base
-    /// data is not stored in `data`, but, as in OPA, it still reads as an empty object when
-    /// read below that value.
     fn lookup_data(&self, fields: &[&str]) -> Result<Value> {
-        let mut value = Self::get_value_chained(self.data.clone(), fields);
-        if value != Value::Undefined || !Self::has_non_object_on_path(&self.data, fields) {
+        match Self::get_value_chained(self.data.clone(), fields) {
+            Value::Undefined => self.package_value_below_non_object(fields),
+            value => Ok(value),
+        }
+    }
+
+    /// A package without rules below a non-object value in base data is not stored in `data`,
+    /// but, as in OPA, it reads as an empty object when read below that value.
+    fn package_value_below_non_object<S: AsRef<str>>(&self, fields: &[S]) -> Result<Value> {
+        let mut value = Value::Undefined;
+        if !Self::has_non_object_on_path(&self.init_data, fields) {
             return Ok(value);
         }
         for module in self.compiled_policy.modules.iter() {
-            let package = Parser::get_static_string_path_components(&module.package.refr)?;
-            let package: Vec<&str> = package.iter().map(String::as_str).collect();
-            if !module.policy.is_empty()
-                || !package.starts_with(fields)
-                || self.has_explicit_data_with_override_ancestor(&package)?
-            {
+            if !module.policy.is_empty() {
                 continue;
             }
-            let mut package_value = Value::new_object();
-            for component in package.iter().skip(fields.len()).rev() {
-                let mut parent = Value::new_object();
-                parent
-                    .as_object_mut()?
-                    .insert(Value::String((*component).into()), package_value);
-                package_value = parent;
+            let package = Parser::get_static_string_path_components(&module.package.refr)?;
+            let package: Vec<&str> = package.iter().map(String::as_str).collect();
+            if package.len() >= fields.len()
+                && package.iter().zip(fields).all(|(p, f)| *p == f.as_ref())
+                && !self.has_explicit_data_with_override_ancestor(&package)?
+            {
+                let rest: Vec<&str> = package.iter().skip(fields.len()).copied().collect();
+                Self::ensure_package_value(&mut value, &rest, true)?;
             }
-            if value == Value::Undefined {
-                value = package_value;
-            } else {
-                value.merge(package_value)?;
+        }
+        if value != Value::Undefined {
+            // OPA rejects packages with rules below a non-object value in base data.
+            for module in self.compiled_policy.modules.iter() {
+                let package = Parser::get_static_string_path_components(&module.package.refr)?;
+                if !module.policy.is_empty()
+                    && Self::has_non_object_on_path(&self.init_data, &package)
+                {
+                    bail!(
+                        "package {} is below a value in data that is not an object",
+                        package.join(".")
+                    );
+                }
             }
         }
         Ok(value)
@@ -3910,14 +3912,16 @@ impl Interpreter {
     }
 
     /// Returns true if `data` holds a value other than an object at or above `path`.
-    fn has_non_object_on_path(data: &Value, path: &[&str]) -> bool {
+    fn has_non_object_on_path<S: AsRef<str>>(data: &Value, path: &[S]) -> bool {
         let mut value = data;
         for component in path {
             match value {
-                Value::Object(fields) => match fields.get(&Value::String((*component).into())) {
-                    Some(v) => value = v,
-                    None => return false,
-                },
+                Value::Object(fields) => {
+                    match fields.get(&Value::String(component.as_ref().into())) {
+                        Some(v) => value = v,
+                        None => return false,
+                    }
+                }
                 Value::Undefined => return false,
                 _ => return true,
             }

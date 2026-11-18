@@ -1541,13 +1541,6 @@ impl Engine {
         self.apply_effective_execution_timer_config();
         self.interpreter.clean_internal_evaluation_state();
 
-        // Ensure that empty modules are created.
-        for m in self.modules.iter().filter(|m| m.policy.is_empty()) {
-            let path = Parser::get_static_string_path_components(&m.package.refr)?;
-            let path: Vec<&str> = path.iter().map(String::as_str).collect();
-            Interpreter::ensure_package_value(self.interpreter.get_data_mut(), &path, false)?;
-        }
-
         self.interpreter.check_default_rules()?;
         for module in self.modules.clone().iter() {
             for rule in &module.policy {

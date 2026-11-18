@@ -59,6 +59,10 @@ cases:
           v := data.a.b with data.a as "x"
         }
         n := data.a.b.c.e
+        wz := v if {
+          v := data.a.b with data.z as 1
+        }
+        ks := {key | some key; data.a.b[key]}
     query: data.q
     want_result:
       r:
@@ -67,6 +71,11 @@ cases:
       k:
         c: {}
         d: {}
+      wz:
+        c: {}
+        d: {}
+      ks:
+        set!: [c, d]
 
   - note: package without rules below a string in base data, read via data
     data:
@@ -191,4 +200,61 @@ cases:
 
         x := 1
     query: data.a
+    error: not an object
+
+  - note: package without rules below a string produced by a rule
+    input:
+      x: str
+    modules:
+      - |
+        package a
+
+        b := input.x
+      - |
+        package a.b.c
+      - |
+        package q
+
+        x := data.a
+        y := data.a.b.c
+    query: data.q
+    want_result:
+      x:
+        b: str
+
+  - note: package without rules below a set produced by a rule
+    modules:
+      - |
+        package a
+        import rego.v1
+
+        s contains "x"
+      - |
+        package a.s.t
+      - |
+        package q
+
+        x := data.a
+        y := data.a.s.t
+    query: data.q
+    want_result:
+      x:
+        s:
+          set!: [x]
+
+  - note: package without rules beside a package with rules below a string in base data
+    data:
+      a: str
+    modules:
+      - |
+        package a.b.c
+      - |
+        package a.b.d
+
+        p := 1
+      - |
+        package q
+
+        x := data.a.b.c
+    query: data.q
     error: not an object
