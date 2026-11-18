@@ -385,6 +385,8 @@ impl RegoVM {
     /// Unknown-dependent helpers, loops, negation, context conditions and
     /// other rule shapes fail closed as [`ResidualStatus::Unsupported`].
     /// Conditions are bounded by [`PartialEvalSettings::max_conditions`].
+    /// Residual text is for display, not executable Rego; interpret the
+    /// structured condition fields instead.
     ///
     /// Rule defaults are evaluated at compile time with undefined `input`.
     /// Dependencies read by a default are not recorded, so an input-dependent

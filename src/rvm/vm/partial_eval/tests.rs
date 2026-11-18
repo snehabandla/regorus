@@ -507,6 +507,7 @@ fn lossy_numeric_residuals_fail_closed() -> anyhow::Result<()> {
         "-9223372036854775808",
         "0.1",
         "9007199254740994.0",
+        "100000000000000000000000.0",
     ] {
         let result = pe(
             &format!("package test\nallow if input.u == {number}"),
@@ -518,7 +519,14 @@ fn lossy_numeric_residuals_fail_closed() -> anyhow::Result<()> {
             result.residual_queries[0].conditions[0].value,
             Some(Value::from_json_str(number)?)
         );
+        let value = result.residual_queries[0].conditions[0]
+            .value
+            .as_ref()
+            .unwrap();
+        assert_eq!(Value::from_json_str(&value.to_json_str_compact()?)?, *value);
     }
+    let policy = "package test\nallow if input.u == 100000000000000000000000.0";
+    assert_eq!(pe(policy, r#"{"u":1e23}"#, &[])?.result, Value::Bool(true));
     Ok(())
 }
 
