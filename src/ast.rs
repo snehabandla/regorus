@@ -688,12 +688,11 @@ impl Expr {
                 Expr::BinExpr { lhs, rhs, .. }
                 | Expr::BoolExpr { lhs, rhs, .. }
                 | Expr::ArithExpr { lhs, rhs, .. } => vec![lhs, rhs],
+                // The key of `k, v in c` stays lazy: it is evaluated only when
+                // the value and the collection are defined.
                 Expr::Membership {
-                    key,
-                    value,
-                    collection,
-                    ..
-                } => key.iter().chain([value, collection]).collect(),
+                    value, collection, ..
+                } => vec![value, collection],
                 _ => Vec::new(),
             }
         }
