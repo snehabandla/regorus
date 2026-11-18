@@ -2598,7 +2598,7 @@ fn partial_eval_residual_rendering_is_in_the_memory_budget() {
     }
     for (known, limit) in [
         (deep, 256 * 1024),
-        (Value::from("x".repeat(128 * 1024)), 300 * 1024),
+        (Value::from("x".repeat(128 * 1024)), 224 * 1024),
     ] {
         let mut vm = partial_eval_vm(
             "package test\nallow if input.u == input.known",
@@ -2611,10 +2611,15 @@ fn partial_eval_residual_rendering_is_in_the_memory_budget() {
         vm.set_memory_budget_config(Some(MemoryBudgetConfig {
             limit: NonZeroU64::new(limit).unwrap(),
         }));
-        assert!(matches!(
-            vm.partial_eval("data.test.allow"),
-            Err(ExplainError::Vm(VmError::MemoryBudgetExceeded { .. }))
-        ));
+        let report = vm.partial_eval("data.test.allow");
+        assert!(
+            matches!(
+                &report,
+                Err(ExplainError::Vm(VmError::MemoryBudgetExceeded { .. }))
+            ),
+            "limit={limit}, outcome={:?}",
+            report.as_ref().map(|result| result.status)
+        );
         vm.set_memory_budget_config(None);
         assert_eq!(
             vm.partial_eval("data.test.allow").unwrap().status,

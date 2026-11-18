@@ -163,18 +163,22 @@ impl RegoVM {
                         Err(_) => {}
                     }
                 }
+                #[cfg(feature = "explanations")]
+                if self.pe.is_some()
+                    && !body_result
+                        .as_ref()
+                        .is_err_and(|e| self.is_fatal_vm_error(e))
+                {
+                    if let Err(error) = self.pe_body_finished(result_reg, body_result.is_ok()) {
+                        self.restore_rule_state(
+                            &mut previous_loop_stack,
+                            &mut previous_comprehension_stack,
+                        );
+                        return Err(error);
+                    }
+                }
                 match body_result {
                     Ok(_) => {
-                        #[cfg(feature = "explanations")]
-                        if self.pe.is_some() {
-                            if let Err(error) = self.pe_body_succeeded(result_reg) {
-                                self.restore_rule_state(
-                                    &mut previous_loop_stack,
-                                    &mut previous_comprehension_stack,
-                                );
-                                return Err(error);
-                            }
-                        }
                         if matches!(rule_info.rule_type, RuleType::Complete) || is_function_call {
                             let current_result = self.get_register(result_reg)?.clone();
                             if current_result != Value::Undefined {
