@@ -1,0 +1,114 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# A variable declared with `some` shadows a rule (or import) of the same
+# name. Expected results were verified against OPA 1.2.0.
+
+cases:
+  - note: some_shadows_rule_in_comprehensions
+    data:
+      a:
+        b:
+          c: 1
+    modules:
+      - &shadow_module |
+        package test
+        k := 1
+
+        set_some := {k | some k; data.a.b[k]}
+        array_some := [k | some k; data.a.b[k]]
+        object_some := {k: v | some k; v := data.a.b[k]}
+        nested := [{k | some k; data.a.b[k]} | true]
+        some_in := {k | some k in ["x", "y"]}
+        some_kv_in := {k | some k, _ in data.a.b}
+        some_in_destructure := {k | some [k, 1] in [["c", 1], ["d", 2]]}
+        default body_use := false
+        body_use if {
+          {k | some k; data.a.b[k]} == {"c"}
+        }
+
+        # Without a declaration, `k` refers to the rule.
+        rule_ref := {k | data.a.b[k]}
+        rule_ref_in := {x | some x in [1, 2]; x == k}
+
+        result := {
+          "set_some": set_some,
+          "array_some": array_some,
+          "object_some": object_some,
+          "nested": nested,
+          "some_in": some_in,
+          "some_kv_in": some_kv_in,
+          "some_in_destructure": some_in_destructure,
+          "body_use": body_use,
+          "rule_ref": rule_ref,
+          "rule_ref_in": rule_ref_in,
+        }
+    query: data.test.result
+    want_result: &object_result
+      set_some:
+        set!: ["c"]
+      array_some: ["c"]
+      object_some:
+        c: 1
+      nested:
+        - set!: ["c"]
+      some_in:
+        set!: ["x", "y"]
+      some_kv_in:
+        set!: ["c"]
+      some_in_destructure:
+        set!: ["c"]
+      body_use: true
+      rule_ref:
+        set!: []
+      rule_ref_in:
+        set!: [1]
+
+  - note: some_shadows_rule_in_comprehensions_suspendable
+    data:
+      a:
+        b:
+          c: 1
+    modules:
+      - *shadow_module
+    query: data.test.result
+    execution_mode: suspendable
+    want_result: *object_result
+
+  - note: some_shadows_rule_over_array_data
+    data:
+      a:
+        b: ["x", "y"]
+    modules:
+      - *shadow_module
+    query: data.test.result
+    want_result: &array_result
+      set_some:
+        set!: [0, 1]
+      array_some: [0, 1]
+      object_some:
+        0: "x"
+        1: "y"
+      nested:
+        - set!: [0, 1]
+      some_in:
+        set!: ["x", "y"]
+      some_kv_in:
+        set!: [0, 1]
+      some_in_destructure:
+        set!: ["c"]
+      body_use: false
+      rule_ref:
+        set!: [1]
+      rule_ref_in:
+        set!: [1]
+
+  - note: some_shadows_rule_over_array_data_suspendable
+    data:
+      a:
+        b: ["x", "y"]
+    modules:
+      - *shadow_module
+    query: data.test.result
+    execution_mode: suspendable
+    want_result: *array_result
