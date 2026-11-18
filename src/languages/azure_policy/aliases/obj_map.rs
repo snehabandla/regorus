@@ -28,12 +28,16 @@ pub fn new_map() -> ObjMap {
 }
 
 /// Find the key matching `key` in an ObjMap: an exact match if present,
-/// otherwise the first key equal to it ignoring ASCII case. Remap paths are
-/// lowercase, but the denormalizer writes keys with their ARM casing.
+/// otherwise the smallest key equal to it ignoring ASCII case. Remap paths
+/// are lowercase, but the denormalizer writes keys with their ARM casing.
 fn obj_key_ci(map: &ObjMap, key: &str) -> Option<Rc<str>> {
     match map.get_key_value(key) {
         Some((k, _)) => Some(k.clone()),
-        None => map.keys().find(|k| k.eq_ignore_ascii_case(key)).cloned(),
+        None => map
+            .keys()
+            .filter(|k| k.eq_ignore_ascii_case(key))
+            .min()
+            .cloned(),
     }
 }
 
@@ -54,7 +58,8 @@ pub fn obj_remove_ci(map: &mut ObjMap, key: &str) -> Option<Value> {
     map.remove(found.as_ref())
 }
 
-/// Find the key matching `key` in an Object, as [`obj_key_ci`] does.
+/// Find the key matching `key` in an Object, as [`obj_key_ci`] does (keys
+/// iterate in sorted order, so the first match is the smallest).
 fn object_key_ci(obj: &Object, key: &str) -> Option<Value> {
     let exact = Value::from(key);
     if obj.contains_key(&exact) {
