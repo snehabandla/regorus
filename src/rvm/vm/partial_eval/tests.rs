@@ -431,6 +431,44 @@ fn strict_ordering_may_raise_so_is_unsupported() -> anyhow::Result<()> {
 }
 
 #[test]
+fn nested_undefined_residual_values_fail_closed() -> anyhow::Result<()> {
+    use alloc::collections::BTreeMap;
+    for known in [
+        Value::from(vec![Value::Undefined]),
+        Value::from(BTreeMap::from([(Value::from("x"), Value::Undefined)])),
+    ] {
+        for rule in [
+            "allow if input.u == input.known",
+            "allow := input.known if input.u == 1",
+        ] {
+            let mut machine = vm(&format!("package test\n{rule}"))?;
+            machine.set_input(Value::from(BTreeMap::from([(
+                Value::from("known"),
+                known.clone(),
+            )])));
+            let mut settings = PartialEvalSettings::default();
+            settings.unknowns = keys(&["u"]);
+            machine.set_partial_eval_settings(settings);
+            let result = machine.partial_eval("data.test.allow")?;
+            assert_eq!(result.status, ResidualStatus::Unsupported, "{rule}");
+            assert!(result.residual_queries.is_empty());
+        }
+    }
+    // Neither null nor the literal string "<undefined>" is an undefined value.
+    let result = pe(
+        "package test\nallow if input.u == input.known",
+        r#"{"known": [null, "<undefined>"]}"#,
+        &["u"],
+    )?;
+    assert_eq!(result.status, ResidualStatus::Exact);
+    assert_eq!(
+        texts(&result),
+        vec![vec![r#"input.u == [null,"<undefined>"]"#]]
+    );
+    Ok(())
+}
+
+#[test]
 fn deployment_unknowns() -> anyhow::Result<()> {
     let rego = r#"package test
 allow if {
@@ -1028,11 +1066,11 @@ fn unknowns_index_values_as_rego_does() -> anyhow::Result<()> {
     let numbered = Value::from(BTreeMap::from([(Value::from(0), Value::from(1))]));
     assert_eq!(
         run(field("xs", numbered), xs0())?,
-        supplied(r#"input["xs"][0]"#)
+        supplied("input.xs[0]")
     );
     let set = Value::from(BTreeSet::from([Value::from("a")]));
     let s_a = [PathSegment::Key("s".into()), PathSegment::Key("a".into())];
-    assert_eq!(run(field("s", set), s_a)?, supplied(r#"input["s"]["a"]"#));
+    assert_eq!(run(field("s", set), s_a)?, supplied("input.s.a"));
     Ok(())
 }
 
@@ -1095,7 +1133,7 @@ fn context_and_index_unknowns_are_validated() -> anyhow::Result<()> {
 
     assert_eq!(
         run(vec![context_u()], "{}", Some(r#"{"u": 1}"#))?.map(|_| ()),
-        supplied(r#"context["u"]"#)
+        supplied("context.u")
     );
     run(vec![context_u()], "{}", Some(r#"{"v": 1}"#))?.map_err(anyhow::Error::msg)?;
     // Unlike input, context is undefined until it is set, so null is a value.
@@ -1107,7 +1145,7 @@ fn context_and_index_unknowns_are_validated() -> anyhow::Result<()> {
 
     assert_eq!(
         run(vec![xs0()], r#"{"xs": [5]}"#, None)?.map(|_| ()),
-        supplied(r#"input["xs"][0]"#)
+        supplied("input.xs[0]")
     );
     run(vec![xs0()], r#"{"xs": []}"#, None)?.map_err(anyhow::Error::msg)?;
     // A string key is not the number index.
@@ -1118,7 +1156,7 @@ fn context_and_index_unknowns_are_validated() -> anyhow::Result<()> {
     run(vec![input_u.clone(), context_u()], "{}", None)?.map_err(anyhow::Error::msg)?;
     assert_eq!(
         run(vec![whole(UnknownRoot::Input), input_u], "null", None)?.map(|_| ()),
-        Err(r#"invalid unknown path `input["u"]`: overlaps `input`"#.into())
+        Err("invalid unknown path `input.u`: overlaps `input`".into())
     );
     // Keys are quoted as JSON strings.
     let odd = UnknownPath::input_keys(["a\"b", ""]);
