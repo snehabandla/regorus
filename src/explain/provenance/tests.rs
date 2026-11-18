@@ -736,22 +736,241 @@ fn azure_policy_conditions_keep_json_and_context_paths() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Sites are decoded only for Rego programs. A program from another
-/// language gets no sites, even when it carries rule information, rather
-/// than being read as Rego.
+/// A language's instructions must not be interpreted as another language's
+/// checks, even when the program carries Rego rule information.
 #[test]
-fn only_rego_programs_are_decoded() -> anyhow::Result<()> {
+fn languages_have_separate_decoders() -> anyhow::Result<()> {
     let rego = "package test\nimport rego.v1\n\nallow if input.x == 1\n";
     let program = compile(&[("p.rego", rego)], &["data.test.allow"])?;
     assert_eq!(program.metadata.language, "");
     assert_eq!(Provenance::new(&program).sites().len(), 1);
-    for (language, sites) in [("rego", 1), ("cedar", 0), ("azure_policy", 0)] {
+    for (language, sites, owner) in [
+        ("rego", 1, true),
+        ("cedar", 0, false),
+        ("azure_policy", 0, true),
+    ] {
         let mut program = (*program).clone();
         program.metadata.language = language.to_owned();
         let provenance = Provenance::new(&program);
         assert_eq!(provenance.sites().len(), sites, "{language}");
-        assert_eq!(provenance.rule(0).is_some(), sites > 0, "{language}");
+        assert_eq!(provenance.rule(0).is_some(), owner, "{language}");
     }
+    Ok(())
+}
+
+#[cfg(feature = "azure_policy")]
+fn compile_azure(json: &str) -> anyhow::Result<crate::Rc<Program>> {
+    use crate::languages::azure_policy::{compiler, parser};
+    let source = crate::lexer::Source::from_contents("policy.json".into(), json.into())?;
+    let rule = parser::parse_policy_rule(&source).map_err(|e| anyhow::anyhow!("{e}"))?;
+    compiler::compile_policy_rule(&rule)
+}
+
+#[cfg(feature = "azure_policy")]
+#[test]
+fn azure_policy_count_where_tracks_elements_not_counts() -> anyhow::Result<()> {
+    use crate::rvm::instructions::PolicyOp;
+    for comparison in [r#""greater": 1"#, r#""greater": 0"#] {
+        let condition = alloc::format!(
+            r#"{{
+    "count": {{
+      "field": "items[*]",
+      "where": {{ "field": "items[*].state", "equals": "open" }}
+    }},
+    {comparison}
+}}"#
+        );
+        let json = alloc::format!(r#"{{"if": {condition}, "then": {{ "effect": "deny" }} }}"#);
+        let program = compile_azure(&json)?;
+        let provenance = Provenance::new(&program);
+        let loop_site = provenance
+            .sites()
+            .iter()
+            .find(|s| s.kind == ConditionKind::Iteration)
+            .ok_or_else(|| anyhow::anyhow!("count loop"))?;
+        assert_eq!(
+            loop_site.left_path.as_deref(),
+            Some(r#"input["resource"]["items"]"#)
+        );
+        let predicate = provenance
+            .sites()
+            .iter()
+            .find(|s| s.azure_policy.as_ref().and_then(|p| p.operator) == Some(PolicyOp::Equals))
+            .ok_or_else(|| anyhow::anyhow!("where predicate"))?;
+        assert_eq!(
+            predicate.left_path.as_deref(),
+            Some(r#"input["resource"]["items"][_]["state"]"#)
+        );
+        assert_eq!(
+            predicate.text,
+            r#"{ "field": "items[*].state", "equals": "open" }"#
+        );
+        assert_eq!(
+            predicate
+                .azure_policy
+                .as_ref()
+                .and_then(|p| p.field.as_deref()),
+            Some("items[*].state")
+        );
+        for site in provenance
+            .sites()
+            .iter()
+            .filter(|s| s.azure_policy.as_ref().and_then(|p| p.operator) == Some(PolicyOp::Greater))
+        {
+            assert_eq!(
+                site.left_path, None,
+                "a computed count is not its collection"
+            );
+            assert_eq!(site.text, condition);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "azure_policy")]
+#[test]
+fn azure_policy_templates_and_reused_registers_do_not_invent_origins() -> anyhow::Result<()> {
+    use crate::rvm::instructions::PolicyOp;
+    let program = compile_azure(
+        r#"{
+  "if": {
+    "allOf": [
+      { "value": "[concat(resourceGroup().name, '-prod')]", "equals": "rg-prod" },
+      { "field": "[if(true, 'type', 'name')]", "notEquals": "vm" },
+      { "not": { "field": "location", "in": ["eastus"] } },
+      { "field": "name", "exists": true }
+    ]
+  },
+  "then": { "effect": "deny" }
+}"#,
+    )?;
+    let provenance = Provenance::new(&program);
+    let sites = provenance.sites();
+    assert_eq!(
+        sites.len(),
+        5,
+        "no synthetic value guard or logical-block checks"
+    );
+    let operators: Vec<_> = sites
+        .iter()
+        .map(|s| s.azure_policy.as_ref().and_then(|p| p.operator))
+        .collect();
+    assert_eq!(
+        operators,
+        vec![
+            Some(PolicyOp::Equals),
+            Some(PolicyOp::NotEquals),
+            Some(PolicyOp::In),
+            Some(PolicyOp::Not),
+            Some(PolicyOp::Exists)
+        ]
+    );
+    let first = sites
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("computed check"))?;
+    assert_eq!(first.left_path, None);
+    let second = sites
+        .get(1)
+        .ok_or_else(|| anyhow::anyhow!("dynamic field"))?;
+    assert_eq!(second.left_path, None);
+    assert_eq!(
+        second
+            .azure_policy
+            .as_ref()
+            .and_then(|p| p.field.as_deref()),
+        Some("[if(true, 'type', 'name')]")
+    );
+    let negation = sites.get(3).ok_or_else(|| anyhow::anyhow!("negation"))?;
+    assert_eq!(negation.kind, ConditionKind::Negation);
+    assert_eq!(
+        negation.right_path, None,
+        "register zero is unused by PolicyOp::Not"
+    );
+    assert_eq!(
+        negation.text,
+        r#"{ "not": { "field": "location", "in": ["eastus"] } }"#
+    );
+    Ok(())
+}
+
+#[cfg(feature = "azure_policy")]
+#[test]
+fn azure_policy_quoted_paths_and_missing_sources() -> anyhow::Result<()> {
+    let json = r#"{
+	"if": { "field": "tags['a.b[0]\"é']", "equals": "[resourceGroup()['0']]" },
+	"then": { "effect": "deny" }
+}"#
+    .replace('\n', "\r\n");
+    let program = compile_azure(&json)?;
+    let provenance = Provenance::new(&program);
+    let site = provenance
+        .sites()
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("quoted check"))?;
+    assert_eq!(at(site), Some(("policy.json", 2, 11)));
+    assert_eq!(
+        site.left_path.as_deref(),
+        Some(r#"input["resource"]["tags"]["a.b[0]\"é"]"#)
+    );
+    assert_eq!(
+        site.right_path.as_deref(),
+        Some(r#"context["resourceGroup"]["0"]"#)
+    );
+    assert_eq!(
+        site.azure_policy.as_ref().and_then(|p| p.field.as_deref()),
+        Some("tags['a.b[0]\"é']")
+    );
+
+    let mut stripped = (*program).clone();
+    stripped.sources.clear();
+    stripped.instruction_spans.clear();
+    let without_sources = Provenance::new(&stripped);
+    let stripped_site = without_sources
+        .sites()
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("stripped check"))?;
+    assert!(stripped_site.text.is_empty());
+    assert_eq!(stripped_site.location, None);
+    assert_eq!(stripped_site.left_path, site.left_path);
+    assert_eq!(stripped_site.right_path, site.right_path);
+    assert_eq!(
+        stripped_site.azure_policy.as_ref().and_then(|p| p.operator),
+        site.azure_policy.as_ref().and_then(|p| p.operator)
+    );
+    Ok(())
+}
+
+#[cfg(feature = "azure_policy")]
+#[test]
+fn azure_policy_aliases_keep_declared_and_normalized_names() -> anyhow::Result<()> {
+    use crate::languages::azure_policy::{aliases::AliasRegistry, compiler, parser};
+    let mut aliases = AliasRegistry::new();
+    aliases.load_from_json(
+        r#"[{
+        "namespace":"Contoso",
+        "resourceTypes":[{"resourceType":"widgets","aliases":[{
+            "name":"Contoso/widgets/skuAlias",
+            "defaultPath":"properties.sku.name"
+        }]}]
+    }]"#,
+    )?;
+    let json = r#"{"if":{"field":"Contoso/widgets/skuAlias","equals":"premium"},"then":{"effect":"deny"}}"#;
+    let source = crate::lexer::Source::from_contents("alias.json".into(), json.into())?;
+    let rule = parser::parse_policy_rule(&source).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let program = compiler::compile_policy_rule_with_aliases(&rule, crate::Rc::new(aliases))?;
+    let provenance = Provenance::new(&program);
+    let site = provenance
+        .sites()
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("alias site"))?;
+    assert_eq!(
+        site.left_path.as_deref(),
+        Some(r#"input["resource"]["skualias"]"#)
+    );
+    assert_eq!(
+        site.azure_policy.as_ref().and_then(|p| p.field.as_deref()),
+        Some("Contoso/widgets/skuAlias")
+    );
     Ok(())
 }
 

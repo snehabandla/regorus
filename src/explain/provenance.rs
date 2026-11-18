@@ -34,7 +34,9 @@ use core::num::{NonZeroU32, NonZeroUsize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SiteId(pub u32);
 
-/// The rule body or function definition that a check belongs to.
+/// The rule body or function definition that a check belongs to. Azure
+/// Policy uses a synthetic `main` owner (rule/definition/body zero), not an
+/// index into its empty compiled rule table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SiteOwner {
@@ -82,7 +84,11 @@ pub struct CheckSite {
     /// Reference the left operand (or the checked value) was read from, as
     /// written, for example `input.user.role`. A value bound by iteration
     /// reads as the collection followed by `[_]`, for example
-    /// `input.items[_]`. `None` for literals and computed values.
+    /// `input.items[_]`. Azure Policy uses normalized input/context paths
+    /// with JSON-quoted key subscripts and unquoted numeric indices. These
+    /// remain static templates, not captured concrete element identities.
+    /// A coalesced field keeps its source path even if absent at runtime.
+    /// `None` for literals, computed values and unresolved dynamic keys.
     pub left_path: Option<String>,
     /// Reference the right operand was read from, as for `left_path`.
     pub right_path: Option<String>,

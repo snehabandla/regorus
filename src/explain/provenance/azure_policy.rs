@@ -150,6 +150,7 @@ struct JsonSource<'a> {
     source: SourceIndex<'a>,
     objects: Vec<Option<usize>>,
     ends: Vec<Option<usize>>,
+    fields: Vec<Option<usize>>,
 }
 
 impl<'a> JsonSource<'a> {
@@ -172,17 +173,28 @@ impl<'a> JsonSource<'a> {
                 _ => {}
             }
         }
+        let mut fields = alloc::vec![None; source.tokens.len()];
+        for (index, object) in objects.iter().enumerate() {
+            if source.symbol(index.saturating_add(1)) == Some(":")
+                && Self::string_at(&source, index).is_some_and(|s| s.eq_ignore_ascii_case("field"))
+            {
+                if let Some(slot) = object.and_then(|open| fields.get_mut(open)) {
+                    *slot = Some(index.saturating_add(2));
+                }
+            }
+        }
         Self {
             source,
             objects,
             ends,
+            fields,
         }
     }
 
-    fn string(&self, index: usize) -> Option<String> {
-        let token = self.source.tokens.get(index)?;
+    fn string_at(source: &SourceIndex<'_>, index: usize) -> Option<String> {
+        let token = source.tokens.get(index)?;
         let (start, end) = token.lexeme();
-        serde_json::from_str(self.source.content.get(start..end)?).ok()
+        serde_json::from_str(source.content.get(start..end)?).ok()
     }
 
     fn condition(
@@ -200,18 +212,12 @@ impl<'a> JsonSource<'a> {
             self.objects.get(anchor).copied().flatten()?
         };
         let close = self.ends.get(open).copied().flatten()?;
-        let mut field = None;
-        for index in open.saturating_add(1)..close {
-            if self.objects.get(index).copied().flatten() == Some(open)
-                && self.source.symbol(index.saturating_add(1)) == Some(":")
-                && self
-                    .string(index)
-                    .is_some_and(|s| s.eq_ignore_ascii_case("field"))
-            {
-                field = self.string(index.saturating_add(2));
-                break;
-            }
-        }
+        let field = self
+            .fields
+            .get(open)
+            .copied()
+            .flatten()
+            .and_then(|index| Self::string_at(&self.source, index));
         Some((
             self.source.text(open, close)?,
             self.source.location(open),
