@@ -931,6 +931,55 @@ fn invocation_subtree_cache_reuse_suspendable() {
 }
 
 #[test]
+fn invocation_mixed_mode_error_keeps_terminal_events_for_every_started_call() {
+    let mut engine = Engine::new();
+    for (name, policy) in [
+        ("helpers.rego", "package helpers\nf(x) := x\np := f(input.x)\n"),
+        ("t.rego", "package t\nr := data[input.ns].p\n"),
+    ] {
+        engine.add_policy(name.to_string(), policy.to_string()).unwrap();
+    }
+    let entrypoint: Rc<str> = "data.t.r".into();
+    let compiled = engine.compile_with_entrypoint(&entrypoint).unwrap();
+    let program = Compiler::compile_from_policy(&compiled, &["data.t.r"]).unwrap();
+    for mode in MODES {
+        let fixture = Fixture::default();
+        let mut vm = RegoVM::new();
+        vm.load_program(program.clone());
+        vm.set_execution_mode(mode);
+        vm.set_input(v(r#"{"ns":"helpers","x":1}"#));
+        vm.set_explanation_recorder(Box::new(fixture.clone()));
+        let result = execute(&mut vm, mode);
+        if mode == ExecutionMode::RunToCompletion {
+            assert_eq!(result.as_ref().unwrap(), &v("1"));
+        }
+        // Mixed-mode evaluation can already fail. Replacing the program must
+        // terminate any remaining captured invocations without losing one.
+        vm.load_program(program.clone());
+        let calls = fixture.calls();
+        assert!(calls.iter().any(|record| matches!(
+            record,
+            CallRecord::Start(_, event)
+                if program.rule_infos[usize::from(event.rule_index)].name == "data.helpers.f"
+        )), "{mode:?}: helper invocation was not reached: {calls:?}");
+        let mut started: Vec<_> = calls.iter().filter_map(|record| match record {
+            CallRecord::Start(_, event) => Some(event.call_instance),
+            _ => None,
+        }).collect();
+        let mut ended: Vec<_> = calls.iter().filter_map(|record| match record {
+            CallRecord::End(context, _, _) => context.call_instance,
+            _ => None,
+        }).collect();
+        started.sort_unstable();
+        ended.sort_unstable();
+        assert_eq!(
+            ended, started,
+            "{mode:?}: invocation events were lost before error/reset cleanup; result={result:?}, calls={calls:?}"
+        );
+    }
+}
+
+#[test]
 fn invocation_abort_is_not_undefined_and_fresh_evaluation_restarts_ids() {
     let program = compile(
         "package t\nf(x) := sum([x,x])\nr := f(input.x)\n",
