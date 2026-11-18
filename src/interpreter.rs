@@ -3440,10 +3440,11 @@ impl Interpreter {
     }
 
     /// Looks up `fields` in `data`. A package without rules below a non-object value in base
-    /// data is not stored in `data`, but, as in OPA, it still reads as an empty object.
+    /// data is not stored in `data`, but, as in OPA, it still reads as an empty object when
+    /// read below that value.
     fn lookup_data(&self, fields: &[&str]) -> Result<Value> {
         let mut value = Self::get_value_chained(self.data.clone(), fields);
-        if value != Value::Undefined || fields.is_empty() {
+        if value != Value::Undefined || !Self::has_non_object_on_path(&self.data, fields) {
             return Ok(value);
         }
         for module in self.compiled_policy.modules.iter() {
@@ -3908,7 +3909,22 @@ impl Interpreter {
         obj
     }
 
-    #[inline]
+    /// Returns true if `data` holds a value other than an object at or above `path`.
+    fn has_non_object_on_path(data: &Value, path: &[&str]) -> bool {
+        let mut value = data;
+        for component in path {
+            match value {
+                Value::Object(fields) => match fields.get(&Value::String((*component).into())) {
+                    Some(v) => value = v,
+                    None => return false,
+                },
+                Value::Undefined => return false,
+                _ => return true,
+            }
+        }
+        !matches!(value, Value::Object(_) | Value::Undefined)
+    }
+
     /// Ensures that `data` has an object at the package `path`. Returns false, leaving `data`
     /// unchanged, for a package without rules when `data` holds a non-object value at or above
     /// `path`: as in OPA, such a package does not conflict with base data, which wins.
@@ -3917,22 +3933,9 @@ impl Interpreter {
         path: &[&str],
         has_rules: bool,
     ) -> Result<bool> {
-        if !has_rules {
-            let mut value = &*data;
-            for component in path {
-                match value {
-                    Value::Object(fields) => {
-                        match fields.get(&Value::String((*component).into())) {
-                            Some(v) => value = v,
-                            None => break,
-                        }
-                    }
-                    Value::Undefined => break,
-                    _ => return Ok(false),
-                }
-            }
+        if !has_rules && Self::has_non_object_on_path(data, path) {
+            return Ok(false);
         }
-
         let vref = Self::make_or_get_value_mut(data, path)?;
         if *vref == Value::Undefined {
             *vref = Value::new_object();
@@ -3940,6 +3943,7 @@ impl Interpreter {
         Ok(true)
     }
 
+    #[inline]
     pub fn make_or_get_value_mut<'a>(obj: &'a mut Value, paths: &[&str]) -> Result<&'a mut Value> {
         let (first, tail) = match paths.split_first() {
             Some(v) => v,
