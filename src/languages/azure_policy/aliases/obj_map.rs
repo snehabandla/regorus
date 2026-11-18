@@ -293,8 +293,7 @@ pub fn collision_safe_key(short_name: &str) -> String {
 
 // ─── Element-level field removal ────────────────────────────────────────────
 //
-// Shared by both normalizer (stale source cleanup after remap) and
-// denormalizer (cleanup after reverse remap).
+// Used by element remaps to remove each moved source field.
 
 /// Remove a (possibly dot-separated) field from each element of a (possibly
 /// nested) array, navigating via the given `array_chain`.

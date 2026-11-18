@@ -391,8 +391,7 @@ pub struct PrecomputedRemap {
     pub target_field: String,
 }
 
-/// A precomputed reverse remap for denormalization, including the forward
-/// target field name for cleanup after remapping.
+/// A precomputed reverse remap for denormalization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrecomputedReverseRemap {
     /// Chain of array navigations for nested `[*]` levels.
@@ -401,7 +400,8 @@ pub struct PrecomputedReverseRemap {
     pub source_field: String,
     /// Field to write within each element (was the forward source).
     pub target_field: String,
-    /// The forward target field to remove after remapping.
+    /// The forward target field; always equal to `source_field`, which the
+    /// remap removes. No longer read; kept for compatibility.
     pub cleanup_field: String,
     /// Whether the alias's arrays sit at the resource root rather than under
     /// `properties` (any ASCII case, quoted or not), with the same names as
