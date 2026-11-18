@@ -2749,6 +2749,44 @@ fn partial_eval_warning_is_in_the_memory_budget() {
 
 #[cfg(feature = "explanations")]
 #[test]
+fn partial_eval_residual_rendering_is_in_the_memory_budget() {
+    use regorus::explain::{ExplainError, PartialEvalSettings, ResidualStatus, UnknownPath};
+    use std::collections::BTreeMap;
+
+    let _guard = LimitGuard::lock();
+    let mut deep = Value::Null;
+    for _ in 0..16_384 {
+        deep = Value::from(vec![deep]);
+    }
+    for (known, limit) in [
+        (deep, 256 * 1024),
+        (Value::from("x".repeat(128 * 1024)), 300 * 1024),
+    ] {
+        let mut vm = partial_eval_vm(
+            "package test\nallow if input.u == input.known",
+            "p.rego".into(),
+        );
+        vm.set_input(Value::from(BTreeMap::from([(Value::from("known"), known)])));
+        let mut settings = PartialEvalSettings::default();
+        settings.unknowns = vec![UnknownPath::input_keys(["u"])];
+        vm.set_partial_eval_settings(settings);
+        vm.set_memory_budget_config(Some(MemoryBudgetConfig {
+            limit: NonZeroU64::new(limit).unwrap(),
+        }));
+        assert!(matches!(
+            vm.partial_eval("data.test.allow"),
+            Err(ExplainError::Vm(VmError::MemoryBudgetExceeded { .. }))
+        ));
+        vm.set_memory_budget_config(None);
+        assert_eq!(
+            vm.partial_eval("data.test.allow").unwrap().status,
+            ResidualStatus::Exact
+        );
+    }
+}
+
+#[cfg(feature = "explanations")]
+#[test]
 fn partial_eval_warning_after_vm_error_is_budgeted() {
     use regorus::explain::{ExplainError, PartialEvalSettings, ResidualStatus, UnknownPath};
     use regorus::rvm::program::SpanInfo;

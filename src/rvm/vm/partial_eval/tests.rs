@@ -97,6 +97,23 @@ fn known_checks_eliminate_or_drop_out() -> anyhow::Result<()> {
 }
 
 #[test]
+fn provisional_conditions_survive_body_error_accounting() -> anyhow::Result<()> {
+    let policy = r#"package test
+allow if {
+  input.u == 1
+  some x in [1, "bad"]
+  1 / x > 0
+}"#;
+    let result = pe(policy, "{}", &["u"])?;
+    assert_eq!(result.status, ResidualStatus::Unsupported);
+    assert_eq!(result.result, Value::Undefined);
+    assert!(result.residual_queries.is_empty());
+    assert_eq!(pe(policy, r#"{"u": 1}"#, &[])?.result, Value::Bool(true));
+    assert_eq!(pe(policy, r#"{"u": 2}"#, &[])?.result, Value::Undefined);
+    Ok(())
+}
+
+#[test]
 fn operators_are_mirrored_onto_the_input_path() -> anyhow::Result<()> {
     let cases = [
         ("18 < input.age", "input.age > 18"),
@@ -489,6 +506,36 @@ fn deeply_nested_known_values_remain_exact() -> anyhow::Result<()> {
         result.residual_queries[0].conditions[0].value.as_ref(),
         Some(&known)
     );
+    Ok(())
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn residual_value_scan_checks_the_execution_timer() -> anyhow::Result<()> {
+    use crate::utils::limits::{acquire_limits_test_lock, ExecutionTimerConfig};
+    use core::{num::NonZeroU32, time::Duration};
+
+    let _guard = acquire_limits_test_lock();
+    let mut machine = vm(TWO_CONDITIONS)?;
+    let mut known = Value::Null;
+    for _ in 0..20 {
+        known = Value::from(vec![known.clone(), known]);
+    }
+    let mut state = machine.validate_unknowns()?;
+    state.shadow.insert(0, Taint::Unknown {
+        path: (UnknownRoot::Input, vec![PathSegment::Key("u".into())]),
+        used: false,
+    });
+    machine.pe = Some(Box::new(state));
+    machine.registers = vec![Value::Undefined, known, Value::Undefined];
+    machine.set_execution_timer_config(Some(ExecutionTimerConfig {
+        limit: Duration::ZERO,
+        check_interval: NonZeroU32::MIN,
+    }));
+    assert!(matches!(
+        machine.pe_compare(Some(2), 0, 1, Operator::Eq),
+        Err(VmError::TimeLimitExceeded { .. })
+    ));
     Ok(())
 }
 
