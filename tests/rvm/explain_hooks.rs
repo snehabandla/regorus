@@ -8,9 +8,9 @@
 
 use anyhow::{bail, Result};
 use regorus::explain::{
-    BodyEndEvent, BuiltinErrorEvent, CallEndEvent, CallResultSource, CallReusedEvent, CallStartEvent,
-    CheckEvent, CheckSite, ConditionKind, EmissionEvent, ExplanationRecorder, HookContext,
-    NotCapturedEvent, Operator, Outcome, Provenance, UncapturedConstruct,
+    BodyEndEvent, BuiltinErrorEvent, CallEndEvent, CallResultSource, CallReusedEvent,
+    CallStartEvent, CheckEvent, CheckSite, ConditionKind, EmissionEvent, ExplanationRecorder,
+    HookContext, NotCapturedEvent, Operator, Outcome, Provenance, UncapturedConstruct,
 };
 use regorus::languages::rego::compiler::Compiler;
 use regorus::rvm::program::Program;
@@ -86,17 +86,25 @@ impl ExplanationRecorder for Fixture {
     }
 
     fn call_start(&mut self, context: &HookContext, event: &CallStartEvent) {
-        self.1.lock().unwrap().push(CallRecord::Start(*context, *event));
+        self.1
+            .lock()
+            .unwrap()
+            .push(CallRecord::Start(*context, *event));
     }
 
     fn call_end(&mut self, context: &HookContext, event: &CallEndEvent<'_>) {
         self.1.lock().unwrap().push(CallRecord::End(
-            *context, event.source, event.result.cloned(),
+            *context,
+            event.source,
+            event.result.cloned(),
         ));
     }
 
     fn call_reused(&mut self, context: &HookContext, event: &CallReusedEvent) {
-        self.1.lock().unwrap().push(CallRecord::Reused(*context, *event));
+        self.1
+            .lock()
+            .unwrap()
+            .push(CallRecord::Reused(*context, *event));
     }
 
     fn check(&mut self, context: &HookContext, event: &CheckEvent<'_>) {
@@ -220,22 +228,29 @@ fn run(policy: &str, query: &str, input: &str) -> Run {
 
 impl Run {
     fn call_ids(&self, name: &str) -> Vec<u64> {
-        self.calls.iter().filter_map(|record| match record {
-            CallRecord::Start(_, event)
-                if self.program.rule_infos[usize::from(event.rule_index)].name == name =>
-            {
-                Some(event.call_instance)
-            }
-            _ => None,
-        }).collect()
+        self.calls
+            .iter()
+            .filter_map(|record| match record {
+                CallRecord::Start(_, event)
+                    if self.program.rule_infos[usize::from(event.rule_index)].name == name =>
+                {
+                    Some(event.call_instance)
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     fn call_end(&self, id: u64) -> (Option<CallResultSource>, Option<Value>) {
-        self.calls.iter().find_map(|record| match record {
-            CallRecord::End(context, source, value) if context.call_instance == Some(id) =>
-                Some((*source, value.clone())),
-            _ => None,
-        }).unwrap()
+        self.calls
+            .iter()
+            .find_map(|record| match record {
+                CallRecord::End(context, source, value) if context.call_instance == Some(id) => {
+                    Some((*source, value.clone()))
+                }
+                _ => None,
+            })
+            .unwrap()
     }
 
     fn events(&self) -> Vec<Event> {
@@ -694,10 +709,14 @@ fn recorder_is_reset_for_each_evaluation() {
         execute(&mut vm, mode).unwrap();
         vm.set_input(v(r#"{"a":false}"#));
         execute(&mut vm, mode).unwrap();
-        let starts: Vec<_> = fixture.calls().into_iter().filter_map(|record| match record {
-            CallRecord::Start(_, event) => Some(event.call_instance),
-            _ => None,
-        }).collect();
+        let starts: Vec<_> = fixture
+            .calls()
+            .into_iter()
+            .filter_map(|record| match record {
+                CallRecord::Start(_, event) => Some(event.call_instance),
+                _ => None,
+            })
+            .collect();
         assert_eq!(starts, [1, 1]);
         let events: Vec<_> = fixture.take().into_iter().map(|r| r.event).collect();
         assert_eq!(
@@ -738,7 +757,10 @@ r := [f(input.a[0],input.a[1],input.a[2]), f(input.b[0],input.b[1],input.b[2])]
         let ids = r.call_ids("data.t.f");
         assert_eq!(ids, [2, 3]);
         for id in ids {
-            assert_eq!(r.call_end(id), (Some(CallResultSource::Body), Some(v(r#""ok""#))));
+            assert_eq!(
+                r.call_end(id),
+                (Some(CallResultSource::Body), Some(v(r#""ok""#)))
+            );
         }
         for record in &r.calls {
             if let CallRecord::Start(caller, event) = record {
@@ -756,14 +778,21 @@ r := [f(input.a[0],input.a[1],input.a[2]), f(input.b[0],input.b[1],input.b[2])]
     }
     let r = run(policy, "data.t.r", r#"{"a":[0,0,0],"b":[1,0,0]}"#);
     let id = r.call_ids("data.t.f")[0];
-    assert_eq!(r.call_end(id), (Some(CallResultSource::Undefined), Some(Value::Undefined)));
+    assert_eq!(
+        r.call_end(id),
+        (Some(CallResultSource::Undefined), Some(Value::Undefined))
+    );
 }
 
 #[test]
 fn invocation_cache_reuse_preserves_original_identity_and_result_source() {
     for (definition, source, input) in [
         ("default p := false", CallResultSource::Default, "{}"),
-        ("default p := false\np if input.x", CallResultSource::Default, r#"{"x":false}"#),
+        (
+            "default p := false\np if input.x",
+            CallResultSource::Default,
+            r#"{"x":false}"#,
+        ),
         ("p := input.x", CallResultSource::Body, r#"{"x":false}"#),
     ] {
         let policy = format!("package t\n{definition}\nr := [p,p]\n");
@@ -772,24 +801,43 @@ fn invocation_cache_reuse_preserves_original_identity_and_result_source() {
         let ids = r.call_ids("data.t.p");
         assert_eq!(ids.len(), 1);
         assert_eq!(r.call_end(ids[0]), (Some(source), Some(Value::Bool(false))));
-        let uses: Vec<_> = r.calls.iter().filter_map(|record| match record {
-            CallRecord::Reused(caller, event) => Some((caller.call_instance, event.call_instance)),
-            _ => None,
-        }).collect();
+        let uses: Vec<_> = r
+            .calls
+            .iter()
+            .filter_map(|record| match record {
+                CallRecord::Reused(caller, event) => {
+                    Some((caller.call_instance, event.call_instance))
+                }
+                _ => None,
+            })
+            .collect();
         assert_eq!(uses, [(Some(1), Some(ids[0]))]);
     }
-    let r = run("package t\np := input.missing\nr if { not p; not p }\n", "data.t.r", "{}");
+    let r = run(
+        "package t\np := input.missing\nr if { not p; not p }\n",
+        "data.t.r",
+        "{}",
+    );
     let id = r.call_ids("data.t.p")[0];
     assert_eq!(r.result.as_ref().unwrap(), &Value::Bool(true));
-    assert_eq!(r.call_end(id), (Some(CallResultSource::Undefined), Some(Value::Undefined)));
+    assert_eq!(
+        r.call_end(id),
+        (Some(CallResultSource::Undefined), Some(Value::Undefined))
+    );
     assert!(r.calls.iter().any(|record| matches!(
         record, CallRecord::Reused(_, event) if event.call_instance == Some(id)
     )));
-    let r = run("package t\np contains x if { some x in input.xs }\nr := [count(p),count(p)]\n",
-        "data.t.r", r#"{"xs":[]}"#);
+    let r = run(
+        "package t\np contains x if { some x in input.xs }\nr := [count(p),count(p)]\n",
+        "data.t.r",
+        r#"{"xs":[]}"#,
+    );
     assert_eq!(r.result.as_ref().unwrap(), &v("[0,0]"));
     let id = r.call_ids("data.t.p")[0];
-    assert_eq!(r.call_end(id), (Some(CallResultSource::Body), Some(Value::new_set())));
+    assert_eq!(
+        r.call_end(id),
+        (Some(CallResultSource::Body), Some(Value::new_set()))
+    );
     assert!(r.calls.iter().any(|record| matches!(
         record, CallRecord::Reused(_, event) if event.call_instance == Some(id)
     )));
@@ -814,7 +862,11 @@ fn invocation_with_undefined_arguments_still_has_start_and_end() {
 
 #[test]
 fn invocation_abort_is_not_undefined_and_fresh_evaluation_restarts_ids() {
-    let program = compile("package t\nf(x) := sum([x,x])\nr := f(input.x)\n", "data.t.r").unwrap();
+    let program = compile(
+        "package t\nf(x) := sum([x,x])\nr := f(input.x)\n",
+        "data.t.r",
+    )
+    .unwrap();
     for mode in MODES {
         let fixture = Fixture::default();
         let mut vm = RegoVM::new();
@@ -825,27 +877,47 @@ fn invocation_abort_is_not_undefined_and_fresh_evaluation_restarts_ids() {
         vm.set_input(v(r#"{"x":1e308}"#));
         assert!(execute(&mut vm, mode).is_err());
         let calls = fixture.calls();
-        let ends: Vec<_> = calls.iter().filter_map(|record| match record {
-            CallRecord::End(context, source, value) =>
-                Some((context.call_instance, *source, value.clone())),
-            _ => None,
-        }).collect();
+        let ends: Vec<_> = calls
+            .iter()
+            .filter_map(|record| match record {
+                CallRecord::End(context, source, value) => {
+                    Some((context.call_instance, *source, value.clone()))
+                }
+                _ => None,
+            })
+            .collect();
         assert_eq!(ends, [(Some(2), None, None), (Some(1), None, None)]);
         vm.set_input(v(r#"{"x":1}"#));
         assert_eq!(execute(&mut vm, mode).unwrap(), v("2"));
         let calls = fixture.calls();
-        let starts: Vec<_> = calls.iter().filter_map(|record| match record {
-            CallRecord::Start(_, event) => Some(event.call_instance),
-            _ => None,
-        }).collect();
+        let starts: Vec<_> = calls
+            .iter()
+            .filter_map(|record| match record {
+                CallRecord::Start(_, event) => Some(event.call_instance),
+                _ => None,
+            })
+            .collect();
         assert_eq!(starts, [1, 2]);
-        assert_eq!(calls.iter().filter(|record| matches!(
-            record, CallRecord::End(_, Some(CallResultSource::Body), Some(_))
-        )).count(), 2);
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|record| matches!(
+                    record,
+                    CallRecord::End(_, Some(CallResultSource::Body), Some(_))
+                ))
+                .count(),
+            2
+        );
     }
-    let r = run("package t\nf(x) := x + 1\nr := f(input.x)\n", "data.t.r", r#"{"x":"bad"}"#);
-    assert_eq!(r.call_end(r.call_ids("data.t.f")[0]),
-        (Some(CallResultSource::Undefined), Some(Value::Undefined)));
+    let r = run(
+        "package t\nf(x) := x + 1\nr := f(input.x)\n",
+        "data.t.r",
+        r#"{"x":"bad"}"#,
+    );
+    assert_eq!(
+        r.call_end(r.call_ids("data.t.f")[0]),
+        (Some(CallResultSource::Undefined), Some(Value::Undefined))
+    );
 }
 
 #[test]
@@ -862,33 +934,57 @@ fn invocation_identity_survives_host_await_and_late_installation_is_explicit() {
             vm.set_explanation_recorder(Box::new(fixture.clone()));
         }
         vm.execute().unwrap();
-        assert!(matches!(vm.execution_state(), ExecutionState::Suspended { .. }));
+        assert!(matches!(
+            vm.execution_state(),
+            ExecutionState::Suspended { .. }
+        ));
         let before = fixture.calls();
-        assert_eq!(before.iter().filter(|record| matches!(record, CallRecord::Start(_, _))).count(),
-            if late { 0 } else { 3 });
+        assert_eq!(
+            before
+                .iter()
+                .filter(|record| matches!(record, CallRecord::Start(_, _)))
+                .count(),
+            if late { 0 } else { 3 }
+        );
         if late {
             vm.set_explanation_recorder(Box::new(fixture.clone()));
         }
         assert!(vm.resume(None).is_err());
         assert!(fixture.calls().is_empty());
         vm.resume(Some(v("7"))).unwrap();
-        assert!(matches!(vm.execution_state(), ExecutionState::Completed { result } if result == &v("[1,7,1]")));
+        assert!(
+            matches!(vm.execution_state(), ExecutionState::Completed { result } if result == &v("[1,7,1]"))
+        );
         let after = fixture.calls();
-        let reused: Vec<_> = after.iter().filter_map(|record| match record {
-            CallRecord::Reused(_, event) => Some(event.call_instance),
-            _ => None,
-        }).collect();
+        let reused: Vec<_> = after
+            .iter()
+            .filter_map(|record| match record {
+                CallRecord::Reused(_, event) => Some(event.call_instance),
+                _ => None,
+            })
+            .collect();
         assert_eq!(reused, [if late { None } else { Some(2) }]);
         if !late {
-            let ended: Vec<_> = after.iter().filter_map(|record| match record {
-                CallRecord::End(context, _, _) => context.call_instance,
-                _ => None,
-            }).collect();
+            let ended: Vec<_> = after
+                .iter()
+                .filter_map(|record| match record {
+                    CallRecord::End(context, _, _) => context.call_instance,
+                    _ => None,
+                })
+                .collect();
             assert_eq!(ended, [3, 1]);
         }
-        assert!(!after.iter().any(|record| matches!(record, CallRecord::Start(_, _))));
-        assert_eq!(fixture.take().iter().filter(|record| record.event == Event::Reset).count(),
-            usize::from(!late));
+        assert!(!after
+            .iter()
+            .any(|record| matches!(record, CallRecord::Start(_, _))));
+        assert_eq!(
+            fixture
+                .take()
+                .iter()
+                .filter(|record| record.event == Event::Reset)
+                .count(),
+            usize::from(!late)
+        );
     }
 }
 
@@ -911,12 +1007,25 @@ fn invocation_late_recorder_does_not_assign_uncaptured_default_to_caller() {
     assert_eq!(vm.get_host_await_identifier(), Some(&v(r#""child""#)));
     vm.set_explanation_recorder(recorder);
     vm.resume(Some(Value::Bool(false))).unwrap();
-    assert!(matches!(vm.execution_state(), ExecutionState::Completed { result } if result == &v("[true,false]")));
-    let ends: Vec<_> = fixture.calls().into_iter().filter_map(|record| match record {
-        CallRecord::End(context, source, value) => Some((context.call_instance, source, value)),
-        _ => None,
-    }).collect();
-    assert_eq!(ends, [(Some(1), Some(CallResultSource::Body), Some(v("[true,false]")))]);
+    assert!(
+        matches!(vm.execution_state(), ExecutionState::Completed { result } if result == &v("[true,false]"))
+    );
+    let ends: Vec<_> = fixture
+        .calls()
+        .into_iter()
+        .filter_map(|record| match record {
+            CallRecord::End(context, source, value) => Some((context.call_instance, source, value)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        ends,
+        [(
+            Some(1),
+            Some(CallResultSource::Body),
+            Some(v("[true,false]"))
+        )]
+    );
 }
 
 #[test]

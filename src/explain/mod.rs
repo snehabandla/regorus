@@ -102,8 +102,8 @@ mod tests;
 pub use error::ExplainError;
 pub use provenance::{CheckSite, Provenance, RuleOwner, SiteId, SiteOwner};
 pub use recorder::{
-    BodyEndEvent, BuiltinErrorEvent, CallEndEvent, CallResultSource, CallReusedEvent, CallStartEvent,
-    CheckEvent, EmissionEvent, ExplanationRecorder, HookContext, NotCapturedEvent,
+    BodyEndEvent, BuiltinErrorEvent, CallEndEvent, CallResultSource, CallReusedEvent,
+    CallStartEvent, CheckEvent, EmissionEvent, ExplanationRecorder, HookContext, NotCapturedEvent,
     UncapturedConstruct,
 };
 pub use report::{
