@@ -1593,3 +1593,40 @@ cases:
           - a: {}
             raw: 1
     round_trip: true
+
+  - note: "two element aliases spelled differently but named alike keep both values"
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                {
+                  "name": "Test/widgets/rules[*].c",
+                  "defaultPath": "properties.rules[*].a",
+                  "paths": []
+                },
+                {
+                  "name": "Test/widgets/rules[*]['b']",
+                  "defaultPath": "properties.rules[*].c",
+                  "paths": []
+                },
+                {
+                  "name": "Test/widgets/rules[*]['c']",
+                  "defaultPath": "properties.rules[*].d",
+                  "paths": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    input:
+      type: Test/widgets
+      properties:
+        rules:
+          - a: 1
+            d: 1
+    round_trip: true

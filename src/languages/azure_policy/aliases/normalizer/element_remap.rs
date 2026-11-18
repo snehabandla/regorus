@@ -19,9 +19,9 @@ use super::super::obj_map::{
 ///
 /// Each source is taken in turn, but all targets are written afterwards, so
 /// pairs that swap or chain field names don't read each other's results.
-/// If a target lies inside or around another pair's source, the pairs may
-/// rely on the old order, so each is instead copied and then its source
-/// removed, one pair at a time.
+/// If a target equals its own source or lies inside or around a pair's
+/// source, or two pairs share a source or a target, the pairs may rely on the old order, so each
+/// is instead copied and then its source removed, one pair at a time.
 ///
 /// When `lowercase` is `true` (normalizer), target path segments are
 /// lowercased.  When `false` (denormalizer), they are written verbatim
@@ -153,12 +153,19 @@ fn remap_at_depth_in_btree(
     }
 }
 
-/// Whether some pair's target lies inside or around some pair's source.
-fn has_nested_pairs(fields: &[(&str, &str)]) -> bool {
-    fields.iter().any(|&(_, target)| {
-        fields.iter().any(|&(source, _)| {
-            is_strictly_nested(source, target) || is_strictly_nested(target, source)
-        })
+/// Whether the pairs may rely on being moved one at a time: some pair's
+/// target equals its own source or lies inside or around some pair's
+/// source, or two pairs share a source or a target.
+fn must_move_in_order(fields: &[(&str, &str)]) -> bool {
+    fields.iter().enumerate().any(|(i, &(source, target))| {
+        source.eq_ignore_ascii_case(target)
+            || fields.iter().any(|&(other, _)| {
+                is_strictly_nested(other, target) || is_strictly_nested(target, other)
+            })
+            || fields
+                .iter()
+                .skip(i.saturating_add(1))
+                .any(|&(s, t)| s.eq_ignore_ascii_case(source) || t.eq_ignore_ascii_case(target))
     })
 }
 
@@ -174,7 +181,7 @@ fn is_strictly_nested(inner: &str, outer: &str) -> bool {
 
 /// Move each `(source, target)` pair's value directly in a BTreeMap.
 fn remap_fields_in_btree(btree: &mut Object, fields: &[(&str, &str)], lowercase: bool) {
-    if has_nested_pairs(fields) {
+    if must_move_in_order(fields) {
         for &(source, target) in fields {
             if let Some(val) = read_dotted_path_btree(btree, source) {
                 write_btree(btree, target, val, lowercase);
@@ -223,7 +230,7 @@ fn read_dotted_path_btree(btree: &Object, path: &str) -> Option<Value> {
 /// Move each `(source, target)` pair's value in an ObjMap.  Used only at
 /// the top level when `depth >= array_chain.len()`.
 fn remap_fields(obj: &mut ObjMap, fields: &[(&str, &str)], lowercase: bool) {
-    if has_nested_pairs(fields) {
+    if must_move_in_order(fields) {
         for &(source, target) in fields {
             if let Some(val) = read_dotted_path(obj, source) {
                 write_obj(obj, target, val, lowercase);
