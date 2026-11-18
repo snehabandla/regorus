@@ -672,67 +672,6 @@ impl Expr {
             Self::OrExpr { eidx, .. } => eidx,
         }
     }
-
-    /// The outermost calls (including operators) nested in the operands of
-    /// this negated expression. OPA evaluates them before the negation, so an
-    /// Undefined one fails the enclosing body instead of satisfying `not`.
-    /// Comprehensions are evaluated as a whole and are not searched.
-    pub(crate) fn negation_lifted_calls(&self) -> Vec<Ref<Expr>> {
-        fn operands(expr: &Expr) -> Vec<&Ref<Expr>> {
-            match *expr {
-                Expr::Call { ref params, .. } => params.iter().collect(),
-                Expr::Array { ref items, .. } | Expr::Set { ref items, .. } => {
-                    items.iter().collect()
-                }
-                Expr::Object { ref fields, .. } => fields
-                    .iter()
-                    .flat_map(|field| [&field.1, &field.2])
-                    .collect(),
-                Expr::UnaryExpr { ref expr, .. } | Expr::RefDot { refr: ref expr, .. } => {
-                    vec![expr]
-                }
-                Expr::RefBrack {
-                    ref refr,
-                    ref index,
-                    ..
-                } => vec![refr, index],
-                Expr::BinExpr {
-                    ref lhs, ref rhs, ..
-                }
-                | Expr::BoolExpr {
-                    ref lhs, ref rhs, ..
-                }
-                | Expr::ArithExpr {
-                    ref lhs, ref rhs, ..
-                } => vec![lhs, rhs],
-                // The key of `k, v in c` stays lazy: it is evaluated only when
-                // the value and the collection are defined.
-                Expr::Membership {
-                    ref value,
-                    ref collection,
-                    ..
-                } => vec![value, collection],
-                _ => Vec::new(),
-            }
-        }
-        fn collect(expr: &Ref<Expr>, calls: &mut Vec<Ref<Expr>>) {
-            match *expr.as_ref() {
-                Expr::Call { .. }
-                | Expr::BinExpr { .. }
-                | Expr::BoolExpr { .. }
-                | Expr::ArithExpr { .. }
-                | Expr::Membership { .. } => calls.push(expr.clone()),
-                ref other => operands(other)
-                    .into_iter()
-                    .for_each(|operand| collect(operand, calls)),
-            }
-        }
-        let mut calls = Vec::new();
-        operands(self)
-            .into_iter()
-            .for_each(|e| collect(e, &mut calls));
-        calls
-    }
 }
 
 #[cfg(test)]

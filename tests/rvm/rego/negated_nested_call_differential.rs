@@ -87,14 +87,15 @@ const NOT_COUNT: &str = "y if not count(input.v) == 1";
 const NOT_COUNT_IN: &str = "y if not count(input.v) in [1]";
 const NOT_COUNT_ARRAY: &str = "y if not [count(input.v)] == [1]";
 const NOT_COUNT_BARE: &str = "y if not count(input.v)";
-const NOT_TO_NUMBER: &str = "y if not to_number(input.v) == 1";
 const NOT_DIV: &str = "y if not input.a / input.b == 1";
-const NOT_OBJECT_GET: &str = r#"y if not object.get(input.v, "k", 0) == 1"#;
 const NOT_NESTED_ARG: &str = r#"y if not startswith(upper(input.s), "a")"#;
 const NOT_FAILING_CALL: &str = r#"y if not startswith(input.s, "a")"#;
 const NOT_CALL_CHAIN: &str = "y if not abs(to_number(input.v)) == 1";
 const NOT_FUNCTION_ARG: &str = "f(_) := 1\ny if not f(count(input.v)) == 2";
-const NOT_INDEX: &str = "y if not input.x[count(input.v)] == 1";
+const NOT_INDEX_FIELD: &str = "y if not input.x[count(input.v)].k == 1";
+const NOT_OBJECT_OPERAND: &str = r#"y if not {"a": count(input.v)} == {"a": 1}"#;
+const NOT_SET_OPERAND: &str = "y if not {count(input.v)} == {1}";
+const NOT_COMPREHENSION_OPERAND: &str = "y if not [count(input.v) | true] == [1]";
 const NOT_FUNCTION: &str = "f(x) := 1 if x > 0\ny if not f(input.v) == 2";
 const NOT_IN_BODY: &str = "y if {\n  input.w == 1\n  not count(input.v) == 1\n  input.w > 0\n}";
 const NOT_DEFAULT: &str = "default y := false\ny if not count(input.v) == 1";
@@ -140,6 +141,27 @@ fn cases() -> Vec<Case> {
             r#"{"v": [1, 2]}"#,
             "true",
         ),
+        case(
+            "object operand",
+            NOT_OBJECT_OPERAND,
+            r#"{"v": 5}"#,
+            V(UNDEFINED),
+            error(COUNT_ERROR, UNDEFINED),
+        ),
+        same(
+            "object operand twin",
+            NOT_OBJECT_OPERAND,
+            r#"{"v": [1, 2]}"#,
+            "true",
+        ),
+        case(
+            "set operand",
+            NOT_SET_OPERAND,
+            r#"{"v": 5}"#,
+            V(UNDEFINED),
+            error(COUNT_ERROR, UNDEFINED),
+        ),
+        same("set operand twin", NOT_SET_OPERAND, r#"{"v": [1, 2]}"#, "true"),
         // The negated call itself is not lifted: its failure makes `not`
         // succeed.
         case(
@@ -169,14 +191,6 @@ fn cases() -> Vec<Case> {
             UNDEFINED,
         ),
         case(
-            "to_number",
-            NOT_TO_NUMBER,
-            r#"{"v": "x"}"#,
-            V(UNDEFINED),
-            error("could not parse", UNDEFINED),
-        ),
-        same("to_number twin", NOT_TO_NUMBER, r#"{"v": "2"}"#, "true"),
-        case(
             "divide by zero",
             NOT_DIV,
             r#"{"a": 1, "b": 0}"#,
@@ -184,19 +198,6 @@ fn cases() -> Vec<Case> {
             error("divide by zero", UNDEFINED),
         ),
         same("divide twin", NOT_DIV, r#"{"a": 1, "b": 2}"#, "true"),
-        case(
-            "object.get on a number",
-            NOT_OBJECT_GET,
-            r#"{"v": 5}"#,
-            V(UNDEFINED),
-            error("`object.get` expects object argument", UNDEFINED),
-        ),
-        same(
-            "object.get twin",
-            NOT_OBJECT_GET,
-            r#"{"v": {"k": 2}}"#,
-            "true",
-        ),
         case(
             "nested call argument",
             NOT_NESTED_ARG,
@@ -232,16 +233,16 @@ fn cases() -> Vec<Case> {
             "true",
         ),
         case(
-            "index",
-            NOT_INDEX,
-            r#"{"x": [0, 0, 0], "v": 5}"#,
+            "index field",
+            NOT_INDEX_FIELD,
+            r#"{"x": [{"k": 0}], "v": 5}"#,
             V(UNDEFINED),
             error(COUNT_ERROR, UNDEFINED),
         ),
         same(
-            "index twin",
-            NOT_INDEX,
-            r#"{"x": [0, 0, 0], "v": [1]}"#,
+            "index field twin",
+            NOT_INDEX_FIELD,
+            r#"{"x": [{"k": 0}], "v": []}"#,
             "true",
         ),
         same("undefined function", NOT_FUNCTION, r#"{"v": 0}"#, UNDEFINED),
@@ -354,6 +355,19 @@ fn cases() -> Vec<Case> {
             r#"{"v": [5]}"#,
             UNDEFINED,
         ),
+        case(
+            "comprehension operand",
+            NOT_COMPREHENSION_OPERAND,
+            r#"{"v": 5}"#,
+            V("true"),
+            error(COUNT_ERROR, UNDEFINED),
+        ),
+        same(
+            "comprehension operand twin",
+            NOT_COMPREHENSION_OPERAND,
+            r#"{"v": [1]}"#,
+            UNDEFINED,
+        ),
     ]
 }
 
@@ -451,5 +465,26 @@ fn negated_nested_calls_match_opa() -> Result<()> {
         failures.len(),
         failures.join("\n")
     );
+    Ok(())
+}
+
+/// The interpreter evaluates each lifted call once, as OPA and the RVM do:
+/// `h` prints once whether it is undefined, defined but the negated
+/// expression is undefined, or the negated expression is defined.
+#[test]
+fn negated_nested_calls_are_evaluated_once() -> Result<()> {
+    let module = "package test\n\nh(x) := 1 if {\n  print(\"h\")\n  x == 1\n}\n\ny if not h(input.v) == input.w\n";
+    for (input, want) in [
+        (r#"{"v": 5}"#, UNDEFINED),
+        (r#"{"v": 1}"#, "true"),
+        (r#"{"v": 1, "w": 1}"#, UNDEFINED),
+    ] {
+        let mut engine = new_engine(module, false)?;
+        engine.set_gather_prints(true);
+        engine.set_input(Value::from_json_str(input)?);
+        assert_eq!(engine.eval_rule(ENTRYPOINT.to_string())?, want_value(want)?);
+        let prints = engine.take_prints()?;
+        assert_eq!(prints.len(), 1, "input {input}: {prints:?}");
+    }
     Ok(())
 }

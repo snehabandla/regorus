@@ -8,6 +8,7 @@
 
 use super::{Compiler, CompilerError, ComprehensionType, ContextType, Result};
 use crate::ast::{self, LiteralStmt, Query};
+use crate::query::traversal::negation_lifted_calls;
 use crate::rvm::instructions::GuardMode;
 use crate::rvm::program::RuleType;
 use crate::rvm::Instruction;
@@ -284,7 +285,7 @@ impl<'a> Compiler<'a> {
                     // Calls nested in the operands are evaluated before the
                     // negation; an Undefined one fails the body.
                     let mut lifted = Vec::new();
-                    for call in expr.negation_lifted_calls() {
+                    for call in negation_lifted_calls(expr).map_err(CompilerError::from)? {
                         if compiler.loop_expr_register_map.contains_key(&call) {
                             continue;
                         }

@@ -29,6 +29,7 @@ use crate::value::*;
 use crate::*;
 use crate::{Expression, Extension, Location, QueryResult, QueryResults};
 
+use crate::query::traversal::negation_lifted_calls;
 #[cfg(feature = "coverage")]
 use crate::query::traversal::traverse;
 
@@ -1197,26 +1198,13 @@ impl Interpreter {
                 }
             }
             Literal::NotExpr { span, expr, .. } => {
-                let value = match expr.as_ref() {
-                    // Extra parameter is allowed; but a return argument is not allowed.
-                    Expr::Call {
-                        span: call_span,
-                        fcn,
-                        params,
-                        ..
-                    } => self.eval_call(
-                        call_span,
-                        expr,
-                        fcn,
-                        params,
-                        get_extra_arg(
-                            expr,
-                            Some(self.current_module_path.as_str()),
-                            &self.compiled_policy.functions,
-                        ),
-                        false,
-                    )?,
-                    _ => self.eval_expr(expr)?,
+                let mut lifted = Vec::new();
+                let value = self.eval_negated_expr(expr, &mut lifted);
+                for call in &lifted {
+                    self.remove_loop_var_value(call);
+                }
+                let Some(value) = value? else {
+                    return Ok(false);
                 };
 
                 if let Some(ctx) = self.contexts.last_mut() {
@@ -1224,16 +1212,6 @@ impl Interpreter {
                         result
                             .expressions
                             .push(Self::make_expression_result(span, &Value::Bool(true)));
-                    }
-                }
-
-                // An Undefined call nested in the operands fails the body
-                // instead of satisfying `not` (see `negation_lifted_calls`).
-                if value == Value::Undefined {
-                    for call in expr.negation_lifted_calls() {
-                        if self.eval_expr(&call)? == Value::Undefined {
-                            return Ok(false);
-                        }
                     }
                 }
 
@@ -3557,6 +3535,51 @@ impl Interpreter {
         }
     }
 
+    /// Evaluates a negated expression. OPA evaluates the calls nested in its
+    /// operands (`negation_lifted_calls`) before the negation: an Undefined
+    /// one fails the body (`None`) instead of satisfying `not`. The values of
+    /// the others are cached for the negated expression; the caller removes
+    /// the `lifted` entries.
+    fn eval_negated_expr(
+        &mut self,
+        expr: &ExprRef,
+        lifted: &mut Vec<ExprRef>,
+    ) -> Result<Option<Value>> {
+        for call in negation_lifted_calls(expr)? {
+            if self.get_loop_var_value(&call)?.is_some() {
+                continue;
+            }
+            let value = self.eval_expr(&call)?;
+            if value == Value::Undefined {
+                return Ok(None);
+            }
+            self.set_loop_var_value(&call, value)?;
+            lifted.push(call);
+        }
+        let value = match expr.as_ref() {
+            // Extra parameter is allowed; but a return argument is not allowed.
+            Expr::Call {
+                span: call_span,
+                fcn,
+                params,
+                ..
+            } => self.eval_call(
+                call_span,
+                expr,
+                fcn,
+                params,
+                get_extra_arg(
+                    expr,
+                    Some(self.current_module_path.as_str()),
+                    &self.compiled_policy.functions,
+                ),
+                false,
+            )?,
+            _ => self.eval_expr(expr)?,
+        };
+        Ok(Some(value))
+    }
+
     fn eval_expr(&mut self, expr: &ExprRef) -> Result<Value> {
         self.with_native_depth(|this| this.eval_expr_impl(expr))
     }
@@ -3591,6 +3614,19 @@ impl Interpreter {
                         self.coverage.insert(source.clone(), c);
                     }
                 }
+            }
+        }
+
+        // Operators lifted out of a negated expression (`eval_negated_expr`).
+        if matches!(
+            expr.as_ref(),
+            Expr::BinExpr { .. }
+                | Expr::BoolExpr { .. }
+                | Expr::ArithExpr { .. }
+                | Expr::Membership { .. }
+        ) {
+            if let Some(v) = self.get_loop_var_value(expr)? {
+                return Ok(v.clone());
             }
         }
 
