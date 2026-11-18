@@ -151,14 +151,34 @@ fn remap_at_depth_in_btree(
     }
 }
 
+/// Read each pair's source, paired with its target. A source inside one an
+/// earlier pair already moved is skipped, as moving them in turn would.
+fn read_sources<'a>(
+    fields: &[(&str, &'a str)],
+    read: impl Fn(&str) -> Option<Value>,
+) -> Vec<(&'a str, Value)> {
+    let mut read_from: Vec<&str> = Vec::new();
+    let mut moved = Vec::new();
+    for &(source, target) in fields {
+        let inside_moved = read_from.iter().any(|outer| {
+            source
+                .strip_prefix(outer)
+                .is_some_and(|rest| rest.starts_with('.'))
+        });
+        if inside_moved {
+            continue;
+        }
+        if let Some(val) = read(source) {
+            read_from.push(source);
+            moved.push((target, val));
+        }
+    }
+    moved
+}
+
 /// Move each `(source, target)` pair's value directly in a BTreeMap.
 fn remap_fields_in_btree(btree: &mut Object, fields: &[(&str, &str)], lowercase: bool) {
-    let moved: Vec<(&str, Value)> = fields
-        .iter()
-        .filter_map(|&(source, target)| {
-            read_dotted_path_btree(btree, source).map(|val| (target, val))
-        })
-        .collect();
+    let moved = read_sources(fields, |source| read_dotted_path_btree(btree, source));
     if moved.is_empty() {
         return;
     }
@@ -192,10 +212,7 @@ fn read_dotted_path_btree(btree: &Object, path: &str) -> Option<Value> {
 /// Move each `(source, target)` pair's value in an ObjMap.  Used only at
 /// the top level when `depth >= array_chain.len()`.
 fn remap_fields(obj: &mut ObjMap, fields: &[(&str, &str)], lowercase: bool) {
-    let moved: Vec<(&str, Value)> = fields
-        .iter()
-        .filter_map(|&(source, target)| read_dotted_path(obj, source).map(|val| (target, val)))
-        .collect();
+    let moved = read_sources(fields, |source| read_dotted_path(obj, source));
     if moved.is_empty() {
         return;
     }

@@ -1359,3 +1359,80 @@ cases:
             - state: waiting
               status: idle
     round_trip: true
+
+  - note: "an absent nested override alias is not filled from its parent alias"
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                {
+                  "name": "Test/widgets/rules[*].settings",
+                  "defaultPath": "properties.rules[*].configuration",
+                  "paths": []
+                },
+                {
+                  "name": "Test/widgets/rules[*].settings.mode",
+                  "defaultPath": "properties.rules[*].legacyMode",
+                  "paths": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    input:
+      type: Test/widgets
+      properties:
+        rules:
+          - configuration:
+              mode: strict
+    expected_normalized:
+      type: Test/widgets
+      rules:
+        - settings:
+            mode: strict
+    round_trip: true
+
+  - note: "an alias over an ARM object keeps a field another alias also reads"
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                {
+                  "name": "Test/widgets/rules[*].a",
+                  "defaultPath": "properties.rules[*].x.y",
+                  "paths": []
+                },
+                {
+                  "name": "Test/widgets/rules[*].b",
+                  "defaultPath": "properties.rules[*].x",
+                  "paths": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    input:
+      type: Test/widgets
+      properties:
+        rules:
+          - x:
+              y: 1
+              z: 2
+    expected_normalized:
+      type: Test/widgets
+      rules:
+        - a: 1
+          b:
+            y: 1
+            z: 2
+    round_trip: true
