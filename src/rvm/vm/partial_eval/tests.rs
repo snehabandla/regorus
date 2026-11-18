@@ -603,6 +603,105 @@ fn fatal_errors_are_not_unsupported() -> anyhow::Result<()> {
 }
 
 #[test]
+fn host_await_identifiers_consume_unknowns() -> anyhow::Result<()> {
+    for reference in ["input", "input.u"] {
+        let source = format!(
+            "package test\nallow := __builtin_host_await(\"payload\", {reference})"
+        );
+        for respond in [false, true] {
+            let mut machine = vm(&source)?;
+            machine.set_input(Value::new_object());
+            if respond {
+                let identifier = if reference == "input" {
+                    Value::new_object()
+                } else {
+                    Value::Undefined
+                };
+                machine.set_host_await_responses([(identifier, [Value::Bool(true)])]);
+            }
+            let mut settings = PartialEvalSettings::default();
+            settings.unknowns = keys(&["u"]);
+            machine.set_partial_eval_settings(settings);
+            assert_eq!(machine.partial_eval("data.test.allow")?.status, ResidualStatus::Unsupported,
+                "{reference}, respond={respond}");
+        }
+    }
+    let mut machine = vm(
+        "package test\nallow := __builtin_host_await(\"payload\", input.u)"
+    )?;
+    machine.set_input(Value::from_json_str(r#"{"u":"ok"}"#)?);
+    machine.set_host_await_responses([(Value::from("ok"), [Value::Bool(true)])]);
+    let mut settings = PartialEvalSettings::default();
+    settings.unknowns = keys(&["other"]);
+    machine.set_partial_eval_settings(settings);
+    let result = machine.partial_eval("data.test.allow")?;
+    assert_eq!(result.status, ResidualStatus::Exact);
+    assert_eq!(result.result, Value::Bool(true));
+    Ok(())
+}
+
+#[test]
+fn implicit_entry_results_consume_unknowns() -> anyhow::Result<()> {
+    for ending in [
+        None,
+        Some(Instruction::DestructuringSuccess {}),
+        Some(Instruction::Return { value: 0 }),
+    ] {
+        let mut program = Program::new();
+        program.add_instruction(Instruction::LoadInput { dest: 0 }, None);
+        if let Some(ending) = ending {
+            program.add_instruction(ending, None);
+        }
+        program.add_entry_point("entry".into(), 0);
+        let mut machine = RegoVM::new();
+        machine.load_program(Arc::new(program));
+        machine.set_input(Value::new_object());
+        let mut settings = PartialEvalSettings::default();
+        settings.unknowns = keys(&["u"]);
+        machine.set_partial_eval_settings(settings);
+        assert_eq!(machine.partial_eval("entry")?.status, ResidualStatus::Unsupported);
+        machine.set_partial_eval_settings(PartialEvalSettings::default());
+        let result = machine.partial_eval("entry")?;
+        assert_eq!(result.status, ResidualStatus::Exact);
+        assert_eq!(result.result, Value::new_object());
+    }
+    Ok(())
+}
+
+#[test]
+fn chained_index_skips_keys_after_known_undefined() -> anyhow::Result<()> {
+    use crate::rvm::instructions::{ChainedIndexParams, LiteralOrRegister};
+
+    let mut program = Program::new();
+    program.literals.push(Value::from("missing"));
+    let params_index = program.instruction_data.add_chained_index_params(ChainedIndexParams {
+        dest: 1,
+        root: 0,
+        path_components: alloc::vec![
+            LiteralOrRegister::Literal(0),
+            LiteralOrRegister::Register(255),
+        ],
+    });
+    program.add_instruction(Instruction::LoadInput { dest: 0 }, None);
+    program.add_instruction(Instruction::ChainedIndex { params_index }, None);
+    program.add_instruction(Instruction::Return { value: 1 }, None);
+    program.add_entry_point("entry".into(), 0);
+    let mut machine = RegoVM::new();
+    machine.load_program(Arc::new(program));
+    machine.set_base_register_count(2);
+    machine.set_input(Value::new_object());
+    for unknowns in [vec![], keys(&["u"])] {
+        let mut settings = PartialEvalSettings::default();
+        settings.unknowns = unknowns;
+        machine.set_partial_eval_settings(settings);
+        let result = machine.partial_eval("entry")?;
+        assert_eq!(result.status, ResidualStatus::Exact);
+        assert_eq!(result.result, Value::Undefined);
+    }
+    Ok(())
+}
+
+#[test]
 fn shadow_indexing_preserves_invalid_register_errors() -> anyhow::Result<()> {
     let mut program = Program::new();
     program.add_instruction(Instruction::LoadInput { dest: 0 }, None);

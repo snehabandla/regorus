@@ -2603,6 +2603,39 @@ fn partial_eval_serialization_preflight_memory_failure_publishes_error_state() {
 
 #[cfg(feature = "explanations")]
 #[test]
+fn partial_eval_transient_shadow_paths_are_budgeted() {
+    use regorus::explain::{ExplainError, PartialEvalSettings, ResidualStatus, UnknownPath};
+    use regorus::rvm::{Instruction, Program};
+
+    let _guard = LimitGuard::lock();
+    let mut program = Program::new();
+    program.literals.push(Value::from("x".repeat(256 * 1024)));
+    program.add_instruction(Instruction::LoadInput { dest: 0 }, None);
+    program.add_instruction(
+        Instruction::IndexLiteral { dest: 0, container: 0, literal_idx: 0 },
+        None,
+    );
+    program.add_instruction(Instruction::Return { value: 0 }, None);
+    program.add_entry_point("entry".into(), 0);
+    let mut vm = RegoVM::new();
+    vm.load_program(Arc::new(program));
+    vm.set_input(Value::new_object());
+    let mut settings = PartialEvalSettings::default();
+    settings.unknowns = vec![UnknownPath::input_keys(["u"])];
+    vm.set_partial_eval_settings(settings);
+    vm.set_memory_budget_config(Some(MemoryBudgetConfig {
+        limit: NonZeroU64::new(64 * 1024).unwrap(),
+    }));
+    let result = vm.partial_eval("entry");
+    assert!(matches!(result, Err(ExplainError::Vm(VmError::MemoryBudgetExceeded { .. }))), "{result:?}");
+    vm.set_memory_budget_config(None);
+    let result = vm.partial_eval("entry").unwrap();
+    assert_eq!(result.status, ResidualStatus::Exact);
+    assert_eq!(result.result, Value::Undefined);
+}
+
+#[cfg(feature = "explanations")]
+#[test]
 fn partial_eval_validation_is_in_the_memory_budget() {
     use regorus::explain::{ExplainError, PartialEvalSettings, UnknownPath};
 
