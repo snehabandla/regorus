@@ -40,7 +40,7 @@ import rego.v1
 result := data.probe.sub
 n := count(data.probe.sub)
 keys := object.keys(data.probe.sub)
-pairs := {k | some k, _ in data.probe.sub}
+pairs contains k if some k, _ in data.probe.sub
 eq_check := object.remove(data.probe.sub, ["s"]) == json.unmarshal(`{"defined": 1, "f": false, "d": "dflt", "o": {}, "inner": {}}`)
 has_undefined_body if "undefined_body" in object.keys(data.probe.sub)
 ser := json.marshal(data.probe.sub)
@@ -187,3 +187,4 @@ fn package_of_only_undefined_rules_is_empty_object() -> Result<()> {
         ],
     )
 }
+
