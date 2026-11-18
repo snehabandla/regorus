@@ -79,9 +79,9 @@ pub(super) fn decode(program: &Program) -> Provenance {
 }
 
 fn component(program: &Program, index: u16) -> Option<String> {
-    match program.literals.get(usize::from(index))? {
-        Value::String(key) => serde_json::to_string(key.as_ref()).ok(),
-        Value::Number(number) => number.as_u64().map(|n| n.to_string()),
+    match *program.literals.get(usize::from(index))? {
+        Value::String(ref key) => serde_json::to_string(key.as_ref()).ok(),
+        Value::Number(ref number) => number.as_u64().map(|n| n.to_string()),
         _ => None,
     }
 }
