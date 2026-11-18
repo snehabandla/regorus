@@ -187,4 +187,3 @@ fn package_of_only_undefined_rules_is_empty_object() -> Result<()> {
         ],
     )
 }
-
