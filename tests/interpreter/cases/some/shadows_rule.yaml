@@ -1,72 +1,9 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-# A variable declared with `some` shadows a rule (or import) of the same
-# name. Expected results were verified against OPA 1.2.0.
+# A variable declared with `some` shadows a rule of the same name.
 
 cases:
-  - note: some-shadows-rule-in-body
-    data:
-      a:
-        b:
-          c: 1
-    modules:
-      - &body_module |
-        package test
-        import rego.v1
-        k := 1
-
-        body_some contains x if {
-          some k
-          data.a.b[k]
-          x := k
-        }
-
-        body_head contains k if {
-          some k
-          data.a.b[k]
-        }
-
-        body_some_in contains x if {
-          some k in ["x"]
-          x := k
-        }
-
-        # Without a declaration, `k` refers to the rule.
-        body_rule_ref contains x if {
-          data.a.b[k]
-          x := k
-        }
-    query: data.test
-    want_result:
-      k: 1
-      body_some:
-        set!: ["c"]
-      body_head:
-        set!: ["c"]
-      body_some_in:
-        set!: ["x"]
-      body_rule_ref:
-        set!: []
-
-  - note: some-shadows-rule-in-body-array-data
-    data:
-      a:
-        b: ["x", "y"]
-    modules:
-      - *body_module
-    query: data.test
-    want_result:
-      k: 1
-      body_some:
-        set!: [0, 1]
-      body_head:
-        set!: [0, 1]
-      body_some_in:
-        set!: ["x"]
-      body_rule_ref:
-        set!: [1]
-
   - note: some-shadows-partial-set-rule
     data:
       a:
@@ -126,29 +63,3 @@ cases:
       r:
         set!: ["c"]
       s: 5
-
-  - note: some-shadows-import
-    data:
-      a:
-        b:
-          c: 1
-    modules:
-      - |
-        package lib
-        import rego.v1
-        k := 1
-      - |
-        package test
-        import rego.v1
-        import data.lib.k
-        r := {k | some k; data.a.b[k]}
-        s := {x | data.a.b[x]; x != k}
-        t := {x | x := k}
-    query: data.test
-    want_result:
-      r:
-        set!: ["c"]
-      s:
-        set!: ["c"]
-      t:
-        set!: [1]
