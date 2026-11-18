@@ -10,7 +10,9 @@
 //! Instead, the first guarded call installs one hook that records panics on
 //! threads inside a guarded call and forwards every other panic to the hook
 //! that was installed before it. A hook the host installs afterwards replaces
-//! it; guarded panics are then still caught, only without the extra details.
+//! it: guarded panics are then still caught, but also reach that hook and lose
+//! the extra details. Swapping hooks is not atomic on stable Rust, so a hook the
+//! host sets concurrently with the first guarded call can be lost.
 
 extern crate alloc;
 
@@ -83,13 +85,18 @@ mod hook {
             return false;
         }
         let backtrace = Backtrace::force_capture();
-        let details = alloc::format!("panic hook observed: {info}\nbacktrace:\n{backtrace:#?}");
+        store_details(Some(alloc::format!(
+            "panic hook observed: {info}\nbacktrace:\n{backtrace:#?}"
+        )));
+        true
+    }
+
+    fn store_details(details: Option<String>) {
         let _ = PANIC_BACKTRACE.try_with(|slot| {
             if let Ok(mut slot) = slot.try_borrow_mut() {
-                *slot = Some(details);
+                *slot = details;
             }
         });
-        true
     }
 
     pub(super) fn take_panic_backtrace() -> Option<String> {
@@ -106,11 +113,7 @@ mod hook {
         pub(super) fn enter() -> Self {
             ensure_installed();
             let _ = GUARD_DEPTH.try_with(|depth| depth.set(depth.get().saturating_add(1)));
-            let _ = PANIC_BACKTRACE.try_with(|slot| {
-                if let Ok(mut slot) = slot.try_borrow_mut() {
-                    *slot = None;
-                }
-            });
+            store_details(None);
             GuardScope(())
         }
     }
@@ -219,9 +222,6 @@ where
         return poisoned_result();
     }
 
-    // The closure passed across this boundary closes over raw pointers and lock guards.
-    // These types are not unwind safe by default and may become poisoned if a panic occurs.
-    // We therefore use AssertUnwindSafe to get the compiler to accept the closure.
     // Upon unwind, we mark regorus as poisoned and disallow further use.
     #[cfg(feature = "std")]
     return finalize(catch_panic(f));
@@ -236,6 +236,9 @@ where
     F: FnOnce() -> RegorusResult,
 {
     let _guard_scope = hook::GuardScope::enter();
+    // The closure passed across this boundary closes over raw pointers and lock guards.
+    // These types are not unwind safe by default and may become poisoned if a panic occurs.
+    // We therefore use AssertUnwindSafe to get the compiler to accept the closure.
     match panic::catch_unwind(AssertUnwindSafe(f)) {
         Ok(value) => GuardResult::Success(value),
         Err(payload) => GuardResult::Panic(panic_message_to_string(payload)),
