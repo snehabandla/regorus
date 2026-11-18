@@ -1820,7 +1820,10 @@ fn nested_comprehension_conditions_do_not_replace_the_finding_subject() -> anyho
         attempt: Some(1),
         scope,
     };
-    let subject = rule.definitions[0]
+    let subject = rule
+        .definitions
+        .first_mut()
+        .context("queried definition")?
         .conditions
         .first_mut()
         .context("subject loop")?;
@@ -1859,8 +1862,14 @@ fn nested_comprehension_conditions_do_not_replace_the_finding_subject() -> anyho
         binding: None,
     };
     let conditions = vec![subject.clone(), local, predicate, negation];
-    rule.definitions[0].conditions = conditions.clone();
-    rule.emissions[0].conditions = conditions.clone();
+    rule.definitions
+        .first_mut()
+        .context("queried definition")?
+        .conditions = conditions.clone();
+    rule.emissions
+        .first_mut()
+        .context("queried emission")?
+        .conditions = conditions.clone();
     rule.attempts = Some(vec![AttemptExplanation {
         attempt: 1,
         definition: 0,
@@ -2068,7 +2077,7 @@ fn value_only_helpers_keep_argument_origins_without_body_predicates() -> anyhow:
         contributions.push(binding);
         report.rules.push(helper);
     }
-    report.rules[0].results = Some(vec![ResultExplanation::new(
+    report.rules.first_mut().context("queried rule")?.results = Some(vec![ResultExplanation::new(
         None,
         ReportedValue::Known(report.query_result.clone()),
         Count::Exact(1),
