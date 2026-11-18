@@ -60,10 +60,17 @@ mod hook {
         INSTALLED.store(true, Ordering::Release);
     }
 
-    /// Lets a test that replaced the process hook have it installed again.
     #[cfg(test)]
-    pub(super) fn forget_installation() {
+    type Hook = Box<dyn Fn(&PanicHookInfo<'_>) + Sync + Send + 'static>;
+
+    /// Swaps the process hook without racing an install; the next guarded call reinstalls.
+    #[cfg(test)]
+    pub(super) fn replace_process_hook(new: Hook) -> Hook {
+        let _install = INSTALL_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        let previous = panic::take_hook();
+        panic::set_hook(new);
         INSTALLED.store(false, Ordering::Release);
+        previous
     }
 
     /// Records a panic raised inside a guarded call; returns false for any other panic.
@@ -284,8 +291,7 @@ pub(crate) fn reset_poison() {
 
 #[cfg(all(test, feature = "std"))]
 mod tests {
-    use super::hook::forget_installation as forget_hook_installation;
-    use super::{catch_panic, with_unwind_guard, GuardResult};
+    use super::{catch_panic, hook, with_unwind_guard, GuardResult};
     use crate::common::{regorus_result_drop, RegorusResult, RegorusStatus};
     use std::panic;
     use std::sync::{mpsc, Mutex};
@@ -320,9 +326,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clear();
-        let previous_hook = panic::take_hook();
-        panic::set_hook(Box::new(host_hook));
-        forget_hook_installation();
+        let previous_hook = hook::replace_process_hook(Box::new(host_hook));
 
         let workers: Vec<_> = (0..THREADS)
             .map(|thread| {
@@ -390,8 +394,7 @@ mod tests {
         }
 
         // Restore before asserting: the hook cannot be changed while unwinding.
-        panic::set_hook(previous_hook);
-        forget_hook_installation();
+        drop(hook::replace_process_hook(previous_hook));
         assert!(
             problems.is_empty(),
             "{} problems: {:#?}",
