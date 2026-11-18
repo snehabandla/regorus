@@ -3269,9 +3269,12 @@ impl Interpreter {
                     continue;
                 }
 
-                let vref = Self::make_or_get_value_mut(&mut self.data, &module_value_components)?;
-                if *vref == Value::Undefined {
-                    *vref = Value::new_object();
+                if !Self::ensure_package_value(
+                    &mut self.data,
+                    &module_value_components,
+                    !module.policy.is_empty(),
+                )? {
+                    continue;
                 }
 
                 for rule in &module.policy {
@@ -3419,6 +3422,39 @@ impl Interpreter {
         Ok(false)
     }
 
+    /// Looks up `fields` in `data`. A package without rules below a non-object value in base
+    /// data is not stored in `data`, but, as in OPA, it still reads as an empty object.
+    fn lookup_data(&self, fields: &[&str]) -> Result<Value> {
+        let mut value = Self::get_value_chained(self.data.clone(), fields);
+        if value != Value::Undefined || fields.is_empty() {
+            return Ok(value);
+        }
+        for module in self.compiled_policy.modules.iter() {
+            let package = Parser::get_static_string_path_components(&module.package.refr)?;
+            let package: Vec<&str> = package.iter().map(String::as_str).collect();
+            if !module.policy.is_empty()
+                || !package.starts_with(fields)
+                || self.has_explicit_data_with_override_ancestor(&package)?
+            {
+                continue;
+            }
+            let mut package_value = Value::new_object();
+            for component in package[fields.len()..].iter().rev() {
+                let mut parent = Value::new_object();
+                parent
+                    .as_object_mut()?
+                    .insert(Value::String((*component).into()), package_value);
+                package_value = parent;
+            }
+            if value == Value::Undefined {
+                value = package_value;
+            } else {
+                value.merge(package_value)?;
+            }
+        }
+        Ok(value)
+    }
+
     fn lookup_var(&mut self, span: &Span, fields: &[&str], no_error: bool) -> Result<Value> {
         let name = span.source_str();
 
@@ -3443,7 +3479,7 @@ impl Interpreter {
         // Ensure that rules are evaluated
         if name.text() == "data" {
             if self.is_processed(fields)? {
-                return Ok(Self::get_value_chained(self.data.clone(), fields));
+                return self.lookup_data(fields);
             }
 
             // If "data" is used in a query, without any fields, then evaluate all the modules.
@@ -3479,7 +3515,7 @@ impl Interpreter {
                 }
             }
 
-            Ok(Self::get_value_chained(self.data.clone(), fields))
+            self.lookup_data(fields)
         } else if !self.compiled_policy.modules.is_empty() {
             let module = self.current_module()?;
             let mut module_var_path =
@@ -3856,6 +3892,37 @@ impl Interpreter {
     }
 
     #[inline]
+    /// Ensures that `data` has an object at the package `path`. Returns false, leaving `data`
+    /// unchanged, for a package without rules when `data` holds a non-object value at or above
+    /// `path`: as in OPA, such a package does not conflict with base data, which wins.
+    pub(crate) fn ensure_package_value(
+        data: &mut Value,
+        path: &[&str],
+        has_rules: bool,
+    ) -> Result<bool> {
+        if !has_rules {
+            let mut value = &*data;
+            for component in path {
+                match value {
+                    Value::Object(fields) => {
+                        match fields.get(&Value::String((*component).into())) {
+                            Some(v) => value = v,
+                            None => break,
+                        }
+                    }
+                    Value::Undefined => break,
+                    _ => return Ok(false),
+                }
+            }
+        }
+
+        let vref = Self::make_or_get_value_mut(data, path)?;
+        if *vref == Value::Undefined {
+            *vref = Value::new_object();
+        }
+        Ok(true)
+    }
+
     pub fn make_or_get_value_mut<'a>(obj: &'a mut Value, paths: &[&str]) -> Result<&'a mut Value> {
         let (first, tail) = match paths.split_first() {
             Some(v) => v,
