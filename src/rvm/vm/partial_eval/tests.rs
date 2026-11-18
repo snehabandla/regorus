@@ -469,6 +469,30 @@ fn nested_undefined_residual_values_fail_closed() -> anyhow::Result<()> {
 }
 
 #[test]
+fn deeply_nested_known_values_remain_exact() -> anyhow::Result<()> {
+    use alloc::collections::BTreeMap;
+    let mut known = Value::Null;
+    for _ in 0..16_384 {
+        known = Value::from(vec![known]);
+    }
+    let mut machine = vm("package test\nallow if input.u == input.known")?;
+    machine.set_input(Value::from(BTreeMap::from([(
+        Value::from("known"),
+        known.clone(),
+    )])));
+    let mut settings = PartialEvalSettings::default();
+    settings.unknowns = keys(&["u"]);
+    machine.set_partial_eval_settings(settings);
+    let result = machine.partial_eval("data.test.allow")?;
+    assert_eq!(result.status, ResidualStatus::Exact);
+    assert_eq!(
+        result.residual_queries[0].conditions[0].value.as_ref(),
+        Some(&known)
+    );
+    Ok(())
+}
+
+#[test]
 fn deployment_unknowns() -> anyhow::Result<()> {
     let rego = r#"package test
 allow if {
@@ -1064,10 +1088,7 @@ fn unknowns_index_values_as_rego_does() -> anyhow::Result<()> {
 
     // Rego reads `input.xs[0]` from a number key and `input.s.a` from a set.
     let numbered = Value::from(BTreeMap::from([(Value::from(0), Value::from(1))]));
-    assert_eq!(
-        run(field("xs", numbered), xs0())?,
-        supplied("input.xs[0]")
-    );
+    assert_eq!(run(field("xs", numbered), xs0())?, supplied("input.xs[0]"));
     let set = Value::from(BTreeSet::from([Value::from("a")]));
     let s_a = [PathSegment::Key("s".into()), PathSegment::Key("a".into())];
     assert_eq!(run(field("s", set), s_a)?, supplied("input.s.a"));
