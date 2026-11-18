@@ -455,13 +455,7 @@ fn redacted_rule_result_and_emission_json() -> Result<(), serde_json::Error> {
     assert!(rule.is_some());
     if let Some(rule) = rule {
         rule.result = ReportedValue::Redacted;
-        rule.definitions = vec![DefinitionExplanation {
-            index: 0,
-            body: 0,
-            outcome: Outcome::Success,
-            location: None,
-            conditions: Vec::new(),
-        }];
+        rule.definitions.clear();
         for emission in &mut rule.emissions {
             emission.key = Some(ReportedValue::Redacted);
             emission.value = ReportedValue::Redacted;
@@ -2005,7 +1999,13 @@ fn value_only_helpers_keep_argument_origins_without_body_predicates() -> anyhow:
     let rule = report.rules.first_mut().context("queried rule")?;
     rule.call_instance = 1;
     rule.result = ReportedValue::Known(report.query_result.clone());
-    rule.definitions.clear();
+    rule.definitions = vec![DefinitionExplanation {
+        index: 0,
+        body: 0,
+        outcome: Outcome::Success,
+        location: None,
+        conditions: Vec::new(),
+    }];
     rule.attempts = Some(vec![AttemptExplanation {
         attempt: 1,
         definition: 0,
