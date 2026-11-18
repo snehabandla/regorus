@@ -8,9 +8,9 @@
 
 use anyhow::{bail, Result};
 use regorus::explain::{
-    BodyEndEvent, BuiltinErrorEvent, CheckEvent, CheckSite, ConditionKind, EmissionEvent,
-    ExplanationRecorder, HookContext, NotCapturedEvent, Operator, Outcome, Provenance,
-    UncapturedConstruct,
+    BodyEndEvent, BuiltinErrorEvent, CallEndEvent, CallResultSource, CallReusedEvent, CallStartEvent,
+    CheckEvent, CheckSite, ConditionKind, EmissionEvent, ExplanationRecorder, HookContext,
+    NotCapturedEvent, Operator, Outcome, Provenance, UncapturedConstruct,
 };
 use regorus::languages::rego::compiler::Compiler;
 use regorus::rvm::program::Program;
@@ -54,7 +54,14 @@ struct Recorded {
 }
 
 #[derive(Clone, Default)]
-struct Fixture(Arc<Mutex<Vec<Recorded>>>);
+struct Fixture(Arc<Mutex<Vec<Recorded>>>, Arc<Mutex<Vec<CallRecord>>>);
+
+#[derive(Debug, Clone, PartialEq)]
+enum CallRecord {
+    Start(HookContext, CallStartEvent),
+    End(HookContext, Option<CallResultSource>, Option<Value>),
+    Reused(HookContext, CallReusedEvent),
+}
 
 impl Fixture {
     fn push(&self, context: Option<&HookContext>, event: Event) {
@@ -67,11 +74,29 @@ impl Fixture {
     fn take(&self) -> Vec<Recorded> {
         std::mem::take(&mut *self.0.lock().unwrap())
     }
+
+    fn calls(&self) -> Vec<CallRecord> {
+        std::mem::take(&mut *self.1.lock().unwrap())
+    }
 }
 
 impl ExplanationRecorder for Fixture {
     fn reset(&mut self) {
         self.push(None, Event::Reset);
+    }
+
+    fn call_start(&mut self, context: &HookContext, event: &CallStartEvent) {
+        self.1.lock().unwrap().push(CallRecord::Start(*context, *event));
+    }
+
+    fn call_end(&mut self, context: &HookContext, event: &CallEndEvent<'_>) {
+        self.1.lock().unwrap().push(CallRecord::End(
+            *context, event.source, event.result.cloned(),
+        ));
+    }
+
+    fn call_reused(&mut self, context: &HookContext, event: &CallReusedEvent) {
+        self.1.lock().unwrap().push(CallRecord::Reused(*context, *event));
     }
 
     fn check(&mut self, context: &HookContext, event: &CheckEvent<'_>) {
@@ -127,6 +152,7 @@ struct Run {
     result: Result<Value>,
     events: Vec<Recorded>,
     program: Arc<Program>,
+    calls: Vec<CallRecord>,
 }
 
 fn compile(policy: &str, query: &str) -> Result<Arc<Program>> {
@@ -163,6 +189,7 @@ fn run_program(program: &Arc<Program>, input: &str, mode: ExecutionMode, strict:
         result,
         events: fixture.take(),
         program: program.clone(),
+        calls: fixture.calls(),
     }
 }
 
@@ -178,6 +205,7 @@ fn run_with(policy: &str, query: &str, input: &str, strict: bool) -> Run {
             .collect()
     };
     assert_eq!(strip(&first), strip(&second), "modes disagree");
+    assert_eq!(first.calls, second.calls, "invocation events disagree");
     assert_eq!(
         format!("{:?}", first.result),
         format!("{:?}", second.result),
@@ -191,6 +219,25 @@ fn run(policy: &str, query: &str, input: &str) -> Run {
 }
 
 impl Run {
+    fn call_ids(&self, name: &str) -> Vec<u64> {
+        self.calls.iter().filter_map(|record| match record {
+            CallRecord::Start(_, event)
+                if self.program.rule_infos[usize::from(event.rule_index)].name == name =>
+            {
+                Some(event.call_instance)
+            }
+            _ => None,
+        }).collect()
+    }
+
+    fn call_end(&self, id: u64) -> (Option<CallResultSource>, Option<Value>) {
+        self.calls.iter().find_map(|record| match record {
+            CallRecord::End(context, source, value) if context.call_instance == Some(id) =>
+                Some((*source, value.clone())),
+            _ => None,
+        }).unwrap()
+    }
+
     fn events(&self) -> Vec<Event> {
         self.events.iter().map(|r| r.event.clone()).collect()
     }
@@ -647,6 +694,11 @@ fn recorder_is_reset_for_each_evaluation() {
         execute(&mut vm, mode).unwrap();
         vm.set_input(v(r#"{"a":false}"#));
         execute(&mut vm, mode).unwrap();
+        let starts: Vec<_> = fixture.calls().into_iter().filter_map(|record| match record {
+            CallRecord::Start(_, event) => Some(event.call_instance),
+            _ => None,
+        }).collect();
+        assert_eq!(starts, [1, 1]);
         let events: Vec<_> = fixture.take().into_iter().map(|r| r.event).collect();
         assert_eq!(
             events,
@@ -665,6 +717,178 @@ fn recorder_is_reset_for_each_evaluation() {
         vm.set_input(v(r#"{"a":true}"#));
         assert_eq!(execute(&mut vm, mode).unwrap(), Value::from(true));
         assert!(fixture.take().is_empty());
+    }
+}
+
+#[test]
+fn invocation_ids_separate_repeated_calls_and_rejected_parameters() {
+    let policy = r#"
+package t
+f(1,y,z) := "ok"
+f(x,2,z) := "ok"
+f(x,y,3) := "ok"
+r := [f(input.a[0],input.a[1],input.a[2]), f(input.b[0],input.b[1],input.b[2])]
+"#;
+    for input in [
+        r#"{"a":[1,0,0],"b":[0,2,3]}"#,
+        r#"{"a":[1,2,0],"b":[0,0,3]}"#,
+    ] {
+        let r = run(policy, "data.t.r", input);
+        assert_eq!(r.result.as_ref().unwrap(), &v(r#"["ok","ok"]"#));
+        let ids = r.call_ids("data.t.f");
+        assert_eq!(ids, [2, 3]);
+        for id in ids {
+            assert_eq!(r.call_end(id), (Some(CallResultSource::Body), Some(v(r#""ok""#))));
+        }
+        for record in &r.calls {
+            if let CallRecord::Start(caller, event) = record {
+                if event.call_instance != 1 {
+                    assert_eq!(caller.call_instance, Some(1));
+                    assert_eq!(caller.call_depth, 1);
+                }
+            }
+        }
+        for record in &r.events {
+            if let Some(context) = record.context {
+                assert!(context.call_instance.is_some());
+            }
+        }
+    }
+    let r = run(policy, "data.t.r", r#"{"a":[0,0,0],"b":[1,0,0]}"#);
+    let id = r.call_ids("data.t.f")[0];
+    assert_eq!(r.call_end(id), (Some(CallResultSource::Undefined), Some(Value::Undefined)));
+}
+
+#[test]
+fn invocation_cache_reuse_preserves_original_identity_and_result_source() {
+    for (definition, source, input) in [
+        ("default p := false", CallResultSource::Default, "{}"),
+        ("default p := false\np if input.x", CallResultSource::Default, r#"{"x":false}"#),
+        ("p := input.x", CallResultSource::Body, r#"{"x":false}"#),
+    ] {
+        let policy = format!("package t\n{definition}\nr := [p,p]\n");
+        let r = run(&policy, "data.t.r", input);
+        assert_eq!(r.result.as_ref().unwrap(), &v("[false,false]"));
+        let ids = r.call_ids("data.t.p");
+        assert_eq!(ids.len(), 1);
+        assert_eq!(r.call_end(ids[0]), (Some(source), Some(Value::Bool(false))));
+        let uses: Vec<_> = r.calls.iter().filter_map(|record| match record {
+            CallRecord::Reused(caller, event) => Some((caller.call_instance, event.call_instance)),
+            _ => None,
+        }).collect();
+        assert_eq!(uses, [(Some(1), Some(ids[0]))]);
+    }
+    let r = run("package t\np := input.missing\nr if { not p; not p }\n", "data.t.r", "{}");
+    let id = r.call_ids("data.t.p")[0];
+    assert_eq!(r.result.as_ref().unwrap(), &Value::Bool(true));
+    assert_eq!(r.call_end(id), (Some(CallResultSource::Undefined), Some(Value::Undefined)));
+    assert!(r.calls.iter().any(|record| matches!(
+        record, CallRecord::Reused(_, event) if event.call_instance == Some(id)
+    )));
+    let r = run("package t\np contains x if { some x in input.xs }\nr := [count(p),count(p)]\n",
+        "data.t.r", r#"{"xs":[]}"#);
+    assert_eq!(r.result.as_ref().unwrap(), &v("[0,0]"));
+    let id = r.call_ids("data.t.p")[0];
+    assert_eq!(r.call_end(id), (Some(CallResultSource::Body), Some(Value::new_set())));
+    assert!(r.calls.iter().any(|record| matches!(
+        record, CallRecord::Reused(_, event) if event.call_instance == Some(id)
+    )));
+}
+
+#[test]
+fn invocation_with_undefined_arguments_still_has_start_and_end() {
+    for (input, expected) in [
+        ("{}", Value::Undefined),
+        (r#"{"x":false}"#, Value::Bool(false)),
+    ] {
+        let r = run("package t\nf(x) := x\nr := f(input.x)\n", "data.t.r", input);
+        let id = r.call_ids("data.t.f")[0];
+        let source = if expected == Value::Undefined {
+            CallResultSource::Undefined
+        } else {
+            CallResultSource::Body
+        };
+        assert_eq!(r.call_end(id), (Some(source), Some(expected)));
+    }
+}
+
+#[test]
+fn invocation_abort_is_not_undefined_and_fresh_evaluation_restarts_ids() {
+    let program = compile("package t\nf(x) := sum([x,x])\nr := f(input.x)\n", "data.t.r").unwrap();
+    for mode in MODES {
+        let fixture = Fixture::default();
+        let mut vm = RegoVM::new();
+        vm.load_program(program.clone());
+        vm.set_execution_mode(mode);
+        vm.set_strict_builtin_errors(true);
+        vm.set_explanation_recorder(Box::new(fixture.clone()));
+        vm.set_input(v(r#"{"x":1e308}"#));
+        assert!(execute(&mut vm, mode).is_err());
+        let calls = fixture.calls();
+        let ends: Vec<_> = calls.iter().filter_map(|record| match record {
+            CallRecord::End(context, source, value) =>
+                Some((context.call_instance, *source, value.clone())),
+            _ => None,
+        }).collect();
+        assert_eq!(ends, [(Some(2), None, None), (Some(1), None, None)]);
+        vm.set_input(v(r#"{"x":1}"#));
+        assert_eq!(execute(&mut vm, mode).unwrap(), v("2"));
+        let calls = fixture.calls();
+        let starts: Vec<_> = calls.iter().filter_map(|record| match record {
+            CallRecord::Start(_, event) => Some(event.call_instance),
+            _ => None,
+        }).collect();
+        assert_eq!(starts, [1, 2]);
+        assert_eq!(calls.iter().filter(|record| matches!(
+            record, CallRecord::End(_, Some(CallResultSource::Body), Some(_))
+        )).count(), 2);
+    }
+    let r = run("package t\nf(x) := x + 1\nr := f(input.x)\n", "data.t.r", r#"{"x":"bad"}"#);
+    assert_eq!(r.call_end(r.call_ids("data.t.f")[0]),
+        (Some(CallResultSource::Undefined), Some(Value::Undefined)));
+}
+
+#[test]
+fn invocation_identity_survives_host_await_and_late_installation_is_explicit() {
+    let policy = "package t\np := input.x\nf(x) := __builtin_host_await(x,\"host\")\nr := [p,f(input.x),p]\n";
+    let program = compile(policy, "data.t.r").unwrap();
+    for late in [false, true] {
+        let fixture = Fixture::default();
+        let mut vm = RegoVM::new();
+        vm.load_program(program.clone());
+        vm.set_input(v(r#"{"x":1}"#));
+        vm.set_execution_mode(ExecutionMode::Suspendable);
+        if !late {
+            vm.set_explanation_recorder(Box::new(fixture.clone()));
+        }
+        vm.execute().unwrap();
+        assert!(matches!(vm.execution_state(), ExecutionState::Suspended { .. }));
+        let before = fixture.calls();
+        assert_eq!(before.iter().filter(|record| matches!(record, CallRecord::Start(_, _))).count(),
+            if late { 0 } else { 3 });
+        if late {
+            vm.set_explanation_recorder(Box::new(fixture.clone()));
+        }
+        assert!(vm.resume(None).is_err());
+        assert!(fixture.calls().is_empty());
+        vm.resume(Some(v("7"))).unwrap();
+        assert!(matches!(vm.execution_state(), ExecutionState::Completed { result } if result == &v("[1,7,1]")));
+        let after = fixture.calls();
+        let reused: Vec<_> = after.iter().filter_map(|record| match record {
+            CallRecord::Reused(_, event) => Some(event.call_instance),
+            _ => None,
+        }).collect();
+        assert_eq!(reused, [if late { None } else { Some(2) }]);
+        if !late {
+            let ended: Vec<_> = after.iter().filter_map(|record| match record {
+                CallRecord::End(context, _, _) => context.call_instance,
+                _ => None,
+            }).collect();
+            assert_eq!(ended, [3, 1]);
+        }
+        assert!(!after.iter().any(|record| matches!(record, CallRecord::Start(_, _))));
+        assert_eq!(fixture.take().iter().filter(|record| record.event == Event::Reset).count(),
+            usize::from(!late));
     }
 }
 
