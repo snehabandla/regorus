@@ -25,8 +25,9 @@ use super::errors::Result;
 use super::execution_model::ExecutionMode;
 use super::machine::RegoVM;
 use crate::explain::{
-    ExplainError, Operator, PartialEvalResult, PartialEvalSettings, PathSegment, ResidualCondition,
-    ResidualKind, ResidualQuery, ResidualStatus, RuleKind, SourceLocation, UnknownRoot,
+    ExplainError, Operator, PartialEvalResult, PartialEvalSettings, PathSegment,
+    ResidualAlternativeStatus, ResidualCondition, ResidualKind, ResidualQuery, ResidualStatus,
+    RuleKind, SourceLocation, UnknownRoot,
 };
 use crate::rvm::instructions::{GuardMode, Instruction, LiteralOrRegister};
 use crate::rvm::program::{Program, RuleType};
@@ -511,6 +512,8 @@ impl RegoVM {
                 key: None,
                 value,
                 conditions,
+                status: ResidualAlternativeStatus::Exact,
+                unresolved: None,
             }],
             warnings: Vec::new(),
         })
@@ -945,6 +948,7 @@ fn condition(
         input_path: Some(path),
         value: cond.value,
         negated: Vec::new(),
+        call: None,
         rule,
         location: location(program, cond.pc),
     }))
