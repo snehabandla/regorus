@@ -203,3 +203,26 @@ fn package_of_only_undefined_rules_is_empty_object() -> Result<()> {
         ],
     )
 }
+
+#[test]
+fn subpackages_without_rules_are_empty_objects() -> Result<()> {
+    check(
+        &[
+            "package a\nx := 1",
+            "package a.b\nf(v) := v",
+            "package a.z",
+            "package a.c.d.e\ny if false",
+            "package q\nr := data.a\nb := data.a.b\nz := data.a.z\nn := count(data.a)",
+        ],
+        &[
+            (
+                "data.q.r",
+                EMPTY,
+                Some(r#"{"b": {}, "c": {"d": {"e": {}}}, "x": 1, "z": {}}"#),
+            ),
+            ("data.q.b", EMPTY, Some("{}")),
+            ("data.q.z", EMPTY, Some("{}")),
+            ("data.q.n", EMPTY, Some("4")),
+        ],
+    )
+}
