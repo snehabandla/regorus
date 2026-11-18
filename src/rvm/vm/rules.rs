@@ -253,7 +253,13 @@ impl RegoVM {
         } else {
             None
         };
-        let result = self.execute_call_rule_common_inner(dest, rule_index, function_call_params);
+        let result = self.execute_call_rule_common_inner(
+            dest,
+            rule_index,
+            function_call_params,
+            #[cfg(feature = "explanations")]
+            call,
+        );
         #[cfg(feature = "explanations")]
         if let Some(id) = call {
             let value = result
@@ -272,6 +278,7 @@ impl RegoVM {
         dest: u8,
         rule_index: u16,
         function_call_params: Option<&FunctionCallParams>,
+        #[cfg(feature = "explanations")] call: Option<u64>,
     ) -> Result<()> {
         let rule_idx = usize::from(rule_index);
 
@@ -330,7 +337,7 @@ impl RegoVM {
                     .and_then(|idx| self.program.literals.get(usize::from(idx)))
                     .is_some()
             {
-                self.explain_call_default();
+                self.explain_call_default(call);
             }
             if !is_function_rule {
                 let available = self.rule_cache.len();
@@ -433,7 +440,7 @@ impl RegoVM {
                             {
                                 #[cfg(feature = "explanations")]
                                 if self.explain_enabled() {
-                                    self.explain_call_default();
+                                    self.explain_call_default(call);
                                 }
                                 self.set_register(dest, default_value)?;
                             }
@@ -532,7 +539,7 @@ impl RegoVM {
                     .and_then(|idx| self.program.literals.get(usize::from(idx)))
                     .is_some()
             {
-                self.explain_call_default();
+                self.explain_call_default(call);
             }
             if !is_function_rule {
                 let available = self.rule_cache.len();
@@ -553,11 +560,11 @@ impl RegoVM {
                 self.registers.resize(new_len, Value::Undefined);
             }
             #[cfg(feature = "explanations")]
-            let captured_result = result.clone();
+            let captured_result = call.map(|id| (id, result.clone()));
             self.set_register(dest, result)?;
             #[cfg(feature = "explanations")]
-            if let Some(id) = call {
-                self.explain_end_call(id, Some(&captured_result))?;
+            if let Some((id, value)) = captured_result {
+                self.explain_end_call(id, Some(&value))?;
             }
             return Ok(());
         }
@@ -952,7 +959,7 @@ impl RegoVM {
                             *slot = default_value;
                             #[cfg(feature = "explanations")]
                             if self.explain_enabled() {
-                                self.explain_call_default();
+                                self.explain_call_default(frame_data.explain_call);
                             }
                         }
                     }

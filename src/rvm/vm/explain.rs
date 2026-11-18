@@ -242,8 +242,13 @@ impl RegoVM {
         Ok(Some(id))
     }
 
-    pub(super) fn explain_call_default(&mut self) {
-        if let Some(call) = self.explain.calls.last_mut() {
+    pub(super) fn explain_call_default(&mut self, id: Option<u64>) {
+        if let Some(call) = self
+            .explain
+            .calls
+            .last_mut()
+            .filter(|call| call.context.call_instance == id)
+        {
             call.defaulted = true;
         }
     }

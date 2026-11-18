@@ -893,6 +893,33 @@ fn invocation_identity_survives_host_await_and_late_installation_is_explicit() {
 }
 
 #[test]
+fn invocation_late_recorder_does_not_assign_uncaptured_default_to_caller() {
+    let program = compile(
+        "package t\ndefault p := false\np if __builtin_host_await(input.x,\"child\")\nr := [__builtin_host_await(input.x,\"outer\"),p]\n",
+        "data.t.r",
+    ).unwrap();
+    let fixture = Fixture::default();
+    let mut vm = RegoVM::new();
+    vm.load_program(program);
+    vm.set_execution_mode(ExecutionMode::Suspendable);
+    vm.set_input(v(r#"{"x":true}"#));
+    vm.set_explanation_recorder(Box::new(fixture.clone()));
+    vm.execute().unwrap();
+    assert_eq!(vm.get_host_await_identifier(), Some(&v(r#""outer""#)));
+    let recorder = vm.take_explanation_recorder().unwrap();
+    vm.resume(Some(Value::Bool(true))).unwrap();
+    assert_eq!(vm.get_host_await_identifier(), Some(&v(r#""child""#)));
+    vm.set_explanation_recorder(recorder);
+    vm.resume(Some(Value::Bool(false))).unwrap();
+    assert!(matches!(vm.execution_state(), ExecutionState::Completed { result } if result == &v("[true,false]")));
+    let ends: Vec<_> = fixture.calls().into_iter().filter_map(|record| match record {
+        CallRecord::End(context, source, value) => Some((context.call_instance, source, value)),
+        _ => None,
+    }).collect();
+    assert_eq!(ends, [(Some(1), Some(CallResultSource::Body), Some(v("[true,false]")))]);
+}
+
+#[test]
 fn assert_eq_is_reported_as_an_equality() {
     let mut program = Program::new();
     program.literals = vec![Value::from(1), Value::from(2)];
