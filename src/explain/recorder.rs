@@ -57,6 +57,8 @@ pub trait ExplanationRecorder: Send + Sync {
 
     /// An invocation completes or aborts. `context` identifies the callee at
     /// its call site; definition/body indices are zero, not a selected body.
+    /// Non-nested legacy mixed-mode termination aborts outstanding captured
+    /// invocations rather than inventing completion or changing the VM result.
     fn call_end(&mut self, _context: &HookContext, _event: &CallEndEvent<'_>) {}
 
     /// A caller uses a cached rule result. No new invocation is created.
@@ -87,7 +89,8 @@ pub trait ExplanationRecorder: Send + Sync {
 #[non_exhaustive]
 pub struct HookContext {
     /// Evaluation-local executing invocation, or `None` outside a captured
-    /// invocation (including a call already active when capture was installed).
+    /// invocation (including a call already active when capture was installed,
+    /// or one whose capture was aborted).
     pub call_instance: Option<u64>,
     /// Program counter of the instruction that produced the event, except
     /// for [`check`](ExplanationRecorder::check), where it is the pc of the

@@ -267,8 +267,7 @@ impl RegoVM {
                 .ok()
                 .and_then(|()| self.registers.get(usize::from(dest)))
                 .cloned();
-            let end = self.explain_end_call(id, value.as_ref());
-            return result.and(end);
+            self.explain_end_call(id, value.as_ref());
         }
         result
     }
@@ -564,7 +563,7 @@ impl RegoVM {
             self.set_register(dest, result)?;
             #[cfg(feature = "explanations")]
             if let Some((id, value)) = captured_result {
-                self.explain_end_call(id, Some(&value))?;
+                self.explain_end_call(id, Some(&value));
             }
             return Ok(());
         }
@@ -1004,7 +1003,7 @@ impl RegoVM {
 
         #[cfg(feature = "explanations")]
         if let Some(id) = frame_data.explain_call {
-            self.explain_end_call(id, Some(&final_value))?;
+            self.explain_end_call(id, Some(&final_value));
         }
         Ok(final_value)
     }

@@ -25,7 +25,7 @@ impl RegoVM {
                 #[cfg(feature = "explanations")]
                 if self.explain_enabled() {
                     if let Some(id) = self.explain_begin_call(params.func_rule_index)? {
-                        self.explain_end_call(id, Some(&Value::Undefined))?;
+                        self.explain_end_call(id, Some(&Value::Undefined));
                     }
                 }
                 self.memory_check()?;

@@ -255,18 +255,26 @@ impl RegoVM {
 
     #[cold]
     #[inline(never)]
-    pub(super) fn explain_end_call(&mut self, id: u64, result: Option<&Value>) -> Result<()> {
-        let call = self
+    pub(super) fn explain_end_call(&mut self, id: u64, result: Option<&Value>) {
+        if self
             .explain
             .calls
-            .pop()
-            .filter(|call| call.context.call_instance == Some(id))
-            .ok_or_else(|| VmError::Internal {
-                message: String::from("explanation invocation stack mismatch"),
-                pc: self.pc,
-            })?;
-        self.explain_deliver_call_end(call, result);
-        Ok(())
+            .last()
+            .is_some_and(|call| call.context.call_instance == Some(id))
+        {
+            if let Some(call) = self.explain.calls.pop() {
+                self.explain_deliver_call_end(call, result);
+            }
+        } else if self
+            .explain
+            .calls
+            .iter()
+            .any(|call| call.context.call_instance == Some(id))
+        {
+            // Legacy mixed-mode dispatch can terminate a caller with a child
+            // still active. Abort capture, without changing evaluation behavior.
+            self.explain_abort_calls();
+        }
     }
 
     fn explain_deliver_call_end(&mut self, call: Invocation, result: Option<&Value>) {
