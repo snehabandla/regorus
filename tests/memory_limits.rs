@@ -2446,30 +2446,70 @@ fn partial_eval_transient_shadow_paths_are_budgeted() {
     use regorus::rvm::{Instruction, Program};
 
     let _guard = LimitGuard::lock();
-    let mut program = Program::new();
-    program.literals.push(Value::from("x".repeat(256 * 1024)));
-    program.add_instruction(Instruction::LoadInput { dest: 0 }, None);
-    program.add_instruction(
-        Instruction::IndexLiteral { dest: 0, container: 0, literal_idx: 0 },
-        None,
-    );
-    program.add_instruction(Instruction::Return { value: 0 }, None);
-    program.add_entry_point("entry".into(), 0);
-    let mut vm = RegoVM::new();
-    vm.load_program(Arc::new(program));
-    vm.set_input(Value::new_object());
-    let mut settings = PartialEvalSettings::default();
-    settings.unknowns = vec![UnknownPath::input_keys(["u"])];
-    vm.set_partial_eval_settings(settings);
-    vm.set_memory_budget_config(Some(MemoryBudgetConfig {
-        limit: NonZeroU64::new(64 * 1024).unwrap(),
-    }));
-    let result = vm.partial_eval("entry");
-    assert!(matches!(result, Err(ExplainError::Vm(VmError::MemoryBudgetExceeded { .. }))), "{result:?}");
-    vm.set_memory_budget_config(None);
-    let result = vm.partial_eval("entry").unwrap();
-    assert_eq!(result.status, ResidualStatus::Exact);
-    assert_eq!(result.result, Value::Undefined);
+    for move_prefix in [false, true] {
+        for short_key in [false, true] {
+            let key = "x".repeat(if short_key {
+                8
+            } else if move_prefix {
+                32 * 1024
+            } else {
+                256 * 1024
+            });
+            let mut program = Program::new();
+            program.literals.push(Value::from(key.as_str()));
+            program.add_instruction(Instruction::LoadInput { dest: 0 }, None);
+            program.add_instruction(
+                Instruction::IndexLiteral {
+                    dest: 0,
+                    container: 0,
+                    literal_idx: 0,
+                },
+                None,
+            );
+            if move_prefix {
+                program.add_instruction(Instruction::Move { dest: 0, src: 0 }, None);
+                program.add_instruction(Instruction::LoadTrue { dest: 0 }, None);
+            }
+            program.add_instruction(Instruction::Return { value: 0 }, None);
+            program.add_entry_point("entry".into(), 0);
+            let mut vm = RegoVM::new();
+            vm.load_program(Arc::new(program));
+            vm.set_input(Value::new_object());
+            let mut settings = PartialEvalSettings::default();
+            settings.unknowns = vec![if move_prefix {
+                UnknownPath::input_keys([key.as_str(), "u"])
+            } else {
+                UnknownPath::input_keys(["u"])
+            }];
+            vm.set_partial_eval_settings(settings);
+            vm.set_memory_budget_config(Some(MemoryBudgetConfig {
+                limit: NonZeroU64::new(if move_prefix { 80 * 1024 } else { 64 * 1024 }).unwrap(),
+            }));
+            let result = vm.partial_eval("entry");
+            if short_key {
+                assert_eq!(result.unwrap().status, ResidualStatus::Exact);
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(ExplainError::Vm(VmError::MemoryBudgetExceeded { .. }))
+                    ),
+                    "move_prefix={move_prefix}: {result:?}"
+                );
+            }
+            vm.set_memory_budget_config(None);
+            let result = vm.partial_eval("entry").unwrap();
+            assert_eq!(result.status, ResidualStatus::Exact);
+            assert_eq!(
+                result.result,
+                if move_prefix {
+                    Value::Bool(true)
+                } else {
+                    Value::Undefined
+                }
+            );
+        }
+    }
 }
 
 #[cfg(feature = "explanations")]
