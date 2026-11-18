@@ -202,15 +202,11 @@ impl RegoVM {
                 available: self.program.rule_infos.len(),
             })?;
         let cacheable = info.function_info.is_none();
-        let caller = self.explain_context();
         if cacheable && self.rule_cache.get(index).is_some_and(|entry| entry.0) {
-            let event = CallReusedEvent {
-                call_instance: self.explain.cached_calls.get(index).copied().flatten(),
-                rule_index,
-            };
-            self.explain_deliver(|_, recorder| recorder.call_reused(&caller, &event));
+            self.explain_reuse_call(rule_index);
             return Ok(None);
         }
+        let caller = self.explain_context();
         let id = self
             .explain
             .next_call
@@ -240,6 +236,22 @@ impl RegoVM {
         };
         self.explain_deliver(|_, recorder| recorder.call_start(&caller, &event));
         Ok(Some(id))
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub(super) fn explain_reuse_call(&mut self, rule_index: u16) {
+        let caller = self.explain_context();
+        let event = CallReusedEvent {
+            call_instance: self
+                .explain
+                .cached_calls
+                .get(usize::from(rule_index))
+                .copied()
+                .flatten(),
+            rule_index,
+        };
+        self.explain_deliver(|_, recorder| recorder.call_reused(&caller, &event));
     }
 
     pub(super) fn explain_call_default(&mut self, id: Option<u64>) {

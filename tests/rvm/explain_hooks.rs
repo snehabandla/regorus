@@ -931,6 +931,47 @@ fn invocation_subtree_cache_reuse_suspendable() {
 }
 
 #[test]
+fn invocation_subtree_cache_reuse_late_recorder_preserves_unknown_identity() {
+    let mut engine = Engine::new();
+    for (name, policy) in [
+        ("target.rego", "package target.dept\np := input.x\n"),
+        (
+            "framework.rego",
+            "package framework\nr := [data.target[input.a], __builtin_host_await(input.x,\"host\"), data.target[input.b]]\n",
+        ),
+    ] {
+        engine.add_policy(name.to_string(), policy.to_string()).unwrap();
+    }
+    let entrypoint: Rc<str> = "data.framework.r".into();
+    let compiled = engine.compile_with_entrypoint(&entrypoint).unwrap();
+    let program = Compiler::compile_from_policy(&compiled, &["data.framework.r"]).unwrap();
+    let mut vm = RegoVM::new();
+    vm.load_program(program.clone());
+    vm.set_execution_mode(ExecutionMode::Suspendable);
+    vm.set_input(v(r#"{"a":"dept","b":"dept","x":1}"#));
+    vm.execute().unwrap();
+    assert!(matches!(vm.execution_state(), ExecutionState::Suspended { .. }));
+    let fixture = Fixture::default();
+    vm.set_explanation_recorder(Box::new(fixture.clone()));
+    vm.resume(Some(Value::Bool(true))).unwrap();
+    assert!(matches!(
+        vm.execution_state(),
+        ExecutionState::Completed { result } if result == &v(r#"[{"p":1},true,{"p":1}]"#)
+    ));
+    let calls = fixture.calls();
+    let uses: Vec<_> = calls.iter().filter_map(|record| match record {
+        CallRecord::Reused(caller, event)
+            if program.rule_infos[usize::from(event.rule_index)].name == "data.target.dept.p" =>
+        {
+            Some((caller.call_instance, event.call_instance))
+        }
+        _ => None,
+    }).collect();
+    assert_eq!(uses, [(None, None)], "{calls:?}");
+    assert!(!calls.iter().any(|record| matches!(record, CallRecord::Start(_, _))));
+}
+
+#[test]
 fn invocation_mixed_mode_error_keeps_terminal_events_for_every_started_call() {
     let mut engine = Engine::new();
     for (name, policy) in [
