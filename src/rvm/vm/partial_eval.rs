@@ -227,6 +227,14 @@ fn is_lossless(root: &Value, checkpoint: &mut impl FnMut() -> Result<()>) -> Res
             Value::Undefined | Value::Set(_) | Value::Number(crate::number::Number::BigInt(_)) => {
                 return Ok(false);
             }
+            Value::Number(_) => {
+                let json = node.json_string_with_checkpoint(false, checkpoint)?;
+                let roundtrip = Value::from_json_str(&json)?;
+                checkpoint()?;
+                if *node != roundtrip {
+                    return Ok(false);
+                }
+            }
             Value::Array(ref items) => pending.extend(items.iter()),
             Value::Object(ref fields) => {
                 for (key, child) in fields.iter() {
