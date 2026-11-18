@@ -1627,13 +1627,17 @@ fn attempts_scopes_and_cached_uses_keep_ownership() -> anyhow::Result<()> {
         attempt: Some(4),
         scope: None,
     };
-    helper.definitions.push(fixtures::definition(
-        1,
-        0,
-        Outcome::Success,
-        7,
-        alloc::vec![condition],
-    ));
+    helper.definitions.push(DefinitionExplanation {
+        index: 1,
+        body: 0,
+        outcome: Outcome::Success,
+        location: Some(SourceLocation {
+            file: String::from("p.rego"),
+            line: 7,
+            column: 1,
+        }),
+        conditions: alloc::vec![condition],
+    });
     rule.definitions[1].index = 0;
     for (definition, attempt) in rule.definitions.iter_mut().zip([1, 2]) {
         for condition in &mut definition.conditions {
