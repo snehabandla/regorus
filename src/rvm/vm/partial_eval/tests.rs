@@ -605,9 +605,8 @@ fn fatal_errors_are_not_unsupported() -> anyhow::Result<()> {
 #[test]
 fn host_await_identifiers_consume_unknowns() -> anyhow::Result<()> {
     for reference in ["input", "input.u"] {
-        let source = format!(
-            "package test\nallow := __builtin_host_await(\"payload\", {reference})"
-        );
+        let source =
+            format!("package test\nallow := __builtin_host_await(\"payload\", {reference})");
         for respond in [false, true] {
             let mut machine = vm(&source)?;
             machine.set_input(Value::new_object());
@@ -622,21 +621,33 @@ fn host_await_identifiers_consume_unknowns() -> anyhow::Result<()> {
             let mut settings = PartialEvalSettings::default();
             settings.unknowns = keys(&["u"]);
             machine.set_partial_eval_settings(settings);
-            assert_eq!(machine.partial_eval("data.test.allow")?.status, ResidualStatus::Unsupported,
-                "{reference}, respond={respond}");
+            assert_eq!(
+                machine.partial_eval("data.test.allow")?.status,
+                ResidualStatus::Unsupported,
+                "{reference}, respond={respond}"
+            );
         }
     }
-    let mut machine = vm(
-        "package test\nallow := __builtin_host_await(\"payload\", input.u)"
-    )?;
-    machine.set_input(Value::from_json_str(r#"{"u":"ok"}"#)?);
-    machine.set_host_await_responses([(Value::from("ok"), [Value::Bool(true)])]);
-    let mut settings = PartialEvalSettings::default();
-    settings.unknowns = keys(&["other"]);
-    machine.set_partial_eval_settings(settings);
-    let result = machine.partial_eval("data.test.allow")?;
-    assert_eq!(result.status, ResidualStatus::Exact);
-    assert_eq!(result.result, Value::Bool(true));
+    for respond in [false, true] {
+        let mut machine = vm("package test\nallow := __builtin_host_await(\"payload\", input.u)")?;
+        machine.set_input(Value::from_json_str(r#"{"u":"ok"}"#)?);
+        if respond {
+            machine.set_host_await_responses([(Value::from("ok"), [Value::Bool(true)])]);
+        }
+        let mut settings = PartialEvalSettings::default();
+        settings.unknowns = keys(&["other"]);
+        machine.set_partial_eval_settings(settings);
+        let result = machine.partial_eval("data.test.allow")?;
+        assert_eq!(result.status, ResidualStatus::Exact);
+        assert_eq!(
+            result.result,
+            if respond {
+                Value::Bool(true)
+            } else {
+                Value::Undefined
+            }
+        );
+    }
     Ok(())
 }
 
@@ -659,7 +670,10 @@ fn implicit_entry_results_consume_unknowns() -> anyhow::Result<()> {
         let mut settings = PartialEvalSettings::default();
         settings.unknowns = keys(&["u"]);
         machine.set_partial_eval_settings(settings);
-        assert_eq!(machine.partial_eval("entry")?.status, ResidualStatus::Unsupported);
+        assert_eq!(
+            machine.partial_eval("entry")?.status,
+            ResidualStatus::Unsupported
+        );
         machine.set_partial_eval_settings(PartialEvalSettings::default());
         let result = machine.partial_eval("entry")?;
         assert_eq!(result.status, ResidualStatus::Exact);
@@ -674,14 +688,16 @@ fn chained_index_skips_keys_after_known_undefined() -> anyhow::Result<()> {
 
     let mut program = Program::new();
     program.literals.push(Value::from("missing"));
-    let params_index = program.instruction_data.add_chained_index_params(ChainedIndexParams {
-        dest: 1,
-        root: 0,
-        path_components: alloc::vec![
-            LiteralOrRegister::Literal(0),
-            LiteralOrRegister::Register(255),
-        ],
-    });
+    let params_index = program
+        .instruction_data
+        .add_chained_index_params(ChainedIndexParams {
+            dest: 1,
+            root: 0,
+            path_components: alloc::vec![
+                LiteralOrRegister::Literal(0),
+                LiteralOrRegister::Register(255),
+            ],
+        });
     program.add_instruction(Instruction::LoadInput { dest: 0 }, None);
     program.add_instruction(Instruction::ChainedIndex { params_index }, None);
     program.add_instruction(Instruction::Return { value: 1 }, None);
@@ -689,14 +705,30 @@ fn chained_index_skips_keys_after_known_undefined() -> anyhow::Result<()> {
     let mut machine = RegoVM::new();
     machine.load_program(Arc::new(program));
     machine.set_base_register_count(2);
-    machine.set_input(Value::new_object());
-    for unknowns in [vec![], keys(&["u"])] {
-        let mut settings = PartialEvalSettings::default();
-        settings.unknowns = unknowns;
-        machine.set_partial_eval_settings(settings);
-        let result = machine.partial_eval("entry")?;
-        assert_eq!(result.status, ResidualStatus::Exact);
-        assert_eq!(result.result, Value::Undefined);
+    for input in ["{}", r#"{"missing":{}}"#] {
+        machine.set_input(Value::from_json_str(input)?);
+        for unknowns in [vec![], keys(&["u"])] {
+            let mut settings = PartialEvalSettings::default();
+            settings.unknowns = unknowns;
+            machine.set_partial_eval_settings(settings);
+            let result = machine.partial_eval("entry");
+            if input == "{}" {
+                let result = result?;
+                assert_eq!(result.status, ResidualStatus::Exact);
+                assert_eq!(result.result, Value::Undefined);
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(ExplainError::Vm(VmError::RegisterIndexOutOfBounds {
+                            index: 255,
+                            ..
+                        }))
+                    ),
+                    "{result:?}"
+                );
+            }
+        }
     }
     Ok(())
 }

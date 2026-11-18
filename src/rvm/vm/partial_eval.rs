@@ -353,6 +353,16 @@ impl RegoVM {
             }
         }
         let state = self.pe.as_deref_mut().ok_or(ExplainError::NotEnabled)?;
+        // Only the entry result consumes an implicit register-zero return;
+        // nested rule/destructuring jump results are discarded by the caller.
+        if run.is_ok()
+            && !matches!(
+                program.instructions.get(self.pc),
+                Some(Instruction::Return { .. })
+            )
+        {
+            state.note_read(0, self.pc, self.register_stack.len());
+        }
         if state.frame_depth == 0 {
             state.flag_unused(self.pc);
         }
@@ -571,6 +581,7 @@ impl RegoVM {
         else {
             return Ok(None);
         };
+        self.check_initial_memory_limit()?;
         let mut value = self.pe_raw(container)?;
         for component in keys {
             let key = match *component {
@@ -587,6 +598,7 @@ impl RegoVM {
                 match segment(&key) {
                     Some(seg) => {
                         segments.push(seg);
+                        self.check_initial_memory_limit()?;
                         class = self
                             .pe
                             .as_deref()
@@ -597,6 +609,9 @@ impl RegoVM {
                 }
             }
             value = value[&key].clone();
+            if value == Value::Undefined && class == Class::Clean {
+                break;
+            }
         }
         if let Some(pe) = self.pe_mut() {
             pe.mark_used(container);
