@@ -14,7 +14,9 @@ use crate::rvm::instructions::{
     ChainedIndexParams, LiteralOrRegister, VirtualDataDocumentLookupParams,
 };
 use crate::rvm::Instruction;
-use crate::utils::{append_path_component, format_string_path};
+use crate::utils::{
+    append_path_component, format_string_path, get_rule_path_components, PathComponent,
+};
 use crate::Value;
 use alloc::collections::BTreeSet;
 use alloc::string::{String, ToString};
@@ -204,7 +206,31 @@ impl<'a> Compiler<'a> {
             .cloned()
             .collect();
 
-        if !matching_rules.is_empty() {
+        // Packages under the read path are part of its value even without rules.
+        let mut matches_package = false;
+        for module in self.policy.inner.modules.iter() {
+            let Ok(parts) = get_rule_path_components(&module.package.refr) else {
+                continue;
+            };
+            let path: Vec<&str> = core::iter::once("data")
+                .chain(parts.iter().map(|part| match *part {
+                    PathComponent::String(ref name) | PathComponent::Raw(ref name) => name.as_str(),
+                }))
+                .collect();
+            let mut zipped = path_pattern.iter().zip(&path);
+            if path_pattern.len() <= path.len()
+                && zipped.all(|(p, n)| p.is_none() || p.as_deref() == Some(*n))
+            {
+                matches_package = true;
+                if let Ok(node @ &mut Value::Undefined) =
+                    self.program.rule_tree.make_or_get_value_mut(&path)
+                {
+                    *node = Value::new_object();
+                }
+            }
+        }
+
+        if !matching_rules.is_empty() || matches_package {
             // This path is a prefix of some rules - use DataVirtualDocumentLookup
             for rule_path in &matching_rules {
                 if !self
