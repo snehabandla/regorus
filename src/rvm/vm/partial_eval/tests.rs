@@ -8,7 +8,6 @@ use crate::rvm::program::{FunctionInfo, RuleInfo, RuleType};
 use crate::rvm::vm::VmError;
 use crate::rvm::{Instruction, Program};
 use crate::Engine;
-use alloc::string::ToString as _;
 use alloc::sync::Arc;
 use alloc::vec;
 
