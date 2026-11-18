@@ -10,8 +10,8 @@ use crate::value::Object;
 use crate::Value;
 
 use super::super::obj_map::{
-    obj_get_ci, obj_get_mut_ci, obj_insert, object_get_ci, object_get_mut_ci, set_nested,
-    set_nested_lowercased, set_nested_verbatim, ObjMap,
+    obj_get_ci, obj_get_mut_ci, obj_insert, object_get_ci, object_get_mut_ci, remove_dotted_path,
+    remove_dotted_path_obj, set_nested, set_nested_lowercased, set_nested_verbatim, ObjMap,
 };
 use super::super::types::PrecomputedRemap;
 
@@ -26,7 +26,9 @@ pub struct ElementRemap {
 }
 
 /// Apply an element-level field remap to each element of an array (or nested
-/// array chain).
+/// array chain). The value is moved: the source is removed before the target
+/// is written, so a target nested under its own source path (`cfg` to
+/// `cfg.value`) is not deleted with it.
 ///
 /// When `lowercase` is `true` (normalizer), target path segments are
 /// lowercased.  When `false` (denormalizer), they are written verbatim
@@ -176,12 +178,13 @@ fn remap_at_depth_in_btree(
     }
 }
 
-/// Remap a value between dotted paths directly in a BTreeMap.
+/// Move a value between dotted paths directly in a BTreeMap.
 fn remap_deep_field_in_btree(btree: &mut Object, source: &str, target: &str, lowercase: bool) {
     let val = match read_dotted_path_btree(btree, source) {
         Some(v) => v,
         None => return,
     };
+    remove_dotted_path_obj(btree, source);
 
     let segments: Vec<&str> = target.split('.').collect();
     if segments.is_empty() {
@@ -207,13 +210,14 @@ fn read_dotted_path_btree(btree: &Object, path: &str) -> Option<Value> {
     Some(cur.clone())
 }
 
-/// Remap a value from one (possibly nested) dot-separated path to another
+/// Move a value from one (possibly nested) dot-separated path to another
 /// in an ObjMap.  Used only at the top level when `depth >= array_chain.len()`.
 fn remap_deep_field(obj: &mut ObjMap, source: &str, target: &str, lowercase: bool) {
     let val = match read_dotted_path(obj, source) {
         Some(v) => v,
         None => return,
     };
+    remove_dotted_path(obj, source);
 
     let segments: Vec<&str> = target.split('.').collect();
     if segments.is_empty() {

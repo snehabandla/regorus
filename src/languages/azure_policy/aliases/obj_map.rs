@@ -343,118 +343,17 @@ pub fn collision_safe_key(short_name: &str) -> String {
 // Shared by both normalizer (stale source cleanup after remap) and
 // denormalizer (cleanup after reverse remap).
 
-/// Remove a (possibly dot-separated) field from each element of a (possibly
-/// nested) array, navigating via the given `array_chain`.
-pub fn remove_element_field(obj: &mut ObjMap, array_chain: &[Vec<String>], field: &str) {
-    remove_field_at_depth(obj, array_chain, 0, field);
+/// Remove the value at a dot-separated path from an element Object, matching
+/// each key exactly or else ignoring ASCII case.
+pub fn remove_dotted_path_obj(obj: &mut Object, path: &str) {
+    let segments: Vec<&str> = path.split('.').collect();
+    remove_at_dotted_path_obj(obj, &segments);
 }
 
-fn remove_field_at_depth(obj: &mut ObjMap, array_chain: &[Vec<String>], depth: usize, field: &str) {
-    let Some(nav) = array_chain.get(depth) else {
-        let segments: Vec<&str> = field.split('.').collect();
-        if segments.len() == 1 {
-            if let Some(&seg) = segments.first() {
-                obj_remove_ci(obj, seg);
-            }
-        } else if segments.len() > 1 {
-            remove_at_dotted_path(obj, &segments);
-        }
-        return;
-    };
-
-    let first = match nav.first() {
-        Some(f) => f.as_str(),
-        None => return,
-    };
-
-    let arr_val = if nav.len() == 1 {
-        match obj_get_mut_ci(obj, first) {
-            Some(v) => v,
-            None => return,
-        }
-    } else {
-        let mut cur: &mut Value = match obj_get_mut_ci(obj, first) {
-            Some(v) => v,
-            None => return,
-        };
-        for segment in nav.iter().skip(1) {
-            cur = match cur.as_object_mut() {
-                Ok(inner) => match object_get_mut_ci(inner, segment) {
-                    Some(v) => v,
-                    None => return,
-                },
-                Err(_) => return,
-            };
-        }
-        cur
-    };
-
-    if let Value::Array(elements) = arr_val {
-        let inner = Rc::make_mut(elements);
-        for elem in inner.iter_mut() {
-            if let Value::Object(obj_rc) = elem {
-                let inner_btree = Rc::make_mut(obj_rc);
-                remove_field_at_depth_obj(inner_btree, array_chain, depth.saturating_add(1), field);
-            }
-        }
-    }
-}
-
-/// Object-native recursion for element-level field removal.
-fn remove_field_at_depth_obj(
-    obj: &mut Object,
-    array_chain: &[Vec<String>],
-    depth: usize,
-    field: &str,
-) {
-    let Some(nav) = array_chain.get(depth) else {
-        let segments: Vec<&str> = field.split('.').collect();
-        if segments.len() == 1 {
-            if let Some(&seg) = segments.first() {
-                object_remove_ci(obj, seg);
-            }
-        } else if segments.len() > 1 {
-            remove_at_dotted_path_obj(obj, &segments);
-        }
-        return;
-    };
-
-    let first = match nav.first() {
-        Some(f) => f.as_str(),
-        None => return,
-    };
-
-    let arr_val = if nav.len() == 1 {
-        match object_get_mut_ci(obj, first) {
-            Some(v) => v,
-            None => return,
-        }
-    } else {
-        let mut cur: &mut Value = match object_get_mut_ci(obj, first) {
-            Some(v) => v,
-            None => return,
-        };
-        for segment in nav.iter().skip(1) {
-            cur = match cur.as_object_mut() {
-                Ok(inner) => match object_get_mut_ci(inner, segment) {
-                    Some(v) => v,
-                    None => return,
-                },
-                Err(_) => return,
-            };
-        }
-        cur
-    };
-
-    if let Value::Array(elements) = arr_val {
-        let inner = Rc::make_mut(elements);
-        for elem in inner.iter_mut() {
-            if let Value::Object(obj_rc) = elem {
-                let inner_btree = Rc::make_mut(obj_rc);
-                remove_field_at_depth_obj(inner_btree, array_chain, depth.saturating_add(1), field);
-            }
-        }
-    }
+/// [`remove_dotted_path_obj`] for an ObjMap.
+pub fn remove_dotted_path(obj: &mut ObjMap, path: &str) {
+    let segments: Vec<&str> = path.split('.').collect();
+    remove_at_dotted_path(obj, &segments);
 }
 
 /// Remove the leaf segment at a dotted path directly in an Object.
