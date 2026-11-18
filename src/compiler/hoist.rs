@@ -610,6 +610,26 @@ impl LoopHoister {
                             .add_unbound_variable(var);
                     }
                 }
+                // Pattern variables also shadow rules and imports of the same name.
+                if let Some(globals) = context.module_globals.clone() {
+                    for pattern in key.iter().chain(core::iter::once(value)) {
+                        crate::query::traversal::traverse(pattern, &mut |e| match e.as_ref() {
+                            crate::ast::Expr::Var { span, .. } => {
+                                let name = span.text();
+                                if globals.contains(name) && !context.bound_vars.contains(name) {
+                                    shadowing
+                                        .get_or_insert_with(|| context.clone())
+                                        .add_unbound_variable(name);
+                                }
+                                Ok(false)
+                            }
+                            crate::ast::Expr::Array { .. } | crate::ast::Expr::Object { .. } => {
+                                Ok(true)
+                            }
+                            _ => Ok(false),
+                        })?;
+                    }
+                }
                 let binding_plan = super::destructuring_planner::create_some_in_binding_plan(
                     key,
                     value,

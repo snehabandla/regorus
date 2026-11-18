@@ -175,16 +175,17 @@ impl ScopeContext {
             return true;
         }
 
+        // A `some` declaration shadows a rule or import of the same name.
+        if self.is_unbound(var_name) {
+            return true;
+        }
+
         if self
             .module_globals
             .as_ref()
             .is_some_and(|globals| globals.contains(var_name))
         {
             return false;
-        }
-
-        if self.is_unbound(var_name) {
-            return true;
         }
 
         if self.has_scheduler_scope {
