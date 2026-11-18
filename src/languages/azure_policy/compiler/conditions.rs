@@ -143,9 +143,9 @@ impl Compiler {
     // -- operator condition compilation ------------------------------------
 
     pub(super) fn compile_condition(&mut self, condition: &Condition) -> Result<u8> {
-        let previous = self.condition_span.replace(condition.span.clone());
+        let previous = self.json_span.replace(condition.span.clone());
         let result = self.compile_condition_inner(condition);
-        self.condition_span = previous;
+        self.json_span = previous;
         result
     }
 

@@ -17,6 +17,8 @@
 //! static metadata, not runtime capture or a report producer. Azure Policy
 //! includes collection-count operations and native checks within templates;
 //! sites do not assert that the VM currently delivers events for them.
+//! Recompile older Azure Policy programs to obtain JSON owners for template
+//! operations whose saved spans only identify a synthetic expression source.
 
 mod azure_policy;
 

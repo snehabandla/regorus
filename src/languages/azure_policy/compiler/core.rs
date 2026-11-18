@@ -77,7 +77,7 @@ pub(super) struct Compiler {
     /// ARM function currently being compiled, used for author-facing errors.
     pub(super) current_arm_function: Option<String>,
     /// JSON owner for instructions lowered from synthetic template sources.
-    pub(super) condition_span: Option<crate::lexer::Span>,
+    pub(super) json_span: Option<crate::lexer::Span>,
 }
 
 // ---------------------------------------------------------------------------
@@ -167,12 +167,12 @@ impl Compiler {
     }
 
     pub(super) fn emit(&mut self, instruction: Instruction, span: &crate::lexer::Span) {
-        let owner = self.condition_span.clone();
-        let span = if span.source.get_path() == "<expr>" {
-            owner.as_ref().unwrap_or(span)
-        } else {
-            span
-        };
+        let owner = self
+            .json_span
+            .as_ref()
+            .filter(|_| span.source.get_path() == "<expr>")
+            .cloned();
+        let span = owner.as_ref().unwrap_or(span);
         let span_info = self.span_info(span);
         self.program.add_instruction(instruction, Some(span_info));
     }

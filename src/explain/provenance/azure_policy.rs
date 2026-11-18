@@ -161,6 +161,13 @@ struct JsonSource<'a> {
     operators: Vec<Option<PolicyOp>>,
 }
 
+type ConditionSource = (
+    String,
+    Option<SourceLocation>,
+    Option<String>,
+    Option<PolicyOp>,
+);
+
 impl<'a> JsonSource<'a> {
     fn new(file: &'a str, content: &'a str) -> Self {
         let source = SourceIndex::new(file, content);
@@ -213,15 +220,7 @@ impl<'a> JsonSource<'a> {
         serde_json::from_str(source.content.get(start..end)?).ok()
     }
 
-    fn condition(
-        &self,
-        span: &SpanInfo,
-    ) -> Option<(
-        String,
-        Option<SourceLocation>,
-        Option<String>,
-        Option<PolicyOp>,
-    )> {
+    fn condition(&self, span: &SpanInfo) -> Option<ConditionSource> {
         let anchor = self
             .source
             .tokens
@@ -238,8 +237,10 @@ impl<'a> JsonSource<'a> {
             .copied()
             .flatten()
             .and_then(|index| Self::string_at(&self.source, index));
+        let original = open;
         while self.operators.get(open).copied().flatten().is_none() {
             let Some(parent) = self.objects.get(open).copied().flatten() else {
+                open = original;
                 break;
             };
             open = parent;
