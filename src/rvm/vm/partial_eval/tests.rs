@@ -486,6 +486,45 @@ fn nested_undefined_residual_values_fail_closed() -> anyhow::Result<()> {
 }
 
 #[test]
+fn lossy_large_integer_residuals_fail_closed() -> anyhow::Result<()> {
+    for rule in [
+        "allow if input.u == 18446744073709551617",
+        "allow := 18446744073709551617 if input.u == 1",
+        "allow if input.u == [18446744073709551617]",
+    ] {
+        let result = pe(&format!("package test\n{rule}"), "{}", &["u"])?;
+        assert_eq!(result.status, ResidualStatus::Unsupported, "{rule}");
+        assert!(result.residual_queries.is_empty());
+    }
+    for number in ["18446744073709551615", "-9223372036854775808", "0.1"] {
+        let result = pe(&format!("package test\nallow if input.u == {number}"), "{}", &["u"])?;
+        assert_eq!(result.status, ResidualStatus::Exact, "{number}");
+        assert_eq!(
+            result.residual_queries[0].conditions[0].value,
+            Some(Value::from_json_str(number)?)
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn defined_false_results_are_not_undefined() -> anyhow::Result<()> {
+    let concrete = pe("package test\nallow := false", "{}", &[])?;
+    assert_eq!(concrete.status, ResidualStatus::Exact);
+    assert_eq!(concrete.result, Value::Bool(false));
+    assert!(concrete.residual_queries.is_empty());
+    let policy = "package test\nallow := false if input.u == 1";
+    let residual = pe(policy, "{}", &["u"])?;
+    assert_eq!(residual.status, ResidualStatus::Exact);
+    assert_eq!(residual.result, Value::Undefined);
+    assert_eq!(texts(&residual), vec![vec!["input.u == 1"]]);
+    assert_eq!(residual.residual_queries[0].value, Value::Bool(false));
+    assert_eq!(pe(policy, r#"{"u":1}"#, &[])?.result, Value::Bool(false));
+    assert_eq!(pe(policy, r#"{"u":2}"#, &[])?.result, Value::Undefined);
+    Ok(())
+}
+
+#[test]
 fn deeply_nested_known_values_remain_exact() -> anyhow::Result<()> {
     use alloc::collections::BTreeMap;
     let mut known = Value::Null;
