@@ -2834,7 +2834,8 @@ impl Interpreter {
         params: &[ExprRef],
     ) -> Result<Value> {
         self.check_execution_time()?;
-        // Return generated values of walk builtin.
+        // Return generated values of walk builtin, or of a call lifted out of a
+        // negated expression (`eval_negated_expr`).
         if let Some(v) = self.get_loop_var_value(expr)? {
             return Ok(v.clone());
         }
