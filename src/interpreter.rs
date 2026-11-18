@@ -3931,7 +3931,7 @@ impl Interpreter {
 
     /// Ensures that `data` has an object at the package `path`. Returns false, leaving `data`
     /// unchanged, for a package without rules when `data` holds a non-object value at or above
-    /// `path`: as in OPA, such a package does not conflict with base data, which wins.
+    /// `path`: as in OPA, such a package does not conflict with that value, which wins.
     pub(crate) fn ensure_package_value(
         data: &mut Value,
         path: &[&str],
