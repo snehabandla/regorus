@@ -2520,10 +2520,18 @@ fn partial_eval_warning_after_vm_error_is_budgeted() {
     let _guard = LimitGuard::lock();
     for filename_len in [8, 256 * 1024] {
         let mut program = Program::new();
-        let source = program.add_source("p".repeat(filename_len), "input".into());
+        let source = program.add_source("p".repeat(filename_len), "input == input".into());
         program.add_instruction(
             Instruction::LoadInput { dest: 0 },
             Some(SpanInfo::new(source, 1, 1, 5)),
+        );
+        program.add_instruction(
+            Instruction::Eq {
+                dest: 0,
+                left: 0,
+                right: 0,
+            },
+            Some(SpanInfo::new(source, 1, 1, 14)),
         );
         program.add_instruction(Instruction::LoadTrue { dest: 0 }, None);
         program.add_instruction(Instruction::LoadNull { dest: 1 }, None);
@@ -2564,7 +2572,7 @@ fn partial_eval_warning_after_vm_error_is_budgeted() {
             assert!(matches!(
                 vm.execution_state(),
                 ExecutionState::Error {
-                    error: VmError::ArithmeticError { pc: 3, .. }
+                    error: VmError::ArithmeticError { pc: 4, .. }
                 }
             ));
         }

@@ -428,6 +428,14 @@ fn other_errors_after_a_read_are_unsupported() -> anyhow::Result<()> {
     // outside a rule.
     let mut program = Program::new();
     program.add_instruction(Instruction::LoadInput { dest: 0 }, None);
+    program.add_instruction(
+        Instruction::Eq {
+            dest: 0,
+            left: 0,
+            right: 0,
+        },
+        None,
+    );
     program.add_instruction(Instruction::LoadTrue { dest: 0 }, None);
     program.add_instruction(Instruction::LoadNull { dest: 1 }, None);
     program.add_instruction(
@@ -555,13 +563,13 @@ fn fatal_errors_are_not_unsupported() -> anyhow::Result<()> {
         vm.set_partial_eval_settings(settings);
         anyhow::Ok(vm.partial_eval("data.test.allow"))
     };
-    let looping = "package test\nallow if {\n  input.k == 1\n  some i in numbers.range(1, 100000)\n  i < 0\n}";
+    let looping = "package test\nallow if {\n  _u := input.u\n  input.k == 1\n  some i in numbers.range(1, 100000)\n  i < 0\n}";
     #[cfg(feature = "regex")]
-    let regex = "package test\nallow if regex.match(input.p, \"test\")";
-    let overflow = "package test\nallow if {\n  input.k == 1\n  y := input.a + input.a\n  y > 0\n}";
+    let regex = "package test\nallow if { _u := input.u; regex.match(input.p, \"test\") }";
+    let overflow = "package test\nallow if {\n  _u := input.u\n  input.k == 1\n  y := input.a + input.a\n  y > 0\n}";
     // Nothing is flagged with an unknown under `context`, so those cases
-    // only check that the error isn't lost; with one under `input`, every
-    // read of `input` is flagged, so the error must not become Unsupported.
+    // only check that the error isn't lost; the unchecked unknown read under
+    // `input` must not turn a later fatal error into Unsupported.
     let context_u = UnknownPath::new(UnknownRoot::Context, [PathSegment::Key("u".into())]);
     for unknown in [context_u, UnknownPath::input_keys(["u"])] {
         let result = run(looping, &unknown, Some(1000))?;
@@ -590,6 +598,44 @@ fn fatal_errors_are_not_unsupported() -> anyhow::Result<()> {
                 Err(ExplainError::Vm(VmError::NumericOverflow { .. }))
             ),
             "{unknown:?}: {result:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn shadow_indexing_preserves_invalid_register_errors() -> anyhow::Result<()> {
+    let mut program = Program::new();
+    program.add_instruction(Instruction::LoadInput { dest: 0 }, None);
+    program.add_instruction(
+        Instruction::Index {
+            dest: 1,
+            container: 0,
+            key: 255,
+        },
+        None,
+    );
+    program.add_instruction(Instruction::Return { value: 1 }, None);
+    program.add_entry_point("entry".into(), 0);
+    let program = Arc::new(program);
+    for unknowns in [vec![], keys(&["u"])] {
+        let mut machine = RegoVM::new();
+        machine.load_program(program.clone());
+        machine.set_base_register_count(2);
+        machine.set_input(Value::new_object());
+        let mut settings = PartialEvalSettings::default();
+        settings.unknowns = unknowns;
+        machine.set_partial_eval_settings(settings);
+        let result = machine.partial_eval("entry");
+        assert!(
+            matches!(
+                result,
+                Err(ExplainError::Vm(VmError::RegisterIndexOutOfBounds {
+                    index: 255,
+                    ..
+                }))
+            ),
+            "{result:?}"
         );
     }
     Ok(())
