@@ -9,12 +9,14 @@
 //! from, and the rule or function that owns it. Explanation capture records
 //! only program counters; reports resolve them through this table.
 //!
-//! Only programs compiled from Rego are decoded, as identified by
+//! Programs compiled from Rego or Azure Policy are decoded, as identified by
 //! [`ProgramMetadata::language`](crate::rvm::program::ProgramMetadata::language)
 //! (`"rego"`, or empty for the Rego compiler's programs). Programs from any
-//! other language, such as Azure Policy, have no sites until that language
-//! has its own decoder, so their conditions and their reads of the `context`
-//! root are not described rather than misdescribed.
+//! other language have no sites. Azure Policy sites retain JSON conditions,
+//! native operators and normalized input/context path templates. This is
+//! static metadata, not runtime capture or a report producer.
+
+mod azure_policy;
 
 use super::report::{ConditionKind, Operator, RuleKind, SourceLocation};
 use crate::lexer::{Lexer, Source, Token, TokenKind};
@@ -117,6 +119,9 @@ fn is_rego(program: &Program) -> bool {
 impl Provenance {
     /// Decodes the checks of `program`.
     pub fn new(program: &Program) -> Self {
+        if program.metadata.language == "azure_policy" {
+            return azure_policy::decode(program);
+        }
         if !is_rego(program) || program.rule_infos.is_empty() {
             return Self::default();
         }
