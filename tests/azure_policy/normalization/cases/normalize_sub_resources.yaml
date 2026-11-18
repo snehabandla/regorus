@@ -1436,3 +1436,47 @@ cases:
               defaults: {}
               enabled: true
     round_trip: true
+
+  - note: "an array alias sorted after a nested array's aliases is moved after them"
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                {
+                  "name": "Test/widgets/rules[*].action",
+                  "defaultPath": "properties.rules[*].rawaction",
+                  "paths": []
+                },
+                {
+                  "name": "Test/widgets/rules[*].conditions[*].state",
+                  "defaultPath": "properties.rules[*].conditions[*].rawstate",
+                  "paths": []
+                },
+                {
+                  "name": "Test/widgets/rules[*]['conditions']",
+                  "defaultPath": "properties.rules[*].legacyconditions",
+                  "paths": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    input:
+      type: Test/widgets
+      properties:
+        rules:
+          - rawaction: allow
+            legacyconditions:
+              - rawstate: ready
+    expected_normalized:
+      type: Test/widgets
+      rules:
+        - action: allow
+          conditions:
+            - rawstate: ready
+    round_trip: true

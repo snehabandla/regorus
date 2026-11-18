@@ -71,8 +71,9 @@ pub fn apply_alias_entries(
             .unwrap_or(&aliases.default_aggregates)
     });
 
-    // Remaps of the same array move their fields together, so aliases that
-    // swap field names don't consume each other's results. Each removes the
+    // Consecutive remaps of the same array move their fields together, so
+    // aliases that swap field names don't consume each other's results; runs
+    // of other arrays keep their order between them. Each removes the
     // original ARM field so the normalized output only has the alias short
     // name; a stale source key could otherwise collide with restored casing
     // during denormalization.
@@ -81,8 +82,8 @@ pub fn apply_alias_entries(
     for remap in &agg.element_remaps {
         let field = (remap.source_field.as_str(), remap.target_field.as_str());
         match groups
-            .iter_mut()
-            .find(|(chain, _)| *chain == remap.array_chain.as_slice())
+            .last_mut()
+            .filter(|(chain, _)| *chain == remap.array_chain.as_slice())
         {
             Some((_, fields)) => fields.push(field),
             None => groups.push((&remap.array_chain, alloc::vec![field])),

@@ -189,8 +189,9 @@ pub fn denormalize_with_aliases(
             }
 
             // Phase 2d: Precomputed reverse element-level field remaps.
-            // Remaps of the same array move their fields together, so aliases
-            // that swap field names don't consume each other's results.
+            // Consecutive remaps of the same array move their fields together,
+            // so aliases that swap field names don't consume each other's
+            // results; runs of other arrays keep their order between them.
             type Group = (bool, Vec<Vec<String>>, Vec<(String, String)>);
             let mut groups: Vec<Group> = Vec::new();
             for rev in &agg.reverse_element_remaps {
@@ -219,8 +220,8 @@ pub fn denormalize_with_aliases(
                 }
                 let field = (rev.source_field.clone(), target_field);
                 match groups
-                    .iter_mut()
-                    .find(|(root, chain, _)| *root == at_root && *chain == array_chain)
+                    .last_mut()
+                    .filter(|(root, chain, _)| *root == at_root && *chain == array_chain)
                 {
                     Some((_, _, fields)) => fields.push(field),
                     None => groups.push((at_root, array_chain, alloc::vec![field])),
