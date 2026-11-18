@@ -217,17 +217,28 @@ fn index(value: &Value, segment: &PathSegment) -> Value {
     }
 }
 
-/// Whether JSON represents the value without loss: no sets and no
-/// non-string object keys.
-fn is_lossless(value: &Value) -> bool {
-    match *value {
-        Value::Set(_) => false,
-        Value::Array(ref items) => items.iter().all(is_lossless),
-        Value::Object(ref fields) => fields
-            .iter()
-            .all(|(k, v)| matches!(*k, Value::String(_)) && is_lossless(v)),
-        _ => true,
+/// Reject values whose JSON encoding changes their Rego type.
+fn is_lossless(value: &Value, checkpoint: &mut impl FnMut() -> Result<()>) -> Result<bool> {
+    let mut pending = alloc::vec![value];
+    checkpoint()?;
+    while let Some(value) = pending.pop() {
+        match *value {
+            Value::Undefined | Value::Set(_) => return Ok(false),
+            Value::Array(ref items) => pending.extend(items.iter()),
+            Value::Object(ref fields) => {
+                for (key, value) in fields.iter() {
+                    if !matches!(*key, Value::String(_)) {
+                        checkpoint()?;
+                        return Ok(false);
+                    }
+                    pending.push(value);
+                }
+            }
+            _ => {}
+        }
+        checkpoint()?;
     }
+    Ok(true)
 }
 
 const fn mirror(op: Operator) -> Operator {
@@ -357,6 +368,12 @@ impl RegoVM {
     /// which only happens for programs not produced by the built-in
     /// compilers.
     ///
+    /// Residuals currently cover input-path guards and comparisons against
+    /// JSON-safe known values in one complete-rule body without a default.
+    /// Unknown-dependent helpers, loops, negation, context conditions and
+    /// other rule shapes fail closed as [`ResidualStatus::Unsupported`].
+    /// Conditions are bounded by [`PartialEvalSettings::max_conditions`].
+    ///
     /// Rule defaults are evaluated at compile time with undefined `input`.
     /// Dependencies read by a default are not recorded, so an input-dependent
     /// default can produce an `Exact` result even when it depends on an unknown.
@@ -479,7 +496,7 @@ impl RegoVM {
                 anchor,
             )));
         }
-        if !is_lossless(&value) {
+        if !is_lossless(&value, &mut || self.check_initial_memory_limit())? {
             return Ok(unsupported(warning(
                 &program,
                 Some(Reason::NotJson),
@@ -807,9 +824,11 @@ impl RegoVM {
         let value = self.pe_raw(known)?;
         let pc = self.pc;
         let strict = self.strict_builtin_errors && !matches!(op, Operator::Eq | Operator::Ne);
+        let json = matches!(value, Value::Undefined)
+            || is_lossless(&value, &mut || self.check_initial_memory_limit())?;
         if let Some(pe) = self.pe_mut() {
             pe.mark_used(unknown);
-            if !matches!(value, Value::Undefined) && !is_lossless(&value) {
+            if !json {
                 pe.flag(Reason::NotJson, pc);
             }
             if strict {
@@ -931,7 +950,7 @@ fn condition(
     let path = render_path(cond.path.0, &cond.path.1, checkpoint)?;
     let text = match (cond.op, cond.value.as_ref()) {
         (Some(op), Some(value)) => {
-            if !is_lossless(value) {
+            if !is_lossless(value, checkpoint)? {
                 return Ok(None);
             }
             let value = value.to_json_str_compact().map_err(super::VmError::from)?;
@@ -982,7 +1001,7 @@ fn warning(program: &Program, reason: Option<Reason>, pc: usize) -> String {
             String::from("a value that depends on unknown input is not checked")
         }
         Some(Reason::NotJson) => {
-            String::from("a residual value contains a set or a non-string object key")
+            String::from("a residual value contains undefined, a set or a non-string object key")
         }
         Some(Reason::StrictCompare) => {
             String::from("an ordering comparison of unknown input may raise a type error")
