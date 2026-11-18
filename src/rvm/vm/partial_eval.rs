@@ -224,7 +224,9 @@ fn is_lossless(root: &Value, checkpoint: &mut impl FnMut() -> Result<()>) -> Res
     checkpoint()?;
     while let Some(node) = pending.pop() {
         match *node {
-            Value::Undefined | Value::Set(_) => return Ok(false),
+            Value::Undefined | Value::Set(_) | Value::Number(crate::number::Number::BigInt(_)) => {
+                return Ok(false);
+            }
             Value::Array(ref items) => pending.extend(items.iter()),
             Value::Object(ref fields) => {
                 for (key, child) in fields.iter() {
@@ -1014,7 +1016,7 @@ fn warning(program: &Program, reason: Option<Reason>, pc: usize) -> String {
             String::from("a value that depends on unknown input is not checked")
         }
         Some(Reason::NotJson) => {
-            String::from("a residual value contains undefined, a set or a non-string object key")
+            String::from("a residual value cannot be represented losslessly as JSON")
         }
         Some(Reason::StrictCompare) => {
             String::from("an ordering comparison of unknown input may raise a type error")
