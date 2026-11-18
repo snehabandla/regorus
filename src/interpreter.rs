@@ -3457,7 +3457,7 @@ impl Interpreter {
                 continue;
             }
             let mut package_value = Value::new_object();
-            for component in package[fields.len()..].iter().rev() {
+            for component in package.iter().skip(fields.len()).rev() {
                 let mut parent = Value::new_object();
                 parent
                     .as_object_mut()?
