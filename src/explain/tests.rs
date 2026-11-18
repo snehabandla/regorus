@@ -1620,8 +1620,13 @@ fn attempts_scopes_and_cached_uses_keep_ownership() -> anyhow::Result<()> {
     helper.calls = Some(Vec::new());
     helper.definitions.clear();
     // The failed helper attempt is context; only attempt 4 owns its cause.
-    let mut condition = rule.definitions[1].conditions[0].clone();
-    condition.owner = ConditionOwner {
+    let mut helper_condition = rule
+        .definitions
+        .get(1)
+        .and_then(|definition| definition.conditions.first())
+        .context("helper check fixture")?
+        .clone();
+    helper_condition.owner = ConditionOwner {
         rule: helper.name.clone(),
         call_instance: 2,
         attempt: Some(4),
@@ -1636,9 +1641,9 @@ fn attempts_scopes_and_cached_uses_keep_ownership() -> anyhow::Result<()> {
             line: 7,
             column: 1,
         }),
-        conditions: alloc::vec![condition],
+        conditions: alloc::vec![helper_condition],
     });
-    rule.definitions[1].index = 0;
+    rule.definitions.get_mut(1).context("else body")?.index = 0;
     for (definition, attempt) in rule.definitions.iter_mut().zip([1, 2]) {
         for condition in &mut definition.conditions {
             condition.owner.call_instance = 1;
@@ -1690,9 +1695,10 @@ fn attempts_scopes_and_cached_uses_keep_ownership() -> anyhow::Result<()> {
         json.pointer("/rules/1/scopes"),
         Some(&serde_json::json!([]))
     );
-    report.rules[1].attempts = None;
-    report.rules[1].scopes = None;
-    report.rules[1].calls = None;
+    let uncaptured_helper = report.rules.get_mut(1).context("helper invocation")?;
+    uncaptured_helper.attempts = None;
+    uncaptured_helper.scopes = None;
+    uncaptured_helper.calls = None;
     let uncaptured = serde_json::to_value(&report)?;
     assert!(uncaptured.pointer("/rules/1/attempts").is_none());
     assert!(uncaptured.pointer("/rules/1/scopes").is_none());
