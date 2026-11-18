@@ -649,12 +649,9 @@ fn loop_values_without_keys() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Azure Policy programs have no rule information, so their conditions are
-/// not decoded. Reads of the `context` root, such as
-/// `[resourceGroup().name]`, therefore never produce a site or a path.
 #[cfg(feature = "azure_policy")]
 #[test]
-fn azure_policy_programs_have_no_sites() -> anyhow::Result<()> {
+fn azure_policy_conditions_keep_json_and_context_paths() -> anyhow::Result<()> {
     use crate::languages::azure_policy::{compiler, parser};
     let json = r#"{
   "if": {
@@ -678,8 +675,31 @@ fn azure_policy_programs_have_no_sites() -> anyhow::Result<()> {
         .iter()
         .any(|i| matches!(i, Instruction::PolicyCondition { .. })));
     let provenance = Provenance::new(&program);
-    assert_eq!(provenance.sites(), &[]);
-    assert_eq!(provenance.rule(0), None);
+    let sites = provenance.sites();
+    assert_eq!(sites.len(), 3);
+    let first = sites.first().ok_or_else(|| anyhow::anyhow!("first condition"))?;
+    assert_eq!(first.text, r#"{ "field": "location", "notEquals": "[resourceGroup().location]" }"#);
+    assert_eq!(at(first), Some(("policy.json", 4, 7)));
+    assert_eq!(first.left_path.as_deref(), Some(r#"input["resource"]["location"]"#));
+    assert_eq!(first.right_path.as_deref(), Some(r#"context["resourceGroup"]["location"]"#));
+    assert_eq!(first.operator, None);
+    assert_eq!(first.azure_policy, Some(AzurePolicySite {
+        operator: Some(crate::rvm::instructions::PolicyOp::NotEquals),
+        field: Some("location".into()),
+    }));
+    let paths: Vec<_> = sites.iter().map(|s| (s.left_path.as_deref(), s.right_path.as_deref())).collect();
+    assert_eq!(paths, vec![
+        (Some(r#"input["resource"]["location"]"#), Some(r#"context["resourceGroup"]["location"]"#)),
+        (Some(r#"context["resourceGroup"]["name"]"#), None),
+        (Some(r#"context["subscription"]["subscriptionId"]"#), None),
+    ]);
+    assert_eq!(provenance.rule(0).map(|r| (r.name.as_str(), r.kind)), Some(("main", RuleKind::Complete)));
+    for (index, site) in sites.iter().enumerate() {
+        assert_eq!(site.id, SiteId(u32::try_from(index)?));
+        assert_eq!(site.ordinal, index);
+        assert_eq!(site.owner, SiteOwner { rule: 0, definition: 0, body: Some(0) });
+        assert_eq!(provenance.site_at(site.pc), Some(site));
+    }
     Ok(())
 }
 

@@ -18,7 +18,7 @@
 
 use super::report::{ConditionKind, Operator, RuleKind, SourceLocation};
 use crate::lexer::{Lexer, Source, Token, TokenKind};
-use crate::rvm::instructions::{GuardMode, Instruction};
+use crate::rvm::instructions::{GuardMode, Instruction, PolicyOp};
 use crate::rvm::program::{Program, SpanInfo};
 use alloc::string::{String, ToString as _};
 use alloc::vec::Vec;
@@ -84,6 +84,21 @@ pub struct CheckSite {
     pub left_path: Option<String>,
     /// Reference the right operand was read from, as for `left_path`.
     pub right_path: Option<String>,
+    /// Azure Policy metadata, separate from Rego's operator semantics.
+    /// `None` for Rego sites.
+    pub azure_policy: Option<AzurePolicySite>,
+}
+
+/// Language-specific static metadata of an Azure Policy check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AzurePolicySite {
+    /// Native operator, including its Azure Policy casing and null semantics.
+    /// `None` for a collection loop. Internal value guards are not sites.
+    pub operator: Option<PolicyOp>,
+    /// The enclosing JSON condition's declared `field`, preserving aliases
+    /// and dynamic selector expressions. Not a captured concrete input path.
+    pub field: Option<String>,
 }
 
 /// Static provenance of every check in a program. See the module docs.
@@ -163,6 +178,7 @@ impl Provenance {
                     location,
                     left_path: path(shape.left),
                     right_path: path(shape.right),
+                    azure_policy: None,
                 });
                 ordinal = ordinal.saturating_add(1);
             }
