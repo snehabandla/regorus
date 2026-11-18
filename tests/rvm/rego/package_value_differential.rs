@@ -1,0 +1,189 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+//! Differential test for reading a package as a value.
+//!
+//! A rule that is undefined contributes no key to the document of its package:
+//! `data.probe.sub` omits it, so `count`, `object.keys`, iteration, equality and
+//! serialization never see it. Rules that are defined (including `false`,
+//! defaults and empty partial sets/objects) and empty subpackages are kept.
+//! Expected values were checked against OPA 1.2.0. Each query is evaluated in
+//! the interpreter and in both RVM execution modes.
+
+use anyhow::Result;
+use regorus::languages::rego::compiler::Compiler;
+use regorus::rvm::vm::{ExecutionMode, RegoVM};
+use regorus::{Engine, Value};
+
+const SUB: &str = r#"
+package probe.sub
+import rego.v1
+defined := 1
+f := false
+default d := "dflt"
+d := "x" if input.x == 1
+s contains x if some x in input.missing
+o[k] := 1 if some k in input.missing
+undefined_body if input.x == 1
+undefined_value := input.missing
+"#;
+
+const INNER: &str = r#"
+package probe.sub.inner
+import rego.v1
+u if input.x == 1
+"#;
+
+const CONSUMERS: &str = r#"
+package probe
+import rego.v1
+result := data.probe.sub
+n := count(data.probe.sub)
+keys := object.keys(data.probe.sub)
+pairs := {k | some k, _ in data.probe.sub}
+eq_check := object.remove(data.probe.sub, ["s"]) == json.unmarshal(`{"defined": 1, "f": false, "d": "dflt", "o": {}, "inner": {}}`)
+has_undefined_body if "undefined_body" in object.keys(data.probe.sub)
+ser := json.marshal(data.probe.sub)
+"#;
+
+const WHOLE: &str = r#"
+package top
+whole := data.probe
+"#;
+
+const ALL_UNDEFINED: &str = r#"
+package probe.sub
+import rego.v1
+undefined_body if input.x == 1
+undefined_value := input.missing
+"#;
+
+const ALL_UNDEFINED_CONSUMERS: &str = r#"
+package probe
+result := data.probe.sub
+n := count(data.probe.sub)
+"#;
+
+const EMPTY: &str = r#"{}"#;
+const X1: &str = r#"{"x": 1}"#;
+
+const SUB_EMPTY: &str = r#"{"d": "dflt", "defined": 1, "f": false, "inner": {}, "o": {}, "s": []}"#;
+const SUB_X1: &str = r#"{"d": "x", "defined": 1, "f": false, "inner": {"u": true}, "o": {}, "s": [], "undefined_body": true}"#;
+const KEYS_EMPTY: &str = r#"["d", "defined", "f", "inner", "o", "s"]"#;
+const KEYS_X1: &str = r#"["d", "defined", "f", "inner", "o", "s", "undefined_body"]"#;
+
+/// Normalizes a value to JSON (sets become arrays); `None` means undefined.
+fn normalize(value: Result<Value>) -> Result<Option<Value>, String> {
+    match value {
+        Ok(Value::Undefined) => Ok(None),
+        Ok(value) => value
+            .to_json_str()
+            .and_then(|json| Value::from_json_str(&json))
+            .map(Some)
+            .map_err(|err| format!("{value:?} ({err})")),
+        Err(err) => Err(format!("error: {err:#}")),
+    }
+}
+
+fn eval_rvm(engine: &mut Engine, query: &str, input: &Value, mode: ExecutionMode) -> Result<Value> {
+    let compiled = engine.compile_with_entrypoint(&query.into())?;
+    let program = Compiler::compile_from_policy(&compiled, &[query])?;
+    let mut vm = RegoVM::new();
+    vm.load_program(program);
+    vm.set_data(engine.get_data())?;
+    vm.set_input(input.clone());
+    vm.set_execution_mode(mode);
+    Ok(vm.execute_entry_point_by_name(query)?)
+}
+
+/// Requires `query` on `input` to produce `want` (`None` for undefined) in the
+/// interpreter and in both RVM modes.
+fn check(modules: &[&str], cases: &[(&str, &str, Option<&str>)]) -> Result<()> {
+    let mut failures = Vec::new();
+    for &(query, input, want) in cases {
+        let want = want.map(Value::from_json_str).transpose()?;
+        let mut engine = Engine::new();
+        for (idx, module) in modules.iter().enumerate() {
+            engine.add_policy(format!("p{idx}.rego"), module.to_string())?;
+        }
+        let input_value = Value::from_json_str(input)?;
+        engine.set_input(input_value.clone());
+
+        let mut results = vec![("interpreter", engine.eval_rule(query.to_string()))];
+        for (name, mode) in [
+            ("run-to-completion", ExecutionMode::RunToCompletion),
+            ("suspendable", ExecutionMode::Suspendable),
+        ] {
+            results.push((name, eval_rvm(&mut engine, query, &input_value, mode)));
+        }
+        for (name, got) in results {
+            let got = normalize(got);
+            if got.as_ref() != Ok(&want) {
+                failures.push(format!(
+                    "{query} [{name}] input {input}: want {want:?}, got {got:?}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    Ok(())
+}
+
+#[test]
+fn package_value_omits_undefined_rules() -> Result<()> {
+    check(
+        &[CONSUMERS, SUB, INNER],
+        &[
+            ("data.probe.result", EMPTY, Some(SUB_EMPTY)),
+            ("data.probe.result", X1, Some(SUB_X1)),
+            ("data.probe.n", EMPTY, Some("6")),
+            ("data.probe.n", X1, Some("7")),
+            ("data.probe.keys", EMPTY, Some(KEYS_EMPTY)),
+            ("data.probe.keys", X1, Some(KEYS_X1)),
+            ("data.probe.pairs", EMPTY, Some(KEYS_EMPTY)),
+            ("data.probe.pairs", X1, Some(KEYS_X1)),
+            ("data.probe.eq_check", EMPTY, Some("true")),
+            ("data.probe.eq_check", X1, Some("false")),
+            ("data.probe.has_undefined_body", EMPTY, None),
+            ("data.probe.has_undefined_body", X1, Some("true")),
+            (
+                "data.probe.ser",
+                EMPTY,
+                Some(
+                    r#""{\"d\":\"dflt\",\"defined\":1,\"f\":false,\"inner\":{},\"o\":{},\"s\":[]}""#,
+                ),
+            ),
+        ],
+    )
+}
+
+#[test]
+fn parent_package_value_omits_undefined_rules_of_subpackages() -> Result<()> {
+    check(
+        &[WHOLE, SUB, INNER],
+        &[
+            (
+                "data.top.whole",
+                EMPTY,
+                Some(&format!(r#"{{"sub": {SUB_EMPTY}}}"#)),
+            ),
+            (
+                "data.top.whole",
+                X1,
+                Some(&format!(r#"{{"sub": {SUB_X1}}}"#)),
+            ),
+        ],
+    )
+}
+
+#[test]
+fn package_of_only_undefined_rules_is_empty_object() -> Result<()> {
+    check(
+        &[ALL_UNDEFINED_CONSUMERS, ALL_UNDEFINED],
+        &[
+            ("data.probe.result", EMPTY, Some("{}")),
+            ("data.probe.n", EMPTY, Some("0")),
+            ("data.probe.result", X1, Some(r#"{"undefined_body": true}"#)),
+        ],
+    )
+}
