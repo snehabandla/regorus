@@ -1804,11 +1804,13 @@ fn attempts_scopes_and_cached_uses_keep_ownership() -> anyhow::Result<()> {
 #[test]
 fn arbitrary_queries_own_cached_uses_and_negation_scopes() -> anyhow::Result<()> {
     let mut report = complete_rule_report();
-    report
-        .rules
-        .first_mut()
-        .context("queried rule")?
-        .call_instance = 1;
+    let rule = report.rules.first_mut().context("queried rule")?;
+    rule.call_instance = 1;
+    for definition in &mut rule.definitions {
+        for condition in &mut definition.conditions {
+            condition.owner.call_instance = 1;
+        }
+    }
     report.query.entry_point = String::from("data.test.allow; not data.test.allow == false");
     report.query.rule = None;
     report.query.call_instance = None;

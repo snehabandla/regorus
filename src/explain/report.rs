@@ -574,7 +574,8 @@ pub struct AttemptExplanation {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ScopeKind {
-    /// A `not` operand, entered before its evaluation.
+    /// A `not` operand, entered before its evaluation. The completed `not`
+    /// check belongs to the enclosing scope, not to its own operand scope.
     Negation,
     /// An `every` quantifier.
     Every,
@@ -586,7 +587,7 @@ pub enum ScopeKind {
     ObjectComprehension,
 }
 
-/// One dynamic entry into a logical construct within a rule invocation.
+/// One dynamic entry into a logical construct within a rule invocation or query.
 ///
 /// Scopes form call-local trees: a callee starts a new tree even when used
 /// inside a caller's negation. Follow [`CallUse`] edges to recover syntactic
