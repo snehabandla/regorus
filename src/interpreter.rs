@@ -29,6 +29,7 @@ use crate::value::*;
 use crate::*;
 use crate::{Expression, Extension, Location, QueryResult, QueryResults};
 
+use crate::query::traversal::negation_lifted_calls;
 #[cfg(feature = "coverage")]
 use crate::query::traversal::traverse;
 
@@ -1197,26 +1198,19 @@ impl Interpreter {
                 }
             }
             Literal::NotExpr { span, expr, .. } => {
-                let value = match expr.as_ref() {
-                    // Extra parameter is allowed; but a return argument is not allowed.
-                    Expr::Call {
-                        span: call_span,
-                        fcn,
-                        params,
-                        ..
-                    } => self.eval_call(
-                        call_span,
-                        expr,
-                        fcn,
-                        params,
-                        get_extra_arg(
-                            expr,
-                            Some(self.current_module_path.as_str()),
-                            &self.compiled_policy.functions,
-                        ),
-                        false,
-                    )?,
-                    _ => self.eval_expr(expr)?,
+                let mut lifted = Vec::new();
+                let value = self.eval_negated_expr(expr, &mut lifted);
+                for call in &lifted {
+                    self.remove_loop_var_value(call);
+                }
+                let Some(value) = value? else {
+                    if let Some(ctx) = self.contexts.last_mut() {
+                        if let Some(result) = &mut ctx.result {
+                            result.bindings = Value::new_object();
+                            result.expressions.clear();
+                        }
+                    }
+                    return Ok(false);
                 };
 
                 if let Some(ctx) = self.contexts.last_mut() {
@@ -1597,10 +1591,10 @@ impl Interpreter {
             self.current_scope_mut()?.clone_from(scope);
         } else {
             Self::clear_scope(self.current_scope_mut()?);
-            self.get_current_context_mut()?
-                .result
-                .clone_from(&frame.query_result);
         }
+        self.get_current_context_mut()?
+            .result
+            .clone_from(&frame.query_result);
         Ok(())
     }
 
@@ -2140,6 +2134,7 @@ impl Interpreter {
                     .push(Self::make_expression_result(&stmt.span, &Value::Bool(true)));
             }
             let saved_scope = Some(self.current_scope()?.clone());
+            let query_result = self.get_current_context()?.result.clone();
             let module_idx = self.current_module_index;
             let Some(BindingPlan::SomeIn {
                 key_plan,
@@ -2174,7 +2169,7 @@ impl Interpreter {
                 target: None,
                 previous_loop_value: None,
                 saved_scope,
-                query_result: None,
+                query_result,
                 saved_state: None,
                 started: false,
                 success: false,
@@ -2846,7 +2841,8 @@ impl Interpreter {
         params: &[ExprRef],
     ) -> Result<Value> {
         self.check_execution_time()?;
-        // Return generated values of walk builtin.
+        // Return generated values of walk builtin, or of a call lifted out of a
+        // negated expression (`eval_negated_expr`).
         if let Some(v) = self.get_loop_var_value(expr)? {
             return Ok(v.clone());
         }
@@ -3017,9 +3013,13 @@ impl Interpreter {
                     .map_err(|err| anyhow!("loop hoisting table out of bounds: {err}"))?
                     .cloned()
                 {
-                    // Execute the destructuring plan with the parameter value
-                    self.execute_destructuring_plan(&destructuring_plan, param_value)?
-                        == Value::from(true)
+                    // Execute the destructuring plan with the parameter value.
+                    // Its expressions belong to the callee's module.
+                    let saved_module_index =
+                        core::mem::replace(&mut self.current_module_index, callee_module_idx);
+                    let bound = self.execute_destructuring_plan(&destructuring_plan, param_value);
+                    self.current_module_index = saved_module_index;
+                    bound? == Value::from(true)
                 } else {
                     // Raise error if binding plan is not found
                     return Err(span.error(&format!(
@@ -3547,6 +3547,53 @@ impl Interpreter {
         }
     }
 
+    /// Evaluates a negated expression. OPA evaluates the calls nested in its
+    /// operands (`negation_lifted_calls`) before the negation: an Undefined
+    /// one fails the body (`None`) instead of satisfying `not`. The values of
+    /// the others are cached for the negated expression; the caller removes
+    /// the `lifted` entries.
+    fn eval_negated_expr(
+        &mut self,
+        expr: &ExprRef,
+        lifted: &mut Vec<ExprRef>,
+    ) -> Result<Option<Value>> {
+        let calls = negation_lifted_calls(expr, &mut |e| {
+            self.check_execution_time()?;
+            Ok(self.get_loop_var_value(e)?.is_some())
+        })?;
+        self.memory_check()?;
+        for call in calls {
+            let value = self.eval_expr(&call)?;
+            if value == Value::Undefined {
+                return Ok(None);
+            }
+            self.set_loop_var_value(&call, value)?;
+            lifted.push(call);
+        }
+        let value = match expr.as_ref() {
+            // Extra parameter is allowed; but a return argument is not allowed.
+            Expr::Call {
+                span: call_span,
+                fcn,
+                params,
+                ..
+            } => self.eval_call(
+                call_span,
+                expr,
+                fcn,
+                params,
+                get_extra_arg(
+                    expr,
+                    Some(self.current_module_path.as_str()),
+                    &self.compiled_policy.functions,
+                ),
+                false,
+            )?,
+            _ => self.eval_expr(expr)?,
+        };
+        Ok(Some(value))
+    }
+
     fn eval_expr(&mut self, expr: &ExprRef) -> Result<Value> {
         self.with_native_depth(|this| this.eval_expr_impl(expr))
     }
@@ -3581,6 +3628,19 @@ impl Interpreter {
                         self.coverage.insert(source.clone(), c);
                     }
                 }
+            }
+        }
+
+        // Operators lifted out of a negated expression (`eval_negated_expr`).
+        if matches!(
+            expr.as_ref(),
+            Expr::BinExpr { .. }
+                | Expr::BoolExpr { .. }
+                | Expr::ArithExpr { .. }
+                | Expr::Membership { .. }
+        ) {
+            if let Some(v) = self.get_loop_var_value(expr)? {
+                return Ok(v.clone());
             }
         }
 
