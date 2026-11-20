@@ -24,6 +24,25 @@ use test_generator::test_resources;
 
 const CASES_DIR: &str = "tests/explanation_corpus/cases";
 
+#[cfg(feature = "explanations")]
+mod residual;
+
+#[derive(Deserialize, Debug)]
+#[serde(deny_unknown_fields)]
+struct PartialEvalExpectation {
+    status: ExpectedResidualStatus,
+    alternatives: Option<usize>,
+}
+
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ExpectedResidualStatus {
+    Exact,
+    Unsupported,
+    Partial,
+    PossibleConflict,
+}
+
 /// Language constructs a case exercises. Every variant must be covered by at
 /// least one case (`corpus_is_well_formed`).
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -111,9 +130,8 @@ struct Case {
     /// Undefined (false, OPA's default). Applied to every evaluator and OPA.
     #[serde(default)]
     strict_builtin_errors: bool,
-    /// Reserved for the expected partial-evaluation result.
-    #[serde(default, deserialize_with = "present")]
-    partial_eval: Option<Value>,
+    /// Required for unknown-input cases, including unsupported constructs.
+    partial_eval: Option<PartialEvalExpectation>,
     examples: Vec<Example>,
 }
 
@@ -343,8 +361,13 @@ fn check_case_shape(case: &Case) -> Result<()> {
     if case.description.trim().is_empty() {
         bail!("empty description");
     }
-    if case.partial_eval.is_some() {
-        bail!("partial_eval is reserved until partial evaluation can check it");
+    if case.constructs.contains(&Construct::UnknownInput) != case.partial_eval.is_some() {
+        bail!("`partial_eval` must be set exactly for unknown_input cases");
+    }
+    if let Some(pe) = &case.partial_eval {
+        if pe.status != ExpectedResidualStatus::Exact && pe.alternatives.is_some() {
+            bail!("only an exact partial_eval expectation may count alternatives");
+        }
     }
     if matches!(&case.opa_skip, Some(reason) if reason.trim().is_empty()) {
         bail!("opa_skip needs a reason");

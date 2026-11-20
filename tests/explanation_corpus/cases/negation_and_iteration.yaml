@@ -8,6 +8,7 @@ cases:
     description: Negation of an input field, distinguishing absent, false and true.
     constructs: [negation, default, undefined_vs_false, unknown_input]
     unknowns: [input.user]
+    partial_eval: {status: unsupported}
     modules:
       - |
         package test
@@ -73,6 +74,7 @@ cases:
     description: An existential loop that succeeds when any element matches.
     constructs: [some_in, complete_rule, unknown_input]
     unknowns: [input.roles]
+    partial_eval: {status: unsupported}
     modules:
       - |
         package test
@@ -124,6 +126,7 @@ cases:
     description: A universal quantifier, including the vacuous and missing-collection cases.
     constructs: [every, default, undefined_vs_false, unknown_input]
     unknowns: [input.images]
+    partial_eval: {status: unsupported}
     modules:
       - |
         package test
@@ -284,6 +287,7 @@ cases:
     description: A comprehension counted inside a rule condition.
     constructs: [comprehension, builtin, complete_rule, unknown_input]
     unknowns: [input.containers]
+    partial_eval: {status: unsupported}
     modules:
       - |
         package test

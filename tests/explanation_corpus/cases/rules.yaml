@@ -9,6 +9,7 @@ cases:
     description: A boolean rule whose body has two input guards.
     constructs: [complete_rule, undefined_vs_false, unknown_input]
     unknowns: [input.user, input.action]
+    partial_eval: {status: exact, alternatives: 1}
     modules:
       - |
         package test
@@ -87,6 +88,7 @@ cases:
     description: An else chain whose last branch has no body.
     constructs: [else, complete_rule, unknown_input]
     unknowns: [input.role]
+    partial_eval: {status: unsupported}
     modules:
       - |
         package test
@@ -160,6 +162,7 @@ cases:
     description: Two definitions of one boolean rule; either one is enough.
     constructs: [multiple_bodies, complete_rule, unknown_input]
     unknowns: [input.user, input.resource]
+    partial_eval: {status: unsupported}
     modules:
       - |
         package test
@@ -209,6 +212,7 @@ cases:
     description: A partial set built from two definitions, each iterating over input.
     constructs: [partial_set, multiple_bodies, some_in, builtin, unknown_input]
     unknowns: [input.containers]
+    partial_eval: {status: unsupported}
     modules:
       - |
         package test
@@ -249,6 +253,7 @@ cases:
     description: A partial object keyed by an input field.
     constructs: [partial_object, some_in, unknown_input]
     unknowns: [input.resources]
+    partial_eval: {status: unsupported}
     modules:
       - |
         package test
@@ -388,6 +393,7 @@ cases:
     description: A decision derived from an empty partial set, via count and via negation.
     constructs: [partial_set, helper_rule, negation, default, builtin, unknown_input]
     unknowns: [input.containers]
+    partial_eval: {status: unsupported}
     modules:
       - |
         package test
@@ -459,6 +465,7 @@ cases:
     description: An else branch taken because the first condition is Undefined rather than false.
     constructs: [else, complete_rule, undefined_vs_false, unknown_input]
     unknowns: [input.points]
+    partial_eval: {status: unsupported}
     modules:
       - |
         package test
