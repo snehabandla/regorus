@@ -119,9 +119,10 @@ behavior is a separate gate in `tests/rvm/rego/cases/native_depth.yaml`.
 The native BigInt constant fixture supplies a typed data value rather than an
 out-of-range source literal; it explicitly skips OPA's corpus JSON transport.
 
-`residual.rs` interprets structured residual fields after serializing the live
-typed PE result. Concrete results retain their native `Value` so a concrete
-set is not mistaken for its JSON array representation. Presentation `text`,
+`residual.rs` serializes only kind, status and structured residual alternatives
+from live typed PE output. Concrete results are never serialized: they retain
+their native `Value` types and numeric range, including sets and large integers.
+Presentation `text`,
 source locations, rule names and warnings are
 never executable. Conditions in one alternative are AND; complete rules and
 functions select the first matching ordered alternative (including defaults).

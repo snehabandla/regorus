@@ -296,10 +296,21 @@ fn check_completion(report: &Report, example: &Example) -> Result<()> {
 }
 
 fn decode(pe: regorus::explain::PartialEvalResult) -> Result<Report> {
-    let mut report: Report = serde_json::from_value(serde_json::to_value(&pe)?)?;
-    // Concrete sets/non-string-keyed objects need the typed value;
-    // only residual operands are required to be JSON-lossless.
-    report.result = pe.result;
+    // Only residual operands require JSON; concrete results keep native types
+    // and numeric range, including values the JSON serializer cannot encode.
+    let report = Report {
+        kind: serde_json::from_value(serde_json::to_value(pe.kind)?)?,
+        status: serde_json::from_value(serde_json::to_value(pe.status)?)?,
+        result: pe.result,
+        residual_queries: serde_json::from_value(serde_json::to_value(pe.residual_queries)?)?,
+    };
+    let unresolved = report.residual_queries.iter().any(|q| q.status == "unresolved");
+    if (report.status == ExpectedResidualStatus::Partial) != unresolved
+        || (matches!(report.status, ExpectedResidualStatus::Unsupported
+            | ExpectedResidualStatus::PossibleConflict) && !report.residual_queries.is_empty())
+    {
+        bail!("invalid residual status/alternatives envelope");
+    }
     Ok(report)
 }
 
