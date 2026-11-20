@@ -266,7 +266,7 @@ impl RegoVM {
             let value = result
                 .as_ref()
                 .ok()
-                .and_then(|()| self.registers.get(usize::from(dest)))
+                .and_then(|&()| self.registers.get(usize::from(dest)))
                 .cloned();
             self.explain_end_call(id, value.as_ref());
         }

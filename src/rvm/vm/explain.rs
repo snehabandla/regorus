@@ -222,7 +222,7 @@ impl RegoVM {
             rule_index: Some(rule_index),
             definition_index: 0,
             body_index: 0,
-            call_depth: caller.call_depth + 1,
+            call_depth: self.checked_add_one(caller.call_depth, "explanation call depth")?,
             ..caller
         };
         self.explain.calls.push(Invocation {
