@@ -178,8 +178,8 @@ cases:
         input: {resources: [{name: r0, a: {x: "no"}, b: "no"}, {name: r1, a: {x: "no"}, b: "no"}]}
         want_result: {"set!": [r0, r1]}
 
-  - note: pe_replan_deep_negation_chain
-    description: Thirty helper links preserve the leaf's polarity rather than treating a depth cut as concrete (RG-P7).
+  - note: pe_replan_bounded_negation_chain
+    description: Six helper links preserve nested leaf polarity within the default native-depth envelope (bounded RG-P7).
     constructs: [partial_set, helper_rule, negation, unknown_input]
     unknowns: [input.u]
     partial_eval: {status: unsupported}
@@ -192,31 +192,7 @@ cases:
         h3 if not h4
         h4 if not h5
         h5 if not h6
-        h6 if not h7
-        h7 if not h8
-        h8 if not h9
-        h9 if not h10
-        h10 if not h11
-        h11 if not h12
-        h12 if not h13
-        h13 if not h14
-        h14 if not h15
-        h15 if not h16
-        h16 if not h17
-        h17 if not h18
-        h18 if not h19
-        h19 if not h20
-        h20 if not h21
-        h21 if not h22
-        h22 if not h23
-        h23 if not h24
-        h24 if not h25
-        h25 if not h26
-        h26 if not h27
-        h27 if not h28
-        h28 if not h29
-        h29 if not h30
-        h30 if not input.u
+        h6 if not input.u
         deny contains "x" if not h0
     query: data.test.deny
     examples:

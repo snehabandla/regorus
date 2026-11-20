@@ -112,6 +112,10 @@ the reviewed B34 producer. New cases exercise general JSON values, typed paths,
 numeric comparisons, known-gate elimination and all six deployment-context
 leaves. Integration-branch reproductions keep their correct ordinary results
 and explicitly Unsupported PE, rather than pinning defective exact answers.
+The nested-negation chain uses six helper links, preserving the original
+thirty-link chain's even polarity without exceeding default native-depth limits.
+The original deep reproduction remains outside this completion oracle; resource
+behavior is a separate gate in `tests/rvm/rego/cases/native_depth.yaml`.
 
 `residual.rs` interprets structured residual fields after serializing the live
 typed PE result. Concrete results retain their native `Value` so a concrete
