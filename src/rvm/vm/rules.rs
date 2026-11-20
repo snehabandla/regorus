@@ -249,9 +249,7 @@ impl RegoVM {
     ) -> Result<()> {
         // Leave invalid-index diagnostics to the evaluator.
         #[cfg(feature = "explanations")]
-        let call = if self.explain_enabled()
-            && usize::from(rule_index) < self.rule_cache.len()
-        {
+        let call = if self.explain_enabled() && usize::from(rule_index) < self.rule_cache.len() {
             self.explain_begin_call(rule_index)?
         } else {
             None

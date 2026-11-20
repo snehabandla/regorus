@@ -1247,7 +1247,10 @@ fn invocation_malformed_rule_index_preserves_recorder_off_error() {
     program.dispatch_window_size = 2;
     program.max_rule_window_size = 2;
     program.instructions = vec![
-        Instruction::CallRule { dest: 0, rule_index: 0 },
+        Instruction::CallRule {
+            dest: 0,
+            rule_index: 0,
+        },
         Instruction::Return { value: 0 },
     ];
     let program = Arc::new(program);
@@ -1269,7 +1272,10 @@ fn invocation_malformed_rule_index_preserves_recorder_off_error() {
             available: 0,
         });
         assert_eq!(baseline, expected, "{mode:?}: recorder-off baseline");
-        assert_eq!(recorded, expected, "{mode:?}: recording changed the typed error");
+        assert_eq!(
+            recorded, expected,
+            "{mode:?}: recording changed the typed error"
+        );
     }
 }
 
@@ -1301,9 +1307,14 @@ fn invocation_malformed_undefined_argument_preserves_recorder_off_result() {
         })
     });
     for (mode, [baseline, recorded]) in MODES.into_iter().zip(outcomes) {
-        assert_eq!(baseline, Ok(Value::Undefined), "{mode:?}: recorder-off baseline");
         assert_eq!(
-            recorded, Ok(Value::Undefined),
+            baseline,
+            Ok(Value::Undefined),
+            "{mode:?}: recorder-off baseline"
+        );
+        assert_eq!(
+            recorded,
+            Ok(Value::Undefined),
             "{mode:?}: recording changed undefined-argument short-circuit semantics"
         );
     }
@@ -2525,10 +2536,9 @@ fn invocation_deadline_abort_terminates_the_active_call() -> Result<()> {
             "{mode:?}: expected a typed deadline error, got {outcome:?}"
         );
         let calls = fixture.calls();
-        let [
-            CallRecord::Start(caller, start),
-            CallRecord::End(owner, None, None),
-        ] = calls.as_slice() else {
+        let [CallRecord::Start(caller, start), CallRecord::End(owner, None, None)] =
+            calls.as_slice()
+        else {
             bail!("{mode:?}: expected one started invocation and one abort: {calls:?}");
         };
         assert_eq!(caller.call_instance, None);
