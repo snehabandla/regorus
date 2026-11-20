@@ -2381,6 +2381,7 @@ fn destructured_parameter_origins_preserve_typed_projections() -> anyhow::Result
             None,
         )]),
     };
+    let incoming = serde_json::to_value(&call)?;
     for (path, expected) in [
         (
             vec![PathSegment::Index(0)],
@@ -2396,11 +2397,55 @@ fn destructured_parameter_origins_preserve_typed_projections() -> anyhow::Result
             argument: 0,
             path: Some(path),
         }]);
+        let json = serde_json::to_value(&operand)?;
         assert_eq!(
-            serde_json::to_value(&operand)?.get("parameter_origins"),
+            json.get("parameter_origins"),
             Some(&serde_json::json!([{"argument":0,"path":expected}]))
         );
+        let origin = json
+            .pointer("/parameter_origins/0")
+            .context("parameter origin")?;
+        let argument = usize::try_from(
+            origin
+                .get("argument")
+                .and_then(serde_json::Value::as_u64)
+                .context("argument index")?,
+        )?;
+        let mut value = incoming
+            .pointer(&format!("/arguments/{argument}/value"))
+            .context("incoming value")?;
+        for segment in origin
+            .get("path")
+            .and_then(serde_json::Value::as_array)
+            .context("typed projection")?
+        {
+            value = if let Some(index) = segment.get("index").and_then(serde_json::Value::as_u64) {
+                value
+                    .get(usize::try_from(index)?)
+                    .context("array element")?
+            } else {
+                value
+                    .get(
+                        segment
+                            .get("key")
+                            .and_then(serde_json::Value::as_str)
+                            .context("object key")?,
+                    )
+                    .context("object element")?
+            };
+        }
+        assert_eq!(json.get("value"), Some(value));
     }
+    let mut operand = known(Value::from(false), None);
+    operand.parameter_origins = Some(Vec::new());
+    assert_eq!(
+        serde_json::to_value(&operand)?.get("parameter_origins"),
+        Some(&serde_json::json!([]))
+    );
+    operand.parameter_origins = None;
+    assert!(serde_json::to_value(&operand)?
+        .get("parameter_origins")
+        .is_none());
     call.arguments = Some(Vec::new());
     assert_eq!(
         serde_json::to_value(&call)?.get("arguments"),
