@@ -3217,6 +3217,23 @@ fn value_only_helpers_keep_argument_origins_without_body_predicates() -> anyhow:
             }],
             complete: true,
         });
+        report
+            .rules
+            .first_mut()
+            .and_then(|caller| caller.calls.as_mut())
+            .and_then(|calls| {
+                calls
+                    .iter_mut()
+                    .find(|call| call.call_instance == call_instance)
+            })
+            .context("incoming identity use")?
+            .arguments = Some(vec![argument]);
+        let mut parameter = known(Value::from(false), None);
+        parameter.concrete_path = ConcretePath::NoPath;
+        parameter.parameter_origins = Some(vec![ParameterOrigin {
+            argument: 0,
+            path: Some(Vec::new()),
+        }]);
         let binding = ConditionExplanation {
             completed_scope: None,
             call_uses: None,
@@ -3228,7 +3245,7 @@ fn value_only_helpers_keep_argument_origins_without_body_predicates() -> anyhow:
                 scope: None,
             },
             outcome: Outcome::Success,
-            left: Some(argument),
+            left: Some(parameter),
             right: None,
             witness: None,
             binding: Some(String::from("x")),
@@ -3280,8 +3297,15 @@ fn value_only_helpers_keep_argument_origins_without_body_predicates() -> anyhow:
                 "owner":{"rule":"data.test.identity","call_instance":call_instance,"attempt":call_instance},
                 "outcome":"success","binding":"x",
                 "left":{"concrete_path":{"status":"no_path"},"value":false,
-                    "origins":{"paths":[{"status":"captured","root":"input","segments":[{"key":key}]}],"complete":true}}
+                    "parameter_origins":[{"argument":0,"path":[]}]}
             }]))
+        );
+        assert_eq!(
+            json.pointer(&format!("/rules/0/calls/{}/arguments/0", index - 1)),
+            Some(&serde_json::json!({
+                "concrete_path":{"status":"no_path"},"value":false,
+                "origins":{"paths":[{"status":"captured","root":"input","segments":[{"key":key}]}],"complete":true}
+            }))
         );
         assert_eq!(
             json.pointer(&format!(
@@ -3291,13 +3315,12 @@ fn value_only_helpers_keep_argument_origins_without_body_predicates() -> anyhow:
             helper.pointer("/attempts/0/conditions/0"),
         );
     }
-    assert_eq!(
-        json.pointer("/rules/0/calls"),
-        Some(&serde_json::json!([
-            {"use_id":1,"call_instance":2,"attempt":1},
-            {"use_id":2,"call_instance":3,"attempt":1}
-        ]))
-    );
+    for (index, call_instance) in [(0, 2), (1, 3)] {
+        assert_eq!(
+            json.pointer(&format!("/rules/0/calls/{index}/call_instance")),
+            Some(&serde_json::json!(call_instance))
+        );
+    }
     Ok(())
 }
 
