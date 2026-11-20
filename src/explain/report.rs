@@ -884,6 +884,11 @@ pub struct Operand {
     /// Resolve against the incoming use being explained, not outgoing calls.
     /// Computed operands may list several; their values need not equal the
     /// operand. `None` is uncaptured; `Some([])` means none contributed.
+    /// Aggregate contributor lists do not identify an element's contributors;
+    /// projecting a constructed argument cannot distribute that list among
+    /// elements. Keep element provenance unknown unless independently captured.
+    /// Capture/redaction follows concrete paths; omit a sensitive projection
+    /// path in its entirety, never replace its keys with fabricated strings.
     pub parameter_origins: Option<Vec<ParameterOrigin>>,
 }
 
@@ -928,7 +933,7 @@ pub struct ParameterOrigin {
     pub argument: usize,
     /// Typed path within that argument; empty means the whole argument.
     /// Same key/index semantics as concrete paths. `None` means the projection
-    /// is uncaptured or unrepresentable, not the whole argument.
+    /// is uncaptured, withheld or unrepresentable, not the whole argument.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<Vec<PathSegment>>,
 }
