@@ -266,7 +266,7 @@ impl RegoVM {
                 // Rego keys also select set members, and indices select numeric object keys.
                 let key = match *segment {
                     PathSegment::Key(ref key) => Value::from(key.as_str()),
-                    PathSegment::Index(i) => Value::from(i),
+                    PathSegment::Index(index) => Value::from(index),
                 };
                 self.check_initial_memory_limit()?;
                 value = value[&key].clone();

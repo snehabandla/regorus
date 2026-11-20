@@ -2686,11 +2686,9 @@ fn partial_eval_temporary_path_rendering_peak_is_accounted() {
         std::thread::spawn(move || {
             let guard = LimitGuard::lock();
             let mut vm = partial_eval_temporary_vm(None);
-            let input = regorus::value::Object::from_iter([(
-                Value::from(key.as_str()),
-                Value::Bool(true),
-            )])
-            .into();
+            let input =
+                regorus::value::Object::from_iter([(Value::from(key.as_str()), Value::Bool(true))])
+                    .into();
             vm.set_input(input);
             let mut settings = PartialEvalSettings::default();
             settings.unknowns = vec![UnknownPath::input_keys([key.as_str()])];
