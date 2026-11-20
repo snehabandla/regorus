@@ -129,9 +129,7 @@ fn remove_unknown(input: &mut Value, segments: &[PathSegment]) -> Result<()> {
             object.get_mut(&key)
         }
         Value::Array(_) => match first {
-            PathSegment::Index(index) => input
-                .as_array_mut()?
-                .get_mut(usize::try_from(*index)?),
+            PathSegment::Index(index) => input.as_array_mut()?.get_mut(usize::try_from(*index)?),
             PathSegment::Key(_) => None,
             _ => bail!("unsupported path segment"),
         },
@@ -304,10 +302,15 @@ fn decode(pe: regorus::explain::PartialEvalResult) -> Result<Report> {
         result: pe.result,
         residual_queries: serde_json::from_value(serde_json::to_value(pe.residual_queries)?)?,
     };
-    let unresolved = report.residual_queries.iter().any(|q| q.status == "unresolved");
+    let unresolved = report
+        .residual_queries
+        .iter()
+        .any(|q| q.status == "unresolved");
     if (report.status == ExpectedResidualStatus::Partial) != unresolved
-        || (matches!(report.status, ExpectedResidualStatus::Unsupported
-            | ExpectedResidualStatus::PossibleConflict) && !report.residual_queries.is_empty())
+        || (matches!(
+            report.status,
+            ExpectedResidualStatus::Unsupported | ExpectedResidualStatus::PossibleConflict
+        ) && !report.residual_queries.is_empty())
     {
         bail!("invalid residual status/alternatives envelope");
     }
@@ -588,7 +591,13 @@ fn residual_native_constant_without_json_range_or_parser_limits() -> Result<()> 
     program.max_rule_window_size = 1;
     program.dispatch_window_size = 1;
     program.literals.push(huge.clone());
-    program.add_instruction(Instruction::Load { dest: 0, literal_idx: 0 }, None);
+    program.add_instruction(
+        Instruction::Load {
+            dest: 0,
+            literal_idx: 0,
+        },
+        None,
+    );
     program.add_instruction(Instruction::Return { value: 0 }, None);
     program.add_entry_point("data.test.answer".into(), 0);
     let mut vm = RegoVM::new();
