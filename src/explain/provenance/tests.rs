@@ -1154,44 +1154,44 @@ fn operation_iteration_text_keeps_contains_identifiers() -> anyhow::Result<()> {
         );
     }
 
-    fn review_iteration_boundary(body: &str, expected: &str) -> anyhow::Result<()> {
-        let provenance = allow(&alloc::format!(
-            "aa := input.aa\naaa := input.aaa\nb := input.b\nc := input.c\nd := input.d\n  {body}\n"
-        ))?;
-        let loops: Vec<_> = provenance
-            .sites()
-            .iter()
-            .filter(|site| site.kind == ConditionKind::Iteration)
-            .map(|site| (site.text.as_str(), at(site)))
-            .collect();
-        assert_eq!(loops, vec![(expected, Some(("p.rego", 10, 13)))], "{body}");
-        Ok(())
-    }
-
-    #[test]
-    fn review_iteration_semicolon_boundary() -> anyhow::Result<()> {
-        review_iteration_boundary("some x in aa&b|c; d", "aa&b|c")
-    }
-
-    #[test]
-    fn review_iteration_adjacent_operand_boundary() -> anyhow::Result<()> {
-        review_iteration_boundary("some x in aaa&b|c\n  d", "aaa&b|c")
-    }
-
-    #[test]
-    fn review_iteration_negative_number_boundary() -> anyhow::Result<()> {
-        review_iteration_boundary("some x in aaa&b|c\n  d-1", "aaa&b|c")
-    }
-
-    #[test]
-    fn review_iteration_boundary_controls() -> anyhow::Result<()> {
-        review_iteration_boundary("some x in aaa&b|c\n  d - 1", "aaa&b|c")?;
-        review_iteration_boundary("some x in (aa&b|c); d", "(aa&b|c)")?;
-        review_iteration_boundary("some x in (aaa&b|c)\n  d", "(aaa&b|c)")
-    }
     Ok(())
 }
 
+fn review_iteration_boundary(body: &str, expected: &str) -> anyhow::Result<()> {
+    let provenance = allow(&alloc::format!(
+        "aa := input.aa\naaa := input.aaa\nb := input.b\nc := input.c\nd := input.d\n  {body}\n"
+    ))?;
+    let loops: Vec<_> = provenance
+        .sites()
+        .iter()
+        .filter(|site| site.kind == ConditionKind::Iteration)
+        .map(|site| (site.text.as_str(), at(site)))
+        .collect();
+    assert_eq!(loops, vec![(expected, Some(("p.rego", 10, 13)))], "{body}");
+    Ok(())
+}
+
+#[test]
+fn review_iteration_semicolon_boundary() -> anyhow::Result<()> {
+    review_iteration_boundary("some x in aa&b|c; d", "aa&b|c")
+}
+
+#[test]
+fn review_iteration_adjacent_operand_boundary() -> anyhow::Result<()> {
+    review_iteration_boundary("some x in aaa&b|c\n  d", "aaa&b|c")
+}
+
+#[test]
+fn review_iteration_negative_number_boundary() -> anyhow::Result<()> {
+    review_iteration_boundary("some x in aaa&b|c\n  d-1", "aaa&b|c")
+}
+
+#[test]
+fn review_iteration_boundary_controls() -> anyhow::Result<()> {
+    review_iteration_boundary("some x in aaa&b|c\n  d - 1", "aaa&b|c")?;
+    review_iteration_boundary("some x in (aa&b|c); d", "(aa&b|c)")?;
+    review_iteration_boundary("some x in (aaa&b|c)\n  d", "(aaa&b|c)")
+}
 #[test]
 fn operation_iteration_text_keeps_contains_calls() -> anyhow::Result<()> {
     let provenance = provenance(
