@@ -295,6 +295,14 @@ fn check_completion(report: &Report, example: &Example) -> Result<()> {
     Ok(())
 }
 
+fn decode(pe: regorus::explain::PartialEvalResult) -> Result<Report> {
+    let mut report: Report = serde_json::from_value(serde_json::to_value(&pe)?)?;
+    // Concrete sets/non-string-keyed objects need the typed value;
+    // only residual operands are required to be JSON-lossless.
+    report.result = pe.result;
+    Ok(report)
+}
+
 #[test_resources("tests/explanation_corpus/cases/*.yaml")]
 fn corpus_partial_eval(file: &str) {
     run_partial_file(file).unwrap();
@@ -329,10 +337,7 @@ fn run_partial_file(file: &str) -> Result<()> {
                 vm.set_strict_builtin_errors(case.strict_builtin_errors);
                 vm.set_partial_eval_settings(settings);
                 let pe = vm.partial_eval(&case.query)?;
-                let mut report: Report = serde_json::from_value(serde_json::to_value(&pe)?)?;
-                // Concrete sets/non-string-keyed objects need the typed value;
-                // only residual operands are required to be JSON-lossless.
-                report.result = pe.result;
+                let report = decode(pe)?;
                 if report.status != expected.status {
                     bail!("expected {:?}, got {:?}", expected.status, report.status);
                 }
@@ -555,5 +560,37 @@ fn residual_unknown_pruning_distinguishes_array_indices_and_string_keys() -> Res
     let mut array = original.clone();
     remove_unknown(&mut array, &path.segments)?;
     assert_eq!(array, original);
+    Ok(())
+}
+
+#[test]
+fn residual_native_constant_without_json_range_or_parser_limits() -> Result<()> {
+    use regorus::explain::ResidualStatus;
+    use regorus::rvm::{Instruction, Program};
+
+    let ten = Value::from(10_u64);
+    let mut huge = Value::from(1_u64);
+    for _ in 0..400 {
+        huge = Value::from(huge.as_number()?.mul(ten.as_number()?)?);
+    }
+    let mut program = Program::new();
+    program.max_rule_window_size = 1;
+    program.dispatch_window_size = 1;
+    program.literals.push(huge.clone());
+    program.add_instruction(Instruction::Load { dest: 0, literal_idx: 0 }, None);
+    program.add_instruction(Instruction::Return { value: 0 }, None);
+    program.add_entry_point("data.test.answer".into(), 0);
+    let mut vm = RegoVM::new();
+    vm.load_program(std::sync::Arc::new(program));
+    vm.set_input(Value::new_object());
+    let mut settings = PartialEvalSettings::default();
+    settings.unknowns = vec![UnknownPath::input_keys(["u"])];
+    vm.set_partial_eval_settings(settings);
+    let pe = vm.partial_eval("data.test.answer")?;
+    assert_eq!(pe.status, ResidualStatus::Exact);
+    assert_eq!(pe.result, huge);
+    assert!(pe.residual_queries.is_empty());
+    let report = decode(pe)?;
+    assert_eq!(apply(&report, &Value::new_object())?, huge);
     Ok(())
 }
