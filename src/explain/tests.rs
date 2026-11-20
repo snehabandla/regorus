@@ -2092,6 +2092,19 @@ fn conditionality_is_independent_of_bounded_proofs() -> anyhow::Result<()> {
 #[test]
 fn caller_checks_keep_separate_sibling_dependency_paths() -> anyhow::Result<()> {
     let mut report = attributed_report();
+    let first_site = u32::try_from(report.checks.len())?;
+    for (offset, text) in [
+        (0, "f(input.a) == g(input.b)"),
+        (1, "h(input.a) == j(input.b)"),
+    ] {
+        report.checks.push(ConditionSite {
+            site_id: first_site + offset,
+            text: String::from(text),
+            kind: ConditionKind::Comparison,
+            location: None,
+            operator: Some(Operator::Eq),
+        });
+    }
     report.query.call_instance = Some(1);
     let rule = report.rules.first_mut().context("queried rule")?;
     rule.call_instance = 1;
@@ -2113,6 +2126,7 @@ fn caller_checks_keep_separate_sibling_dependency_paths() -> anyhow::Result<()> 
         .and_then(|result| result.proofs.first_mut())
         .context("retained proof")?;
     let mut first = proof.conditions.first().context("caller check")?.clone();
+    first.site_id = first_site;
     first.owner.call_instance = 1;
     first.owner.attempt = Some(1);
     first.call_uses = Some(vec![vec![1], vec![2]]);
@@ -2123,14 +2137,15 @@ fn caller_checks_keep_separate_sibling_dependency_paths() -> anyhow::Result<()> 
     first.left = Some(left);
     first.right = Some(right);
     let mut second = first.clone();
+    second.site_id = first_site + 1;
     second.call_uses = Some(vec![vec![3], vec![4]]);
     second.left.as_mut().context("second left")?.call_uses = Some(vec![vec![3]]);
     second.right.as_mut().context("second right")?.call_uses = Some(vec![vec![4]]);
     proof.call_uses = Some(vec![1, 2, 3, 4]);
     proof.conditions = vec![first, second];
-    for call_instance in 2..=5 {
+    for (call_instance, name) in [(2, "f"), (3, "g"), (4, "h"), (5, "j")] {
         let mut helper = template.clone();
-        helper.name = String::from("data.test.helper");
+        helper.name = format!("data.test.{name}");
         helper.call_instance = call_instance;
         helper.kind = RuleKind::Function;
         helper.result = ReportedValue::Known(Value::from(false));
@@ -2160,6 +2175,10 @@ fn caller_checks_keep_separate_sibling_dependency_paths() -> anyhow::Result<()> 
         let check = json
             .pointer(&format!("/rules/0/results/0/proofs/0/conditions/{index}"))
             .context("sibling comparison")?;
+        assert_eq!(
+            check.get("site_id"),
+            Some(&serde_json::json!(first_site + index))
+        );
         assert_eq!(check.pointer("/left/value"), check.pointer("/right/value"));
         for (side, use_id) in ["left", "right"].into_iter().zip(uses) {
             assert_eq!(
@@ -2186,16 +2205,25 @@ fn caller_checks_keep_separate_sibling_dependency_paths() -> anyhow::Result<()> 
 #[test]
 fn nested_use_paths_resolve_in_caller_to_callee_order() -> anyhow::Result<()> {
     let mut report = attributed_report();
-    let negation_site = u32::try_from(report.checks.len())?;
+    let query_site = u32::try_from(report.checks.len())?;
+    report.checks.push(ConditionSite {
+        site_id: query_site,
+        text: String::from("data.test.deny"),
+        kind: ConditionKind::Truthiness,
+        location: None,
+        operator: None,
+    });
+    let negation_site = query_site + 1;
     report.checks.push(ConditionSite {
         site_id: negation_site,
-        text: String::from("not data.test.allow == false"),
+        text: String::from("not data.test.deny == set()"),
         kind: ConditionKind::Negation,
         location: None,
         operator: Some(Operator::Eq),
     });
     report.query.rule = None;
     report.query.call_instance = None;
+    report.query.entry_point = String::from("data.test.deny; not data.test.deny == set()");
     report.query.calls = Some(vec![
         CallUse {
             use_id: 1,
@@ -2227,6 +2255,7 @@ fn nested_use_paths_resolve_in_caller_to_callee_order() -> anyhow::Result<()> {
     }]);
     let mut callee = root.clone();
     let mut middle = root.clone();
+    middle.name = String::from("data.test.middle");
     middle.call_instance = 3;
     middle.results = None;
     middle.definitions.clear();
@@ -2273,19 +2302,22 @@ fn nested_use_paths_resolve_in_caller_to_callee_order() -> anyhow::Result<()> {
     report.rules.push(middle);
     report.rules.push(callee);
     report.query_conditions = Some(
-        [(1, None), (4, Some(1))]
+        [(1, query_site, None), (4, negation_site, Some(1))]
             .into_iter()
-            .map(|(use_id, scope)| QueryConditionExplanation {
-                site_id: 0,
-                scope,
-                completed_scope: None,
-                outcome: Outcome::Success,
-                left: None,
-                right: None,
-                witness: None,
-                binding: None,
-                call_uses: Some(vec![vec![use_id, 2, 3]]),
-            })
+            .map(
+                |(use_id, site_id, completed_scope)| QueryConditionExplanation {
+                    site_id,
+                    scope: None,
+                    completed_scope,
+                    outcome: Outcome::Success,
+                    left: Some(known(report.query_result.clone(), None)),
+                    right: completed_scope
+                        .map(|_| known(Value::from(BTreeSet::<Value>::new()), None)),
+                    witness: None,
+                    binding: None,
+                    call_uses: Some(vec![vec![use_id, 2, 3]]),
+                },
+            )
             .collect(),
     );
     let json = serde_json::to_value(&report)?;
@@ -2308,6 +2340,19 @@ fn nested_use_paths_resolve_in_caller_to_callee_order() -> anyhow::Result<()> {
     assert_eq!(
         json.pointer("/query_conditions/1/call_uses"),
         Some(&serde_json::json!([[4, 2, 3]]))
+    );
+    assert_eq!(
+        json.pointer("/query_conditions/0/site_id"),
+        Some(&serde_json::json!(query_site))
+    );
+    assert_eq!(
+        json.pointer("/query_conditions/1/site_id"),
+        Some(&serde_json::json!(negation_site))
+    );
+    assert!(json.pointer("/query_conditions/1/scope").is_none());
+    assert_eq!(
+        json.pointer("/query_conditions/1/completed_scope"),
+        Some(&serde_json::json!(1))
     );
     let path = report
         .rules
