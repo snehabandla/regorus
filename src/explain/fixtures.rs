@@ -19,7 +19,6 @@ use alloc::vec::Vec;
 /// redacted.
 pub fn complete_rule_report() -> ExplanationReport {
     let role = ConditionExplanation {
-        argument: None,
         completed_scope: None,
         call_uses: None,
         site_id: 0,
@@ -31,7 +30,6 @@ pub fn complete_rule_report() -> ExplanationReport {
         binding: None,
     };
     let token = ConditionExplanation {
-        argument: None,
         completed_scope: None,
         call_uses: None,
         site_id: 1,
@@ -86,7 +84,6 @@ pub fn complete_rule_report() -> ExplanationReport {
 pub fn partial_set_report() -> ExplanationReport {
     let names: BTreeSet<Value> = [Value::from("bob")].into_iter().collect();
     let in_users = ConditionExplanation {
-        argument: None,
         completed_scope: None,
         call_uses: None,
         site_id: 0,
@@ -139,7 +136,6 @@ pub fn partial_object_report() -> ExplanationReport {
         .collect();
     let labels = Value::from(labels);
     let in_tags = ConditionExplanation {
-        argument: None,
         completed_scope: None,
         call_uses: None,
         site_id: 0,
@@ -219,7 +215,6 @@ pub fn attributed_report() -> ExplanationReport {
         attempt: None,
         conditionality: None,
         conditions: vec![ConditionExplanation {
-            argument: None,
             completed_scope: None,
             call_uses: None,
             site_id: 2,
@@ -590,6 +585,7 @@ pub fn partial_eval_unsupported_result() -> PartialEvalResult {
 
 pub fn known(value: Value, path: Option<&str>) -> Operand {
     Operand {
+        parameter_origins: None,
         call_uses: None,
         value: ReportedValue::Known(value),
         path: path.map(String::from),
@@ -600,6 +596,7 @@ pub fn known(value: Value, path: Option<&str>) -> Operand {
 
 pub fn redacted(path: &str) -> Operand {
     Operand {
+        parameter_origins: None,
         call_uses: None,
         value: ReportedValue::Redacted,
         path: Some(String::from(path)),

@@ -76,7 +76,7 @@
 //! [`Operand::call_uses`] distinguishes which calls contributed to each
 //! operand even when sibling calls return equal values.
 //! Caller-owned [`CallUse::arguments`] preserve incoming argument provenance;
-//! callee parameter checks identify their argument position without importing
+//! callee binding/body operands identify parameter projections without importing
 //! caller paths into callee proofs. Witness key/value binding names preserve
 //! both roles of a two-variable iteration without parsing source text.
 //! Per-result and per-proof [`Conditionality`] is unknown when not captured;
@@ -101,7 +101,7 @@
 //! Direct constructors also initialize optional query witness/binding and
 //! operand-use metadata, using `None` when uncaptured.
 //! They also initialize optional witness binding roles, call arguments and
-//! parameter positions. `QueryTarget` and `CallUse` retain `PartialEq`, not `Eq`,
+//! parameter origins. `QueryTarget` and `CallUse` retain `PartialEq`, not `Eq`,
 //! because captured arguments contain operands.
 //! JSON schema version 2 is retained: omitted bindings remain unknown, including
 //! older reports that omitted either empty or uncaptured bindings. Only an
@@ -129,7 +129,7 @@ pub use report::{
     AttemptExplanation, CallUse, CausalOrigins, ConcretePath, ConditionExplanation, ConditionKind,
     ConditionOwner, ConditionSite, Conditionality, Count, DefinitionExplanation, Derivation,
     DistinctElements, EmissionExplanation, ExplanationReport, IterationBinding, LoopWitness,
-    Operand, Operator, Outcome, PartialEvalResult, PathRoot, PathSegment,
+    Operand, Operator, Outcome, ParameterOrigin, PartialEvalResult, PathRoot, PathSegment,
     QueryConditionExplanation, QueryScopeExplanation, QueryTarget, ReportedValue,
     ResidualAlternativeStatus, ResidualArgument, ResidualCall, ResidualCondition, ResidualKind,
     ResidualQuery, ResidualStatus, ResidualUnresolved, ResidualUnresolvedReason, ResultExplanation,

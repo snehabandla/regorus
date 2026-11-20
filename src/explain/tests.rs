@@ -487,6 +487,7 @@ fn every_reported_value_variant_has_a_json_form() -> Result<(), serde_json::Erro
         ReportedValue::Elided,
     ] {
         let operand = Operand {
+            parameter_origins: None,
             call_uses: None,
             value: value.clone(),
             path: None,
@@ -1106,6 +1107,7 @@ fn concrete_path_states_and_typed_segments_are_distinct() -> Result<(), serde_js
 fn sensitive_concrete_path_can_be_withheld_independently_of_source_template(
 ) -> Result<(), serde_json::Error> {
     let operand = Operand {
+        parameter_origins: None,
         call_uses: None,
         value: ReportedValue::Redacted,
         path: Some(String::from("data.tokens[input.user.token]")),
@@ -2161,10 +2163,24 @@ fn incoming_arguments_keep_caller_paths_out_of_shared_callee_proofs() -> anyhow:
             },
             CallUse {
                 use_id: 4,
+                call_instance: 3,
+                attempt: None,
+                scope: None,
+                arguments: Some(vec![known(Value::from(false), Some("input.b"))]),
+            },
+            CallUse {
+                use_id: 5,
+                call_instance: 2,
+                attempt: None,
+                scope: None,
+                arguments: Some(vec![known(Value::from(false), Some("input.a"))]),
+            },
+            CallUse {
+                use_id: 6,
                 call_instance: 4,
                 attempt: None,
                 scope: None,
-                arguments: Some(vec![argument(2), argument(1)]),
+                arguments: Some(vec![argument(4), argument(5)]),
             },
         ];
         if query_owned {
@@ -2180,6 +2196,13 @@ fn incoming_arguments_keep_caller_paths_out_of_shared_callee_proofs() -> anyhow:
             caller.name = String::from("data.test.allow");
             caller.call_instance = 1;
             caller.result = ReportedValue::Known(Value::from(true));
+            caller.definitions = vec![DefinitionExplanation {
+                index: 0,
+                body: 0,
+                outcome: Outcome::Success,
+                location: None,
+                conditions: Vec::new(),
+            }];
             caller.attempts = Some(vec![AttemptExplanation {
                 attempt: 1,
                 definition: 0,
@@ -2197,6 +2220,14 @@ fn incoming_arguments_keep_caller_paths_out_of_shared_callee_proofs() -> anyhow:
             helper.kind = RuleKind::Function;
             helper.result = ReportedValue::Known(Value::from(call_instance == 4));
             if call_instance == 4 {
+                let parameter = |index| {
+                    let mut operand = known(Value::from(false), None);
+                    operand.parameter_origins = Some(vec![ParameterOrigin {
+                        argument: index,
+                        path: Some(Vec::new()),
+                    }]);
+                    operand
+                };
                 let mut conditions = ["x", "y"]
                     .into_iter()
                     .enumerate()
@@ -2212,11 +2243,10 @@ fn incoming_arguments_keep_caller_paths_out_of_shared_callee_proofs() -> anyhow:
                             call_uses: Some(Vec::new()),
                             completed_scope: None,
                             outcome: Outcome::Success,
-                            left: Some(known(Value::from(false), None)),
+                            left: Some(parameter(index)),
                             right: None,
                             witness: None,
                             binding: Some(String::from(name)),
-                            argument: Some(index),
                         })
                     })
                     .collect::<anyhow::Result<Vec<_>>>()?;
@@ -2231,11 +2261,10 @@ fn incoming_arguments_keep_caller_paths_out_of_shared_callee_proofs() -> anyhow:
                     call_uses: Some(Vec::new()),
                     completed_scope: None,
                     outcome: Outcome::Success,
-                    left: Some(known(Value::from(false), None)),
-                    right: Some(known(Value::from(false), None)),
+                    left: Some(parameter(0)),
+                    right: Some(parameter(1)),
                     witness: None,
                     binding: None,
-                    argument: None,
                 };
                 conditions.push(comparison.clone());
                 helper.definitions = vec![DefinitionExplanation {
@@ -2286,12 +2315,21 @@ fn incoming_arguments_keep_caller_paths_out_of_shared_callee_proofs() -> anyhow:
         let same = helpers.last().context("same")?;
         for (use_index, expected) in [
             (2, ["data.test.f", "data.test.g"]),
-            (3, ["data.test.g", "data.test.f"]),
+            (5, ["data.test.g", "data.test.f"]),
         ] {
             for (position, name) in expected.into_iter().enumerate() {
                 assert_eq!(
-                    same.pointer(&format!("/attempts/0/conditions/{position}/argument")),
+                    same.pointer(&format!(
+                        "/attempts/0/conditions/{position}/left/parameter_origins/0/argument"
+                    )),
                     Some(&serde_json::json!(position))
+                );
+                assert_eq!(
+                    same.pointer(&format!(
+                        "/attempts/0/conditions/2/{}/parameter_origins",
+                        if position == 0 { "left" } else { "right" }
+                    )),
+                    Some(&serde_json::json!([{"argument":position,"path":[]}]))
                 );
                 let actual = caller_uses
                     .get(use_index)
@@ -2299,6 +2337,14 @@ fn incoming_arguments_keep_caller_paths_out_of_shared_callee_proofs() -> anyhow:
                     .context("argument")?;
                 assert_eq!(actual.get("value"), Some(&serde_json::json!(false)));
                 let use_id = actual.pointer("/call_uses/0/0").context("producer use")?;
+                assert_eq!(
+                    use_id,
+                    &serde_json::json!(if use_index == 2 {
+                        position + 1
+                    } else {
+                        position + 4
+                    })
+                );
                 let edge = caller_uses
                     .iter()
                     .find(|call| call.get("use_id") == Some(use_id))
@@ -2316,6 +2362,60 @@ fn incoming_arguments_keep_caller_paths_out_of_shared_callee_proofs() -> anyhow:
             Some(&serde_json::json!([]))
         );
     }
+    Ok(())
+}
+
+#[test]
+fn destructured_parameter_origins_preserve_typed_projections() -> anyhow::Result<()> {
+    // same([x, {"y": y}]) := x == y with argument [false, {"y": false}].
+    let mut call = CallUse {
+        use_id: 1,
+        call_instance: 2,
+        attempt: None,
+        scope: None,
+        arguments: Some(vec![known(
+            Value::from(vec![
+                Value::from(false),
+                Value::from_json_str(r#"{"y":false}"#)?,
+            ]),
+            None,
+        )]),
+    };
+    for (path, expected) in [
+        (
+            vec![PathSegment::Index(0)],
+            serde_json::json!([{"index":0}]),
+        ),
+        (
+            vec![PathSegment::Index(1), PathSegment::Key(String::from("y"))],
+            serde_json::json!([{"index":1},{"key":"y"}]),
+        ),
+    ] {
+        let mut operand = known(Value::from(false), None);
+        operand.parameter_origins = Some(vec![ParameterOrigin {
+            argument: 0,
+            path: Some(path),
+        }]);
+        assert_eq!(
+            serde_json::to_value(&operand)?.get("parameter_origins"),
+            Some(&serde_json::json!([{"argument":0,"path":expected}]))
+        );
+    }
+    call.arguments = Some(Vec::new());
+    assert_eq!(
+        serde_json::to_value(&call)?.get("arguments"),
+        Some(&serde_json::json!([]))
+    );
+    call.arguments = None;
+    assert!(serde_json::to_value(&call)?.get("arguments").is_none());
+    let projection = ParameterOrigin {
+        argument: 0,
+        path: None,
+    };
+    assert_eq!(
+        serde_json::to_value(projection)?,
+        serde_json::json!({"argument":0})
+    );
     Ok(())
 }
 
@@ -2841,7 +2941,6 @@ fn nested_comprehension_conditions_do_not_replace_the_finding_subject() -> anyho
     subject.owner = owner(None);
     subject.witness = None;
     let local = ConditionExplanation {
-        argument: None,
         completed_scope: None,
         call_uses: None,
         site_id: 3,
@@ -2860,7 +2959,6 @@ fn nested_comprehension_conditions_do_not_replace_the_finding_subject() -> anyho
         binding: Some(String::from("tag")),
     };
     let predicate = ConditionExplanation {
-        argument: None,
         completed_scope: None,
         call_uses: None,
         site_id: 4,
@@ -2872,7 +2970,6 @@ fn nested_comprehension_conditions_do_not_replace_the_finding_subject() -> anyho
         binding: None,
     };
     let negation = ConditionExplanation {
-        argument: None,
         completed_scope: Some(1),
         call_uses: None,
         site_id: 1,
@@ -3076,7 +3173,6 @@ fn value_only_helpers_keep_argument_origins_without_body_predicates() -> anyhow:
             complete: true,
         });
         let binding = ConditionExplanation {
-            argument: None,
             completed_scope: None,
             call_uses: None,
             site_id: 0,

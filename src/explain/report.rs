@@ -625,9 +625,11 @@ pub struct AttemptExplanation {
     ///
     /// Captured parameter bindings can use [`ConditionKind::Binding`] at
     /// the parameter's source site: `binding` names the parameter and `left`
-    /// holds the actual argument, including its concrete path or causal
-    /// origins. `argument` identifies the zero-based actual argument in each
-    /// incoming [`CallUse::arguments`], where paths retain caller ownership.
+    /// holds its matched value. [`Operand::parameter_origins`] links both
+    /// binding and body operands to incoming [`CallUse::arguments`].
+    /// Caller-specific paths/origins belong on those incoming arguments,
+    /// never on shared callee evidence; parameter projections specialize
+    /// that evidence for each use, including cached equal-valued arguments.
     /// The owner is the callee attempt. This records a real binding,
     /// not a fabricated body predicate: binding a defined `false` succeeds.
     /// It also works for a value-only function with no body checks.
@@ -708,7 +710,7 @@ pub struct CallUse {
     /// not the callee, even for cached reuse. They describe supplied arguments,
     /// not necessarily contributors to the returned value. `None` is uncaptured;
     /// `Some([])` certifies no arguments. Callee binding checks name the index
-    /// with [`ConditionExplanation::argument`].
+    /// with [`Operand::parameter_origins`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arguments: Option<Vec<Operand>>,
 }
@@ -757,12 +759,6 @@ pub struct ConditionExplanation {
     /// or a parameter binding in [`AttemptExplanation::conditions`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding: Option<String>,
-    /// Zero-based argument position for captured parameter-binding evidence.
-    /// Resolve against the incoming [`CallUse::arguments`] for the use being
-    /// explained, not the callee's outgoing calls. Absent for ordinary bindings
-    /// or when parameter position was not captured.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub argument: Option<usize>,
 }
 
 /// Kind of condition.
@@ -883,6 +879,12 @@ pub struct Operand {
     /// Distinguishes equal-valued sibling operands without parsing text.
     /// `None` means uncaptured; `Some([])` means no callee use contributed.
     pub call_uses: Option<Vec<Vec<u64>>>,
+    /// Contributing parameter projections in this operand's evaluating
+    /// invocation (the physical check owner, or caller for call arguments).
+    /// Resolve against the incoming use being explained, not outgoing calls.
+    /// Computed operands may list several; their values need not equal the
+    /// operand. `None` is uncaptured; `Some([])` means none contributed.
+    pub parameter_origins: Option<Vec<ParameterOrigin>>,
 }
 
 impl Serialize for Operand {
@@ -893,6 +895,7 @@ impl Serialize for Operand {
             is_reported(Some(&self.value)),
             self.origins.is_some(),
             self.call_uses.is_some(),
+            self.parameter_origins.is_some(),
         ]);
         let mut state = serializer.serialize_struct("Operand", len)?;
         match self.path {
@@ -909,8 +912,25 @@ impl Serialize for Operand {
             Some(ref paths) => state.serialize_field("call_uses", paths)?,
             None => state.skip_field("call_uses")?,
         }
+        match self.parameter_origins {
+            Some(ref origins) => state.serialize_field("parameter_origins", origins)?,
+            None => state.skip_field("parameter_origins")?,
+        }
         state.end()
     }
+}
+
+/// An input projection of a function parameter, resolved per incoming use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct ParameterOrigin {
+    /// Zero-based position in [`CallUse::arguments`].
+    pub argument: usize,
+    /// Typed path within that argument; empty means the whole argument.
+    /// Same key/index semantics as concrete paths. `None` means the projection
+    /// is uncaptured or unrepresentable, not the whole argument.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<Vec<PathSegment>>,
 }
 
 /// Bounded causal input identities for a computed operand, not direct reads
