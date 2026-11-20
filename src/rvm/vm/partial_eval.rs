@@ -56,10 +56,6 @@ impl PeState {
             UnknownRoot::Context => self.context_has_unknowns,
         }
     }
-
-    fn flag(&mut self, reason: Reason, pc: usize) {
-        self.unsupported.get_or_insert((reason, pc));
-    }
 }
 
 const fn root_name(root: UnknownRoot) -> &'static str {
@@ -154,6 +150,11 @@ impl RegoVM {
         self.pe_settings = settings;
     }
 
+    fn check_pe_memory_limit(&mut self) -> Result<()> {
+        self.check_initial_memory_limit()
+            .map_err(|error| self.fail_run_to_completion(error))
+    }
+
     /// Evaluates the entry point with the configured unknown paths and
     /// returns what the result depends on. The VM's input and context are
     /// the known values; none may be supplied at or under an unknown path.
@@ -169,6 +170,7 @@ impl RegoVM {
     /// Dependencies read by a default are not recorded, so an input-dependent
     /// default can produce an `Exact` result even when it depends on an unknown.
     /// Memory limits cover validation, execution and report construction.
+    /// Memory failures release execution values and leave the VM in its error state.
     pub fn partial_eval(
         &mut self,
         entry: &str,
@@ -188,11 +190,9 @@ impl RegoVM {
                     super::machine::MemoryBudgetLifecycle::PartialEvaluation;
             }
             let evaluation = PartialEvaluation(self);
-            evaluation.0.check_initial_memory_limit()?;
+            evaluation.0.check_pe_memory_limit()?;
             let result = evaluation.0.partial_eval_inner(entry);
-            if let Err(error) = evaluation.0.check_initial_memory_limit() {
-                return Err(evaluation.0.fail_run_to_completion(error).into());
-            }
+            evaluation.0.check_pe_memory_limit()?;
             result
         })
     }
@@ -229,11 +229,10 @@ impl RegoVM {
                 warnings: alloc::vec![warning(&program, reason, pc)],
             });
         }
-        let result = run?;
         Ok(PartialEvalResult {
             kind,
             status: ResidualStatus::Exact,
-            result,
+            result: run?,
             residual_queries: Vec::new(),
             warnings: Vec::new(),
         })
@@ -244,17 +243,17 @@ impl RegoVM {
         for i in 0..self.pe_settings.unknowns.len() {
             #[allow(clippy::indexing_slicing)]
             let unknown = self.pe_settings.unknowns[i].clone();
-            self.check_initial_memory_limit()?;
+            self.check_pe_memory_limit()?;
             let (root, segments) = (unknown.root, &unknown.segments);
             if let Some(other) = paths
                 .iter()
                 .find(|p| p.0 == root && (p.1.starts_with(segments) || segments.starts_with(&p.1)))
             {
                 return Err(ExplainError::InvalidUnknownPath {
-                    path: render_path(root, segments, &mut || self.check_initial_memory_limit())?,
+                    path: render_path(root, segments, &mut || self.check_pe_memory_limit())?,
                     reason: format!(
                         "overlaps `{}`",
-                        render_path(other.0, &other.1, &mut || self.check_initial_memory_limit())?
+                        render_path(other.0, &other.1, &mut || self.check_pe_memory_limit())?
                     ),
                 });
             }
@@ -268,9 +267,9 @@ impl RegoVM {
                     PathSegment::Key(ref key) => Value::from(key.as_str()),
                     PathSegment::Index(index) => Value::from(index),
                 };
-                self.check_initial_memory_limit()?;
+                self.check_pe_memory_limit()?;
                 value = value[&key].clone();
-                self.check_initial_memory_limit()?;
+                self.check_pe_memory_limit()?;
             }
             // The VM's input is null until it is set; its context is undefined.
             let absent = matches!(value, Value::Undefined)
@@ -279,11 +278,11 @@ impl RegoVM {
                     && matches!(value, Value::Null));
             if !absent {
                 return Err(ExplainError::UnknownValueSupplied {
-                    path: render_path(root, segments, &mut || self.check_initial_memory_limit())?,
+                    path: render_path(root, segments, &mut || self.check_pe_memory_limit())?,
                 });
             }
             paths.push((root, unknown.segments));
-            self.check_initial_memory_limit()?;
+            self.check_pe_memory_limit()?;
         }
         Ok(PeState {
             input_has_unknowns: paths.iter().any(|p| p.0 == UnknownRoot::Input),
@@ -309,7 +308,7 @@ impl RegoVM {
         let pc = self.pc;
         if let Some(pe) = self.pe.as_deref_mut() {
             if pe.has_unknowns(root) {
-                pe.flag(Reason::RootRead(root), pc);
+                pe.unsupported.get_or_insert((Reason::RootRead(root), pc));
             }
         }
         Ok(None)

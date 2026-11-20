@@ -2441,6 +2441,101 @@ fn partial_eval_root_and_numeric_validation_preserves_memory_errors() {
 
 #[cfg(feature = "explanations")]
 #[test]
+fn partial_eval_entry_memory_failure_publishes_error_state() {
+    use regorus::explain::ExplainError;
+
+    let mut guard = LimitGuard::lock();
+    let mut vm = partial_eval_temporary_vm(None);
+    assert_eq!(vm.partial_eval("entry").unwrap().result, Value::Bool(true));
+    guard.set_below_current_usage();
+    let result = vm.partial_eval("entry");
+    guard.disable_limit();
+    let Err(ExplainError::Vm(error @ VmError::MemoryLimitExceeded { limit: 1, .. })) = result
+    else {
+        panic!("expected entry memory failure, got {result:?}");
+    };
+    assert_eq!(vm.execution_state(), &ExecutionState::Error { error });
+    assert!(vm.get_registers().is_empty());
+    assert_eq!(vm.partial_eval("entry").unwrap().result, Value::Bool(true));
+    assert_eq!(
+        vm.execute_entry_point_by_name("entry").unwrap(),
+        Value::Bool(true)
+    );
+}
+
+#[cfg(feature = "explanations")]
+#[test]
+fn partial_eval_transient_validation_memory_failure_publishes_error_state() {
+    use regorus::explain::{
+        ExplainError, PartialEvalSettings, PathSegment, ResidualStatus, UnknownPath, UnknownRoot,
+    };
+
+    let mut guard = LimitGuard::lock();
+    for root in [UnknownRoot::Input, UnknownRoot::Context] {
+        for global in [false, true] {
+            for key_len in [8, 256 * 1024] {
+                let mut vm = partial_eval_temporary_vm(None);
+                vm.set_input(Value::new_object());
+                vm.set_context(Value::new_object());
+                let mut settings = PartialEvalSettings::default();
+                settings.unknowns = vec![UnknownPath::new(
+                    root,
+                    [PathSegment::Key("x".repeat(key_len))],
+                )];
+                vm.set_partial_eval_settings(settings);
+                if global {
+                    guard.set_with_additional_budget(64 * 1024);
+                } else {
+                    vm.set_memory_budget_config(Some(memory_budget(64 * 1024)));
+                }
+                let result = vm.partial_eval("entry");
+                guard.disable_limit();
+                if key_len == 8 {
+                    let report = result.unwrap();
+                    assert_eq!(report.status, ResidualStatus::Exact);
+                    assert_eq!(report.result, Value::Bool(true));
+                } else {
+                    let Err(ExplainError::Vm(error)) = result else {
+                        panic!("expected validation memory failure, got {result:?}");
+                    };
+                    assert!(
+                        if global {
+                            matches!(error, VmError::MemoryLimitExceeded { usage, limit, .. }
+                                if usage > limit)
+                        } else {
+                            matches!(error, VmError::MemoryBudgetExceeded { usage, budget, .. }
+                                if usage > budget && budget == 64 * 1024)
+                        },
+                        "{root:?}, global={global}: {error:?}"
+                    );
+                    assert_eq!(vm.execution_state(), &ExecutionState::Error { error });
+                    assert!(vm.get_registers().is_empty());
+                }
+                vm.set_memory_budget_config(None);
+                let report = vm.partial_eval("entry").unwrap();
+                assert_eq!(report.status, ResidualStatus::Exact);
+                assert_eq!(report.result, Value::Bool(true));
+                let mut settings = PartialEvalSettings::default();
+                settings.unknowns = vec![UnknownPath::new(root, [])];
+                vm.set_partial_eval_settings(settings);
+                assert!(matches!(
+                    vm.partial_eval("entry"),
+                    Err(ExplainError::UnknownValueSupplied { .. })
+                ));
+                assert_eq!(vm.execution_state(), &ExecutionState::Ready);
+                vm.set_partial_eval_settings(PartialEvalSettings::default());
+                assert_eq!(vm.partial_eval("entry").unwrap().result, Value::Bool(true));
+                assert_eq!(
+                    vm.execute_entry_point_by_name("entry").unwrap(),
+                    Value::Bool(true)
+                );
+            }
+        }
+    }
+}
+
+#[cfg(feature = "explanations")]
+#[test]
 fn partial_eval_validation_is_in_the_memory_budget() {
     use regorus::explain::{ExplainError, PartialEvalSettings, UnknownPath};
 
