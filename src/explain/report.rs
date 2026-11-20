@@ -118,6 +118,10 @@ impl Serialize for ReportedEntries<'_> {
 pub struct ExplanationReport {
     /// What was queried; see [`QueryTarget`].
     pub query: QueryTarget,
+    /// Checks executed by the query itself, with no invented rule owner.
+    /// Callee checks retain their rule owners and are reached through use paths.
+    /// `None` means not captured; an empty list means no query check ran.
+    pub query_conditions: Option<Vec<QueryConditionExplanation>>,
     /// The value returned by the query. Omitted from JSON when undefined,
     /// and [`Value::Undefined`] when the evaluation failed and returned no
     /// value.
@@ -143,10 +147,21 @@ impl ExplanationReport {
 impl Serialize for ExplanationReport {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let defined = !is_undefined(&self.query_result);
-        let len = field_count(&[true, true, defined, true, true]);
+        let len = field_count(&[
+            true,
+            true,
+            self.query_conditions.is_some(),
+            defined,
+            true,
+            true,
+        ]);
         let mut state = serializer.serialize_struct("ExplanationReport", len)?;
         state.serialize_field("schema_version", &Self::SCHEMA_VERSION)?;
         state.serialize_field("query", &self.query)?;
+        match &self.query_conditions {
+            Some(conditions) => state.serialize_field("query_conditions", conditions)?,
+            None => state.skip_field("query_conditions")?,
+        }
         if defined {
             state.serialize_field("query_result", &self.query_result)?;
         } else {
@@ -195,7 +210,50 @@ pub struct QueryTarget {
     /// Scopes entered directly by the query. Parents resolve within this
     /// list, and query-owned scopes have no body attempt.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub scopes: Option<Vec<ScopeExplanation>>,
+    pub scopes: Option<Vec<QueryScopeExplanation>>,
+}
+
+/// One dynamic query-owned construct, separate from rule body attempts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[non_exhaustive]
+pub struct QueryScopeExplanation {
+    /// Evaluation-local scope identifier, using the same space as rule scopes.
+    pub scope: u64,
+    /// Construct entered by the query.
+    pub kind: ScopeKind,
+    /// Parent in [`QueryTarget::scopes`], absent at the query's local root.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<u64>,
+    /// Static construct site in [`ExplanationReport::checks`].
+    pub site_id: u32,
+    /// Construct outcome; absent if evaluation aborted before completion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<Outcome>,
+}
+
+/// A query-owned check, without a rule invocation or body attempt.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[non_exhaustive]
+pub struct QueryConditionExplanation {
+    /// Static check site in [`ExplanationReport::checks`].
+    pub site_id: u32,
+    /// Enclosing query scope, absent at its root or when not captured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<u64>,
+    /// Dynamic construct completed by this check, not its enclosing scope.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_scope: Option<u64>,
+    /// Outcome of this query check.
+    pub outcome: Outcome,
+    /// Left or unary operand.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub left: Option<Operand>,
+    /// Right operand.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub right: Option<Operand>,
+    /// Contributing use paths; see [`ConditionExplanation::call_uses`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub call_uses: Option<Vec<Vec<u64>>>,
 }
 
 /// Explanation of one evaluation of a rule.
@@ -587,7 +645,7 @@ pub enum ScopeKind {
     ObjectComprehension,
 }
 
-/// One dynamic entry into a logical construct within a rule invocation or query.
+/// One dynamic entry into a logical construct within a rule invocation.
 ///
 /// Scopes form call-local trees: a callee starts a new tree even when used
 /// inside a caller's negation. Follow [`CallUse`] edges to recover syntactic
@@ -604,10 +662,8 @@ pub struct ScopeExplanation {
     /// Parent scope in the same invocation, absent at its local root.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parent: Option<u64>,
-    /// Attempt within the enclosing [`RuleExplanation`]. Absent for a
-    /// query-owned scope or when attempt ownership was not captured.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub attempt: Option<u64>,
+    /// Attempt within the enclosing [`RuleExplanation`].
+    pub attempt: u64,
     /// Static construct site in [`ExplanationReport::checks`].
     pub site_id: u32,
     /// Outcome of the enclosing construct, not of its inner checks.
@@ -651,14 +707,21 @@ pub struct ConditionExplanation {
     pub site_id: u32,
     /// Invocation that evaluated this check.
     pub owner: ConditionOwner,
-    /// Use edges through which this check contributed to the containing
-    /// proof or caller condition, ordered from the caller toward its owner.
-    /// Each id resolves to a [`CallUse::use_id`] in this report. `None`
-    /// means not captured; an empty list means no callee use contributed.
-    /// Reused checks retain their evaluation owner, but can have different
-    /// use chains in different proofs.
+    /// Contributing callee-use paths, each ordered from the containing
+    /// proof/query's caller toward a dependency. Sibling calls use separate
+    /// paths, not one artificial chain. Each id resolves to [`CallUse::use_id`].
+    /// For a copied callee check, a path identifies the use reaching its owner;
+    /// for a caller-owned check, paths identify its contributing callee uses.
+    /// Ownership is independent of the path endpoints. `None` means not
+    /// captured; an empty list means no callee use contributed.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub call_uses: Option<Vec<u64>>,
+    pub call_uses: Option<Vec<Vec<u64>>>,
+    /// Dynamic scope of the construct this check completed. For example,
+    /// a completed `not` names its operand scope here but is owned by the
+    /// enclosing scope. Resolves in its owner's invocation; absent when not
+    /// captured or when this check completes no construct.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_scope: Option<u64>,
     /// Outcome of this evaluation, not an aggregate over other iterations.
     pub outcome: Outcome,
     /// Left operand, or the checked value of a unary condition.

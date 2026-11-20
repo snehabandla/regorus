@@ -114,10 +114,10 @@ pub use report::{
     AttemptExplanation, CallUse, CausalOrigins, ConcretePath, ConditionExplanation, ConditionKind,
     ConditionOwner, ConditionSite, Conditionality, Count, DefinitionExplanation, Derivation,
     DistinctElements, EmissionExplanation, ExplanationReport, IterationBinding, LoopWitness,
-    Operand, Operator, Outcome, PartialEvalResult, PathRoot, PathSegment, QueryTarget,
-    ReportedValue, ResidualAlternativeStatus, ResidualArgument, ResidualCall, ResidualCondition,
-    ResidualKind, ResidualQuery, ResidualStatus, ResidualUnresolved, ResidualUnresolvedReason,
-    ResultExplanation, RuleExplanation, RuleKind, RuleOutcome, ScopeExplanation, ScopeKind,
-    SourceLocation,
+    Operand, Operator, Outcome, PartialEvalResult, PathRoot, PathSegment,
+    QueryConditionExplanation, QueryScopeExplanation, QueryTarget, ReportedValue,
+    ResidualAlternativeStatus, ResidualArgument, ResidualCall, ResidualCondition, ResidualKind,
+    ResidualQuery, ResidualStatus, ResidualUnresolved, ResidualUnresolvedReason, ResultExplanation,
+    RuleExplanation, RuleKind, RuleOutcome, ScopeExplanation, ScopeKind, SourceLocation,
 };
 pub use settings::{ConditionMode, ExplanationScope, ExplanationSettings, ValueMode};

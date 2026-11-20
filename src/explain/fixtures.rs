@@ -19,6 +19,7 @@ use alloc::vec::Vec;
 /// redacted.
 pub fn complete_rule_report() -> ExplanationReport {
     let role = ConditionExplanation {
+        completed_scope: None,
         call_uses: None,
         site_id: 0,
         owner: owner("data.test.allow", 0),
@@ -29,6 +30,7 @@ pub fn complete_rule_report() -> ExplanationReport {
         binding: None,
     };
     let token = ConditionExplanation {
+        completed_scope: None,
         call_uses: None,
         site_id: 1,
         owner: owner("data.test.allow", 0),
@@ -39,6 +41,7 @@ pub fn complete_rule_report() -> ExplanationReport {
         binding: None,
     };
     ExplanationReport {
+        query_conditions: None,
         query: query("data.test.allow"),
         query_result: Value::from(true),
         rules: vec![RuleExplanation {
@@ -81,6 +84,7 @@ pub fn complete_rule_report() -> ExplanationReport {
 pub fn partial_set_report() -> ExplanationReport {
     let names: BTreeSet<Value> = [Value::from("bob")].into_iter().collect();
     let in_users = ConditionExplanation {
+        completed_scope: None,
         call_uses: None,
         site_id: 0,
         owner: owner("data.test.deny", 0),
@@ -96,6 +100,7 @@ pub fn partial_set_report() -> ExplanationReport {
         binding: Some(String::from("name")),
     };
     ExplanationReport {
+        query_conditions: None,
         query: query("data.test.deny"),
         query_result: Value::from(names.clone()),
         rules: vec![RuleExplanation {
@@ -129,6 +134,7 @@ pub fn partial_object_report() -> ExplanationReport {
         .collect();
     let labels = Value::from(labels);
     let in_tags = ConditionExplanation {
+        completed_scope: None,
         call_uses: None,
         site_id: 0,
         owner: owner("data.test.labels", 0),
@@ -144,6 +150,7 @@ pub fn partial_object_report() -> ExplanationReport {
         binding: None,
     };
     ExplanationReport {
+        query_conditions: None,
         query: query("data.test.labels"),
         query_result: labels.clone(),
         rules: vec![RuleExplanation {
@@ -204,6 +211,7 @@ pub fn attributed_report() -> ExplanationReport {
         attempt: None,
         conditionality: None,
         conditions: vec![ConditionExplanation {
+            completed_scope: None,
             call_uses: None,
             site_id: 2,
             owner: owner("data.test.deny", 0),
@@ -248,6 +256,7 @@ pub fn attributed_report() -> ExplanationReport {
         operator: None,
     };
     ExplanationReport {
+        query_conditions: None,
         query: query("data.test.deny"),
         query_result: Value::from(public.clone()),
         rules: vec![RuleExplanation {
@@ -286,6 +295,7 @@ pub fn conflict_report() -> ExplanationReport {
     let mut target = query("data.test.allow");
     target.with_overrides = true;
     ExplanationReport {
+        query_conditions: None,
         query: target,
         query_result: Value::Undefined,
         rules: vec![RuleExplanation {
