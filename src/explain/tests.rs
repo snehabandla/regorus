@@ -2042,6 +2042,125 @@ fn caller_checks_keep_separate_sibling_dependency_paths() -> anyhow::Result<()> 
 }
 
 #[test]
+fn nested_use_paths_resolve_in_caller_to_callee_order() -> anyhow::Result<()> {
+    let mut report = attributed_report();
+    report.query.rule = None;
+    report.query.call_instance = None;
+    report.query.calls = Some(vec![CallUse {
+        use_id: 1,
+        call_instance: 2,
+        attempt: None,
+        scope: None,
+    }]);
+    let caller = report.rules.first_mut().context("caller")?;
+    caller.call_instance = 2;
+    caller.calls = Some(vec![CallUse {
+        use_id: 2,
+        call_instance: 3,
+        attempt: Some(1),
+        scope: None,
+    }]);
+    let mut callee = caller.clone();
+    callee.name = String::from("data.test.helper");
+    callee.call_instance = 3;
+    callee.calls = Some(Vec::new());
+    callee.results = None;
+    callee.emissions.clear();
+    let mut check = callee
+        .definitions
+        .first()
+        .and_then(|definition| definition.conditions.first())
+        .context("physical callee check")?
+        .clone();
+    check.owner.rule = callee.name.clone();
+    check.owner.call_instance = 3;
+    check.owner.attempt = Some(1);
+    check.call_uses = None;
+    callee.definitions.first_mut().context("callee definition")?.conditions = vec![check.clone()];
+    let proof = caller
+        .results
+        .as_mut()
+        .and_then(|results| results.first_mut())
+        .and_then(|result| result.proofs.first_mut())
+        .context("contributing proof")?;
+    check.call_uses = Some(vec![vec![1, 2]]);
+    proof.conditions = vec![check];
+    proof.call_uses = Some(vec![1, 2]);
+    report.rules.push(callee);
+    let json = serde_json::to_value(&report)?;
+    assert_eq!(
+        json.pointer("/rules/0/results/0/proofs/0/conditions/0/call_uses"),
+        Some(&serde_json::json!([[1, 2]]))
+    );
+    assert_eq!(
+        json.pointer("/rules/0/results/0/proofs/0/conditions/0/owner"),
+        json.pointer("/rules/1/definitions/0/conditions/0/owner")
+    );
+    let path = report
+        .rules
+        .first()
+        .and_then(|rule| rule.results.as_ref())
+        .and_then(|results| results.first())
+        .and_then(|result| result.proofs.first())
+        .and_then(|proof| proof.conditions.first())
+        .and_then(|condition| condition.call_uses.as_ref())
+        .and_then(|paths| paths.first())
+        .context("nested use path")?;
+    let mut calls = report.query.calls.as_ref().context("query uses")?;
+    let mut reached = None;
+    for use_id in path {
+        let edge = calls.iter().find(|edge| edge.use_id == *use_id).context("contiguous use")?;
+        assert_eq!(calls.iter().filter(|edge| edge.use_id == *use_id).count(), 1);
+        let rule = report.rules.iter().find(|rule| rule.call_instance == edge.call_instance)
+            .context("physical callee")?;
+        reached = Some(rule.call_instance);
+        calls = rule.calls.as_ref().context("callee uses")?;
+    }
+    assert_eq!(reached, Some(3));
+    Ok(())
+}
+
+#[test]
+fn captured_empty_use_dependencies_are_not_uncaptured() -> anyhow::Result<()> {
+    let report = attributed_report();
+    let mut proof = report.rules.first()
+        .and_then(|rule| rule.results.as_ref())
+        .and_then(|results| results.first())
+        .and_then(|result| result.proofs.first())
+        .context("proof")?.clone();
+    let mut condition = proof.conditions.first().context("condition")?.clone();
+    let mut query_condition = QueryConditionExplanation {
+        site_id: condition.site_id,
+        scope: None,
+        completed_scope: None,
+        outcome: condition.outcome,
+        left: condition.left.clone(),
+        right: condition.right.clone(),
+        call_uses: None,
+    };
+    proof.call_uses = None;
+    condition.call_uses = None;
+    for value in [
+        serde_json::to_value(&proof)?,
+        serde_json::to_value(&condition)?,
+        serde_json::to_value(&query_condition)?,
+    ] {
+        assert!(value.get("call_uses").is_none());
+    }
+    proof.call_uses = Some(Vec::new());
+    condition.call_uses = Some(Vec::new());
+    query_condition.call_uses = Some(Vec::new());
+    for value in [
+        serde_json::to_value(&proof)?,
+        serde_json::to_value(&condition)?,
+        serde_json::to_value(&query_condition)?,
+    ] {
+        assert_eq!(value.get("call_uses"), Some(&serde_json::json!([])));
+    }
+    Ok(())
+}
+
+#[test]
 fn repeated_negation_completions_name_their_operand_scopes() -> anyhow::Result<()> {
     let mut report = complete_rule_report();
     let rule = report.rules.first_mut().context("queried rule")?;
