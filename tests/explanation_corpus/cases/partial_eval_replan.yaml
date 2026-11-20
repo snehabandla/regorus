@@ -109,7 +109,7 @@ cases:
   - note: pe_replan_unrelated_negation_counter
     description: An assumed positive helper does not make a later concretely true helper's negation hold (RG-P3).
     constructs: [partial_set, helper_rule, function, some_in, negation, unknown_input]
-    unknowns: [input.resources[0].u]
+    unknowns: ['input.resources[0].u']
     partial_eval: {status: unsupported}
     modules:
       - |
@@ -161,7 +161,7 @@ cases:
   - note: pe_replan_helper_calls_keep_own_status
     description: A conditional helper call does not borrow another call's failed path or conditionality (RG-12).
     constructs: [partial_set, helper_rule, function, multiple_bodies, some_in, negation, unknown_input]
-    unknowns: [input.resources[0].b]
+    unknowns: ['input.resources[0].b']
     partial_eval: {status: unsupported}
     modules:
       - |

@@ -59,7 +59,9 @@ fn present_json<'de, D: serde::Deserializer<'de>>(
 /// The corpus supports input-rooted dotted keys, JSON-quoted bracket keys and
 /// unsigned indices. Dynamic references and other roots fail closed.
 pub(super) fn input_path(text: &str) -> Result<UnknownPath> {
-    let mut rest = text.strip_prefix("input").context("path is not input-rooted")?;
+    let mut rest = text
+        .strip_prefix("input")
+        .context("path is not input-rooted")?;
     let mut segments = Vec::new();
     while !rest.is_empty() {
         if let Some(tail) = rest.strip_prefix('.') {
@@ -75,9 +77,12 @@ pub(super) fn input_path(text: &str) -> Result<UnknownPath> {
             segments.push(PathSegment::Key(key.into()));
             rest = &tail[end..];
         } else if let Some(tail) = rest.strip_prefix('[') {
-            let mut stream = serde_json::Deserializer::from_str(tail).into_iter::<serde_json::Value>();
+            let mut stream =
+                serde_json::Deserializer::from_str(tail).into_iter::<serde_json::Value>();
             let item = stream.next().context("missing bracket segment")??;
-            rest = tail[stream.byte_offset()..].strip_prefix(']').context("unclosed bracket")?;
+            rest = tail[stream.byte_offset()..]
+                .strip_prefix(']')
+                .context("unclosed bracket")?;
             segments.push(match item {
                 serde_json::Value::String(key) => PathSegment::Key(key),
                 serde_json::Value::Number(index) => {
@@ -123,8 +128,12 @@ fn remove_unknown(input: &mut Value, segments: &[PathSegment]) -> Result<()> {
             }
             object.get_mut(&key)
         }
-        Value::Array(_) => input.as_array_mut()?.get_mut(usize::try_from(key.as_u64()?)?),
-        Value::Undefined | Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => None,
+        Value::Array(_) => input
+            .as_array_mut()?
+            .get_mut(usize::try_from(key.as_u64()?)?),
+        Value::Undefined | Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+            None
+        }
         _ => bail!("cannot remove an unknown from this input container"),
     };
     if let Some(child) = child {
@@ -139,14 +148,19 @@ impl Condition {
             bail!("residual calls are not supported by this checker");
         }
         match self.kind.as_str() {
-            "negation_holds" if self.operator.is_none()
-                && self.input_path.is_none() && self.value.is_none() => {
+            "negation_holds"
+                if self.operator.is_none() && self.input_path.is_none() && self.value.is_none() =>
+            {
                 for condition in &self.negated {
                     condition.validate()?;
                 }
             }
             "exists" | "truthy" | "condition_holds" if self.negated.is_empty() => {
-                input_path(self.input_path.as_deref().context("missing structured path")?)?;
+                input_path(
+                    self.input_path
+                        .as_deref()
+                        .context("missing structured path")?,
+                )?;
                 if self.kind == "condition_holds" {
                     match self.operator.as_deref() {
                         Some("==" | "!=" | "<" | "<=" | ">" | ">=") => {}
@@ -168,7 +182,10 @@ impl Condition {
         if self.kind == "negation_holds" {
             return Ok(!all_hold(&self.negated, input)?);
         }
-        let value = lookup(input, &input_path(self.input_path.as_deref().context("missing path")?)?)?;
+        let value = lookup(
+            input,
+            &input_path(self.input_path.as_deref().context("missing path")?)?,
+        )?;
         if value == Value::Undefined {
             return Ok(false);
         }
@@ -205,7 +222,10 @@ fn apply(report: &Report, input: &Value) -> Result<Value> {
     if report.status != ExpectedResidualStatus::Exact {
         bail!("non-exact residual is not executable");
     }
-    if !matches!(report.kind.as_str(), "complete" | "function" | "partial_set" | "partial_object") {
+    if !matches!(
+        report.kind.as_str(),
+        "complete" | "function" | "partial_set" | "partial_object"
+    ) {
         bail!("unsupported rule kind");
     }
     if report.result != Value::Undefined && !report.residual_queries.is_empty() {
@@ -237,7 +257,9 @@ fn apply(report: &Report, input: &Value) -> Result<Value> {
         }
         match report.kind.as_str() {
             "complete" | "function" => return Ok(alternative.value.clone()),
-            "partial_set" => { set.insert(alternative.value.clone()); }
+            "partial_set" => {
+                set.insert(alternative.value.clone());
+            }
             "partial_object" => {
                 let key = alternative.key.as_ref().context("missing object key")?;
                 if let Some(previous) = object.insert(key.clone(), alternative.value.clone()) {
@@ -258,7 +280,10 @@ fn apply(report: &Report, input: &Value) -> Result<Value> {
 }
 
 fn check_completion(report: &Report, example: &Example) -> Result<()> {
-    let actual = Ok(apply(report, &example.input.clone().unwrap_or(Value::Undefined))?);
+    let actual = Ok(apply(
+        report,
+        &example.input.clone().unwrap_or(Value::Undefined),
+    )?);
     let expected = Outcome::from_want(&example.want_result, &example.want_error)?;
     if !expected.matches(&actual) {
         bail!("expected {expected:?}, got {}", describe(&actual));
@@ -273,11 +298,17 @@ fn corpus_partial_eval(file: &str) {
 
 fn run_partial_file(file: &str) -> Result<()> {
     for case in load(Path::new(file))?.cases {
-        let Some(expected) = &case.partial_eval else { continue };
+        let Some(expected) = &case.partial_eval else {
+            continue;
+        };
         for example in &case.examples {
             let check = || -> Result<()> {
                 let mut settings = PartialEvalSettings::default();
-                settings.unknowns = case.unknowns.iter().map(|p| input_path(p)).collect::<Result<_>>()?;
+                settings.unknowns = case
+                    .unknowns
+                    .iter()
+                    .map(|p| input_path(p))
+                    .collect::<Result<_>>()?;
                 let mut input = example.input.clone().unwrap_or(Value::Undefined);
                 for unknown in &settings.unknowns {
                     remove_unknown(&mut input, &unknown.segments)?;
@@ -285,7 +316,10 @@ fn run_partial_file(file: &str) -> Result<()> {
                 let mut engine = new_engine(&case, example)?;
                 let compiled = engine.compile_with_entrypoint(&case.query.as_str().into())?;
                 let mut vm = RegoVM::new();
-                vm.load_program(Compiler::compile_from_policy(&compiled, &[case.query.as_str()])?);
+                vm.load_program(Compiler::compile_from_policy(
+                    &compiled,
+                    &[case.query.as_str()],
+                )?);
                 vm.set_data(engine.get_data())?;
                 vm.set_input(input);
                 vm.set_strict_builtin_errors(case.strict_builtin_errors);
@@ -301,13 +335,19 @@ fn run_partial_file(file: &str) -> Result<()> {
                 if report.status == ExpectedResidualStatus::Exact {
                     if let Some(count) = expected.alternatives {
                         if count != report.residual_queries.len() {
-                            bail!("expected {count} alternatives, got {}", report.residual_queries.len());
+                            bail!(
+                                "expected {count} alternatives, got {}",
+                                report.residual_queries.len()
+                            );
                         }
                     }
                     check_completion(&report, example)?;
-                } else if matches!(report.status, ExpectedResidualStatus::Unsupported
-                    | ExpectedResidualStatus::PossibleConflict)
-                    && (report.result != Value::Undefined || !report.residual_queries.is_empty()) {
+                } else if matches!(
+                    report.status,
+                    ExpectedResidualStatus::Unsupported | ExpectedResidualStatus::PossibleConflict
+                ) && (report.result != Value::Undefined
+                    || !report.residual_queries.is_empty())
+                {
                     bail!("non-exact report exposes an outcome");
                 }
                 Ok(())
@@ -330,10 +370,13 @@ fn residual_contract_fixtures() -> Result<()> {
     let role = json!({"text": "not executable Rego", "kind": "condition_holds",
         "operator": "==", "input_path": "input.role", "value": "admin"});
     let locked = json!({"kind": "truthy", "input_path": "input.locked"});
-    let complete = fixture("complete", json!([
-        {"value": true, "conditions": [role]},
-        {"value": true, "conditions": [{"kind": "negation_holds", "negated": [locked]}]}
-    ]))?;
+    let complete = fixture(
+        "complete",
+        json!([
+            {"value": true, "conditions": [role]},
+            {"value": true, "conditions": [{"kind": "negation_holds", "negated": [locked]}]}
+        ]),
+    )?;
     for (input, want) in [
         (r#"{"role":"admin","locked":true}"#, Value::Bool(true)),
         (r#"{"role":"guest","locked":false}"#, Value::Bool(true)),
@@ -341,25 +384,52 @@ fn residual_contract_fixtures() -> Result<()> {
     ] {
         assert_eq!(apply(&complete, &Value::from_json_str(input)?)?, want);
     }
-    let set = fixture("partial_set", json!([
-        {"value": "admin", "conditions": [role]},
-        {"value": "locked", "conditions": [locked]},
-        {"value": "admin", "conditions": [role]}
-    ]))?;
-    assert_eq!(apply(&set, &Value::from_json_str(r#"{"role":"admin","locked":true}"#)?)?,
-        process_value(&Value::from_json_str(r#"{"set!":["admin","locked"]}"#)?)?);
-    assert_eq!(apply(&set, &Value::from_json_str(r#"{"role":"guest","locked":false}"#)?)?,
-        Value::new_set());
-    let object = fixture("partial_object", json!([{"key": "env", "value": "prod",
+    let set = fixture(
+        "partial_set",
+        json!([
+            {"value": "admin", "conditions": [role]},
+            {"value": "locked", "conditions": [locked]},
+            {"value": "admin", "conditions": [role]}
+        ]),
+    )?;
+    assert_eq!(
+        apply(
+            &set,
+            &Value::from_json_str(r#"{"role":"admin","locked":true}"#)?
+        )?,
+        process_value(&Value::from_json_str(r#"{"set!":["admin","locked"]}"#)?)?
+    );
+    assert_eq!(
+        apply(
+            &set,
+            &Value::from_json_str(r#"{"role":"guest","locked":false}"#)?
+        )?,
+        Value::new_set()
+    );
+    let object = fixture(
+        "partial_object",
+        json!([{"key": "env", "value": "prod",
         "conditions": [{"kind": "condition_holds", "operator": "==",
-            "input_path": "input.env", "value": "prod"}]}]))?;
-    assert_eq!(apply(&object, &Value::from_json_str(r#"{"env":"prod"}"#)?)?,
-        Value::from_json_str(r#"{"env":"prod"}"#)?);
-    assert_eq!(apply(&object, &Value::from_json_str(r#"{"env":"dev"}"#)?)?, Value::new_object());
-    let ordered = fixture("function", json!([
-        {"value":"gold","conditions":[role]}, {"value":"basic","conditions":[]}
-    ]))?;
-    assert_eq!(apply(&ordered, &Value::from_json_str(r#"{"role":"admin"}"#)?)?, Value::from("gold"));
+            "input_path": "input.env", "value": "prod"}]}]),
+    )?;
+    assert_eq!(
+        apply(&object, &Value::from_json_str(r#"{"env":"prod"}"#)?)?,
+        Value::from_json_str(r#"{"env":"prod"}"#)?
+    );
+    assert_eq!(
+        apply(&object, &Value::from_json_str(r#"{"env":"dev"}"#)?)?,
+        Value::new_object()
+    );
+    let ordered = fixture(
+        "function",
+        json!([
+            {"value":"gold","conditions":[role]}, {"value":"basic","conditions":[]}
+        ]),
+    )?;
+    assert_eq!(
+        apply(&ordered, &Value::from_json_str(r#"{"role":"admin"}"#)?)?,
+        Value::from("gold")
+    );
     assert_eq!(apply(&ordered, &Value::new_object())?, Value::from("basic"));
     Ok(())
 }
@@ -369,19 +439,41 @@ fn residual_rejects_wrong_answers_and_unknown_semantics() -> Result<()> {
     let corpus = load(Path::new(CASES_DIR).join("rules.yaml").as_path())?;
     let case = corpus.cases.first().context("missing two-condition case")?;
     let example = case.examples.first().context("missing matching example")?;
-    let mut report = fixture("complete", json!([{"value": true, "conditions": [
-        {"kind":"condition_holds","operator":"==","input_path":"input.user.role","value":"guest"},
-        {"kind":"condition_holds","operator":"==","input_path":"input.action","value":"delete"}
-    ]}]))?;
-    assert!(check_completion(&report, example).is_err(), "wrong residual must fail the oracle");
-    let alternative = report.residual_queries.first_mut().context("missing alternative")?;
-    alternative.conditions.first_mut().context("missing condition")?.operator = Some("??".into());
-    assert!(apply(&report, &Value::new_object()).is_err(), "undefined input cannot hide unknown operator");
-    let mut report = fixture("complete", json!([
-        {"value":true,"conditions":[]}, {"value":true,"conditions":[
-            {"kind":"future_condition","input_path":"input.x"}]}
-    ]))?;
-    assert!(apply(&report, &Value::new_object()).is_err(), "first match cannot hide unknown kind");
+    let mut report = fixture(
+        "complete",
+        json!([{"value": true, "conditions": [
+            {"kind":"condition_holds","operator":"==","input_path":"input.user.role","value":"guest"},
+            {"kind":"condition_holds","operator":"==","input_path":"input.action","value":"delete"}
+        ]}]),
+    )?;
+    assert!(
+        check_completion(&report, example).is_err(),
+        "wrong residual must fail the oracle"
+    );
+    let alternative = report
+        .residual_queries
+        .first_mut()
+        .context("missing alternative")?;
+    alternative
+        .conditions
+        .first_mut()
+        .context("missing condition")?
+        .operator = Some("??".into());
+    assert!(
+        apply(&report, &Value::new_object()).is_err(),
+        "undefined input cannot hide unknown operator"
+    );
+    let mut report = fixture(
+        "complete",
+        json!([
+            {"value":true,"conditions":[]}, {"value":true,"conditions":[
+                {"kind":"future_condition","input_path":"input.x"}]}
+        ]),
+    )?;
+    assert!(
+        apply(&report, &Value::new_object()).is_err(),
+        "first match cannot hide unknown kind"
+    );
     report.kind = "future_rule".into();
     assert!(apply(&report, &Value::new_object()).is_err());
     for condition in [
@@ -392,30 +484,51 @@ fn residual_rejects_wrong_answers_and_unknown_semantics() -> Result<()> {
         let report = fixture("complete", json!([{"value":true,"conditions":[condition]}]))?;
         assert!(apply(&report, &Value::new_object()).is_err());
     }
-    let mut case = load(Path::new(CASES_DIR).join("rules.yaml").as_path())?.cases.remove(0);
+    let mut case = load(Path::new(CASES_DIR).join("rules.yaml").as_path())?
+        .cases
+        .remove(0);
     case.partial_eval = None;
-    assert!(check_case_shape(&case).is_err(), "unknown-input cases require PE expectations");
+    assert!(
+        check_case_shape(&case).is_err(),
+        "unknown-input cases require PE expectations"
+    );
     Ok(())
 }
 
 #[test]
 fn residual_paths_null_and_numeric_precision() -> Result<()> {
-    let report = fixture("complete", json!([{"value": false, "conditions": [
-        {"kind":"condition_holds","operator":">","input_path":"input.rows[0][\"0\"]",
-            "value":9007199254740992_u64},
-        {"kind":"condition_holds","operator":"==","input_path":"input[\"a.b\\\"[c]\"]","value":null}
-    ]}]))?;
-    for (number, want) in [("9007199254740993", Value::Bool(false)),
-        ("9007199254740992", Value::Undefined), ("9007199254740992.0", Value::Undefined)] {
-        let input = Value::from_json_str(&format!(
-            r#"{{"rows":[{{"0":{number}}}],"a.b\"[c]":null}}"#))?;
+    let report = fixture(
+        "complete",
+        json!([{"value": false, "conditions": [
+            {"kind":"condition_holds","operator":">","input_path":"input.rows[0][\"0\"]",
+                "value":9007199254740992_u64},
+            {"kind":"condition_holds","operator":"==","input_path":"input[\"a.b\\\"[c]\"]","value":null}
+        ]}]),
+    )?;
+    for (number, want) in [
+        ("9007199254740993", Value::Bool(false)),
+        ("9007199254740992", Value::Undefined),
+        ("9007199254740992.0", Value::Undefined),
+    ] {
+        let input =
+            Value::from_json_str(&format!(r#"{{"rows":[{{"0":{number}}}],"a.b\"[c]":null}}"#))?;
         assert_eq!(apply(&report, &input)?, want);
     }
     let mut input = Value::from_json_str(r#"{"rows":[{"0":1,"keep":2}],"a.b":3,"a":{"b":4}}"#)?;
     remove_unknown(&mut input, &input_path(r#"input.rows[0]["0"]"#)?.segments)?;
     remove_unknown(&mut input, &input_path(r#"input["a.b"]"#)?.segments)?;
-    assert_eq!(input, Value::from_json_str(r#"{"rows":[{"keep":2}],"a":{"b":4}}"#)?);
-    for path in ["inputx", "input.a..b", "input[-1]", "input[_]", "data.a", "context.a"] {
+    assert_eq!(
+        input,
+        Value::from_json_str(r#"{"rows":[{"keep":2}],"a":{"b":4}}"#)?
+    );
+    for path in [
+        "inputx",
+        "input.a..b",
+        "input[-1]",
+        "input[_]",
+        "data.a",
+        "context.a",
+    ] {
         assert!(input_path(path).is_err(), "{path}");
     }
     Ok(())
