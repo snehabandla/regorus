@@ -19,6 +19,7 @@ use alloc::vec::Vec;
 /// redacted.
 pub fn complete_rule_report() -> ExplanationReport {
     let role = ConditionExplanation {
+        call_uses: None,
         site_id: 0,
         owner: owner("data.test.allow", 0),
         outcome: Outcome::Failure,
@@ -28,6 +29,7 @@ pub fn complete_rule_report() -> ExplanationReport {
         binding: None,
     };
     let token = ConditionExplanation {
+        call_uses: None,
         site_id: 1,
         owner: owner("data.test.allow", 0),
         outcome: Outcome::Success,
@@ -79,6 +81,7 @@ pub fn complete_rule_report() -> ExplanationReport {
 pub fn partial_set_report() -> ExplanationReport {
     let names: BTreeSet<Value> = [Value::from("bob")].into_iter().collect();
     let in_users = ConditionExplanation {
+        call_uses: None,
         site_id: 0,
         owner: owner("data.test.deny", 0),
         outcome: Outcome::Success,
@@ -126,6 +129,7 @@ pub fn partial_object_report() -> ExplanationReport {
         .collect();
     let labels = Value::from(labels);
     let in_tags = ConditionExplanation {
+        call_uses: None,
         site_id: 0,
         owner: owner("data.test.labels", 0),
         outcome: Outcome::Success,
@@ -194,11 +198,13 @@ pub fn attributed_report() -> ExplanationReport {
         count: Some(Count::Exact(count)),
     };
     let proof = Derivation {
+        call_uses: None,
         definition: 0,
         body: 0,
         attempt: None,
         conditionality: None,
         conditions: vec![ConditionExplanation {
+            call_uses: None,
             site_id: 2,
             owner: owner("data.test.deny", 0),
             outcome: Outcome::Success,
@@ -584,6 +590,8 @@ pub fn redacted(path: &str) -> Operand {
 /// A query naming `rule`, whose top-level evaluation is call instance 0.
 pub fn query(rule: &str) -> QueryTarget {
     QueryTarget {
+        calls: None,
+        scopes: None,
         entry_point: String::from(rule),
         rule: Some(String::from(rule)),
         call_instance: Some(0),
