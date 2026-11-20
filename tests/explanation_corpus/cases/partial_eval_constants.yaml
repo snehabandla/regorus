@@ -7,10 +7,15 @@ cases:
     constructs: [complete_rule, unknown_input]
     unknowns: [input.u]
     partial_eval: {status: exact, alternatives: 0}
+    # Supply the constant as a native typed Value: the lexer checks every
+    # numeric token with serde_json, so oversized numeric source literals fail.
+    data:
+      native_constant: {"$serde_json::private::Number": "1e400"}
+    opa_skip: The corpus JSON transport cannot encode this native BigInt for OPA.
     modules:
       - |
         package test
-        answer := 1e400 if input.enabled
+        answer := data.native_constant if input.enabled
     query: data.test.answer
     examples:
       - note: known_gate_true

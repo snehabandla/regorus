@@ -128,9 +128,13 @@ fn remove_unknown(input: &mut Value, segments: &[PathSegment]) -> Result<()> {
             }
             object.get_mut(&key)
         }
-        Value::Array(_) => input
-            .as_array_mut()?
-            .get_mut(usize::try_from(key.as_u64()?)?),
+        Value::Array(_) => match first {
+            PathSegment::Index(index) => input
+                .as_array_mut()?
+                .get_mut(usize::try_from(*index)?),
+            PathSegment::Key(_) => None,
+            _ => bail!("unsupported path segment"),
+        },
         Value::Undefined | Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
             None
         }

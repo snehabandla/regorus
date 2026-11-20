@@ -116,6 +116,8 @@ The nested-negation chain uses six helper links, preserving the original
 thirty-link chain's even polarity without exceeding default native-depth limits.
 The original deep reproduction remains outside this completion oracle; resource
 behavior is a separate gate in `tests/rvm/rego/cases/native_depth.yaml`.
+The native BigInt constant fixture supplies a typed data value rather than an
+out-of-range source literal; it explicitly skips OPA's corpus JSON transport.
 
 `residual.rs` interprets structured residual fields after serializing the live
 typed PE result. Concrete results retain their native `Value` so a concrete
