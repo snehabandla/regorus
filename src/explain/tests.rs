@@ -2171,7 +2171,7 @@ fn caller_checks_keep_separate_sibling_dependency_paths() -> anyhow::Result<()> 
         json.pointer("/rules/0/results/0/proofs/0/conditions/0/owner/call_instance"),
         Some(&serde_json::json!(1))
     );
-    for (index, uses) in [(0, [1, 2]), (1, [3, 4])] {
+    for (index, uses, names) in [(0, [1, 2], ["f", "g"]), (1, [3, 4], ["h", "j"])] {
         let check = json
             .pointer(&format!("/rules/0/results/0/proofs/0/conditions/{index}"))
             .context("sibling comparison")?;
@@ -2180,7 +2180,7 @@ fn caller_checks_keep_separate_sibling_dependency_paths() -> anyhow::Result<()> 
             Some(&serde_json::json!(first_site + index))
         );
         assert_eq!(check.pointer("/left/value"), check.pointer("/right/value"));
-        for (side, use_id) in ["left", "right"].into_iter().zip(uses) {
+        for ((side, use_id), name) in ["left", "right"].into_iter().zip(uses).zip(names) {
             assert_eq!(
                 check.pointer(&format!("/{side}/call_uses")),
                 Some(&serde_json::json!([[use_id]]))
@@ -2197,6 +2197,7 @@ fn caller_checks_keep_separate_sibling_dependency_paths() -> anyhow::Result<()> 
                 .find(|helper| helper.call_instance == edge.call_instance)
                 .context("operand producer")?;
             assert_eq!(producer.result, ReportedValue::Known(Value::from(false)));
+            assert_eq!(producer.name, format!("data.test.{name}"));
         }
     }
     Ok(())
