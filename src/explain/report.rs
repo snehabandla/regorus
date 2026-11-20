@@ -158,8 +158,8 @@ impl Serialize for ExplanationReport {
         let mut state = serializer.serialize_struct("ExplanationReport", len)?;
         state.serialize_field("schema_version", &Self::SCHEMA_VERSION)?;
         state.serialize_field("query", &self.query)?;
-        match &self.query_conditions {
-            Some(conditions) => state.serialize_field("query_conditions", conditions)?,
+        match self.query_conditions {
+            Some(ref conditions) => state.serialize_field("query_conditions", conditions)?,
             None => state.skip_field("query_conditions")?,
         }
         if defined {

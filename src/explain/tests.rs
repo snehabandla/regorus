@@ -1766,22 +1766,25 @@ fn attempts_scopes_and_cached_uses_keep_ownership() -> anyhow::Result<()> {
         Some(&serde_json::json!(false))
     );
     for (index, use_id, scope) in [(0, 1, None), (1, 2, Some(1))] {
-        let proof = json
+        let proof_json = json
             .pointer(&format!("/rules/0/results/0/proofs/{index}"))
             .context("cached-use proof")?;
-        assert_eq!(proof.get("call_uses"), Some(&serde_json::json!([use_id])));
         assert_eq!(
-            proof.pointer("/conditions/0/call_uses"),
+            proof_json.get("call_uses"),
+            Some(&serde_json::json!([use_id]))
+        );
+        assert_eq!(
+            proof_json.pointer("/conditions/0/call_uses"),
             Some(&serde_json::json!([[use_id]]))
         );
         assert_eq!(
-            proof.pointer("/conditions/0/owner"),
+            proof_json.pointer("/conditions/0/owner"),
             json.pointer("/rules/1/definitions/0/conditions/0/owner")
         );
         let use_edge = report
             .rules
             .first()
-            .and_then(|rule| rule.calls.as_ref())
+            .and_then(|caller| caller.calls.as_ref())
             .and_then(|calls| calls.iter().find(|call| call.use_id == use_id))
             .context("exact contributing use")?;
         assert_eq!((use_edge.call_instance, use_edge.scope), (2, scope));
@@ -2052,15 +2055,15 @@ fn nested_use_paths_resolve_in_caller_to_callee_order() -> anyhow::Result<()> {
         attempt: None,
         scope: None,
     }]);
-    let caller = report.rules.first_mut().context("caller")?;
-    caller.call_instance = 2;
-    caller.calls = Some(vec![CallUse {
+    let root = report.rules.first_mut().context("caller")?;
+    root.call_instance = 2;
+    root.calls = Some(vec![CallUse {
         use_id: 2,
         call_instance: 3,
         attempt: Some(1),
         scope: None,
     }]);
-    let mut callee = caller.clone();
+    let mut callee = root.clone();
     callee.name = String::from("data.test.helper");
     callee.call_instance = 3;
     callee.calls = Some(Vec::new());
@@ -2085,15 +2088,15 @@ fn nested_use_paths_resolve_in_caller_to_callee_order() -> anyhow::Result<()> {
         location: None,
         conditions: vec![check.clone()],
     }];
-    let proof = caller
+    let retained = root
         .results
         .as_mut()
         .and_then(|results| results.first_mut())
         .and_then(|result| result.proofs.first_mut())
         .context("contributing proof")?;
     check.call_uses = Some(vec![vec![1, 2]]);
-    proof.conditions = vec![check];
-    proof.call_uses = Some(vec![1, 2]);
+    retained.conditions = vec![check];
+    retained.call_uses = Some(vec![1, 2]);
     report.rules.push(callee);
     let json = serde_json::to_value(&report)?;
     assert_eq!(
@@ -2122,7 +2125,10 @@ fn nested_use_paths_resolve_in_caller_to_callee_order() -> anyhow::Result<()> {
             .find(|edge| edge.use_id == *use_id)
             .context("contiguous use")?;
         assert_eq!(
-            calls.iter().filter(|edge| edge.use_id == *use_id).count(),
+            calls
+                .iter()
+                .filter(|candidate| candidate.use_id == *use_id)
+                .count(),
             1
         );
         let rule = report
