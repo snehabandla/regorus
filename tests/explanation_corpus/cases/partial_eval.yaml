@@ -1,0 +1,146 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+cases:
+  - note: pe_deployment_context_leaves
+    description: All six consumer deployment leaves are ordinary unknown paths, not special cases.
+    constructs: [complete_rule, unknown_input]
+    unknowns: [input.deployment.subscriptionId, input.deployment.tenantId, input.deployment.resourceGroupName, input.deployment.location, input.deployment.managementGroupName, input.deployment.targetScope]
+    partial_eval: {status: exact, alternatives: 1}
+    modules:
+      - |
+        package test
+        allow if {
+          input.deployment.subscriptionId == "sub"
+          input.deployment.tenantId == "tenant"
+          input.deployment.resourceGroupName == "rg-prod"
+          input.deployment.location != "eastus"
+          input.deployment.managementGroupName == "mg"
+          input.deployment.targetScope == "resourceGroup"
+        }
+    query: data.test.allow
+    examples:
+      - note: all_match
+        input: {deployment: {subscriptionId: sub, tenantId: tenant, resourceGroupName: rg-prod, location: westus, managementGroupName: mg, targetScope: resourceGroup}}
+        want_result: true
+      - note: location_fails
+        input: {deployment: {subscriptionId: sub, tenantId: tenant, resourceGroupName: rg-prod, location: eastus, managementGroupName: mg, targetScope: resourceGroup}}
+        want_result: "#undefined"
+      - note: absent_management_group
+        input: {deployment: {subscriptionId: sub, tenantId: tenant, resourceGroupName: rg-prod, location: westus, targetScope: resourceGroup}}
+        want_result: "#undefined"
+
+  - note: pe_known_gate_eliminates_deployment_residual
+    description: Known resource facts can eliminate a body despite unrelated deployment unknowns.
+    constructs: [complete_rule, unknown_input]
+    unknowns: [input.deployment.location]
+    partial_eval: {status: exact}
+    modules:
+      - |
+        package test
+        allow if {
+          input.resource.type == "vm"
+          input.deployment.location != "eastus"
+        }
+    query: data.test.allow
+    examples:
+      - {note: matching, input: {resource: {type: vm}, deployment: {location: westus}}, want_result: true}
+      - {note: known_false, input: {resource: {type: storage}, deployment: {location: westus}}, want_result: "#undefined"}
+      - {note: unknown_completion_false, input: {resource: {type: vm}, deployment: {location: eastus}}, want_result: "#undefined"}
+
+  - note: pe_precise_numeric_comparisons
+    description: All six comparisons, including mirrored operators, retain integer precision beyond f64.
+    constructs: [complete_rule, unknown_input]
+    unknowns: [input.n]
+    partial_eval: {status: exact, alternatives: 1}
+    modules:
+      - |
+        package test
+        allow if {
+          9007199254740992 < input.n
+          9007199254740993 <= input.n
+          input.n > 9007199254740992
+          input.n >= 9007199254740993
+          input.n <= 9007199254740993
+          input.n < 9007199254740994
+          input.n == 9007199254740993
+          input.n != 9007199254740992
+        }
+    query: data.test.allow
+    examples:
+      - {note: exact_integer, input: {n: 9007199254740993}, want_result: true}
+      - {note: adjacent_integer, input: {n: 9007199254740992}, want_result: "#undefined"}
+      - {note: equal_float_boundary, input: {n: 9007199254740992.0}, want_result: "#undefined"}
+      - {note: absent, input: {}, want_result: "#undefined"}
+
+  - note: pe_typed_quoted_paths
+    description: Quoted object keys, numeric-looking keys and array indices preserve their identities.
+    constructs: [complete_rule, unknown_input]
+    unknowns: ['input["a.b\"[c]"]["0"]', 'input.rows[0].score']
+    partial_eval: {status: exact, alternatives: 1}
+    modules:
+      - |
+        package test
+        allow if {
+          input["a.b\"[c]"]["0"] == "yes"
+          input.rows[0].score == 1
+        }
+    query: data.test.allow
+    examples:
+      - note: matching
+        input: {'a.b"[c]': {"0": "yes"}, rows: [{score: 1}]}
+        want_result: true
+      - note: wrong_array_element
+        input: {'a.b"[c]': {"0": "yes"}, rows: [{score: 2}, {score: 1}]}
+        want_result: "#undefined"
+      - note: dotted_path_is_different
+        input: {a: {b: {"0": "yes"}}, rows: [{score: 1}]}
+        want_result: "#undefined"
+
+  - note: pe_truthy_false_result
+    description: A defined false head remains a value; null and empty containers are truthy, unlike false or absence.
+    constructs: [complete_rule, undefined_vs_false, unknown_input]
+    unknowns: [input.enabled]
+    partial_eval: {status: exact, alternatives: 1}
+    modules:
+      - |
+        package test
+        answer := false if input.enabled
+    query: data.test.answer
+    examples:
+      - {note: enabled_true, input: {enabled: true}, want_result: false}
+      - {note: enabled_null, input: {enabled: null}, want_result: false}
+      - {note: empty_array, input: {enabled: []}, want_result: false}
+      - {note: empty_object, input: {enabled: {}}, want_result: false}
+      - {note: enabled_false, input: {enabled: false}, want_result: "#undefined"}
+      - {note: absent, input: {}, want_result: "#undefined"}
+
+  - note: pe_json_value_types
+    description: Null and literal metadata-like strings in nested JSON values keep their types.
+    constructs: [complete_rule, unknown_input]
+    unknowns: [input.payload]
+    partial_eval: {status: exact, alternatives: 1}
+    modules:
+      - |
+        package test
+        allow if input.payload == {"items": [null, "<undefined>"]}
+    query: data.test.allow
+    examples:
+      - {note: matching, input: {payload: {items: [null, "<undefined>"]}}, want_result: true}
+      - {note: null_is_not_a_string, input: {payload: {items: ["null", "<undefined>"]}}, want_result: "#undefined"}
+      - {note: array_is_not_object, input: {payload: [null, "<undefined>"]}, want_result: "#undefined"}
+
+  - note: pe_null_comparison
+    description: A null comparison operand is present structured data, not an omitted value.
+    constructs: [complete_rule, unknown_input]
+    unknowns: [input.u]
+    partial_eval: {status: exact, alternatives: 1}
+    modules:
+      - |
+        package test
+        allow if input.u == null
+    query: data.test.allow
+    examples:
+      - {note: null_value, input: {u: null}, want_result: true}
+      - {note: false_value, input: {u: false}, want_result: "#undefined"}
+      - {note: absent, input: {}, want_result: "#undefined"}

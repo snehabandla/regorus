@@ -23,8 +23,9 @@ struct Alternative {
     #[serde(default = "undefined")]
     value: Value,
     conditions: Vec<Condition>,
-    #[serde(default)]
-    status: Option<String>,
+    #[serde(default = "exact")]
+    status: String,
+    #[serde(default, deserialize_with = "present_json")]
     unresolved: Option<serde_json::Value>,
 }
 
@@ -37,6 +38,7 @@ struct Condition {
     value: Option<Value>,
     #[serde(default)]
     negated: Vec<Condition>,
+    #[serde(default, deserialize_with = "present_json")]
     call: Option<serde_json::Value>,
 }
 
@@ -44,9 +46,19 @@ fn undefined() -> Value {
     Value::Undefined
 }
 
+fn exact() -> String {
+    "exact".into()
+}
+
+fn present_json<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<serde_json::Value>, D::Error> {
+    serde_json::Value::deserialize(d).map(Some)
+}
+
 /// The corpus supports input-rooted dotted keys, JSON-quoted bracket keys and
 /// unsigned indices. Dynamic references and other roots fail closed.
-fn input_path(text: &str) -> Result<UnknownPath> {
+pub(super) fn input_path(text: &str) -> Result<UnknownPath> {
     let mut rest = text.strip_prefix("input").context("path is not input-rooted")?;
     let mut segments = Vec::new();
     while !rest.is_empty() {
@@ -202,7 +214,7 @@ fn apply(report: &Report, input: &Value) -> Result<Value> {
     // Validate even untaken alternatives: an unknown operator must never be
     // hidden by a false conjunct or an earlier successful else branch.
     for alternative in &report.residual_queries {
-        if alternative.status.as_deref().is_some_and(|s| s != "exact")
+        if alternative.status != "exact"
             || alternative.unresolved.is_some()
             || alternative.value == Value::Undefined
             || (report.kind == "partial_object") != alternative.key.is_some()
@@ -246,7 +258,7 @@ fn apply(report: &Report, input: &Value) -> Result<Value> {
 }
 
 fn check_completion(report: &Report, example: &Example) -> Result<()> {
-    let actual = apply(report, &example.input.clone().unwrap_or(Value::Undefined));
+    let actual = Ok(apply(report, &example.input.clone().unwrap_or(Value::Undefined))?);
     let expected = Outcome::from_want(&example.want_result, &example.want_error)?;
     if !expected.matches(&actual) {
         bail!("expected {expected:?}, got {}", describe(&actual));
@@ -255,7 +267,11 @@ fn check_completion(report: &Report, example: &Example) -> Result<()> {
 }
 
 #[test_resources("tests/explanation_corpus/cases/*.yaml")]
-fn corpus_partial_eval(file: &str) -> Result<()> {
+fn corpus_partial_eval(file: &str) {
+    run_partial_file(file).unwrap();
+}
+
+fn run_partial_file(file: &str) -> Result<()> {
     for case in load(Path::new(file))?.cases {
         let Some(expected) = &case.partial_eval else { continue };
         for example in &case.examples {
@@ -274,7 +290,11 @@ fn corpus_partial_eval(file: &str) -> Result<()> {
                 vm.set_input(input);
                 vm.set_strict_builtin_errors(case.strict_builtin_errors);
                 vm.set_partial_eval_settings(settings);
-                let report: Report = serde_json::from_value(serde_json::to_value(vm.partial_eval(&case.query)?)?)?;
+                let pe = vm.partial_eval(&case.query)?;
+                let mut report: Report = serde_json::from_value(serde_json::to_value(&pe)?)?;
+                // Concrete sets/non-string-keyed objects need the typed value;
+                // only residual operands are required to be JSON-lossless.
+                report.result = pe.result;
                 if report.status != expected.status {
                     bail!("expected {:?}, got {:?}", expected.status, report.status);
                 }
@@ -285,13 +305,118 @@ fn corpus_partial_eval(file: &str) -> Result<()> {
                         }
                     }
                     check_completion(&report, example)?;
-                } else if report.result != Value::Undefined || !report.residual_queries.is_empty() {
+                } else if matches!(report.status, ExpectedResidualStatus::Unsupported
+                    | ExpectedResidualStatus::PossibleConflict)
+                    && (report.result != Value::Undefined || !report.residual_queries.is_empty()) {
                     bail!("non-exact report exposes an outcome");
                 }
                 Ok(())
             };
             check().with_context(|| format!("{}/{}", case.note, example.note))?;
         }
+    }
+    Ok(())
+}
+
+fn fixture(kind: &str, alternatives: serde_json::Value) -> Result<Report> {
+    Ok(serde_json::from_value(json!({
+        "kind": kind, "status": "exact", "residual_queries": alternatives
+    }))?)
+}
+
+#[test]
+fn residual_contract_fixtures() -> Result<()> {
+    // These are the #876 complete/set/object examples in src/explain/fixtures.rs.
+    let role = json!({"text": "not executable Rego", "kind": "condition_holds",
+        "operator": "==", "input_path": "input.role", "value": "admin"});
+    let locked = json!({"kind": "truthy", "input_path": "input.locked"});
+    let complete = fixture("complete", json!([
+        {"value": true, "conditions": [role]},
+        {"value": true, "conditions": [{"kind": "negation_holds", "negated": [locked]}]}
+    ]))?;
+    for (input, want) in [
+        (r#"{"role":"admin","locked":true}"#, Value::Bool(true)),
+        (r#"{"role":"guest","locked":false}"#, Value::Bool(true)),
+        (r#"{"role":"guest","locked":true}"#, Value::Undefined),
+    ] {
+        assert_eq!(apply(&complete, &Value::from_json_str(input)?)?, want);
+    }
+    let set = fixture("partial_set", json!([
+        {"value": "admin", "conditions": [role]},
+        {"value": "locked", "conditions": [locked]},
+        {"value": "admin", "conditions": [role]}
+    ]))?;
+    assert_eq!(apply(&set, &Value::from_json_str(r#"{"role":"admin","locked":true}"#)?)?,
+        process_value(&Value::from_json_str(r#"{"set!":["admin","locked"]}"#)?)?);
+    assert_eq!(apply(&set, &Value::from_json_str(r#"{"role":"guest","locked":false}"#)?)?,
+        Value::new_set());
+    let object = fixture("partial_object", json!([{"key": "env", "value": "prod",
+        "conditions": [{"kind": "condition_holds", "operator": "==",
+            "input_path": "input.env", "value": "prod"}]}]))?;
+    assert_eq!(apply(&object, &Value::from_json_str(r#"{"env":"prod"}"#)?)?,
+        Value::from_json_str(r#"{"env":"prod"}"#)?);
+    assert_eq!(apply(&object, &Value::from_json_str(r#"{"env":"dev"}"#)?)?, Value::new_object());
+    let ordered = fixture("function", json!([
+        {"value":"gold","conditions":[role]}, {"value":"basic","conditions":[]}
+    ]))?;
+    assert_eq!(apply(&ordered, &Value::from_json_str(r#"{"role":"admin"}"#)?)?, Value::from("gold"));
+    assert_eq!(apply(&ordered, &Value::new_object())?, Value::from("basic"));
+    Ok(())
+}
+
+#[test]
+fn residual_rejects_wrong_answers_and_unknown_semantics() -> Result<()> {
+    let corpus = load(Path::new(CASES_DIR).join("rules.yaml").as_path())?;
+    let case = corpus.cases.first().context("missing two-condition case")?;
+    let example = case.examples.first().context("missing matching example")?;
+    let mut report = fixture("complete", json!([{"value": true, "conditions": [
+        {"kind":"condition_holds","operator":"==","input_path":"input.user.role","value":"guest"},
+        {"kind":"condition_holds","operator":"==","input_path":"input.action","value":"delete"}
+    ]}]))?;
+    assert!(check_completion(&report, example).is_err(), "wrong residual must fail the oracle");
+    let alternative = report.residual_queries.first_mut().context("missing alternative")?;
+    alternative.conditions.first_mut().context("missing condition")?.operator = Some("??".into());
+    assert!(apply(&report, &Value::new_object()).is_err(), "undefined input cannot hide unknown operator");
+    let mut report = fixture("complete", json!([
+        {"value":true,"conditions":[]}, {"value":true,"conditions":[
+            {"kind":"future_condition","input_path":"input.x"}]}
+    ]))?;
+    assert!(apply(&report, &Value::new_object()).is_err(), "first match cannot hide unknown kind");
+    report.kind = "future_rule".into();
+    assert!(apply(&report, &Value::new_object()).is_err());
+    for condition in [
+        json!({"kind":"condition_holds","operator":"==","value":1,"text":"input.x == 1"}),
+        json!({"kind":"condition_holds","operator":"==","input_path":"input.x","text":"input.x == 1"}),
+        json!({"kind":"condition_holds","operator":"in","input_path":"input.x","value":[1]}),
+    ] {
+        let report = fixture("complete", json!([{"value":true,"conditions":[condition]}]))?;
+        assert!(apply(&report, &Value::new_object()).is_err());
+    }
+    let mut case = load(Path::new(CASES_DIR).join("rules.yaml").as_path())?.cases.remove(0);
+    case.partial_eval = None;
+    assert!(check_case_shape(&case).is_err(), "unknown-input cases require PE expectations");
+    Ok(())
+}
+
+#[test]
+fn residual_paths_null_and_numeric_precision() -> Result<()> {
+    let report = fixture("complete", json!([{"value": false, "conditions": [
+        {"kind":"condition_holds","operator":">","input_path":"input.rows[0][\"0\"]",
+            "value":9007199254740992_u64},
+        {"kind":"condition_holds","operator":"==","input_path":"input[\"a.b\\\"[c]\"]","value":null}
+    ]}]))?;
+    for (number, want) in [("9007199254740993", Value::Bool(false)),
+        ("9007199254740992", Value::Undefined), ("9007199254740992.0", Value::Undefined)] {
+        let input = Value::from_json_str(&format!(
+            r#"{{"rows":[{{"0":{number}}}],"a.b\"[c]":null}}"#))?;
+        assert_eq!(apply(&report, &input)?, want);
+    }
+    let mut input = Value::from_json_str(r#"{"rows":[{"0":1,"keep":2}],"a.b":3,"a":{"b":4}}"#)?;
+    remove_unknown(&mut input, &input_path(r#"input.rows[0]["0"]"#)?.segments)?;
+    remove_unknown(&mut input, &input_path(r#"input["a.b"]"#)?.segments)?;
+    assert_eq!(input, Value::from_json_str(r#"{"rows":[{"keep":2}],"a":{"b":4}}"#)?);
+    for path in ["inputx", "input.a..b", "input[-1]", "input[_]", "data.a", "context.a"] {
+        assert!(input_path(path).is_err(), "{path}");
     }
     Ok(())
 }

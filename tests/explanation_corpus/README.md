@@ -20,6 +20,11 @@ REGORUS_OPA=/path/to/opa cargo test --test mod explanation_corpus::corpus_matche
   `divergence.actual_*` for the engines the divergence lists.
 - `corpus_is_well_formed`: checks the structural rules below and prints how
   many cases cover each construct.
+- `residual::corpus_partial_eval` (with `explanations`): removes each example's
+  declared unknown subtrees, runs run-to-completion PE, checks its expected
+  status and optional alternative count, then applies every Exact structured
+  residual to the original concrete input and compares with `want_*`.
+  It never uses an ordinary-evaluation divergence as the PE oracle.
 - `corpus_matches_opa`: when `REGORUS_OPA` is set, runs `opa eval` for every
   example (except cases with `opa_skip`) and compares with `want_*`. Error
   messages differ between OPA and regorus, so any OPA evaluation error
@@ -46,6 +51,7 @@ cases:
     rego_v0: false                # optional; parse modules as Rego v0
     strict_builtin_errors: false  # optional; true makes builtin errors errors instead of Undefined
     unknowns: [input.role]        # required iff tagged unknown_input
+    partial_eval: {status: unsupported} # required iff tagged unknown_input
     secrets: ["s3cr3t"]           # required iff tagged secret
     opa_skip: reason              # optional; OPA can't run this case
     examples:
@@ -69,12 +75,19 @@ substring must not occur in the policy itself.
   example has a nonmatching twin.
 - Every construct is covered by at least one case.
 - `unknowns` is set exactly when the case is tagged `unknown_input`, and every
-  path is under `input`.
+  path is under `input`. Dotted keys, JSON-quoted bracket keys and unsigned
+  bracket indices are supported, preserving key/index identity. With
+  `explanations`, the same typed-path decoder checks declaration syntax and
+  residual lookup; other roots and dynamic paths are rejected.
+- `partial_eval` is required exactly for `unknown_input` cases. Its `status`
+  is `exact`, `unsupported`, `partial` or `possible_conflict`. Optional
+  `alternatives` counts alternatives only for Exact cases; omit it when
+  known facts give different counts across examples.
 - `secrets` is set exactly when the case is tagged `secret`, and every secret
   appears in the case's input or data.
 - A divergence's actual outcome differs from the expected one.
 - No expected or actual error text occurs in the policy source.
-- `partial_eval` and `explanation` are rejected until a checker exists.
+- `explanation` is rejected until a checker exists.
 
 ### Divergences
 
@@ -91,17 +104,55 @@ example records what regorus does today:
 Fixing the bug makes the test fail on the listed engines; remove the
 divergence then.
 
-## Adding explanation or partial-evaluation expectations
+## Partial-evaluation oracle
 
-`explanation` (per example) and `partial_eval` (per case) are reserved. A PR
-that adds an explanation or partial-evaluation feature:
+The original 19 unknown-input cases now all have explicit expectations:
+`complete_rule_two_conditions` is Exact and the other 18 are Unsupported on
+the reviewed B34 producer. New cases exercise general JSON values, typed paths,
+numeric comparisons, known-gate elimination and all six deployment-context
+leaves. Integration-branch reproductions keep their correct ordinary results
+and explicitly Unsupported PE, rather than pinning defective exact answers.
 
-1. Replaces the reserved field's type in `mod.rs` with the feature's expected
-   type, behind the feature's cargo flag.
-2. Adds a check that compares it with the producer's output.
-3. Fills the field in for the cases it supports.
+`residual.rs` interprets structured residual fields after serializing the live
+typed PE result. Concrete results retain their native `Value` so a concrete
+set is not mistaken for its JSON array representation. Presentation `text`,
+source locations, rule names and warnings are
+never executable. Conditions in one alternative are AND; complete rules and
+functions select the first matching ordered alternative (including defaults).
+Partial sets collect and deduplicate every matching value; partial objects
+collect keyed values and reject conflicting contributions. Empty partial
+collections remain defined; absent complete results remain Undefined, not
+false or null. Numeric comparisons use `regorus::Value` equality/ordering,
+not floating-point coercion.
 
-Cases and inputs stay as they are; new constructs get new cases with a twin.
+The deliberately small applier supports input-rooted existence, truthiness,
+the six comparisons and recursively nested negation. It rejects non-Exact
+outcomes, malformed alternatives, unknown rule/condition kinds, unsupported
+operators (including `in` for now), calls and missing structured fields.
+Validation covers even untaken alternatives. Future producers must extend
+this checker alongside their supported constructs; it does not claim to
+execute every representable contract kind. The current producer still does
+not support unknown `data` declarations, context residuals, suspendable PE
+or unknown collection iteration. There is no optional OPA residual-coverage
+report; `corpus_matches_opa` checks concrete outcomes only.
+
+Focused validation selectors (run by the build owner):
+
+```bash
+cargo +1.95.0 test --features explanations --test mod explanation_corpus
+cargo +1.95.0 test --test mod explanation_corpus
+REGORUS_OPA=/path/to/opa cargo +1.95.0 test --features explanations --test mod explanation_corpus::corpus_matches_opa
+```
+
+The test-only contract controls cover the #876 complete/set/object fixtures,
+ordered fallback, wrong residual answers, unsupported semantics, required PE
+fields, typed paths, null and precision beyond `f64`. They do not establish
+that broader PE production is supported.
+
+`explanation` remains reserved. A feature adding explanation expectations must
+replace its type, add a producer check and fill supported examples.
+
+New constructs get new cases with a twin.
 Test functions for `cases/*.yaml` are generated at compile time, so after adding
 a new file, rebuild the tests (for example, `touch tests/explanation_corpus/mod.rs`).
 

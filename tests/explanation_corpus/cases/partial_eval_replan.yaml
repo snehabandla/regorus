@@ -1,0 +1,224 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+# Correct completion outcomes for the 2026-11-13 integration-branch
+# reproductions. B34 does not residualize these constructs.
+cases:
+  - note: pe_replan_inverted_nested_negation
+    description: A concretely empty comprehension must not invert the later unknown negation (RG-P7).
+    constructs: [partial_set, comprehension, negation, unknown_input]
+    unknowns: [input.u]
+    partial_eval: {status: unsupported}
+    modules:
+      - |
+        package test
+        deny contains "x" if {
+          not [x | x := 1; not input.r.missing; input.r.k == 1][0]
+          not input.u
+        }
+    query: data.test.deny
+    examples:
+      - {note: unknown_completes_absent, input: {r: {k: 2}}, want_result: {"set!": [x]}}
+      - {note: unknown_completes_true, input: {r: {k: 2}, u: true}, want_result: {"set!": []}}
+
+  - note: pe_replan_dropped_sibling_negation
+    description: Two different sibling negations must both constrain the outcome (RG-P7).
+    constructs: [partial_set, negation, unknown_input]
+    unknowns: [input.u, input.v]
+    partial_eval: {status: unsupported}
+    modules:
+      - |
+        package test
+        deny contains "x" if { not input.u; not input.v }
+    query: data.test.deny
+    examples:
+      - {note: neither_present, input: {}, want_result: {"set!": [x]}}
+      - {note: first_true, input: {u: true}, want_result: {"set!": []}}
+      - {note: second_true, input: {v: true}, want_result: {"set!": []}}
+
+  - note: pe_replan_nested_live_siblings
+    description: Sibling negations inside a negated helper retain their own scopes (RG-P7).
+    constructs: [partial_set, helper_rule, negation, unknown_input]
+    unknowns: [input.u, input.v]
+    partial_eval: {status: unsupported}
+    modules:
+      - |
+        package test
+        inner if { not input.v; not input.u }
+        deny contains "x" if not inner
+    query: data.test.deny
+    examples:
+      - {note: both_absent, input: {}, want_result: {"set!": []}}
+      - {note: first_true, input: {u: true}, want_result: {"set!": [x]}}
+      - {note: second_true, input: {v: true}, want_result: {"set!": [x]}}
+
+  - note: pe_replan_hidden_conflict
+    description: A helper conflict under negation is an evaluation issue, not a possible clean result.
+    constructs: [partial_set, helper_rule, multiple_bodies, negation, conflict, runtime_error, unknown_input]
+    unknowns: [input.u]
+    partial_eval: {status: unsupported}
+    modules:
+      - |
+        package test
+        h := true
+        h := input.u if input.u == 1
+        deny contains "x" if not h
+    query: data.test.deny
+    examples:
+      - note: conflicting_completion
+        input: {u: 1}
+        want_error: "conflicts"
+        divergence:
+          reason: The current RVM turns inconsistent complete-rule values into Undefined, which makes the enclosing not succeed (source-confirmed in vm/rules.rs).
+          engines: [rvm]
+          actual_result: {"set!": [x]}
+      - {note: nonconflicting_completion, input: {u: 2}, want_result: {"set!": []}}
+
+  - note: pe_replan_derived_unknown
+    description: Unknown arithmetic through a helper remains conditional even without a recorded comparison assumption.
+    constructs: [partial_set, helper_rule, negation, unknown_input]
+    unknowns: [input.u]
+    partial_eval: {status: unsupported}
+    modules:
+      - |
+        package test
+        h if not input.u + 1 == 2
+        deny contains "x" if not h
+    query: data.test.deny
+    examples:
+      - {note: equality_holds, input: {u: 1}, want_result: {"set!": [x]}}
+      - {note: equality_fails, input: {u: 2}, want_result: {"set!": []}}
+
+  - note: pe_replan_concrete_helper_polarity
+    description: A concretely true helper makes its negation false even when another definition reads unknown input (RG-P2).
+    constructs: [partial_set, helper_rule, function, multiple_bodies, negation, unknown_input]
+    unknowns: [input.b]
+    partial_eval: {status: unsupported}
+    modules:
+      - |
+        package test
+        ok(r) if r.a == "yes"
+        ok(r) if r.b == "yes"
+        deny contains "x" if not ok(input)
+    query: data.test.deny
+    examples:
+      - {note: concrete_success, input: {a: "yes", b: "no"}, want_result: {"set!": []}}
+      - {note: both_fail, input: {a: "no", b: "no"}, want_result: {"set!": [x]}}
+      - {note: conditional_success, input: {a: "no", b: "yes"}, want_result: {"set!": []}}
+
+  - note: pe_replan_unrelated_negation_counter
+    description: An assumed positive helper does not make a later concretely true helper's negation hold (RG-P3).
+    constructs: [partial_set, helper_rule, function, some_in, negation, unknown_input]
+    unknowns: [input.resources[0].u]
+    partial_eval: {status: unsupported}
+    modules:
+      - |
+        package test
+        a(r) if r.u == 1
+        b(r) if r.k == 1
+        deny contains r.name if {
+          some r in input.resources
+          a(r)
+          not b(r)
+        }
+    query: data.test.deny
+    examples:
+      - {note: known_helper_blocks, input: {resources: [{name: n, k: 1, u: 1}]}, want_result: {"set!": []}}
+      - {note: known_helper_fails, input: {resources: [{name: n, k: 2, u: 1}]}, want_result: {"set!": [n]}}
+      - {note: first_helper_fails, input: {resources: [{name: n, k: 2, u: 2}]}, want_result: {"set!": []}}
+
+  - note: pe_replan_failed_helper_discards_assumption
+    description: A concretely failed helper must discard its earlier assumption under not (RG-P4).
+    constructs: [partial_set, helper_rule, negation, unknown_input]
+    unknowns: [input.u]
+    partial_eval: {status: unsupported}
+    modules:
+      - |
+        package test
+        h if { input.u == 1; input.a == 2 }
+        deny contains "x" if not h
+    query: data.test.deny
+    examples:
+      - {note: failed_after_unknown, input: {a: 1, u: 1}, want_result: {"set!": [x]}}
+      - {note: also_failed_before_known, input: {a: 1, u: 2}, want_result: {"set!": [x]}}
+      - {note: helper_succeeds, input: {a: 2, u: 1}, want_result: {"set!": []}}
+
+  - note: pe_replan_orphaned_partial_set_assumption
+    description: A failed partial-set definition does not leave an assumption for not over its missing member (RG-9).
+    constructs: [partial_set, helper_rule, negation, unknown_input]
+    unknowns: [input.u]
+    partial_eval: {status: unsupported}
+    modules:
+      - |
+        package test
+        members contains 1 if { input.u == 1; input.a == 2 }
+        deny contains "x" if not members[1]
+    query: data.test.deny
+    examples:
+      - {note: failed_known_gate, input: {a: 1, u: 1}, want_result: {"set!": [x]}}
+      - {note: successful_member, input: {a: 2, u: 1}, want_result: {"set!": []}}
+
+  - note: pe_replan_helper_calls_keep_own_status
+    description: A conditional helper call does not borrow another call's failed path or conditionality (RG-12).
+    constructs: [partial_set, helper_rule, function, multiple_bodies, some_in, negation, unknown_input]
+    unknowns: [input.resources[0].b]
+    partial_eval: {status: unsupported}
+    modules:
+      - |
+        package test
+        ok(r) if r.a.x == "yes"
+        ok(r) if r.b == "yes"
+        deny contains r.name if { some r in input.resources; not ok(r) }
+    query: data.test.deny
+    examples:
+      - note: first_conditional_success
+        input: {resources: [{name: r0, a: {x: "no"}, b: "yes"}, {name: r1, a: {x: "no"}, b: "no"}]}
+        want_result: {"set!": [r1]}
+      - note: both_fail
+        input: {resources: [{name: r0, a: {x: "no"}, b: "no"}, {name: r1, a: {x: "no"}, b: "no"}]}
+        want_result: {"set!": [r0, r1]}
+
+  - note: pe_replan_deep_negation_chain
+    description: Thirty helper links preserve the leaf's polarity rather than treating a depth cut as concrete (RG-P7).
+    constructs: [partial_set, helper_rule, negation, unknown_input]
+    unknowns: [input.u]
+    partial_eval: {status: unsupported}
+    modules:
+      - |
+        package test
+        h0 if not h1
+        h1 if not h2
+        h2 if not h3
+        h3 if not h4
+        h4 if not h5
+        h5 if not h6
+        h6 if not h7
+        h7 if not h8
+        h8 if not h9
+        h9 if not h10
+        h10 if not h11
+        h11 if not h12
+        h12 if not h13
+        h13 if not h14
+        h14 if not h15
+        h15 if not h16
+        h16 if not h17
+        h17 if not h18
+        h18 if not h19
+        h19 if not h20
+        h20 if not h21
+        h21 if not h22
+        h22 if not h23
+        h23 if not h24
+        h24 if not h25
+        h25 if not h26
+        h26 if not h27
+        h27 if not h28
+        h28 if not h29
+        h29 if not h30
+        h30 if not input.u
+        deny contains "x" if not h0
+    query: data.test.deny
+    examples:
+      - {note: true_leaf, input: {u: true}, want_result: {"set!": [x]}}
+      - {note: absent_leaf, input: {}, want_result: {"set!": []}}

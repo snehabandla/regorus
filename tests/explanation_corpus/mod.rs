@@ -376,9 +376,11 @@ fn check_case_shape(case: &Case) -> Result<()> {
         bail!("`unknowns` must be set exactly when constructs include unknown_input");
     }
     for unknown in &case.unknowns {
-        if unknown != "input" && !unknown.starts_with("input.") {
+        if unknown != "input" && !unknown.starts_with("input.") && !unknown.starts_with("input[") {
             bail!("unknown path {unknown} is not under input");
         }
+        #[cfg(feature = "explanations")]
+        residual::input_path(unknown)?;
     }
     if case.constructs.contains(&Construct::Secret) == case.secrets.is_empty() {
         bail!("`secrets` must be set exactly when constructs include secret");
