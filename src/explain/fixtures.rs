@@ -19,6 +19,7 @@ use alloc::vec::Vec;
 /// redacted.
 pub fn complete_rule_report() -> ExplanationReport {
     let role = ConditionExplanation {
+        argument: None,
         completed_scope: None,
         call_uses: None,
         site_id: 0,
@@ -30,6 +31,7 @@ pub fn complete_rule_report() -> ExplanationReport {
         binding: None,
     };
     let token = ConditionExplanation {
+        argument: None,
         completed_scope: None,
         call_uses: None,
         site_id: 1,
@@ -84,6 +86,7 @@ pub fn complete_rule_report() -> ExplanationReport {
 pub fn partial_set_report() -> ExplanationReport {
     let names: BTreeSet<Value> = [Value::from("bob")].into_iter().collect();
     let in_users = ConditionExplanation {
+        argument: None,
         completed_scope: None,
         call_uses: None,
         site_id: 0,
@@ -92,6 +95,8 @@ pub fn partial_set_report() -> ExplanationReport {
         left: None,
         right: None,
         witness: Some(LoopWitness {
+            key_binding: None,
+            value_binding: None,
             iterations: 2,
             successes: 1,
             sample_key: Some(known(Value::from(1_u64), None)),
@@ -134,6 +139,7 @@ pub fn partial_object_report() -> ExplanationReport {
         .collect();
     let labels = Value::from(labels);
     let in_tags = ConditionExplanation {
+        argument: None,
         completed_scope: None,
         call_uses: None,
         site_id: 0,
@@ -142,6 +148,8 @@ pub fn partial_object_report() -> ExplanationReport {
         left: None,
         right: None,
         witness: Some(LoopWitness {
+            key_binding: None,
+            value_binding: None,
             iterations: 1,
             successes: 1,
             sample_key: Some(known(Value::from("env"), None)),
@@ -211,6 +219,7 @@ pub fn attributed_report() -> ExplanationReport {
         attempt: None,
         conditionality: None,
         conditions: vec![ConditionExplanation {
+            argument: None,
             completed_scope: None,
             call_uses: None,
             site_id: 2,

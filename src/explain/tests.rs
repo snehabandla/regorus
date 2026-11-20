@@ -1610,12 +1610,14 @@ fn attempts_scopes_and_cached_uses_keep_ownership() -> anyhow::Result<()> {
     ]);
     rule.calls = Some(alloc::vec![
         CallUse {
+            arguments: None,
             use_id: 1,
             call_instance: 2,
             attempt: Some(2),
             scope: None
         },
         CallUse {
+            arguments: None,
             use_id: 2,
             call_instance: 2,
             attempt: Some(2),
@@ -1842,12 +1844,14 @@ fn arbitrary_queries_own_cached_uses_and_negation_scopes() -> anyhow::Result<()>
     });
     report.query.calls = Some(vec![
         CallUse {
+            arguments: None,
             use_id: 1,
             call_instance: 1,
             attempt: None,
             scope: None,
         },
         CallUse {
+            arguments: None,
             use_id: 2,
             call_instance: 1,
             attempt: None,
@@ -1969,6 +1973,8 @@ fn query_iterations_and_bindings_keep_their_evidence() -> anyhow::Result<()> {
             call_uses: Some(Vec::new()),
             binding: Some(String::from("x")),
             witness: Some(LoopWitness {
+                key_binding: None,
+                value_binding: None,
                 iterations: 1,
                 successes: 1,
                 sample_key: Some(known(Value::from(0), None)),
@@ -2025,6 +2031,194 @@ fn query_iterations_and_bindings_keep_their_evidence() -> anyhow::Result<()> {
     assert!(serde_json::to_value(&report)?
         .pointer("/query_conditions/0/binding")
         .is_none());
+    Ok(())
+}
+
+#[test]
+fn two_variable_query_witness_names_key_and_value_roles() -> anyhow::Result<()> {
+    let mut report = complete_rule_report();
+    report.rules.clear();
+    report.query.rule = None;
+    report.query.call_instance = None;
+    report.query.entry_point = String::from("some k, v in input.tags");
+    report.query_result = Value::from(true);
+    report.checks = vec![ConditionSite {
+        site_id: 0,
+        text: report.query.entry_point.clone(),
+        kind: ConditionKind::Iteration,
+        location: None,
+        operator: None,
+    }];
+    report.query_conditions = Some(vec![QueryConditionExplanation {
+        site_id: 0,
+        scope: None,
+        completed_scope: None,
+        outcome: Outcome::Success,
+        left: Some(known(Value::from(vec![Value::from(false)]), Some("input.tags"))),
+        right: None,
+        call_uses: Some(Vec::new()),
+        binding: None,
+        witness: Some(LoopWitness {
+            key_binding: Some(String::from("k")),
+            value_binding: Some(String::from("v")),
+            iterations: 1,
+            successes: 1,
+            sample_key: Some(known(Value::from(0), None)),
+            sample_value: Some(known(Value::from(false), Some("input.tags"))),
+        }),
+    }]);
+    let json = serde_json::to_value(&report)?;
+    assert_eq!(
+        json.pointer("/query_conditions/0/witness"),
+        Some(&serde_json::json!({
+            "key_binding":"k","value_binding":"v","iterations":1,"successes":1,
+            "sample_key":{"concrete_path":{"status":"not_captured"},"value":0},
+            "sample_value":{"path":"input.tags","concrete_path":{"status":"not_captured"},"value":false}
+        }))
+    );
+    assert!(json.pointer("/query_conditions/0/binding").is_none());
+    let witness = report.query_conditions.as_mut().and_then(|checks| checks.first_mut())
+        .and_then(|check| check.witness.as_mut()).context("query witness")?;
+    witness.key_binding = None;
+    witness.value_binding = None;
+    let uncaptured = serde_json::to_value(&report)?;
+    assert!(uncaptured.pointer("/query_conditions/0/witness/key_binding").is_none());
+    assert!(uncaptured.pointer("/query_conditions/0/witness/value_binding").is_none());
+    Ok(())
+}
+
+#[test]
+fn incoming_arguments_keep_caller_paths_out_of_shared_callee_proofs() -> anyhow::Result<()> {
+    for query_owned in [false, true] {
+        let mut report = complete_rule_report();
+        let mut template = report.rules.first().context("rule template")?.clone();
+        template.definitions.clear();
+        template.emissions.clear();
+        template.results = None;
+        template.attempts = None;
+        template.scopes = Some(Vec::new());
+        template.calls = Some(Vec::new());
+        report.rules.clear();
+        report.checks = ["x", "y", "x == y"].into_iter().enumerate()
+            .map(|(index, text)| Ok(ConditionSite {
+                site_id: u32::try_from(index)?,
+                text: String::from(text),
+                kind: if index == 2 { ConditionKind::Comparison } else { ConditionKind::Binding },
+                operator: (index == 2).then_some(Operator::Eq),
+                location: None,
+            })).collect::<anyhow::Result<_>>()?;
+        report.query_result = Value::from(true);
+        report.query.rule = None;
+        report.query.call_instance = None;
+        report.query.entry_point = String::from(
+            "same(f(input.a), g(input.b)); same(g(input.b), f(input.a))",
+        );
+        let argument = |use_id| {
+            let mut operand = known(Value::from(false), None);
+            operand.call_uses = Some(vec![vec![use_id]]);
+            operand
+        };
+        let mut calls = vec![
+            CallUse { use_id: 1, call_instance: 2, attempt: None, scope: None,
+                arguments: Some(vec![known(Value::from(false), Some("input.a"))]) },
+            CallUse { use_id: 2, call_instance: 3, attempt: None, scope: None,
+                arguments: Some(vec![known(Value::from(false), Some("input.b"))]) },
+            CallUse { use_id: 3, call_instance: 4, attempt: None, scope: None,
+                arguments: Some(vec![argument(1), argument(2)]) },
+            CallUse { use_id: 4, call_instance: 4, attempt: None, scope: None,
+                arguments: Some(vec![argument(2), argument(1)]) },
+        ];
+        if query_owned {
+            report.query.calls = Some(calls);
+        } else {
+            report.query.entry_point = String::from("data.test.allow");
+            report.query.rule = Some(String::from("data.test.allow"));
+            report.query.call_instance = Some(1);
+            for call in &mut calls { call.attempt = Some(1); }
+            let mut caller = template.clone();
+            caller.name = String::from("data.test.allow");
+            caller.call_instance = 1;
+            caller.result = ReportedValue::Known(Value::from(true));
+            caller.attempts = Some(vec![AttemptExplanation {
+                attempt: 1, definition: 0, body: 0, outcome: Some(Outcome::Success),
+                conditions: Some(Vec::new()),
+            }]);
+            caller.calls = Some(calls);
+            report.rules.push(caller);
+        }
+        for (call_instance, name) in [(2, "f"), (3, "g"), (4, "same")] {
+            let mut helper = template.clone();
+            helper.name = format!("data.test.{name}");
+            helper.call_instance = call_instance;
+            helper.kind = RuleKind::Function;
+            helper.result = ReportedValue::Known(Value::from(call_instance == 4));
+            if call_instance == 4 {
+                let mut conditions = ["x", "y"].into_iter().enumerate().map(|(index, name)| {
+                    Ok(ConditionExplanation {
+                        site_id: u32::try_from(index)?,
+                        owner: ConditionOwner { rule: helper.name.clone(), call_instance,
+                            attempt: Some(4), scope: None },
+                        call_uses: Some(Vec::new()), completed_scope: None,
+                        outcome: Outcome::Success, left: Some(known(Value::from(false), None)),
+                        right: None, witness: None, binding: Some(String::from(name)),
+                        argument: Some(index),
+                    })
+                }).collect::<anyhow::Result<Vec<_>>>()?;
+                let comparison = ConditionExplanation {
+                    site_id: 2,
+                    owner: ConditionOwner { rule: helper.name.clone(), call_instance,
+                        attempt: Some(4), scope: None },
+                    call_uses: Some(Vec::new()), completed_scope: None,
+                    outcome: Outcome::Success, left: Some(known(Value::from(false), None)),
+                    right: Some(known(Value::from(false), None)), witness: None,
+                    binding: None, argument: None,
+                };
+                conditions.push(comparison.clone());
+                helper.definitions = vec![DefinitionExplanation {
+                    index: 0, body: 0, outcome: Outcome::Success, location: None,
+                    conditions: vec![comparison],
+                }];
+                helper.attempts = Some(vec![AttemptExplanation {
+                    attempt: 4, definition: 0, body: 0, outcome: Some(Outcome::Success),
+                    conditions: Some(conditions.clone()),
+                }]);
+                helper.results = Some(vec![ResultExplanation::new(
+                    None, ReportedValue::Known(Value::from(true)), Count::Exact(1),
+                    Vec::new(), vec![Derivation {
+                        definition: 0, body: 0, attempt: Some(4), conditionality: None,
+                        call_uses: Some(Vec::new()), conditions,
+                        bindings: Some(Vec::new()),
+                    }],
+                ).context("callee proof")?]);
+            }
+            report.rules.push(helper);
+        }
+        let json = serde_json::to_value(&report)?;
+        let calls = if query_owned { json.pointer("/query/calls") }
+            else { json.pointer("/rules/0/calls") }
+            .and_then(serde_json::Value::as_array).context("caller uses")?;
+        let helpers = json.get("rules").and_then(serde_json::Value::as_array)
+            .context("rules")?;
+        let same = helpers.last().context("same")?;
+        for (use_index, expected) in [(2, ["data.test.f", "data.test.g"]),
+            (3, ["data.test.g", "data.test.f"])] {
+            for (position, name) in expected.into_iter().enumerate() {
+                assert_eq!(same.pointer(&format!("/attempts/0/conditions/{position}/argument")),
+                    Some(&serde_json::json!(position)));
+                let actual = calls.get(use_index).and_then(|call|
+                    call.pointer(&format!("/arguments/{position}"))).context("argument")?;
+                assert_eq!(actual.get("value"), Some(&serde_json::json!(false)));
+                let use_id = actual.pointer("/call_uses/0/0").context("producer use")?;
+                let edge = calls.iter().find(|call| call.get("use_id") == Some(use_id))
+                    .context("caller-owned producer")?;
+                let producer = helpers.iter().find(|rule|
+                    rule.get("call_instance") == edge.get("call_instance")).context("producer")?;
+                assert_eq!(producer.get("name"), Some(&serde_json::json!(name)));
+            }
+        }
+        assert_eq!(same.get("calls"), Some(&serde_json::json!([])));
+        assert_eq!(same.pointer("/results/0/proofs/0/call_uses"), Some(&serde_json::json!([])));
+    }
     Ok(())
 }
 
@@ -2112,6 +2306,7 @@ fn caller_checks_keep_separate_sibling_dependency_paths() -> anyhow::Result<()> 
     rule.calls = Some(
         (1..=4)
             .map(|use_id| CallUse {
+                arguments: None,
                 use_id,
                 call_instance: use_id + 1,
                 attempt: Some(1),
@@ -2227,12 +2422,14 @@ fn nested_use_paths_resolve_in_caller_to_callee_order() -> anyhow::Result<()> {
     report.query.entry_point = String::from("data.test.deny; not data.test.deny == set()");
     report.query.calls = Some(vec![
         CallUse {
+            arguments: None,
             use_id: 1,
             call_instance: 2,
             attempt: None,
             scope: None,
         },
         CallUse {
+            arguments: None,
             use_id: 4,
             call_instance: 2,
             attempt: None,
@@ -2249,6 +2446,7 @@ fn nested_use_paths_resolve_in_caller_to_callee_order() -> anyhow::Result<()> {
     let root = report.rules.first_mut().context("caller")?;
     root.call_instance = 2;
     root.calls = Some(vec![CallUse {
+        arguments: None,
         use_id: 2,
         call_instance: 3,
         attempt: Some(1),
@@ -2262,6 +2460,7 @@ fn nested_use_paths_resolve_in_caller_to_callee_order() -> anyhow::Result<()> {
     middle.definitions.clear();
     middle.emissions.clear();
     middle.calls = Some(vec![CallUse {
+        arguments: None,
         use_id: 3,
         call_instance: 4,
         attempt: Some(1),
@@ -2545,6 +2744,7 @@ fn nested_comprehension_conditions_do_not_replace_the_finding_subject() -> anyho
     subject.owner = owner(None);
     subject.witness = None;
     let local = ConditionExplanation {
+        argument: None,
         completed_scope: None,
         call_uses: None,
         site_id: 3,
@@ -2553,6 +2753,8 @@ fn nested_comprehension_conditions_do_not_replace_the_finding_subject() -> anyho
         left: None,
         right: None,
         witness: Some(LoopWitness {
+            key_binding: None,
+            value_binding: None,
             iterations: 1,
             successes: 1,
             sample_key: Some(known(Value::from(0), None)),
@@ -2561,6 +2763,7 @@ fn nested_comprehension_conditions_do_not_replace_the_finding_subject() -> anyho
         binding: Some(String::from("tag")),
     };
     let predicate = ConditionExplanation {
+        argument: None,
         completed_scope: None,
         call_uses: None,
         site_id: 4,
@@ -2572,6 +2775,7 @@ fn nested_comprehension_conditions_do_not_replace_the_finding_subject() -> anyho
         binding: None,
     };
     let negation = ConditionExplanation {
+        argument: None,
         completed_scope: Some(1),
         call_uses: None,
         site_id: 1,
@@ -2748,12 +2952,14 @@ fn value_only_helpers_keep_argument_origins_without_body_predicates() -> anyhow:
     rule.scopes = Some(Vec::new());
     rule.calls = Some(vec![
         CallUse {
+            arguments: None,
             use_id: 1,
             call_instance: 2,
             attempt: Some(1),
             scope: None,
         },
         CallUse {
+            arguments: None,
             use_id: 2,
             call_instance: 3,
             attempt: Some(1),
@@ -2773,6 +2979,7 @@ fn value_only_helpers_keep_argument_origins_without_body_predicates() -> anyhow:
             complete: true,
         });
         let binding = ConditionExplanation {
+            argument: None,
             completed_scope: None,
             call_uses: None,
             site_id: 0,
