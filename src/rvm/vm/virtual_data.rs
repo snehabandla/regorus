@@ -137,6 +137,7 @@ impl RegoVM {
                                             }
                                         })?;
                                     self.explain_reuse_call(rule_index_u16);
+                                    self.execution_timer_tick(1)?;
                                 }
                                 cached
                             } else {

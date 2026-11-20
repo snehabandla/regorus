@@ -2592,7 +2592,11 @@ fn invocation_subtree_cache_reuse_checks_deadline_between_providers() -> Result<
         vm.set_explanation_recorder(Box::new(control.clone()));
         assert_eq!(execute(&mut vm, mode)?, expected);
         assert_eq!(
-            control.calls().iter().filter(|call| matches!(call, CallRecord::Reused(_, _))).count(),
+            control
+                .calls()
+                .iter()
+                .filter(|call| matches!(call, CallRecord::Reused(_, _)))
+                .count(),
             4,
             "{mode:?}: the control must reach all cached providers"
         );
@@ -2610,11 +2614,16 @@ fn invocation_subtree_cache_reuse_checks_deadline_between_providers() -> Result<
         );
         let calls = fixture.calls();
         assert_eq!(
-            calls.iter().filter(|call| matches!(call, CallRecord::Reused(_, _))).count(),
+            calls
+                .iter()
+                .filter(|call| matches!(call, CallRecord::Reused(_, _)))
+                .count(),
             1,
             "{mode:?}: callbacks must stop once the first exceeds the deadline: {calls:?}"
         );
-        assert!(calls.iter().any(|call| matches!(call, CallRecord::End(_, None, None))));
+        assert!(calls
+            .iter()
+            .any(|call| matches!(call, CallRecord::End(_, None, None))));
     }
     Ok(())
 }
