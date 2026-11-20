@@ -2064,19 +2064,27 @@ fn nested_use_paths_resolve_in_caller_to_callee_order() -> anyhow::Result<()> {
     callee.name = String::from("data.test.helper");
     callee.call_instance = 3;
     callee.calls = Some(Vec::new());
-    callee.results = None;
     callee.emissions.clear();
     let mut check = callee
-        .definitions
-        .first()
-        .and_then(|definition| definition.conditions.first())
+        .results
+        .as_ref()
+        .and_then(|results| results.first())
+        .and_then(|result| result.proofs.first())
+        .and_then(|proof| proof.conditions.first())
         .context("physical callee check")?
         .clone();
+    callee.results = None;
     check.owner.rule = callee.name.clone();
     check.owner.call_instance = 3;
     check.owner.attempt = Some(1);
     check.call_uses = None;
-    callee.definitions.first_mut().context("callee definition")?.conditions = vec![check.clone()];
+    callee.definitions = vec![DefinitionExplanation {
+        index: 0,
+        body: 0,
+        outcome: Outcome::Success,
+        location: None,
+        conditions: vec![check.clone()],
+    }];
     let proof = caller
         .results
         .as_mut()
@@ -2109,9 +2117,18 @@ fn nested_use_paths_resolve_in_caller_to_callee_order() -> anyhow::Result<()> {
     let mut calls = report.query.calls.as_ref().context("query uses")?;
     let mut reached = None;
     for use_id in path {
-        let edge = calls.iter().find(|edge| edge.use_id == *use_id).context("contiguous use")?;
-        assert_eq!(calls.iter().filter(|edge| edge.use_id == *use_id).count(), 1);
-        let rule = report.rules.iter().find(|rule| rule.call_instance == edge.call_instance)
+        let edge = calls
+            .iter()
+            .find(|edge| edge.use_id == *use_id)
+            .context("contiguous use")?;
+        assert_eq!(
+            calls.iter().filter(|edge| edge.use_id == *use_id).count(),
+            1
+        );
+        let rule = report
+            .rules
+            .iter()
+            .find(|rule| rule.call_instance == edge.call_instance)
             .context("physical callee")?;
         reached = Some(rule.call_instance);
         calls = rule.calls.as_ref().context("callee uses")?;
@@ -2123,11 +2140,14 @@ fn nested_use_paths_resolve_in_caller_to_callee_order() -> anyhow::Result<()> {
 #[test]
 fn captured_empty_use_dependencies_are_not_uncaptured() -> anyhow::Result<()> {
     let report = attributed_report();
-    let mut proof = report.rules.first()
+    let mut proof = report
+        .rules
+        .first()
         .and_then(|rule| rule.results.as_ref())
         .and_then(|results| results.first())
         .and_then(|result| result.proofs.first())
-        .context("proof")?.clone();
+        .context("proof")?
+        .clone();
     let mut condition = proof.conditions.first().context("condition")?.clone();
     let mut query_condition = QueryConditionExplanation {
         site_id: condition.site_id,
