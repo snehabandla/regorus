@@ -1,0 +1,23 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+cases:
+  - note: pe_native_constant_outside_json_numeric_range
+    description: An Exact native constant independent of unknown input must not require JSON serialization of the concrete result.
+    constructs: [complete_rule, unknown_input]
+    unknowns: [input.u]
+    partial_eval: {status: exact, alternatives: 0}
+    modules:
+      - |
+        package test
+        answer := 1e400 if input.enabled
+    query: data.test.answer
+    examples:
+      - note: known_gate_true
+        input: {enabled: true}
+        # Value's existing deserializer accepts this exact numeric wrapper;
+        # YAML's ordinary numeric scalar cannot preserve this native integer.
+        want_result: {"$serde_json::private::Number": "1e400"}
+      - note: known_gate_false
+        input: {enabled: false}
+        want_result: "#undefined"

@@ -29,6 +29,18 @@ cases:
       - note: absent_management_group
         input: {deployment: {subscriptionId: sub, tenantId: tenant, resourceGroupName: rg-prod, location: westus, targetScope: resourceGroup}}
         want_result: "#undefined"
+      - note: subscription_fails
+        input: {deployment: {subscriptionId: other, tenantId: tenant, resourceGroupName: rg-prod, location: westus, managementGroupName: mg, targetScope: resourceGroup}}
+        want_result: "#undefined"
+      - note: tenant_fails
+        input: {deployment: {subscriptionId: sub, tenantId: other, resourceGroupName: rg-prod, location: westus, managementGroupName: mg, targetScope: resourceGroup}}
+        want_result: "#undefined"
+      - note: resource_group_fails
+        input: {deployment: {subscriptionId: sub, tenantId: tenant, resourceGroupName: other, location: westus, managementGroupName: mg, targetScope: resourceGroup}}
+        want_result: "#undefined"
+      - note: target_scope_fails
+        input: {deployment: {subscriptionId: sub, tenantId: tenant, resourceGroupName: rg-prod, location: westus, managementGroupName: mg, targetScope: subscription}}
+        want_result: "#undefined"
 
   - note: pe_known_gate_eliminates_deployment_residual
     description: Known resource facts can eliminate a body despite unrelated deployment unknowns.
@@ -72,6 +84,20 @@ cases:
       - {note: adjacent_integer, input: {n: 9007199254740992}, want_result: "#undefined"}
       - {note: equal_float_boundary, input: {n: 9007199254740992.0}, want_result: "#undefined"}
       - {note: absent, input: {}, want_result: "#undefined"}
+
+  - note: pe_isolated_strict_upper_boundary
+    description: A strict comparison boundary is not masked by another equality or ordering conjunct.
+    constructs: [complete_rule, unknown_input]
+    unknowns: [input.n]
+    partial_eval: {status: exact, alternatives: 1}
+    modules:
+      - |
+        package test
+        allow if input.n < 10
+    query: data.test.allow
+    examples:
+      - {note: below_boundary, input: {n: 9}, want_result: true}
+      - {note: at_boundary, input: {n: 10}, want_result: "#undefined"}
 
   - note: pe_typed_quoted_paths
     description: Quoted object keys, numeric-looking keys and array indices preserve their identities.

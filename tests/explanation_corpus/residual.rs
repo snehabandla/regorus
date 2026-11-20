@@ -533,3 +533,23 @@ fn residual_paths_null_and_numeric_precision() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn residual_unknown_pruning_distinguishes_array_indices_and_string_keys() -> Result<()> {
+    let mut array = Value::from_json_str(r#"{"rows":[1]}"#)?;
+    remove_unknown(&mut array, &input_path("input.rows[0]")?.segments)?;
+    assert_eq!(array["rows"].as_array()?.len(), 1);
+    assert_eq!(array["rows"][0], Value::Undefined);
+
+    let mut object = Value::from_json_str(r#"{"rows":{"0":1,"keep":2}}"#)?;
+    remove_unknown(&mut object, &input_path(r#"input.rows["0"]"#)?.segments)?;
+    assert_eq!(object, Value::from_json_str(r#"{"rows":{"keep":2}}"#)?);
+
+    let original = Value::from_json_str(r#"{"rows":[1]}"#)?;
+    let path = input_path(r#"input.rows["0"]"#)?;
+    assert_eq!(lookup(&original, &path)?, Value::Undefined);
+    let mut array = original.clone();
+    remove_unknown(&mut array, &path.segments)?;
+    assert_eq!(array, original);
+    Ok(())
+}
