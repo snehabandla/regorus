@@ -2549,6 +2549,76 @@ fn invocation_deadline_abort_terminates_the_active_call() -> Result<()> {
     Ok(())
 }
 
+struct SlowCallReuse(Fixture);
+
+impl ExplanationRecorder for SlowCallReuse {
+    fn call_start(&mut self, context: &HookContext, event: &CallStartEvent) {
+        self.0.call_start(context, event);
+    }
+
+    fn call_end(&mut self, context: &HookContext, event: &CallEndEvent<'_>) {
+        self.0.call_end(context, event);
+    }
+
+    fn call_reused(&mut self, context: &HookContext, event: &CallReusedEvent) {
+        self.0.call_reused(context, event);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
+#[test]
+fn invocation_subtree_cache_reuse_checks_deadline_between_providers() -> Result<()> {
+    use regorus::utils::limits::ExecutionTimerConfig;
+    use std::num::NonZeroU32;
+
+    let mut engine = Engine::new();
+    engine.add_policy(
+        "target.rego".into(),
+        "package target.dept\np0 := 0\np1 := 1\np2 := 2\np3 := 3\n".into(),
+    )?;
+    engine.add_policy(
+        "t.rego".into(),
+        "package t\nr := [data.target[input.a],data.target[input.b]]\n".into(),
+    )?;
+    let compiled = engine.compile_with_entrypoint(&Rc::from("data.t.r"))?;
+    let program = Compiler::compile_from_policy(&compiled, &["data.t.r"])?;
+    let expected = v(r#"[{"p0":0,"p1":1,"p2":2,"p3":3},{"p0":0,"p1":1,"p2":2,"p3":3}]"#);
+    for mode in MODES {
+        let control = Fixture::default();
+        let mut vm = RegoVM::new();
+        vm.load_program(program.clone());
+        vm.set_execution_mode(mode);
+        vm.set_input(v(r#"{"a":"dept","b":"dept"}"#));
+        vm.set_explanation_recorder(Box::new(control.clone()));
+        assert_eq!(execute(&mut vm, mode)?, expected);
+        assert_eq!(
+            control.calls().iter().filter(|call| matches!(call, CallRecord::Reused(_, _))).count(),
+            4,
+            "{mode:?}: the control must reach all cached providers"
+        );
+
+        let fixture = Fixture::default();
+        vm.set_explanation_recorder(Box::new(SlowCallReuse(fixture.clone())));
+        vm.set_execution_timer_config(Some(ExecutionTimerConfig {
+            limit: std::time::Duration::from_millis(100),
+            check_interval: NonZeroU32::MIN,
+        }));
+        let outcome = vm.execute();
+        assert!(
+            matches!(outcome, Err(VmError::TimeLimitExceeded { .. })),
+            "{mode:?}: expected deadline error, got {outcome:?}"
+        );
+        let calls = fixture.calls();
+        assert_eq!(
+            calls.iter().filter(|call| matches!(call, CallRecord::Reused(_, _))).count(),
+            1,
+            "{mode:?}: callbacks must stop once the first exceeds the deadline: {calls:?}"
+        );
+        assert!(calls.iter().any(|call| matches!(call, CallRecord::End(_, None, None))));
+    }
+    Ok(())
+}
+
 struct SlowReset;
 
 impl ExplanationRecorder for SlowReset {
