@@ -1972,31 +1972,31 @@ fn fallback_eligibility_retains_failed_helper_dependencies() -> anyhow::Result<(
         report.rules = vec![caller];
         report.rules.extend(helpers);
         let json = serde_json::to_value(&report)?;
-        let result = json.pointer("/rules/0/results/0").context("result")?;
-        let proof = result.pointer("/proofs/0").context("proof")?;
-        assert_eq!(proof.get("conditions"), Some(&serde_json::json!([])));
-        assert_eq!(proof.get("call_uses"), Some(&serde_json::json!([1])));
+        let result_json = json.pointer("/rules/0/results/0").context("result")?;
+        let proof_json = result_json.pointer("/proofs/0").context("proof")?;
+        assert_eq!(proof_json.get("conditions"), Some(&serde_json::json!([])));
+        assert_eq!(proof_json.get("call_uses"), Some(&serde_json::json!([1])));
         assert_eq!(
-            proof.get("conditionality"),
+            proof_json.get("conditionality"),
             Some(&serde_json::to_value(conditionality)?)
         );
-        assert_eq!(proof.get("conditionality"), result.get("conditionality"));
-        let eligibility = proof
+        assert_eq!(proof_json.get("conditionality"), result_json.get("conditionality"));
+        let eligibility = proof_json
             .get("eligibility")
             .and_then(serde_json::Value::as_array)
             .context("captured eligibility")?;
         assert_eq!(eligibility.len(), 1);
-        let guard = eligibility.first().context("guard")?;
-        assert_eq!(guard.get("outcome"), Some(&serde_json::json!("failure")));
+        let guard_json = eligibility.first().context("guard")?;
+        assert_eq!(        guard_json.get("outcome"), Some(&serde_json::json!("failure")));
         assert_eq!(
-            guard.get("owner"),
+            guard_json.get("owner"),
             Some(&serde_json::json!({
                 "rule":"data.test.p", "call_instance":1, "attempt":1
             }))
         );
-        assert_eq!(guard.get("call_uses"), Some(&serde_json::json!([[1]])));
+        assert_eq!(guard_json.get("call_uses"), Some(&serde_json::json!([[1]])));
         assert_eq!(
-            guard,
+            guard_json,
             json.pointer("/rules/0/attempts/0/conditions/0")
                 .context("failed primary")?
         );
@@ -2008,18 +2008,18 @@ fn fallback_eligibility_retains_failed_helper_dependencies() -> anyhow::Result<(
             json.pointer("/rules/0/attempts/2/conditions/0/call_uses"),
             Some(&serde_json::json!([[2]]))
         );
-        let proof = report
+        let mutable_proof = report
             .rules
             .first_mut()
             .and_then(|rule| rule.results.as_mut())
             .and_then(|results| results.first_mut())
             .and_then(|result| result.proofs.first_mut())
             .context("mutable proof")?;
-        proof.eligibility = None;
-        assert!(serde_json::to_value(&proof)?.get("eligibility").is_none());
-        proof.eligibility = Some(Vec::new());
+        mutable_proof.eligibility = None;
+        assert!(serde_json::to_value(&mutable_proof)?.get("eligibility").is_none());
+        mutable_proof.eligibility = Some(Vec::new());
         assert_eq!(
-            serde_json::to_value(&proof)?.get("eligibility"),
+            serde_json::to_value(&mutable_proof)?.get("eligibility"),
             Some(&serde_json::json!([]))
         );
     }
