@@ -1980,14 +1980,20 @@ fn fallback_eligibility_retains_failed_helper_dependencies() -> anyhow::Result<(
             proof_json.get("conditionality"),
             Some(&serde_json::to_value(conditionality)?)
         );
-        assert_eq!(proof_json.get("conditionality"), result_json.get("conditionality"));
+        assert_eq!(
+            proof_json.get("conditionality"),
+            result_json.get("conditionality")
+        );
         let eligibility = proof_json
             .get("eligibility")
             .and_then(serde_json::Value::as_array)
             .context("captured eligibility")?;
         assert_eq!(eligibility.len(), 1);
         let guard_json = eligibility.first().context("guard")?;
-        assert_eq!(        guard_json.get("outcome"), Some(&serde_json::json!("failure")));
+        assert_eq!(
+            guard_json.get("outcome"),
+            Some(&serde_json::json!("failure"))
+        );
         assert_eq!(
             guard_json.get("owner"),
             Some(&serde_json::json!({
@@ -2013,10 +2019,12 @@ fn fallback_eligibility_retains_failed_helper_dependencies() -> anyhow::Result<(
             .first_mut()
             .and_then(|rule| rule.results.as_mut())
             .and_then(|results| results.first_mut())
-            .and_then(|result| result.proofs.first_mut())
+            .and_then(|attribution| attribution.proofs.first_mut())
             .context("mutable proof")?;
         mutable_proof.eligibility = None;
-        assert!(serde_json::to_value(&mutable_proof)?.get("eligibility").is_none());
+        assert!(serde_json::to_value(&mutable_proof)?
+            .get("eligibility")
+            .is_none());
         mutable_proof.eligibility = Some(Vec::new());
         assert_eq!(
             serde_json::to_value(&mutable_proof)?.get("eligibility"),
@@ -2485,20 +2493,30 @@ fn incoming_arguments_keep_caller_paths_out_of_uncached_function_proofs() -> any
                     binding: None,
                 };
                 conditions.push(comparison.clone());
+                // This helper succeeds in the else body of its second definition.
                 helper.definitions = vec![DefinitionExplanation {
-                    index: 0,
-                    body: 0,
+                    index: 1,
+                    body: 1,
                     outcome: Outcome::Success,
                     location: None,
                     conditions: vec![comparison],
                 }];
-                helper.attempts = Some(vec![AttemptExplanation {
-                    attempt: call_instance,
-                    definition: 0,
-                    body: 0,
-                    outcome: Some(Outcome::Success),
-                    conditions: Some(conditions.clone()),
-                }]);
+                helper.attempts = Some(vec![
+                    AttemptExplanation {
+                        attempt: call_instance.saturating_sub(1),
+                        definition: 1,
+                        body: 0,
+                        outcome: Some(Outcome::Failure),
+                        conditions: None,
+                    },
+                    AttemptExplanation {
+                        attempt: call_instance,
+                        definition: 1,
+                        body: 1,
+                        outcome: Some(Outcome::Success),
+                        conditions: Some(conditions.clone()),
+                    },
+                ]);
                 helper.results = Some(vec![ResultExplanation::new(
                     None,
                     ReportedValue::Known(Value::from(true)),
@@ -2506,8 +2524,8 @@ fn incoming_arguments_keep_caller_paths_out_of_uncached_function_proofs() -> any
                     Vec::new(),
                     vec![Derivation {
                         eligibility: None,
-                        definition: 0,
-                        body: 0,
+                        definition: 1,
+                        body: 1,
                         attempt: Some(call_instance),
                         conditionality: None,
                         call_uses: Some(Vec::new()),
@@ -2552,17 +2570,19 @@ fn incoming_arguments_keep_caller_paths_out_of_uncached_function_proofs() -> any
                 .context("proof attempt resolves in its containing invocation")?;
             assert_eq!(attempt.get("definition"), proof.get("definition"));
             assert_eq!(attempt.get("body"), proof.get("body"));
+            assert_eq!(proof.get("definition"), Some(&serde_json::json!(1)));
+            assert_eq!(proof.get("body"), Some(&serde_json::json!(1)));
             assert_ne!(proof.get("attempt"), Some(&serde_json::json!(1)));
             for (position, name) in expected.into_iter().enumerate() {
                 assert_eq!(
-                    same.pointer(&format!(
-                        "/attempts/0/conditions/{position}/left/parameter_origins/0/argument"
+                    attempt.pointer(&format!(
+                        "/conditions/{position}/left/parameter_origins/0/argument"
                     )),
                     Some(&serde_json::json!(position))
                 );
                 assert_eq!(
-                    same.pointer(&format!(
-                        "/attempts/0/conditions/2/{}/parameter_origins",
+                    attempt.pointer(&format!(
+                        "/conditions/2/{}/parameter_origins",
                         if position == 0 { "left" } else { "right" }
                     )),
                     Some(&serde_json::json!([{"argument":position,"path":[]}]))
