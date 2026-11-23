@@ -785,19 +785,23 @@ impl<'a> SourceIndex<'a> {
         let next = last.saturating_add(1);
         let mut depth = 0_usize;
         let one_expression = (first..=last).all(|index| {
-            depth = match self.bracket(index) {
-                1 => depth.saturating_add(1),
-                -1 => depth.saturating_sub(1),
-                _ => depth,
-            };
-            // Keyword spellings can also be operands, such as `contains`
-            // in v1 or unimported future keywords in v0.
             let previous = index.wrapping_sub(1);
             let follows_operand = index > first
                 && self.tokens.get(previous).is_some_and(|token| {
                     token.kind != TokenClass::Symbol
                         || matches!(self.symbol(previous), Some(")" | "]" | "}"))
                 });
+            let bracket = self.bracket(index);
+            if depth == 0 && bracket == 1 && follows_operand && !self.continues(index) {
+                return false;
+            }
+            depth = match bracket {
+                1 => depth.saturating_add(1),
+                -1 => depth.saturating_sub(1),
+                _ => depth,
+            };
+            // Keyword spellings can also be operands, such as `contains`
+            // in v1 or unimported future keywords in v0.
             depth != 0
                 || (self.symbol(index) != Some(";")
                     && (!follows_operand
