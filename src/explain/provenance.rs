@@ -792,7 +792,13 @@ impl<'a> SourceIndex<'a> {
                         || matches!(self.symbol(previous), Some(")" | "]" | "}"))
                 });
             let bracket = self.bracket(index);
-            if depth == 0 && bracket == 1 && follows_operand && !self.continues(index) {
+            // Calls can span lines and use keyword-shaped names.
+            let call = self.symbol(index) == Some("(")
+                && self
+                    .tokens
+                    .get(previous)
+                    .is_some_and(|token| token.kind == TokenClass::Name);
+            if depth == 0 && bracket == 1 && follows_operand && !call && !self.continues(index) {
                 return false;
             }
             depth = match bracket {
