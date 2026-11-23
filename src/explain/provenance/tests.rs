@@ -1702,21 +1702,24 @@ fn operation_iteration_text_keeps_contains_calls() -> anyhow::Result<()> {
 }
 
 #[test]
-fn operation_iteration_text_keeps_multiline_calls() -> anyhow::Result<()> {
-    let provenance = provenance(
-        "package test\nimport rego.v1\nf(x) := {x}\nallow if {\n  some x in input.a|f\n(input.b)\n}\n",
-        &["data.test.allow"],
-    )?;
-    let loops: Vec<_> = provenance
-        .sites()
-        .iter()
-        .filter(|site| site.kind == ConditionKind::Iteration)
-        .map(|site| (site.text.as_str(), at(site)))
-        .collect();
-    assert_eq!(
-        loops,
-        vec![("input.a|f\n(input.b)", Some(("p.rego", 5, 13)))]
-    );
+fn operation_iteration_text_keeps_indirect_and_multiline_calls() -> anyhow::Result<()> {
+    for expression in ["input.a|f\n(input.b)", "input.a|data.test[\"f\"] (input.b)"] {
+        let provenance = provenance(
+            &alloc::format!("package test\nimport rego.v1\nf(x) := {{x}}\nallow if {{\n  some x in {expression}\n}}\n"),
+            &["data.test.allow"],
+        )?;
+        let loops: Vec<_> = provenance
+            .sites()
+            .iter()
+            .filter(|site| site.kind == ConditionKind::Iteration)
+            .map(|site| (site.text.as_str(), at(site)))
+            .collect();
+        assert_eq!(
+            loops,
+            vec![(expression, Some(("p.rego", 5, 13)))],
+            "{expression}"
+        );
+    }
     Ok(())
 }
 
