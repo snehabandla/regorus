@@ -1647,6 +1647,17 @@ fn operation_iteration_text_keeps_negative_number_boundaries() -> anyhow::Result
 }
 
 #[test]
+fn operation_iteration_text_stops_at_bracketed_statements() -> anyhow::Result<()> {
+    for following in ["[d]", "{d}", "(d)"] {
+        check_operation_iteration_boundary(
+            &alloc::format!("some x in aaa&b|c\n{following}"),
+            "aaa&b|c",
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
 fn operation_iteration_boundary_controls() -> anyhow::Result<()> {
     for (body, expected) in [
         ("some x in aaa&b|c\n  d - 1", "aaa&b|c"),
