@@ -660,6 +660,16 @@ impl<'a> SourceIndex<'a> {
             .flatten()
     }
 
+    fn negative_number(&self, index: usize) -> bool {
+        self.tokens.get(index).is_some_and(|token| {
+            token.kind == TokenClass::Number
+                && self
+                    .content
+                    .get(token.start..token.end)
+                    .is_some_and(|number| number.starts_with('-'))
+        })
+    }
+
     fn is_keyword(&self, index: usize) -> bool {
         self.tokens.get(index).is_some_and(|token| {
             token.kind == TokenClass::Name
@@ -757,7 +767,7 @@ impl<'a> SourceIndex<'a> {
 
     /// Whether an operand can start at token `first` and end at `last`:
     /// neither continues the term or statement around it, and no top-level
-    /// keyword separates the operands.
+    /// keyword, statement separator or adjacent operand separates the operands.
     fn bounded(&self, first: usize, last: usize) -> bool {
         let before = first.wrapping_sub(1);
         let starts = match (self.tokens.get(before), self.tokens.get(first)) {
@@ -774,7 +784,7 @@ impl<'a> SourceIndex<'a> {
         });
         let next = last.saturating_add(1);
         let mut depth = 0_usize;
-        let no_keywords = (first..=last).all(|index| {
+        let one_expression = (first..=last).all(|index| {
             depth = match self.bracket(index) {
                 1 => depth.saturating_add(1),
                 -1 => depth.saturating_sub(1),
@@ -788,11 +798,17 @@ impl<'a> SourceIndex<'a> {
                     token.kind != TokenClass::Symbol
                         || matches!(self.symbol(previous), Some(")" | "]" | "}"))
                 });
-            depth != 0 || !self.is_keyword(index) || !follows_operand
+            depth != 0
+                || (self.symbol(index) != Some(";")
+                    && (!follows_operand
+                        || (!self.is_keyword(index)
+                            && (self.symbol(index).is_some() || self.negative_number(index)))))
         });
         starts
             && ends
-            && no_keywords
+            && one_expression
+            // The lexer includes an unspaced subtraction sign in the number.
+            && !self.negative_number(next)
             && !matches!(
                 self.symbol(next),
                 Some(
