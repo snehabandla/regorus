@@ -9,10 +9,9 @@
 use anyhow::{bail, Result};
 use regorus::explain::{
     AttemptEndEvent, AttemptStartEvent, BodyEndEvent, BuiltinErrorEvent, CallEndEvent,
-    CallResultSource, CallReusedEvent,
-    CallStartEvent, CheckEvent, CheckSite, ComprehensionElement, ComprehensionEmissionEvent,
-    ConditionKind, EmissionEvent, ExplanationRecorder, HookContext, NotCapturedEvent, Operator,
-    Outcome, Provenance, UncapturedConstruct,
+    CallResultSource, CallReusedEvent, CallStartEvent, CheckEvent, CheckSite, ComprehensionElement,
+    ComprehensionEmissionEvent, ConditionKind, EmissionEvent, ExplanationRecorder, HookContext,
+    NotCapturedEvent, Operator, Outcome, Provenance, UncapturedConstruct,
 };
 use regorus::languages::rego::compiler::Compiler;
 use regorus::rvm::instructions::FunctionCallParams;
@@ -1400,11 +1399,7 @@ r := [f(input.x),f(input.x)]
         for mode in MODES {
             let input = format!(r#"{{"x":{x}}}"#);
             let r = run_program(&program, &input, mode, false);
-            let expected = if x == 0 {
-                Value::Undefined
-            } else {
-                v(values)
-            };
+            let expected = if x == 0 { Value::Undefined } else { v(values) };
             assert_eq!(r.result.as_ref().unwrap(), &expected);
             let mut baseline = RegoVM::new();
             baseline.load_program(program.clone());
@@ -2755,24 +2750,95 @@ fn errors_in_a_comprehension_do_not_flag_later_bodies() {
 #[test]
 fn parameter_patterns_are_not_reported_as_checks() {
     let policy = "package t\nf(1) := \"one\" if { input.x } else := \"fallback\"\nf(y) := \"other\" if { y != 1 }\nr := f(2)\n";
-    let r = run(policy, "data.t.r", "{}");
-    assert_eq!(r.result.as_ref().unwrap(), &v(r#""other""#));
-    let observed: Vec<_> = r
-        .events
-        .iter()
-        .skip(1)
-        .map(|e| {
-            let c = e.context.unwrap();
-            (c.call_depth, c.definition_index, e.event.clone())
-        })
-        .collect();
+    let program = compile(policy, "data.t.r").unwrap();
+    let [first, second] = MODES.map(|mode| run_program(&program, "{}", mode, false));
+    for (mode, r) in MODES.into_iter().zip([&first, &second]) {
+        assert_eq!(r.result.as_ref().unwrap(), &v(r#""other""#));
+        let mut baseline = RegoVM::new();
+        baseline.load_program(program.clone());
+        baseline.set_execution_mode(mode);
+        baseline.set_input(v("{}"));
+        assert_eq!(execute(&mut baseline, mode).unwrap(), v(r#""other""#));
+        assert_attempt_pairs(&r.attempts);
+        let mut expected = vec![(0, 0, Some(Undefined), None)];
+        // Native matching skips the definition; suspendable matching also
+        // tries (and rejects) its else body. Neither executes body checks.
+        if mode == ExecutionMode::Suspendable {
+            expected.push((0, 1, Some(Undefined), None));
+        }
+        expected.push((1, 0, Some(Success), Some(v(r#""other""#))));
+        assert_eq!(r.attempt_ends(r.call_ids("data.t.f")[0]), expected);
+        assert_eq!(
+            r.attempt_ends(r.call_ids("data.t.r")[0]),
+            [(0, 0, Some(Success), Some(v(r#""other""#)))]
+        );
+        let observed: Vec<_> = r
+            .events
+            .iter()
+            .skip(1)
+            .map(|e| {
+                let c = e.context.unwrap();
+                (c.call_depth, c.definition_index, e.event.clone())
+            })
+            .collect();
+        assert_eq!(
+            observed,
+            [
+                (2, 1, compare(Operator::Ne, "2", "1", Success)),
+                (2, 1, body_end(Success, Some(r#""other""#))),
+                (1, 0, body_end(Success, Some(r#""other""#))),
+            ]
+        );
+    }
+    let normalize = |run: &Run| -> Vec<(Option<HookContext>, Event)> {
+        run.events
+            .iter()
+            .map(|record| {
+                let context = record.context.map(|mut context| {
+                    let id = context.attempt.expect("body event lacks an attempt");
+                    let owner = run
+                        .attempts
+                        .iter()
+                        .find_map(|attempt| match attempt {
+                            AttemptRecord::Start(owner, event) if event.attempt == id => {
+                                Some(owner)
+                            }
+                            _ => None,
+                        })
+                        .expect("event references an uncaptured attempt");
+                    let same_owner = |other: &HookContext| {
+                        other.call_instance == context.call_instance
+                            && other.rule_index == context.rule_index
+                            && other.definition_index == context.definition_index
+                            && other.body_index == context.body_index
+                            && other.call_depth == context.call_depth
+                    };
+                    assert!(same_owner(owner), "event has the wrong attempt owner");
+                    // Only IDs change: map the verified owner to its native
+                    // attempt, retaining every other context/event field.
+                    let canonical = first
+                        .attempts
+                        .iter()
+                        .find_map(|attempt| match attempt {
+                            AttemptRecord::Start(owner, event) if same_owner(owner) => {
+                                Some(event.attempt)
+                            }
+                            _ => None,
+                        })
+                        .expect("no equivalent native attempt owner");
+                    context.attempt = Some(canonical);
+                    context
+                });
+                (context, record.event.clone())
+            })
+            .collect()
+    };
+    assert_eq!(normalize(&first), normalize(&second), "modes disagree");
+    assert_eq!(first.calls, second.calls, "invocation events disagree");
     assert_eq!(
-        observed,
-        [
-            (2, 1, compare(Operator::Ne, "2", "1", Success)),
-            (2, 1, body_end(Success, Some(r#""other""#))),
-            (1, 0, body_end(Success, Some(r#""other""#))),
-        ]
+        format!("{:?}", first.result),
+        format!("{:?}", second.result),
+        "modes disagree on the result"
     );
 }
 
@@ -3517,7 +3583,10 @@ fn attempt_callback_time_counts_toward_deadline_and_aborts() -> Result<()> {
         assert_attempt_pairs(&attempts);
         assert!(matches!(
             attempts.as_slice(),
-            [AttemptRecord::Start(_, _), AttemptRecord::End(_, None, None)]
+            [
+                AttemptRecord::Start(_, _),
+                AttemptRecord::End(_, None, None)
+            ]
         ));
         assert!(matches!(
             fixture.calls().as_slice(),

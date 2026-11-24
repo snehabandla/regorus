@@ -14,10 +14,9 @@ use core::fmt;
 use crate::builtins::types::get_type;
 use crate::explain::{
     AttemptEndEvent, AttemptStartEvent, BodyEndEvent, BuiltinErrorEvent, CallEndEvent,
-    CallResultSource, CallReusedEvent,
-    CallStartEvent, CheckEvent, ComprehensionElement, ComprehensionEmissionEvent, ConditionKind,
-    EmissionEvent, ExplanationRecorder, HookContext, NotCapturedEvent, Operator, Outcome,
-    UncapturedConstruct,
+    CallResultSource, CallReusedEvent, CallStartEvent, CheckEvent, ComprehensionElement,
+    ComprehensionEmissionEvent, ConditionKind, EmissionEvent, ExplanationRecorder, HookContext,
+    NotCapturedEvent, Operator, Outcome, UncapturedConstruct,
 };
 use crate::rvm::instructions::{ComprehensionMode, GuardMode, Instruction, LoopMode};
 use crate::rvm::program::{Program, RuleType};
@@ -365,11 +364,7 @@ impl RegoVM {
 
     #[cold]
     #[inline(never)]
-    pub(super) fn explain_end_attempt(
-        &mut self,
-        outcome: Option<Outcome>,
-        result_reg: Option<u8>,
-    ) {
+    pub(super) fn explain_end_attempt(&mut self, outcome: Option<Outcome>, result_reg: Option<u8>) {
         let depth = self.call_rule_stack.len();
         let context = self
             .explain
