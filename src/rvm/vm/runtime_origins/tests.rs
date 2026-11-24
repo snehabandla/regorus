@@ -45,6 +45,123 @@ fn compile(policy: &str) -> Result<Arc<Program>> {
     Ok(Compiler::compile_from_policy(&compiled, &["data.t.r"])?)
 }
 
+#[cfg(feature = "std")]
+fn run_member_depth_child(case: &str) -> Result<()> {
+    use crate::rvm::instructions::ArrayCreateParams;
+    let parts: Vec<_> = case.split(':').collect();
+    let [mode, recording, shared, cleanup] = parts.as_slice() else {
+        anyhow::bail!("invalid member-depth scenario");
+    };
+    let mode = match *mode {
+        "native" => ExecutionMode::RunToCompletion,
+        "suspendable" => ExecutionMode::Suspendable,
+        _ => anyhow::bail!("invalid member-depth mode"),
+    };
+    let recording = *recording == "on";
+    let shared = *shared == "shared";
+    let mut program = Program::new();
+    program.dispatch_window_size = 3;
+    let wrapping = program.instruction_data.add_array_create_params(
+        ArrayCreateParams { dest: 0, elements: vec![0] },
+    );
+    program.instructions.push(Instruction::LoadTrue { dest: 0 });
+    program.instructions.extend(
+        core::iter::repeat_n(Instruction::ArrayCreate { params_index: wrapping }, 5_000),
+    );
+    // Main-frame return overwrites register zero in suspendable mode. Keep
+    // the nested value alive so recorder teardown, not return, releases it.
+    program.instructions.push(Instruction::Move { dest: 1, src: 0 });
+    if shared {
+        program.instructions.push(Instruction::Move { dest: 2, src: 1 });
+    }
+    program.instructions.extend([
+        Instruction::LoadTrue { dest: 0 },
+        Instruction::Return { value: 0 },
+    ]);
+    program.instruction_spans = vec![None; program.instructions.len()];
+    let mut vm = RegoVM::new();
+    vm.load_program(Arc::new(program));
+    vm.set_execution_mode(mode);
+    if recording {
+        vm.set_explanation_recorder(Box::new(Recorder));
+    }
+    std::eprintln!("member-depth {case}: before construction");
+    anyhow::ensure!(matches!(vm.execute()?, Value::Bool(true)), "boolean result required");
+    std::eprintln!("member-depth {case}: construction completed");
+    let snapshot = shared.then(|| vm.explain.origins.get(1));
+    std::eprintln!("member-depth {case}: before {cleanup}");
+    match *cleanup {
+        "remove" => {
+            anyhow::ensure!(vm.take_explanation_recorder().is_some() == recording);
+        }
+        "replace" => vm.set_explanation_recorder(Box::new(Recorder)),
+        "reset" => vm.set_input(Value::Null),
+        "drop" => drop(vm),
+        _ => anyhow::bail!("invalid member-depth cleanup"),
+    }
+    std::eprintln!("member-depth {case}: cleanup completed; before snapshot release");
+    drop(snapshot);
+    std::eprintln!("member-depth {case}: snapshot released; before final VM/value release");
+    Ok(())
+}
+
+#[test]
+#[cfg(feature = "std")]
+#[cfg_attr(miri, ignore = "requires native-stack subprocess isolation")]
+#[allow(clippy::panic_in_result_fn)]
+fn deep_constructed_member_teardown_is_stack_bounded() -> Result<()> {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    const CHILD: &str = "REGORUS_MEMBER_DEPTH_CHILD";
+    const NAME: &str = "rvm::vm::runtime_origins::tests::deep_constructed_member_teardown_is_stack_bounded";
+    if let Ok(case) = std::env::var(CHILD) {
+        return std::thread::Builder::new()
+            .name("member-depth".into())
+            .stack_size(512 * 1024)
+            .spawn(move || {
+                run_member_depth_child(&case)?;
+                std::eprintln!("member-depth {case}: worker completed");
+                Ok(())
+            })?
+            .join()
+            .map_err(|_| anyhow::anyhow!("member-depth worker panicked"))?;
+    }
+    let mut failed = Vec::new();
+    for mode in ["native", "suspendable"] {
+        for recording in ["off", "on"] {
+            for shared in ["single", "shared"] {
+                for cleanup in ["remove", "replace", "reset", "drop"] {
+                    let case = alloc::format!("{mode}:{recording}:{shared}:{cleanup}");
+                    let mut child = Command::new(std::env::current_exe()?)
+                        .args(["--exact", NAME, "--nocapture"])
+                        .env(CHILD, &case)
+                        .stdout(Stdio::inherit())
+                        .stderr(Stdio::inherit())
+                        .spawn()?;
+                    let deadline = Instant::now() + Duration::from_secs(30);
+                    loop {
+                        if let Some(status) = child.try_wait()? {
+                            if !status.success() {
+                                failed.push(alloc::format!("{case}: {status}"));
+                            }
+                            break;
+                        }
+                        if Instant::now() >= deadline {
+                            child.kill()?;
+                            child.wait()?;
+                            failed.push(alloc::format!("{case}: deadline exceeded"));
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
+            }
+        }
+    }
+    anyhow::ensure!(failed.is_empty(), "member-depth subprocess failures: {failed:?}");
+    Ok(())
+}
+
 fn run_member_program(
     mut program: Program,
     input: Value,
