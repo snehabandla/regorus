@@ -117,6 +117,7 @@ fn constructed_members_keep_nested_alias_snapshots_in_both_modes() -> Result<()>
     ];
     for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
         let mut baseline = None;
+        let mut reuse_baseline = None;
         for recording in [false, true] {
             let mut vm = run_member_program(program.clone(),
                 v(r#"{"a":[{"x":7}],"b":[{"x":7}]}"#)?, mode, recording)?;
@@ -126,9 +127,9 @@ fn constructed_members_keep_nested_alias_snapshots_in_both_modes() -> Result<()>
             assert_eq!(vm.get_register(7)?, vm.get_register(8)?);
             assert_eq!(vm.get_register(12)?, &Value::Undefined);
             assert_eq!(vm.get_register(13)?, &Value::Undefined);
+            let epoch = vm.explain.origins.epoch;
             if recording {
                 assert_eq!(Some(vm.registers.clone()), baseline);
-                let epoch = vm.explain.origins.epoch;
                 assert_eq!(vm.explain.origins.get(6), source(epoch, vec![
                     PathSegment::Key("b".into()), PathSegment::Index(0),
                     PathSegment::Key("x".into()),
@@ -148,12 +149,24 @@ fn constructed_members_keep_nested_alias_snapshots_in_both_modes() -> Result<()>
                 vm.explain.origins.resize(2, 16);
                 assert_eq!(vm.explain.origins.get(1), snapshot);
                 assert_eq!(vm.explain.origins.get(3), RuntimeOrigin::Unknown);
-                vm.initialize_execution_state();
-                assert!(vm.explain.origins.registers.is_empty());
-                assert!(vm.explain.origins.windows.is_empty());
-                assert_ne!(vm.explain.origins.epoch, epoch);
             } else {
                 baseline = Some(vm.registers.clone());
+                assert!(vm.explain.origins.registers.is_empty());
+            }
+            vm.set_input(v(r#"{"a":[{"x":9}],"b":[{"x":11}]}"#)?);
+            assert!(vm.explain.origins.registers.is_empty());
+            assert!(vm.explain.origins.windows.is_empty());
+            assert_eq!(vm.execute()?, Value::Bool(true));
+            assert_eq!(vm.get_register(6)?, &v("11")?);
+            if recording {
+                assert_eq!(Some(vm.registers.clone()), reuse_baseline);
+                assert_ne!(vm.explain.origins.epoch, epoch);
+                assert_eq!(vm.explain.origins.get(6), source(vm.explain.origins.epoch, vec![
+                    PathSegment::Key("b".into()), PathSegment::Index(0),
+                    PathSegment::Key("x".into()),
+                ]));
+            } else {
+                reuse_baseline = Some(vm.registers.clone());
                 assert!(vm.explain.origins.registers.is_empty());
             }
         }
