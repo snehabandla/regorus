@@ -566,6 +566,14 @@ impl RegoVM {
             ObjectSet { obj, key, value } => {
                 let key_value = self.get_register(key)?.clone();
                 let value_value = self.get_register(value)?.clone();
+                #[cfg(feature = "explanations")]
+                let origin = if self.explain_enabled()
+                    && matches!(self.get_register(obj)?, Value::Object(_))
+                {
+                    Some(self.explain_collection_write(obj, value, key_value.clone(), false)?)
+                } else {
+                    None
+                };
                 // The operands may alias `obj`, which the write replaces.
                 #[cfg(feature = "explanations")]
                 let emitted = self
@@ -578,6 +586,10 @@ impl RegoVM {
                 if let Ok(obj_mut) = obj_value.as_object_mut() {
                     obj_mut.insert(key_value, value_value);
                     self.set_register(obj, obj_value)?;
+                    #[cfg(feature = "explanations")]
+                    if let Some(origin) = origin {
+                        self.explain_finish_collection_write(obj, origin)?;
+                    }
                     #[cfg(feature = "explanations")]
                     if let Some((emitted_key, emitted_value)) = emitted {
                         self.explain_emission(obj, Some(&emitted_key), &emitted_value);
@@ -636,6 +648,8 @@ impl RegoVM {
                         })?
                         .clone();
 
+                    #[cfg(feature = "explanations")]
+                    let mut origin_fields = self.explain_enabled().then(Vec::new);
                     if let Ok(obj_mut) = obj_value.as_object_mut() {
                         let mut literal_updates = params.literal_key_field_pairs().iter();
                         let mut current_literal_update = literal_updates.next();
@@ -647,6 +661,10 @@ impl RegoVM {
                                 {
                                     if key == literal_key {
                                         *value = self.get_register(value_reg)?.clone();
+                                        #[cfg(feature = "explanations")]
+                                        if let Some(fields) = origin_fields.as_mut() {
+                                            fields.push((key.clone(), value_reg));
+                                        }
                                         current_literal_update = literal_updates.next();
                                     }
                                 }
@@ -660,6 +678,10 @@ impl RegoVM {
                             {
                                 let value_value = self.get_register(value_reg)?.clone();
                                 obj_mut.insert(key_value.clone(), value_value);
+                                #[cfg(feature = "explanations")]
+                                if let Some(fields) = origin_fields.as_mut() {
+                                    fields.push((key_value.clone(), value_reg));
+                                }
                             }
                             current_literal_update = literal_updates.next();
                         }
@@ -667,6 +689,10 @@ impl RegoVM {
                         for &(key_reg, value_reg) in params.field_pairs() {
                             let key_value = self.get_register(key_reg)?.clone();
                             let value_value = self.get_register(value_reg)?.clone();
+                            #[cfg(feature = "explanations")]
+                            if let Some(fields) = origin_fields.as_mut() {
+                                fields.push((key_value.clone(), value_reg));
+                            }
                             obj_mut.insert(key_value, value_value);
                         }
                     } else {
@@ -676,10 +702,15 @@ impl RegoVM {
                         });
                     }
 
+                    #[cfg(feature = "explanations")]
+                    let origin = match origin_fields {
+                        Some(fields) => Some(self.explain_constructor_origin(&fields, false)?),
+                        None => None,
+                    };
                     self.set_register(params.dest, obj_value)?;
                     #[cfg(feature = "explanations")]
-                    if self.explain_enabled() {
-                        self.explain_computed_origin(params.dest);
+                    if let Some(origin) = origin {
+                        self.explain.origins.set(params.dest, origin);
                     }
                 }
                 Ok(InstructionOutcome::Continue)
@@ -740,6 +771,15 @@ impl RegoVM {
             }
             ArrayPush { arr, value } => {
                 let value_to_push = self.get_register(value)?.clone();
+                #[cfg(feature = "explanations")]
+                let origin = if self.explain_enabled()
+                    && matches!(self.get_register(arr)?, Value::Array(_))
+                {
+                    let index = self.get_register(arr)?.as_array().map_or(0, |array| array.len());
+                    Some(self.explain_collection_write(arr, value, Value::from(index), false)?)
+                } else {
+                    None
+                };
 
                 // Take ownership so Rc refcount stays at 1 and make_mut is a no-op.
                 let mut arr_value = self.take_register(arr)?;
@@ -747,6 +787,10 @@ impl RegoVM {
                 if let Ok(arr_mut) = arr_value.as_array_mut() {
                     arr_mut.push(value_to_push);
                     self.set_register(arr, arr_value)?;
+                    #[cfg(feature = "explanations")]
+                    if let Some(origin) = origin {
+                        self.explain_finish_collection_write(arr, origin)?;
+                    }
                 } else {
                     let offending = arr_value.clone();
                     self.set_register(arr, arr_value)?;
@@ -768,12 +812,25 @@ impl RegoVM {
                 }
 
                 let value_to_push = self.get_register(value)?.clone();
+                #[cfg(feature = "explanations")]
+                let origin = if self.explain_enabled()
+                    && matches!(self.get_register(arr)?, Value::Array(_))
+                {
+                    let index = self.get_register(arr)?.as_array().map_or(0, |array| array.len());
+                    Some(self.explain_collection_write(arr, value, Value::from(index), false)?)
+                } else {
+                    None
+                };
 
                 let mut arr_value = self.take_register(arr)?;
 
                 if let Ok(arr_mut) = arr_value.as_array_mut() {
                     arr_mut.push(value_to_push);
                     self.set_register(arr, arr_value)?;
+                    #[cfg(feature = "explanations")]
+                    if let Some(origin) = origin {
+                        self.explain_finish_collection_write(arr, origin)?;
+                    }
                 } else {
                     let offending = arr_value.clone();
                     self.set_register(arr, arr_value)?;
@@ -808,10 +865,22 @@ impl RegoVM {
                             .collect::<Result<Vec<_>>>()?;
 
                         let array_value = Value::from_array(elements);
+                        #[cfg(feature = "explanations")]
+                        let origin = if self.explain_enabled() {
+                            let fields: Vec<_> = params
+                                .element_registers()
+                                .iter()
+                                .enumerate()
+                                .map(|(index, &register)| (Value::from(index), register))
+                                .collect();
+                            Some(self.explain_constructor_origin(&fields, false)?)
+                        } else {
+                            None
+                        };
                         self.set_register(params.dest, array_value)?;
                         #[cfg(feature = "explanations")]
-                        if self.explain_enabled() {
-                            self.explain_computed_origin(params.dest);
+                        if let Some(origin) = origin {
+                            self.explain.origins.set(params.dest, origin);
                         }
                     }
                     Ok(InstructionOutcome::Continue)
@@ -834,6 +903,14 @@ impl RegoVM {
             }
             SetAdd { set, value } => {
                 let value_to_add = self.get_register(value)?.clone();
+                #[cfg(feature = "explanations")]
+                let origin = if self.explain_enabled()
+                    && matches!(self.get_register(set)?, Value::Set(_))
+                {
+                    Some(self.explain_collection_write(set, value, value_to_add.clone(), true)?)
+                } else {
+                    None
+                };
                 // The operand may alias `set`, which the write replaces.
                 #[cfg(feature = "explanations")]
                 let emitted = self.explain_enabled().then(|| value_to_add.clone());
@@ -846,6 +923,10 @@ impl RegoVM {
                         set_mut.insert(value_to_add);
                     }
                     self.set_register(set, set_value)?;
+                    #[cfg(feature = "explanations")]
+                    if let Some(origin) = origin {
+                        self.explain_finish_collection_write(set, origin)?;
+                    }
                     #[cfg(feature = "explanations")]
                     if let Some(emitted_value) = emitted {
                         self.explain_emission(set, None, &emitted_value);
@@ -880,10 +961,21 @@ impl RegoVM {
                         }
 
                         let set_value = Value::from(set);
+                        #[cfg(feature = "explanations")]
+                        let origin = if self.explain_enabled() {
+                            let fields = params
+                                .element_registers()
+                                .iter()
+                                .map(|&register| Ok((self.get_register(register)?.clone(), register)))
+                                .collect::<Result<Vec<_>>>()?;
+                            Some(self.explain_constructor_origin(&fields, true)?)
+                        } else {
+                            None
+                        };
                         self.set_register(params.dest, set_value)?;
                         #[cfg(feature = "explanations")]
-                        if self.explain_enabled() {
-                            self.explain_computed_origin(params.dest);
+                        if let Some(origin) = origin {
+                            self.explain.origins.set(params.dest, origin);
                         }
                     }
                     Ok(InstructionOutcome::Continue)

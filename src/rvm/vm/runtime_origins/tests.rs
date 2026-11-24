@@ -45,6 +45,231 @@ fn compile(policy: &str) -> Result<Arc<Program>> {
     Ok(Compiler::compile_from_policy(&compiled, &["data.t.r"])?)
 }
 
+fn run_member_program(
+    mut program: Program,
+    input: Value,
+    mode: ExecutionMode,
+    recording: bool,
+) -> Result<RegoVM> {
+    program.dispatch_window_size = 16;
+    program.instructions.extend([
+        Instruction::LoadTrue { dest: 15 },
+        Instruction::Return { value: 15 },
+    ]);
+    program.instruction_spans = vec![None; program.instructions.len()];
+    let mut vm = RegoVM::new();
+    vm.load_program(Arc::new(program));
+    vm.set_input(input);
+    vm.set_execution_mode(mode);
+    if recording {
+        vm.set_explanation_recorder(Box::new(Recorder));
+    }
+    anyhow::ensure!(vm.execute()? == Value::Bool(true));
+    Ok(vm)
+}
+
+#[test]
+#[allow(clippy::panic_in_result_fn)]
+fn constructed_members_keep_nested_alias_snapshots_in_both_modes() -> Result<()> {
+    use crate::rvm::instructions::{ArrayCreateParams, ChainedIndexParams, ObjectCreateParams};
+    let mut program = Program::new();
+    program.literals = vec![v(r#""a""#)?, v(r#""b""#)?, v("0")?, v("1")?,
+        v(r#""k.[\"0\"]""#)?, v("{}")?, v(r#""x""#)?];
+    let pair = program.instruction_data.add_array_create_params(
+        ArrayCreateParams { dest: 1, elements: vec![1, 2] },
+    );
+    let nested = program.instruction_data.add_array_create_params(
+        ArrayCreateParams { dest: 4, elements: vec![1] },
+    );
+    let undefined_array = program.instruction_data.add_array_create_params(
+        ArrayCreateParams { dest: 12, elements: vec![14] },
+    );
+    let object = program.instruction_data.add_object_create_params(ObjectCreateParams {
+        dest: 5, template_literal_idx: 5, literal_key_fields: vec![(4, 2)], fields: vec![(10, 4)],
+    });
+    let undefined_object = program.instruction_data.add_object_create_params(ObjectCreateParams {
+        dest: 13, template_literal_idx: 5, literal_key_fields: vec![(4, 14)], fields: vec![],
+    });
+    let projection = program.instruction_data.add_chained_index_params(ChainedIndexParams {
+        dest: 6, root: 5, path_components: vec![
+            LiteralOrRegister::Literal(4), LiteralOrRegister::Literal(2),
+            LiteralOrRegister::Literal(3), LiteralOrRegister::Literal(2),
+            LiteralOrRegister::Literal(6),
+        ],
+    });
+    program.instructions = vec![
+        Instruction::LoadInput { dest: 0 },
+        Instruction::IndexLiteral { dest: 1, container: 0, literal_idx: 0 },
+        Instruction::IndexLiteral { dest: 2, container: 0, literal_idx: 1 },
+        Instruction::ArrayCreate { params_index: pair },
+        Instruction::Move { dest: 3, src: 1 },
+        Instruction::ArrayPush { arr: 1, value: 2 },
+        Instruction::ArrayCreate { params_index: nested },
+        Instruction::Load { dest: 10, literal_idx: 4 },
+        Instruction::ObjectCreate { params_index: object },
+        Instruction::ArrayPush { arr: 1, value: 1 },
+        Instruction::ChainedIndex { params_index: projection },
+        Instruction::IndexLiteral { dest: 7, container: 3, literal_idx: 2 },
+        Instruction::IndexLiteral { dest: 8, container: 3, literal_idx: 3 },
+        Instruction::ArrayPushDefined { arr: 1, value: 14 },
+        Instruction::ArrayCreate { params_index: undefined_array },
+        Instruction::ObjectCreate { params_index: undefined_object },
+    ];
+    for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
+        let mut baseline = None;
+        for recording in [false, true] {
+            let mut vm = run_member_program(program.clone(),
+                v(r#"{"a":[{"x":7}],"b":[{"x":7}]}"#)?, mode, recording)?;
+            assert_eq!(vm.get_register(1)?.as_array()?.len(), 4);
+            assert_eq!(vm.get_register(3)?.as_array()?.len(), 2);
+            assert_eq!(vm.get_register(6)?, &v("7")?);
+            assert_eq!(vm.get_register(7)?, vm.get_register(8)?);
+            assert_eq!(vm.get_register(12)?, &Value::Undefined);
+            assert_eq!(vm.get_register(13)?, &Value::Undefined);
+            if recording {
+                assert_eq!(Some(vm.registers.clone()), baseline);
+                let epoch = vm.explain.origins.epoch;
+                assert_eq!(vm.explain.origins.get(6), source(epoch, vec![
+                    PathSegment::Key("b".into()), PathSegment::Index(0),
+                    PathSegment::Key("x".into()),
+                ]));
+                assert_eq!(vm.explain.origins.get(7),
+                    source(epoch, vec![PathSegment::Key("a".into())]));
+                assert_eq!(vm.explain.origins.get(8),
+                    source(epoch, vec![PathSegment::Key("b".into())]));
+                assert_ne!(vm.explain.origins.get(1), vm.explain.origins.get(3));
+                assert_eq!(vm.explain.origins.get(12), RuntimeOrigin::Unknown);
+                assert_eq!(vm.explain.origins.get(13), RuntimeOrigin::Unknown);
+                let snapshot = vm.explain.origins.get(1);
+                vm.explain.origins.enter_window();
+                assert!(vm.explain.origins.registers.is_empty());
+                vm.explain.origins.leave_window();
+                assert_eq!(vm.explain.origins.get(1), snapshot);
+                vm.explain.origins.resize(2, 16);
+                assert_eq!(vm.explain.origins.get(1), snapshot);
+                assert_eq!(vm.explain.origins.get(3), RuntimeOrigin::Unknown);
+                vm.initialize_execution_state();
+                assert!(vm.explain.origins.registers.is_empty());
+                assert!(vm.explain.origins.windows.is_empty());
+                assert_ne!(vm.explain.origins.epoch, epoch);
+            } else {
+                baseline = Some(vm.registers.clone());
+                assert!(vm.explain.origins.registers.is_empty());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::panic_in_result_fn)]
+fn set_duplicate_correspondence_is_ambiguous_only_for_distinct_sources() -> Result<()> {
+    use crate::rvm::instructions::SetCreateParams;
+    let mut program = Program::new();
+    program.literals = vec![v(r#""a""#)?, v(r#""b""#)?];
+    let same = program.instruction_data.add_set_create_params(
+        SetCreateParams { dest: 3, elements: vec![1, 1] },
+    );
+    let different = program.instruction_data.add_set_create_params(
+        SetCreateParams { dest: 5, elements: vec![1, 2] },
+    );
+    program.instructions = vec![
+        Instruction::LoadInput { dest: 0 },
+        Instruction::IndexLiteral { dest: 1, container: 0, literal_idx: 0 },
+        Instruction::IndexLiteral { dest: 2, container: 0, literal_idx: 1 },
+        Instruction::SetCreate { params_index: same },
+        Instruction::Move { dest: 4, src: 3 },
+        Instruction::SetAdd { set: 3, value: 2 },
+        Instruction::SetAdd { set: 3, value: 1 },
+        Instruction::SetCreate { params_index: different },
+        Instruction::Index { dest: 6, container: 4, key: 1 },
+        Instruction::Index { dest: 7, container: 3, key: 1 },
+        Instruction::Index { dest: 8, container: 5, key: 1 },
+        Instruction::SetNew { dest: 9 },
+        Instruction::SetAdd { set: 9, value: 1 },
+        Instruction::SetAdd { set: 9, value: 14 },
+        Instruction::Index { dest: 10, container: 9, key: 1 },
+    ];
+    for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
+        let mut baseline = None;
+        for recording in [false, true] {
+            let vm = run_member_program(program.clone(), v(r#"{"a":[1],"b":[1]}"#)?,
+                mode, recording)?;
+            assert_eq!(vm.get_register(6)?, &v("[1]")?);
+            assert_eq!(vm.get_register(6)?, vm.get_register(7)?);
+            assert_eq!(vm.get_register(6)?, vm.get_register(8)?);
+            if recording {
+                assert_eq!(Some(vm.registers.clone()), baseline);
+                let a = source(vm.explain.origins.epoch, vec![PathSegment::Key("a".into())]);
+                assert_eq!(vm.explain.origins.get(6), a);
+                assert_eq!(vm.explain.origins.get(10), a);
+                assert_eq!(vm.explain.origins.get(7), RuntimeOrigin::Unknown);
+                assert_eq!(vm.explain.origins.get(8), RuntimeOrigin::Unknown);
+            } else {
+                baseline = Some(vm.registers.clone());
+                assert!(vm.explain.origins.registers.is_empty());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::panic_in_result_fn)]
+fn object_mutation_preserves_untouched_sources_and_prewrite_self_aliases() -> Result<()> {
+    use crate::rvm::instructions::ChainedIndexParams;
+    let mut program = Program::new();
+    program.literals = vec![v(r#""left""#)?, v(r#""replacement""#)?,
+        v(r#""change""#)?, v(r#""keep""#)?, v(r#""self""#)?];
+    let nested = program.instruction_data.add_chained_index_params(ChainedIndexParams {
+        dest: 8, root: 1, path_components: vec![
+            LiteralOrRegister::Literal(4), LiteralOrRegister::Literal(3),
+        ],
+    });
+    program.instructions = vec![
+        Instruction::LoadInput { dest: 0 },
+        Instruction::IndexLiteral { dest: 1, container: 0, literal_idx: 0 },
+        Instruction::Move { dest: 2, src: 1 },
+        Instruction::IndexLiteral { dest: 3, container: 0, literal_idx: 1 },
+        Instruction::Load { dest: 7, literal_idx: 2 },
+        Instruction::ObjectSet { obj: 1, key: 7, value: 3 },
+        Instruction::IndexLiteral { dest: 4, container: 1, literal_idx: 3 },
+        Instruction::IndexLiteral { dest: 5, container: 1, literal_idx: 2 },
+        Instruction::IndexLiteral { dest: 6, container: 2, literal_idx: 2 },
+        Instruction::Load { dest: 7, literal_idx: 4 },
+        Instruction::ObjectSet { obj: 1, key: 7, value: 1 },
+        Instruction::ChainedIndex { params_index: nested },
+    ];
+    for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
+        let mut baseline = None;
+        for recording in [false, true] {
+            let vm = run_member_program(program.clone(),
+                v(r#"{"left":{"keep":[1],"change":[1]},"replacement":[1]}"#)?,
+                mode, recording)?;
+            assert_eq!(vm.get_register(4)?, &v("[1]")?);
+            assert_eq!(vm.get_register(4)?, vm.get_register(5)?);
+            assert_eq!(vm.get_register(4)?, vm.get_register(6)?);
+            if recording {
+                assert_eq!(Some(vm.registers.clone()), baseline);
+                let epoch = vm.explain.origins.epoch;
+                let keep = source(epoch, vec![PathSegment::Key("left".into()),
+                    PathSegment::Key("keep".into())]);
+                assert_eq!(vm.explain.origins.get(4), keep);
+                assert_eq!(vm.explain.origins.get(8), keep);
+                assert_eq!(vm.explain.origins.get(5),
+                    source(epoch, vec![PathSegment::Key("replacement".into())]));
+                assert_eq!(vm.explain.origins.get(6), source(epoch, vec![
+                    PathSegment::Key("left".into()), PathSegment::Key("change".into()),
+                ]));
+            } else {
+                baseline = Some(vm.registers.clone());
+                assert!(vm.explain.origins.registers.is_empty());
+            }
+        }
+    }
+    Ok(())
+}
+
 #[test]
 #[allow(clippy::panic_in_result_fn)]
 fn source_identity_is_typed_and_moves_preserve_it_without_value_matching() -> Result<()> {
