@@ -933,12 +933,12 @@ fn overflowing_array_index_never_claims_a_nonexistent_source_slot() -> Result<()
     let mut program = Program::new();
     program.dispatch_window_size = 6;
     program.literals = vec![v("0")?, v("4294967296")?];
-    let constructed = program
-        .instruction_data
-        .add_array_create_params(crate::rvm::instructions::ArrayCreateParams {
+    let constructed = program.instruction_data.add_array_create_params(
+        crate::rvm::instructions::ArrayCreateParams {
             dest: 3,
             elements: vec![1],
-        });
+        },
+    );
     let mut baseline = None;
     for recording in [false, true] {
         let mut vm = RegoVM::new();

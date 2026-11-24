@@ -83,7 +83,8 @@ impl Drop for MemberOrigins {
                         if let Some(mut snapshot) = Rc::into_inner(snapshot) {
                             let child_members = core::mem::take(&mut snapshot.members);
                             if !child_members.is_empty() {
-                                pending.push(OriginReleaseFrame::Members(child_members.into_iter()));
+                                pending
+                                    .push(OriginReleaseFrame::Members(child_members.into_iter()));
                             }
                             current = Some(OriginReleaseFrame::Origin(core::mem::take(
                                 &mut snapshot.fallback,
