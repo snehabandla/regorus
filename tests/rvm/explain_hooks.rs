@@ -1722,8 +1722,8 @@ fn invocation_program_replacement_discards_unbudgeted_continuation() {
     )
     .unwrap();
     let replacement = compile("package t\np := 9\nr := [p,p]\n", "data.t.r").unwrap();
-    for recording in [false, true] {
-        for replace in [false, true] {
+    for replace in [false, true] {
+        for recording in [false, true] {
             let fixture = Fixture::default();
             let mut vm = RegoVM::new();
             vm.load_program(original.clone());
@@ -1757,13 +1757,14 @@ fn invocation_program_replacement_discards_unbudgeted_continuation() {
                     };
                     assert_eq!(context.call_instance, Some(1));
                 }
-                assert!(matches!(vm.execution_state(), ExecutionState::Ready));
                 assert_eq!(
                     vm.resume(Some(v("7"))),
                     Err(VmError::InvalidResumeState {
                         state: "Ready".into(),
                         pc: usize::try_from(replacement.main_entry_point).unwrap(),
-                    })
+                    }),
+                    "replacement must reject the old continuation: {:?}",
+                    vm.execution_state()
                 );
                 assert!(matches!(vm.execution_state(), ExecutionState::Ready));
                 assert!(fixture.calls().is_empty());
@@ -1941,7 +1942,7 @@ fn invocation_undefined_argument_to_nonfunction_does_not_report_a_call_or_reuse(
     )
     .unwrap();
     assert!(compiled.rule_infos[usize::from(rule_index)].function_info.is_none());
-    for cached in [false, true] {
+    for cached in [true, false] {
         let mut program = (*compiled).clone();
         program.dispatch_window_size = program.dispatch_window_size.max(2);
         program
