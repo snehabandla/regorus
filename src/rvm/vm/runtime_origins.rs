@@ -14,6 +14,8 @@
 //! and returned values remain unknown pending helper propagation. Body resets
 //! retain exactly the slots the VM retains. Unknown members stay unknown;
 //! duplicate set contributions with different origins cannot select a source.
+//! Final snapshot owners drain iteratively, including register destruction and
+//! recorder replacement; shared snapshots remain live until their last owner.
 //! Chained origin work samples the existing timer only while recording.
 
 use alloc::collections::BTreeMap;
@@ -43,9 +45,66 @@ pub(super) enum RuntimeOrigin {
     Collection {
         epoch: u64,
         instance: u64,
-        members: Rc<BTreeMap<Value, RuntimeOrigin>>,
-        fallback: Rc<RuntimeOrigin>,
+        snapshot: Rc<MemberOrigins>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct MemberOrigins {
+    members: BTreeMap<Value, RuntimeOrigin>,
+    fallback: RuntimeOrigin,
+}
+
+enum OriginReleaseFrame {
+    Origin(RuntimeOrigin),
+    Members(alloc::collections::btree_map::IntoIter<Value, RuntimeOrigin>),
+}
+
+impl Drop for MemberOrigins {
+    fn drop(&mut self) {
+        // The walker detaches owned payloads before their ordinary drop runs.
+        if self.members.is_empty() && matches!(self.fallback, RuntimeOrigin::Unknown) {
+            return;
+        }
+        let members = core::mem::take(&mut self.members);
+        let mut pending = Vec::new();
+        if !members.is_empty() {
+            pending.push(OriginReleaseFrame::Members(members.into_iter()));
+        }
+        let mut current = Some(OriginReleaseFrame::Origin(core::mem::take(
+            &mut self.fallback,
+        )));
+        while let Some(frame) = current.take().or_else(|| pending.pop()) {
+            match frame {
+                OriginReleaseFrame::Origin(origin) => {
+                    if let RuntimeOrigin::Collection { snapshot, .. } = origin {
+                        // Exactly one releasing Arc owner receives the payload,
+                        // including concurrent final releases. Shared owners stay live.
+                        if let Some(mut snapshot) = Rc::into_inner(snapshot) {
+                            let members = core::mem::take(&mut snapshot.members);
+                            if !members.is_empty() {
+                                pending.push(OriginReleaseFrame::Members(members.into_iter()));
+                            }
+                            current = Some(OriginReleaseFrame::Origin(core::mem::take(
+                                &mut snapshot.fallback,
+                            )));
+                        }
+                    }
+                }
+                OriginReleaseFrame::Members(mut members) => {
+                    if let Some((key, origin)) = members.next() {
+                        drop(key);
+                        // Do not retain an exhausted iterator while descending
+                        // into its final child: chains need constant scratch space.
+                        if members.len() != 0 {
+                            pending.push(OriginReleaseFrame::Members(members));
+                        }
+                        current = Some(OriginReleaseFrame::Origin(origin));
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub(super) struct MemberWrite {
@@ -63,14 +122,12 @@ impl RuntimeOrigin {
         {
             return Self::Unknown;
         }
-        if let Self::Collection {
-            members, fallback, ..
-        } = self
-        {
-            return members
+        if let Self::Collection { snapshot, .. } = self {
+            return snapshot
+                .members
                 .get(key)
                 .cloned()
-                .unwrap_or_else(|| fallback.indexed(container, key));
+                .unwrap_or_else(|| snapshot.fallback.indexed(container, key));
         }
         let &Self::Source {
             epoch,
@@ -202,29 +259,29 @@ impl RegoVM {
         let RuntimeOrigin::Computed { epoch, instance } = self.explain.origins.computed() else {
             return Ok(RuntimeOrigin::Unknown);
         };
-        let (mut members, fallback) = match previous {
-            RuntimeOrigin::Collection {
-                members, fallback, ..
-            } => (members, fallback),
-            origin => (Rc::new(BTreeMap::new()), Rc::new(origin)),
+        let mut snapshot = match previous {
+            RuntimeOrigin::Collection { snapshot, .. } => snapshot,
+            origin => Rc::new(MemberOrigins {
+                members: BTreeMap::new(),
+                fallback: origin,
+            }),
         };
         // Copy-on-write snapshots can copy every retained entry when aliased.
         self.execution_timer_tick(
-            u32::try_from(members.len().saturating_add(1)).unwrap_or(u32::MAX),
+            u32::try_from(snapshot.members.len().saturating_add(1)).unwrap_or(u32::MAX),
         )?;
         self.memory_check()?;
-        let member = if duplicate && members.get(&key) != Some(&member) {
+        let member = if duplicate && snapshot.members.get(&key) != Some(&member) {
             RuntimeOrigin::Unknown
         } else {
             member
         };
-        Rc::make_mut(&mut members).insert(key, member);
+        Rc::make_mut(&mut snapshot).members.insert(key, member);
         self.memory_check()?;
         Ok(RuntimeOrigin::Collection {
             epoch,
             instance,
-            members,
-            fallback,
+            snapshot,
         })
     }
 
@@ -273,7 +330,7 @@ impl RegoVM {
         let mut origin = self.explain.origins.computed();
         for (key, register) in fields {
             let duplicate = set && matches!(&origin,
-                RuntimeOrigin::Collection { members, .. } if members.contains_key(key));
+                RuntimeOrigin::Collection { snapshot, .. } if snapshot.members.contains_key(key));
             origin = self.explain_member_origin(
                 origin,
                 key.clone(),
