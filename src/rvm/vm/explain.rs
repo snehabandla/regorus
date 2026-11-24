@@ -339,11 +339,11 @@ impl RegoVM {
     #[inline(never)]
     pub(super) fn explain_begin_attempt(
         &mut self,
-        call: Option<u64>,
+        call_instance: Option<u64>,
         definition: usize,
         body: usize,
     ) -> Result<Option<(u64, u64)>> {
-        let Some(id) = call else {
+        let Some(call_id) = call_instance else {
             return Ok(None);
         };
         let Some(mut context) = self
@@ -351,7 +351,7 @@ impl RegoVM {
             .calls
             .iter()
             .rev()
-            .find(|call| call.context.call_instance == Some(id))
+            .find(|call| call.context.call_instance == Some(call_id))
             .map(|call| call.context)
         else {
             return Ok(None);
@@ -360,7 +360,7 @@ impl RegoVM {
         context.definition_index = definition;
         context.body_index = body;
         context.in_comprehension = self.explain_context().in_comprehension;
-        let previous = self.explain_attempt_owner(Some(id));
+        let previous = self.explain_attempt_owner(Some(call_id));
         let id = self
             .explain
             .next_attempt
@@ -387,8 +387,8 @@ impl RegoVM {
         Ok(context.call_instance.zip(context.attempt))
     }
 
-    pub(super) fn explain_attempt_owner(&self, call: Option<u64>) -> Option<(u64, u64)> {
-        let id = call?;
+    pub(super) fn explain_attempt_owner(&self, call_instance: Option<u64>) -> Option<(u64, u64)> {
+        let id = call_instance?;
         self.explain
             .calls
             .iter()
