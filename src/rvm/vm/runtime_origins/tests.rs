@@ -364,3 +364,130 @@ fn recorder_off_has_no_origin_storage_and_preserves_outcomes_in_both_modes() {
         assert_eq!(vm.execution_state(), &off);
     }
 }
+
+#[test]
+#[cfg(any(target_pointer_width = "32", target_pointer_width = "64"))]
+fn overflowing_array_index_never_claims_a_nonexistent_source_slot() {
+    let mut program = Program::new();
+    program.dispatch_window_size = 3;
+    program.literals = vec![v("0"), v("4294967296")];
+    let mut baseline = None;
+    for recording in [false, true] {
+        let mut vm = RegoVM::new();
+        vm.load_program(Arc::new(program.clone()));
+        vm.set_input(v("[[]]"));
+        if recording {
+            vm.set_explanation_recorder(Box::new(Recorder));
+        }
+        instruction(&mut vm, &program, Instruction::LoadInput { dest: 0 });
+        for (dest, literal_idx) in [(1, 0), (2, 1)] {
+            instruction(
+                &mut vm,
+                &program,
+                Instruction::IndexLiteral {
+                    dest,
+                    container: 0,
+                    literal_idx,
+                },
+            );
+        }
+        assert_eq!(vm.get_register(1).unwrap(), &v("[]"));
+        let overflow_value = vm.get_register(2).unwrap().clone();
+        #[cfg(target_pointer_width = "32")]
+        assert_eq!(overflow_value, v("[]"));
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(overflow_value, Value::Undefined);
+        if recording {
+            assert_eq!(Some(overflow_value), baseline);
+            let zero_origin = source(
+                vm.explain.origins.epoch,
+                vec![PathSegment::Index(0)],
+            );
+            assert_eq!(vm.explain.origins.get(1), zero_origin);
+            let overflow_origin = vm.explain.origins.get(2);
+            #[cfg(target_pointer_width = "32")]
+            assert!(
+                overflow_origin == RuntimeOrigin::Unknown || overflow_origin == zero_origin,
+                "truncated lookup must identify actual slot zero or stay unknown, got {overflow_origin:?}"
+            );
+            #[cfg(target_pointer_width = "64")]
+            assert_eq!(overflow_origin, RuntimeOrigin::Unknown);
+        } else {
+            baseline = Some(overflow_value);
+            assert!(vm.explain.origins.registers.is_empty());
+        }
+    }
+}
+
+#[test]
+fn bounded_large_chained_index_observes_deadlines_with_and_without_origins() {
+    use core::num::NonZeroU32;
+    use core::time::Duration;
+    use std::time::Instant;
+
+    use crate::rvm::vm::VmError;
+    use crate::utils::limits::{acquire_limits_test_lock, ExecutionTimerConfig};
+
+    let _guard = acquire_limits_test_lock();
+    const DEPTH: usize = 4096;
+    let mut input = v("7");
+    for _ in 0..DEPTH {
+        input = Value::from_array(vec![input]);
+    }
+    let mut program = Program::new();
+    program.dispatch_window_size = 2;
+    program.literals = vec![v("0")];
+    let params_index = program.instruction_data.add_chained_index_params(
+        crate::rvm::instructions::ChainedIndexParams {
+            dest: 1,
+            root: 0,
+            path_components: vec![LiteralOrRegister::Literal(0); DEPTH],
+        },
+    );
+    program.instructions = vec![
+        Instruction::LoadInput { dest: 0 },
+        Instruction::ChainedIndex { params_index },
+        Instruction::Return { value: 1 },
+    ];
+    program.instruction_spans = vec![None; program.instructions.len()];
+    let program = Arc::new(program);
+    let mut missed = Vec::new();
+    for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
+        for recording in [false, true] {
+            let mut vm = RegoVM::new();
+            vm.load_program(program.clone());
+            vm.set_input(input.clone());
+            vm.set_execution_mode(mode);
+            if recording {
+                vm.set_explanation_recorder(Box::new(Recorder));
+            }
+            for limit in [Duration::from_secs(60), Duration::ZERO] {
+                vm.set_execution_timer_config(Some(ExecutionTimerConfig {
+                    limit,
+                    // Three opcodes cannot reach this interval by dispatch
+                    // alone; the long traversal must account for its work.
+                    check_interval: NonZeroU32::new(8).unwrap(),
+                }));
+                let started = Instant::now();
+                let outcome = vm.execute();
+                let elapsed = started.elapsed();
+                if limit.is_zero() {
+                    if !matches!(outcome, Err(VmError::TimeLimitExceeded { pc: 1, .. })) {
+                        missed.push((mode, recording, elapsed, outcome));
+                    }
+                } else {
+                    assert_eq!(outcome, Ok(v("7")));
+                    assert!(matches!(vm.execution_state(), ExecutionState::Completed { result }
+                        if result == &v("7")));
+                    std::eprintln!(
+                        "bounded chain depth={DEPTH} mode={mode:?} origins={recording} elapsed={elapsed:?}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        missed.is_empty(),
+        "deep traversal missed its deadline (mode, origins, elapsed, typed outcome): {missed:?}"
+    );
+}
