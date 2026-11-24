@@ -66,10 +66,10 @@ impl Drop for MemberOrigins {
         if self.members.is_empty() && matches!(self.fallback, RuntimeOrigin::Unknown) {
             return;
         }
-        let members = core::mem::take(&mut self.members);
+        let root_members = core::mem::take(&mut self.members);
         let mut pending = Vec::new();
-        if !members.is_empty() {
-            pending.push(OriginReleaseFrame::Members(members.into_iter()));
+        if !root_members.is_empty() {
+            pending.push(OriginReleaseFrame::Members(root_members.into_iter()));
         }
         let mut current = Some(OriginReleaseFrame::Origin(core::mem::take(
             &mut self.fallback,
@@ -81,9 +81,9 @@ impl Drop for MemberOrigins {
                         // Exactly one releasing Arc owner receives the payload,
                         // including concurrent final releases. Shared owners stay live.
                         if let Some(mut snapshot) = Rc::into_inner(snapshot) {
-                            let members = core::mem::take(&mut snapshot.members);
-                            if !members.is_empty() {
-                                pending.push(OriginReleaseFrame::Members(members.into_iter()));
+                            let child_members = core::mem::take(&mut snapshot.members);
+                            if !child_members.is_empty() {
+                                pending.push(OriginReleaseFrame::Members(child_members.into_iter()));
                             }
                             current = Some(OriginReleaseFrame::Origin(core::mem::take(
                                 &mut snapshot.fallback,
@@ -91,13 +91,13 @@ impl Drop for MemberOrigins {
                         }
                     }
                 }
-                OriginReleaseFrame::Members(mut members) => {
-                    if let Some((key, origin)) = members.next() {
+                OriginReleaseFrame::Members(mut remaining_members) => {
+                    if let Some((key, origin)) = remaining_members.next() {
                         drop(key);
                         // Do not retain an exhausted iterator while descending
                         // into its final child: chains need constant scratch space.
-                        if members.len() != 0 {
-                            pending.push(OriginReleaseFrame::Members(members));
+                        if remaining_members.len() != 0 {
+                            pending.push(OriginReleaseFrame::Members(remaining_members));
                         }
                         current = Some(OriginReleaseFrame::Origin(origin));
                     }
@@ -122,7 +122,7 @@ impl RuntimeOrigin {
         {
             return Self::Unknown;
         }
-        if let Self::Collection { snapshot, .. } = self {
+        if let &Self::Collection { ref snapshot, .. } = self {
             return snapshot
                 .members
                 .get(key)
@@ -312,9 +312,9 @@ impl RegoVM {
         write: MemberWrite,
     ) -> Result<()> {
         let origin = match write.key {
-            Some(key) => self.explain_member_origin(
-                write.previous, key, write.member, write.duplicate,
-            )?,
+            Some(key) => {
+                self.explain_member_origin(write.previous, key, write.member, write.duplicate)?
+            }
             None => write.previous,
         };
         self.explain.origins.set(dest, origin);
@@ -328,13 +328,14 @@ impl RegoVM {
         set: bool,
     ) -> Result<RuntimeOrigin> {
         let mut origin = self.explain.origins.computed();
-        for (key, register) in fields {
-            let duplicate = set && matches!(&origin,
+        for &(ref key, register) in fields {
+            let duplicate = set
+                && matches!(&origin,
                 RuntimeOrigin::Collection { snapshot, .. } if snapshot.members.contains_key(key));
             origin = self.explain_member_origin(
                 origin,
                 key.clone(),
-                self.explain.origins.get(*register),
+                self.explain.origins.get(register),
                 duplicate,
             )?;
         }

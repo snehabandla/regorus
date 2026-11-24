@@ -49,30 +49,40 @@ fn compile(policy: &str) -> Result<Arc<Program>> {
 fn run_member_depth_child(case: &str) -> Result<()> {
     use crate::rvm::instructions::ArrayCreateParams;
     let parts: Vec<_> = case.split(':').collect();
-    let [mode, recording, shared, cleanup] = parts.as_slice() else {
+    let &[mode, recording, shared, cleanup] = parts.as_slice() else {
         anyhow::bail!("invalid member-depth scenario");
     };
-    let mode = match *mode {
+    let mode = match mode {
         "native" => ExecutionMode::RunToCompletion,
         "suspendable" => ExecutionMode::Suspendable,
         _ => anyhow::bail!("invalid member-depth mode"),
     };
-    let recording = *recording == "on";
-    let shared = *shared == "shared";
+    let recording = recording == "on";
+    let shared = shared == "shared";
     let mut program = Program::new();
     program.dispatch_window_size = 3;
-    let wrapping = program.instruction_data.add_array_create_params(
-        ArrayCreateParams { dest: 0, elements: vec![0] },
-    );
+    let wrapping = program
+        .instruction_data
+        .add_array_create_params(ArrayCreateParams {
+            dest: 0,
+            elements: vec![0],
+        });
     program.instructions.push(Instruction::LoadTrue { dest: 0 });
-    program.instructions.extend(
-        core::iter::repeat_n(Instruction::ArrayCreate { params_index: wrapping }, 5_000),
-    );
+    program.instructions.extend(core::iter::repeat_n(
+        Instruction::ArrayCreate {
+            params_index: wrapping,
+        },
+        5_000,
+    ));
     // Main-frame return overwrites register zero in suspendable mode. Keep
     // the nested value alive so recorder teardown, not return, releases it.
-    program.instructions.push(Instruction::Move { dest: 1, src: 0 });
+    program
+        .instructions
+        .push(Instruction::Move { dest: 1, src: 0 });
     if shared {
-        program.instructions.push(Instruction::Move { dest: 2, src: 1 });
+        program
+            .instructions
+            .push(Instruction::Move { dest: 2, src: 1 });
     }
     program.instructions.extend([
         Instruction::LoadTrue { dest: 0 },
@@ -85,12 +95,12 @@ fn run_member_depth_child(case: &str) -> Result<()> {
     if recording {
         vm.set_explanation_recorder(Box::new(Recorder));
     }
-    std::eprintln!("member-depth {case}: before construction");
-    anyhow::ensure!(matches!(vm.execute()?, Value::Bool(true)), "boolean result required");
-    std::eprintln!("member-depth {case}: construction completed");
+    anyhow::ensure!(
+        matches!(vm.execute()?, Value::Bool(true)),
+        "boolean result required"
+    );
     let snapshot = shared.then(|| vm.explain.origins.get(1));
-    std::eprintln!("member-depth {case}: before {cleanup}");
-    match *cleanup {
+    match cleanup {
         "remove" => {
             anyhow::ensure!(vm.take_explanation_recorder().is_some() == recording);
         }
@@ -99,9 +109,7 @@ fn run_member_depth_child(case: &str) -> Result<()> {
         "drop" => drop(vm),
         _ => anyhow::bail!("invalid member-depth cleanup"),
     }
-    std::eprintln!("member-depth {case}: cleanup completed; before snapshot release");
     drop(snapshot);
-    std::eprintln!("member-depth {case}: snapshot released; before final VM/value release");
     Ok(())
 }
 
@@ -110,19 +118,17 @@ fn run_member_depth_child(case: &str) -> Result<()> {
 #[cfg_attr(miri, ignore = "requires native-stack subprocess isolation")]
 #[allow(clippy::panic_in_result_fn)]
 fn deep_constructed_member_teardown_is_stack_bounded() -> Result<()> {
+    use core::time::Duration;
     use std::process::{Command, Stdio};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
     const CHILD: &str = "REGORUS_MEMBER_DEPTH_CHILD";
-    const NAME: &str = "rvm::vm::runtime_origins::tests::deep_constructed_member_teardown_is_stack_bounded";
+    const NAME: &str =
+        "rvm::vm::runtime_origins::tests::deep_constructed_member_teardown_is_stack_bounded";
     if let Ok(case) = std::env::var(CHILD) {
         return std::thread::Builder::new()
             .name("member-depth".into())
             .stack_size(512 * 1024)
-            .spawn(move || {
-                run_member_depth_child(&case)?;
-                std::eprintln!("member-depth {case}: worker completed");
-                Ok(())
-            })?
+            .spawn(move || run_member_depth_child(&case))?
             .join()
             .map_err(|_| anyhow::anyhow!("member-depth worker panicked"))?;
     }
@@ -158,7 +164,10 @@ fn deep_constructed_member_teardown_is_stack_bounded() -> Result<()> {
             }
         }
     }
-    anyhow::ensure!(failed.is_empty(), "member-depth subprocess failures: {failed:?}");
+    anyhow::ensure!(
+        failed.is_empty(),
+        "member-depth subprocess failures: {failed:?}"
+    );
     Ok(())
 }
 
@@ -190,54 +199,119 @@ fn run_member_program(
 fn constructed_members_keep_nested_alias_snapshots_in_both_modes() -> Result<()> {
     use crate::rvm::instructions::{ArrayCreateParams, ChainedIndexParams, ObjectCreateParams};
     let mut program = Program::new();
-    program.literals = vec![v(r#""a""#)?, v(r#""b""#)?, v("0")?, v("1")?,
-        v(r#""k.[\"0\"]""#)?, v("{}")?, v(r#""x""#)?];
-    let pair = program.instruction_data.add_array_create_params(
-        ArrayCreateParams { dest: 1, elements: vec![1, 2] },
-    );
-    let nested = program.instruction_data.add_array_create_params(
-        ArrayCreateParams { dest: 4, elements: vec![1] },
-    );
-    let undefined_array = program.instruction_data.add_array_create_params(
-        ArrayCreateParams { dest: 12, elements: vec![14] },
-    );
-    let object = program.instruction_data.add_object_create_params(ObjectCreateParams {
-        dest: 5, template_literal_idx: 5, literal_key_fields: vec![(4, 2)], fields: vec![(10, 4)],
-    });
-    let undefined_object = program.instruction_data.add_object_create_params(ObjectCreateParams {
-        dest: 13, template_literal_idx: 5, literal_key_fields: vec![(4, 14)], fields: vec![],
-    });
-    let projection = program.instruction_data.add_chained_index_params(ChainedIndexParams {
-        dest: 6, root: 5, path_components: vec![
-            LiteralOrRegister::Literal(4), LiteralOrRegister::Literal(2),
-            LiteralOrRegister::Literal(3), LiteralOrRegister::Literal(2),
-            LiteralOrRegister::Literal(6),
-        ],
-    });
+    program.literals = vec![
+        v(r#""a""#)?,
+        v(r#""b""#)?,
+        v("0")?,
+        v("1")?,
+        v(r#""k.[\"0\"]""#)?,
+        v("{}")?,
+        v(r#""x""#)?,
+    ];
+    let pair = program
+        .instruction_data
+        .add_array_create_params(ArrayCreateParams {
+            dest: 1,
+            elements: vec![1, 2],
+        });
+    let nested = program
+        .instruction_data
+        .add_array_create_params(ArrayCreateParams {
+            dest: 4,
+            elements: vec![1],
+        });
+    let undefined_array = program
+        .instruction_data
+        .add_array_create_params(ArrayCreateParams {
+            dest: 12,
+            elements: vec![14],
+        });
+    let object = program
+        .instruction_data
+        .add_object_create_params(ObjectCreateParams {
+            dest: 5,
+            template_literal_idx: 5,
+            literal_key_fields: vec![(4, 2)],
+            fields: vec![(10, 4)],
+        });
+    let undefined_object = program
+        .instruction_data
+        .add_object_create_params(ObjectCreateParams {
+            dest: 13,
+            template_literal_idx: 5,
+            literal_key_fields: vec![(4, 14)],
+            fields: vec![],
+        });
+    let projection = program
+        .instruction_data
+        .add_chained_index_params(ChainedIndexParams {
+            dest: 6,
+            root: 5,
+            path_components: vec![
+                LiteralOrRegister::Literal(4),
+                LiteralOrRegister::Literal(2),
+                LiteralOrRegister::Literal(3),
+                LiteralOrRegister::Literal(2),
+                LiteralOrRegister::Literal(6),
+            ],
+        });
     program.instructions = vec![
         Instruction::LoadInput { dest: 0 },
-        Instruction::IndexLiteral { dest: 1, container: 0, literal_idx: 0 },
-        Instruction::IndexLiteral { dest: 2, container: 0, literal_idx: 1 },
+        Instruction::IndexLiteral {
+            dest: 1,
+            container: 0,
+            literal_idx: 0,
+        },
+        Instruction::IndexLiteral {
+            dest: 2,
+            container: 0,
+            literal_idx: 1,
+        },
         Instruction::ArrayCreate { params_index: pair },
         Instruction::Move { dest: 3, src: 1 },
         Instruction::ArrayPush { arr: 1, value: 2 },
-        Instruction::ArrayCreate { params_index: nested },
-        Instruction::Load { dest: 10, literal_idx: 4 },
-        Instruction::ObjectCreate { params_index: object },
+        Instruction::ArrayCreate {
+            params_index: nested,
+        },
+        Instruction::Load {
+            dest: 10,
+            literal_idx: 4,
+        },
+        Instruction::ObjectCreate {
+            params_index: object,
+        },
         Instruction::ArrayPush { arr: 1, value: 1 },
-        Instruction::ChainedIndex { params_index: projection },
-        Instruction::IndexLiteral { dest: 7, container: 3, literal_idx: 2 },
-        Instruction::IndexLiteral { dest: 8, container: 3, literal_idx: 3 },
+        Instruction::ChainedIndex {
+            params_index: projection,
+        },
+        Instruction::IndexLiteral {
+            dest: 7,
+            container: 3,
+            literal_idx: 2,
+        },
+        Instruction::IndexLiteral {
+            dest: 8,
+            container: 3,
+            literal_idx: 3,
+        },
         Instruction::ArrayPushDefined { arr: 1, value: 14 },
-        Instruction::ArrayCreate { params_index: undefined_array },
-        Instruction::ObjectCreate { params_index: undefined_object },
+        Instruction::ArrayCreate {
+            params_index: undefined_array,
+        },
+        Instruction::ObjectCreate {
+            params_index: undefined_object,
+        },
     ];
     for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
         let mut baseline = None;
         let mut reuse_baseline = None;
         for recording in [false, true] {
-            let mut vm = run_member_program(program.clone(),
-                v(r#"{"a":[{"x":7}],"b":[{"x":7}]}"#)?, mode, recording)?;
+            let mut vm = run_member_program(
+                program.clone(),
+                v(r#"{"a":[{"x":7}],"b":[{"x":7}]}"#)?,
+                mode,
+                recording,
+            )?;
             assert_eq!(vm.get_register(1)?.as_array()?.len(), 4);
             assert_eq!(vm.get_register(3)?.as_array()?.len(), 2);
             assert_eq!(vm.get_register(6)?, &v("7")?);
@@ -247,14 +321,25 @@ fn constructed_members_keep_nested_alias_snapshots_in_both_modes() -> Result<()>
             let epoch = vm.explain.origins.epoch;
             if recording {
                 assert_eq!(Some(vm.registers.clone()), baseline);
-                assert_eq!(vm.explain.origins.get(6), source(epoch, vec![
-                    PathSegment::Key("b".into()), PathSegment::Index(0),
-                    PathSegment::Key("x".into()),
-                ]));
-                assert_eq!(vm.explain.origins.get(7),
-                    source(epoch, vec![PathSegment::Key("a".into())]));
-                assert_eq!(vm.explain.origins.get(8),
-                    source(epoch, vec![PathSegment::Key("b".into())]));
+                assert_eq!(
+                    vm.explain.origins.get(6),
+                    source(
+                        epoch,
+                        vec![
+                            PathSegment::Key("b".into()),
+                            PathSegment::Index(0),
+                            PathSegment::Key("x".into()),
+                        ]
+                    )
+                );
+                assert_eq!(
+                    vm.explain.origins.get(7),
+                    source(epoch, vec![PathSegment::Key("a".into())])
+                );
+                assert_eq!(
+                    vm.explain.origins.get(8),
+                    source(epoch, vec![PathSegment::Key("b".into())])
+                );
                 assert_ne!(vm.explain.origins.get(1), vm.explain.origins.get(3));
                 assert_eq!(vm.explain.origins.get(12), RuntimeOrigin::Unknown);
                 assert_eq!(vm.explain.origins.get(13), RuntimeOrigin::Unknown);
@@ -278,10 +363,17 @@ fn constructed_members_keep_nested_alias_snapshots_in_both_modes() -> Result<()>
             if recording {
                 assert_eq!(Some(vm.registers.clone()), reuse_baseline);
                 assert_ne!(vm.explain.origins.epoch, epoch);
-                assert_eq!(vm.explain.origins.get(6), source(vm.explain.origins.epoch, vec![
-                    PathSegment::Key("b".into()), PathSegment::Index(0),
-                    PathSegment::Key("x".into()),
-                ]));
+                assert_eq!(
+                    vm.explain.origins.get(6),
+                    source(
+                        vm.explain.origins.epoch,
+                        vec![
+                            PathSegment::Key("b".into()),
+                            PathSegment::Index(0),
+                            PathSegment::Key("x".into()),
+                        ]
+                    )
+                );
             } else {
                 reuse_baseline = Some(vm.registers.clone());
                 assert!(vm.explain.origins.registers.is_empty());
@@ -297,34 +389,66 @@ fn set_duplicate_correspondence_is_ambiguous_only_for_distinct_sources() -> Resu
     use crate::rvm::instructions::SetCreateParams;
     let mut program = Program::new();
     program.literals = vec![v(r#""a""#)?, v(r#""b""#)?];
-    let same = program.instruction_data.add_set_create_params(
-        SetCreateParams { dest: 3, elements: vec![1, 1] },
-    );
-    let different = program.instruction_data.add_set_create_params(
-        SetCreateParams { dest: 5, elements: vec![1, 2] },
-    );
+    let same = program
+        .instruction_data
+        .add_set_create_params(SetCreateParams {
+            dest: 3,
+            elements: vec![1, 1],
+        });
+    let different = program
+        .instruction_data
+        .add_set_create_params(SetCreateParams {
+            dest: 5,
+            elements: vec![1, 2],
+        });
     program.instructions = vec![
         Instruction::LoadInput { dest: 0 },
-        Instruction::IndexLiteral { dest: 1, container: 0, literal_idx: 0 },
-        Instruction::IndexLiteral { dest: 2, container: 0, literal_idx: 1 },
+        Instruction::IndexLiteral {
+            dest: 1,
+            container: 0,
+            literal_idx: 0,
+        },
+        Instruction::IndexLiteral {
+            dest: 2,
+            container: 0,
+            literal_idx: 1,
+        },
         Instruction::SetCreate { params_index: same },
         Instruction::Move { dest: 4, src: 3 },
         Instruction::SetAdd { set: 3, value: 2 },
         Instruction::SetAdd { set: 3, value: 1 },
-        Instruction::SetCreate { params_index: different },
-        Instruction::Index { dest: 6, container: 4, key: 1 },
-        Instruction::Index { dest: 7, container: 3, key: 1 },
-        Instruction::Index { dest: 8, container: 5, key: 1 },
+        Instruction::SetCreate {
+            params_index: different,
+        },
+        Instruction::Index {
+            dest: 6,
+            container: 4,
+            key: 1,
+        },
+        Instruction::Index {
+            dest: 7,
+            container: 3,
+            key: 1,
+        },
+        Instruction::Index {
+            dest: 8,
+            container: 5,
+            key: 1,
+        },
         Instruction::SetNew { dest: 9 },
         Instruction::SetAdd { set: 9, value: 1 },
         Instruction::SetAdd { set: 9, value: 14 },
-        Instruction::Index { dest: 10, container: 9, key: 1 },
+        Instruction::Index {
+            dest: 10,
+            container: 9,
+            key: 1,
+        },
     ];
     for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
         let mut baseline = None;
         for recording in [false, true] {
-            let vm = run_member_program(program.clone(), v(r#"{"a":[1],"b":[1]}"#)?,
-                mode, recording)?;
+            let vm =
+                run_member_program(program.clone(), v(r#"{"a":[1],"b":[1]}"#)?, mode, recording)?;
             assert_eq!(vm.get_register(6)?, &v("[1]")?);
             assert_eq!(vm.get_register(6)?, vm.get_register(7)?);
             assert_eq!(vm.get_register(6)?, vm.get_register(8)?);
@@ -349,48 +473,108 @@ fn set_duplicate_correspondence_is_ambiguous_only_for_distinct_sources() -> Resu
 fn object_mutation_preserves_untouched_sources_and_prewrite_self_aliases() -> Result<()> {
     use crate::rvm::instructions::ChainedIndexParams;
     let mut program = Program::new();
-    program.literals = vec![v(r#""left""#)?, v(r#""replacement""#)?,
-        v(r#""change""#)?, v(r#""keep""#)?, v(r#""self""#)?];
-    let nested = program.instruction_data.add_chained_index_params(ChainedIndexParams {
-        dest: 8, root: 1, path_components: vec![
-            LiteralOrRegister::Literal(4), LiteralOrRegister::Literal(3),
-        ],
-    });
+    program.literals = vec![
+        v(r#""left""#)?,
+        v(r#""replacement""#)?,
+        v(r#""change""#)?,
+        v(r#""keep""#)?,
+        v(r#""self""#)?,
+    ];
+    let nested = program
+        .instruction_data
+        .add_chained_index_params(ChainedIndexParams {
+            dest: 8,
+            root: 1,
+            path_components: vec![LiteralOrRegister::Literal(4), LiteralOrRegister::Literal(3)],
+        });
     program.instructions = vec![
         Instruction::LoadInput { dest: 0 },
-        Instruction::IndexLiteral { dest: 1, container: 0, literal_idx: 0 },
+        Instruction::IndexLiteral {
+            dest: 1,
+            container: 0,
+            literal_idx: 0,
+        },
         Instruction::Move { dest: 2, src: 1 },
-        Instruction::IndexLiteral { dest: 3, container: 0, literal_idx: 1 },
-        Instruction::Load { dest: 7, literal_idx: 2 },
-        Instruction::ObjectSet { obj: 1, key: 7, value: 3 },
-        Instruction::IndexLiteral { dest: 4, container: 1, literal_idx: 3 },
-        Instruction::IndexLiteral { dest: 5, container: 1, literal_idx: 2 },
-        Instruction::IndexLiteral { dest: 6, container: 2, literal_idx: 2 },
-        Instruction::Load { dest: 7, literal_idx: 4 },
-        Instruction::ObjectSet { obj: 1, key: 7, value: 1 },
-        Instruction::ChainedIndex { params_index: nested },
+        Instruction::IndexLiteral {
+            dest: 3,
+            container: 0,
+            literal_idx: 1,
+        },
+        Instruction::Load {
+            dest: 7,
+            literal_idx: 2,
+        },
+        Instruction::ObjectSet {
+            obj: 1,
+            key: 7,
+            value: 3,
+        },
+        Instruction::IndexLiteral {
+            dest: 4,
+            container: 1,
+            literal_idx: 3,
+        },
+        Instruction::IndexLiteral {
+            dest: 5,
+            container: 1,
+            literal_idx: 2,
+        },
+        Instruction::IndexLiteral {
+            dest: 6,
+            container: 2,
+            literal_idx: 2,
+        },
+        Instruction::Load {
+            dest: 7,
+            literal_idx: 4,
+        },
+        Instruction::ObjectSet {
+            obj: 1,
+            key: 7,
+            value: 1,
+        },
+        Instruction::ChainedIndex {
+            params_index: nested,
+        },
     ];
     for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
         let mut baseline = None;
         for recording in [false, true] {
-            let vm = run_member_program(program.clone(),
+            let vm = run_member_program(
+                program.clone(),
                 v(r#"{"left":{"keep":[1],"change":[1]},"replacement":[1]}"#)?,
-                mode, recording)?;
+                mode,
+                recording,
+            )?;
             assert_eq!(vm.get_register(4)?, &v("[1]")?);
             assert_eq!(vm.get_register(4)?, vm.get_register(5)?);
             assert_eq!(vm.get_register(4)?, vm.get_register(6)?);
             if recording {
                 assert_eq!(Some(vm.registers.clone()), baseline);
                 let epoch = vm.explain.origins.epoch;
-                let keep = source(epoch, vec![PathSegment::Key("left".into()),
-                    PathSegment::Key("keep".into())]);
+                let keep = source(
+                    epoch,
+                    vec![
+                        PathSegment::Key("left".into()),
+                        PathSegment::Key("keep".into()),
+                    ],
+                );
                 assert_eq!(vm.explain.origins.get(4), keep);
                 assert_eq!(vm.explain.origins.get(8), keep);
-                assert_eq!(vm.explain.origins.get(5),
-                    source(epoch, vec![PathSegment::Key("replacement".into())]));
-                assert_eq!(vm.explain.origins.get(6), source(epoch, vec![
-                    PathSegment::Key("left".into()), PathSegment::Key("change".into()),
-                ]));
+                assert_eq!(
+                    vm.explain.origins.get(5),
+                    source(epoch, vec![PathSegment::Key("replacement".into())])
+                );
+                assert_eq!(
+                    vm.explain.origins.get(6),
+                    source(
+                        epoch,
+                        vec![
+                            PathSegment::Key("left".into()),
+                            PathSegment::Key("change".into()),
+                        ]
+                    )
+                );
             } else {
                 baseline = Some(vm.registers.clone());
                 assert!(vm.explain.origins.registers.is_empty());

@@ -775,7 +775,10 @@ impl RegoVM {
                 let origin = if self.explain_enabled()
                     && matches!(self.get_register(arr)?, Value::Array(_))
                 {
-                    let index = self.get_register(arr)?.as_array().map_or(0, |array| array.len());
+                    let index = self
+                        .get_register(arr)?
+                        .as_array()
+                        .map_or(0, |array| array.len());
                     Some(self.explain_collection_write(arr, value, Value::from(index), false)?)
                 } else {
                     None
@@ -816,7 +819,10 @@ impl RegoVM {
                 let origin = if self.explain_enabled()
                     && matches!(self.get_register(arr)?, Value::Array(_))
                 {
-                    let index = self.get_register(arr)?.as_array().map_or(0, |array| array.len());
+                    let index = self
+                        .get_register(arr)?
+                        .as_array()
+                        .map_or(0, |array| array.len());
                     Some(self.explain_collection_write(arr, value, Value::from(index), false)?)
                 } else {
                     None
@@ -966,7 +972,9 @@ impl RegoVM {
                             let fields = params
                                 .element_registers()
                                 .iter()
-                                .map(|&register| Ok((self.get_register(register)?.clone(), register)))
+                                .map(|&register| {
+                                    Ok((self.get_register(register)?.clone(), register))
+                                })
                                 .collect::<Result<Vec<_>>>()?;
                             Some(self.explain_constructor_origin(&fields, true)?)
                         } else {
