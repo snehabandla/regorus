@@ -681,7 +681,7 @@ fn quoted_residual_path_serialization_checks_the_execution_timer() -> anyhow::Re
     let _guard = acquire_limits_test_lock();
     let short = PathSegment::Key("a.b".into());
     let mut short_checkpoints = 0;
-    render_path(UnknownRoot::Input, &[short.clone()], &mut || {
+    render_path(UnknownRoot::Input, core::slice::from_ref(&short), &mut || {
         short_checkpoints += 1;
         Ok(())
     })?;
