@@ -674,42 +674,52 @@ fn residual_value_scan_checks_the_execution_timer() -> anyhow::Result<()> {
 
 #[cfg(feature = "std")]
 #[test]
-fn quoted_residual_path_serialization_checks_the_execution_timer() -> anyhow::Result<()> {
+fn residual_path_serialization_checks_the_execution_timer() -> anyhow::Result<()> {
     use crate::utils::limits::{acquire_limits_test_lock, ExecutionTimerConfig};
     use core::{num::NonZeroU32, time::Duration};
 
     let _guard = acquire_limits_test_lock();
-    let short = PathSegment::Key("a.b".into());
-    let mut short_checkpoints = 0;
-    render_path(UnknownRoot::Input, core::slice::from_ref(&short), &mut || {
-        short_checkpoints += 1;
-        Ok(())
-    })?;
-    let check_interval = NonZeroU32::new(short_checkpoints + 1)
-        .ok_or_else(|| anyhow::anyhow!("quoted path checkpoint interval overflow"))?;
-    let mut machine = vm(TWO_CONDITIONS)?;
-    for (key, should_expire) in [
-        (short, false),
-        (PathSegment::Key("a.b".repeat(32 * 1024)), true),
+    let mut most_short_checkpoints = 0;
+    for key in ["a.b", "x"] {
+        let short = PathSegment::Key(key.into());
+        let mut count = 0;
+        render_path(
+            UnknownRoot::Input,
+            core::slice::from_ref(&short),
+            &mut || {
+                count += 1;
+                Ok(())
+            },
+        )?;
+        most_short_checkpoints = most_short_checkpoints.max(count);
+    }
+    let check_interval = NonZeroU32::new(most_short_checkpoints + 1)
+        .ok_or_else(|| anyhow::anyhow!("path checkpoint interval overflow"))?;
+    for (short_key, long_key, expected) in [
+        ("a.b", "a.b".repeat(32 * 1024), "input[\"a.b\"]"),
+        ("x", "x".repeat(96 * 1024), "input.x"),
     ] {
-        // The short control finishes before sampling; only additional encoding
-        // checkpoints for the larger key can reach the expired deadline.
-        machine.set_execution_timer_config(Some(ExecutionTimerConfig {
-            limit: Duration::ZERO,
-            check_interval,
-        }));
-        let result = render_path(UnknownRoot::Input, &[key], &mut || machine.pe_checkpoint());
-        if should_expire {
-            assert!(
-                matches!(
-                    &result,
-                    Err(ExplainError::Vm(VmError::TimeLimitExceeded { .. }))
-                ),
-                "large quoted key bypassed the encoding deadline: {:?}",
-                result.as_ref().map(String::len)
-            );
-        } else {
-            assert_eq!(result?, "input[\"a.b\"]");
+        let short = PathSegment::Key(short_key.into());
+        let mut machine = vm(TWO_CONDITIONS)?;
+        for (key, should_expire) in [(short, false), (PathSegment::Key(long_key), true)] {
+            // Only extra work for the long key may reach the expired deadline.
+            machine.set_execution_timer_config(Some(ExecutionTimerConfig {
+                limit: Duration::ZERO,
+                check_interval,
+            }));
+            let result = render_path(UnknownRoot::Input, &[key], &mut || machine.pe_checkpoint());
+            if should_expire {
+                assert!(
+                    matches!(
+                        &result,
+                        Err(ExplainError::Vm(VmError::TimeLimitExceeded { .. }))
+                    ),
+                    "large {short_key:?} key bypassed the rendering deadline: {:?}",
+                    result.as_ref().map(String::len)
+                );
+            } else {
+                assert_eq!(result?, expected);
+            }
         }
     }
     Ok(())
