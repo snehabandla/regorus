@@ -531,6 +531,71 @@ fn lossy_numeric_residuals_fail_closed() -> anyhow::Result<()> {
 }
 
 #[test]
+fn numeric_residual_paths_preserve_object_key_identity() -> anyhow::Result<()> {
+    use alloc::collections::BTreeMap;
+
+    for (literal, index) in [
+        ("18446744073709551615", Some(u64::MAX)),
+        ("1.0", Some(1)),
+        ("18446744073709549568.0", Some(18_446_744_073_709_549_568)),
+        ("18446744073709551616.0", None),
+    ] {
+        let key = Value::from(literal.parse::<crate::number::Number>()?);
+        let projected_key = Value::from(index.unwrap_or(u64::MAX));
+        let object = Value::from(BTreeMap::from([(projected_key.clone(), Value::from(1))]));
+        assert_eq!(object[&projected_key], Value::from(1));
+        let expected = if index.is_some() {
+            assert_eq!(key, projected_key, "{literal}");
+            Value::Bool(true)
+        } else {
+            assert_ne!(key, projected_key, "{literal}");
+            assert_eq!(object[&key], Value::Undefined);
+            Value::Undefined
+        };
+        let mut machine = vm(&format!("package test\nallow if input.xs[{literal}] == 1"))?;
+        machine.set_input(Value::from(BTreeMap::from([(Value::from("xs"), object)])));
+        let concrete = machine.partial_eval("data.test.allow")?;
+        assert_eq!(concrete.status, ResidualStatus::Exact, "{literal}");
+        assert_eq!(concrete.result, expected, "{literal}");
+        assert!(concrete.residual_queries.is_empty());
+
+        machine.set_input(Value::new_object());
+        let mut settings = PartialEvalSettings::default();
+        settings.unknowns = keys(&["xs"]);
+        machine.set_partial_eval_settings(settings);
+        let residual = machine.partial_eval("data.test.allow")?;
+        match index {
+            Some(index) => {
+                assert_eq!(segment(&key), Some(PathSegment::Index(index)));
+                assert_eq!(residual.status, ResidualStatus::Exact, "{literal}");
+                assert_eq!(residual.result, Value::Undefined);
+                assert_eq!(residual.residual_queries.len(), 1);
+                let query = &residual.residual_queries[0];
+                assert_eq!(query.status, ResidualAlternativeStatus::Exact);
+                assert_eq!(query.value, Value::Bool(true));
+                assert_eq!(query.conditions.len(), 1);
+                let condition = &query.conditions[0];
+                assert_eq!(condition.kind, ResidualKind::ConditionHolds);
+                assert_eq!(condition.operator, Some(Operator::Eq));
+                assert_eq!(condition.value, Some(Value::from(1)));
+                assert_eq!(condition.input_path, Some(format!("input.xs[{index}]")));
+            }
+            None => {
+                assert_eq!(
+                    residual.status,
+                    ResidualStatus::Unsupported,
+                    "{literal}: projected={:?}, report={residual:?}",
+                    segment(&key)
+                );
+                assert_eq!(segment(&key), None);
+                assert!(residual.residual_queries.is_empty());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn defined_false_results_are_not_undefined() -> anyhow::Result<()> {
     let concrete = pe("package test\nallow := false", "{}", &[])?;
     assert_eq!(concrete.status, ResidualStatus::Exact);
@@ -601,6 +666,49 @@ fn residual_value_scan_checks_the_execution_timer() -> anyhow::Result<()> {
         machine.pe_compare(Some(2), 0, 1, Operator::Eq),
         Err(VmError::TimeLimitExceeded { .. })
     ));
+    Ok(())
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn quoted_residual_path_serialization_checks_the_execution_timer() -> anyhow::Result<()> {
+    use crate::utils::limits::{acquire_limits_test_lock, ExecutionTimerConfig};
+    use core::{num::NonZeroU32, time::Duration};
+
+    let _guard = acquire_limits_test_lock();
+    let short = PathSegment::Key("a.b".into());
+    let mut short_checkpoints = 0;
+    render_path(UnknownRoot::Input, &[short.clone()], &mut || {
+        short_checkpoints += 1;
+        Ok(())
+    })?;
+    let check_interval = NonZeroU32::new(short_checkpoints + 1)
+        .ok_or_else(|| anyhow::anyhow!("quoted path checkpoint interval overflow"))?;
+    let mut machine = vm(TWO_CONDITIONS)?;
+    for (key, should_expire) in [
+        (short, false),
+        (PathSegment::Key("a.b".repeat(32 * 1024)), true),
+    ] {
+        // The short control finishes before sampling; only additional encoding
+        // checkpoints for the larger key can reach the expired deadline.
+        machine.set_execution_timer_config(Some(ExecutionTimerConfig {
+            limit: Duration::ZERO,
+            check_interval,
+        }));
+        let result = render_path(UnknownRoot::Input, &[key], &mut || machine.pe_checkpoint());
+        if should_expire {
+            assert!(
+                matches!(
+                    &result,
+                    Err(ExplainError::Vm(VmError::TimeLimitExceeded { .. }))
+                ),
+                "large quoted key bypassed the encoding deadline: {:?}",
+                result.as_ref().map(String::len)
+            );
+        } else {
+            assert_eq!(result?, "input[\"a.b\"]");
+        }
+    }
     Ok(())
 }
 
