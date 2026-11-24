@@ -9,8 +9,9 @@ use crate::Value;
 
 use super::super::obj_map::{
     collision_safe_key, is_root_field_collision, obj_contains, obj_insert, obj_insert_rc,
-    obj_remove, set_nested_lowercased, ObjMap,
+    obj_remove, ObjMap,
 };
+use super::super::path;
 use super::super::types::ResolvedAliases;
 use super::element_remap::apply_element_remap_precomputed;
 use super::flatten::normalize_value;
@@ -41,20 +42,16 @@ pub fn apply_alias_entries(
 
         // Use precomputed segments for all paths (default and versioned).
         let segments = entry.select_path_segments(api_version);
-        let value = navigate_arm_path_segments(raw, segments);
-
-        if let Some(value) = value {
+        if let Some(value) = path::get(raw, segments, false) {
             // Flatten nested sub-resource arrays too (e.g. `x.y` under plain `x`);
             // otherwise this overwrites what `merge_properties` flattened.
-            let value = normalize_value(&value, &entry.short_name, Some(sub_resource_set));
+            let value = normalize_value(value, &entry.short_name, Some(sub_resource_set));
 
             if is_root_field_collision(&entry.short_name, &entry.default_path) {
                 let target = collision_safe_key(&entry.short_name);
-                set_nested_lowercased(result, &target, value);
-            } else if entry.short_name.contains('.') {
-                set_nested_lowercased(result, &entry.short_name, value);
+                obj_insert_rc(result, Rc::from(target), value);
             } else {
-                obj_insert_rc(result, Rc::clone(&entry.short_name_lc), value);
+                path::set_keys(result, &entry.short_segments, value, true);
             }
         }
     }
@@ -91,9 +88,9 @@ pub fn apply_alias_entries(
                     })
                     .and_then(|entry| {
                         let segments = entry.select_path_segments(api_version);
-                        let value = navigate_arm_path_segments_ci(raw, segments)?;
+                        let value = path::get(raw, segments, true)?;
                         Some(normalize_value(
-                            &value,
+                            value,
                             &entry.short_name,
                             Some(sub_resource_set),
                         ))
@@ -116,33 +113,4 @@ pub fn apply_alias_entries(
             }
         }
     }
-}
-
-/// Navigate an ARM path using precomputed segments (avoids per-call split).
-fn navigate_arm_path_segments(value: &Value, segments: &[Rc<str>]) -> Option<Value> {
-    let mut current = value;
-    for segment in segments {
-        current = current
-            .as_object()
-            .ok()?
-            .get(&Value::String(Rc::clone(segment)))?;
-    }
-    Some(current.clone())
-}
-
-/// [`navigate_arm_path_segments`], falling back to the first key that differs
-/// only in ASCII case (the key `merge_properties` takes) when there is no
-/// exact match.
-fn navigate_arm_path_segments_ci(value: &Value, segments: &[Rc<str>]) -> Option<Value> {
-    let mut current = value;
-    for segment in segments {
-        let obj = current.as_object().ok()?;
-        current = match obj.get(&Value::String(Rc::clone(segment))) {
-            Some(v) => v,
-            None => obj.iter().find_map(|(k, v)| {
-                matches!(k, Value::String(s) if s.eq_ignore_ascii_case(segment)).then_some(v)
-            })?,
-        };
-    }
-    Some(current.clone())
 }

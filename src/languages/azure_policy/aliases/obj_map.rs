@@ -42,6 +42,7 @@ pub fn obj_key_ci(map: &ObjMap, key: &str) -> Option<Rc<str>> {
 }
 
 /// Look up `key`, falling back to a key that differs only in ASCII case.
+#[allow(dead_code)] // Replaced by `path`; removed in A30.
 pub fn obj_get_ci<'a>(map: &'a ObjMap, key: &str) -> Option<&'a Value> {
     map.get(obj_key_ci(map, key)?.as_ref())
 }
@@ -53,6 +54,7 @@ pub fn obj_get_mut_ci<'a>(map: &'a mut ObjMap, key: &str) -> Option<&'a mut Valu
 }
 
 /// [`obj_remove`], falling back to a key that differs only in ASCII case.
+#[allow(dead_code)] // Replaced by `path`; removed in A30.
 pub fn obj_remove_ci(map: &mut ObjMap, key: &str) -> Option<Value> {
     let found = obj_key_ci(map, key)?;
     map.remove(found.as_ref())
@@ -84,6 +86,7 @@ pub fn object_get_mut_ci<'a>(obj: &'a mut Object, key: &str) -> Option<&'a mut V
 
 /// Remove `key` from an Object, falling back to a key that differs only in
 /// ASCII case.
+#[allow(dead_code)] // Replaced by `path`; removed in A30.
 fn object_remove_ci(obj: &mut Object, key: &str) -> Option<Value> {
     let found = object_key_ci(obj, key)?;
     obj.remove(&found)
@@ -106,6 +109,7 @@ pub fn obj_insert_rc(map: &mut ObjMap, key: Rc<str>, val: Value) {
 /// Both paths allocate an `Rc<str>` (header + string bytes).  The fast-path
 /// avoids creating an intermediate lowercased `String` when the input is
 /// already all-lowercase ASCII.
+#[allow(dead_code)] // Replaced by `path`; removed in A30.
 pub fn rc_lowercase(s: &str) -> Rc<str> {
     if s.bytes().all(|b| !b.is_ascii_uppercase()) {
         Rc::from(s)
@@ -116,6 +120,7 @@ pub fn rc_lowercase(s: &str) -> Rc<str> {
 
 /// Insert a key-value pair with the key lowercased, using [`rc_lowercase`]
 /// for the allocation fast-path.
+#[allow(dead_code)] // Replaced by `path`; removed in A30.
 pub fn obj_insert_lc(map: &mut ObjMap, key: &str, val: Value) {
     let lc = rc_lowercase(key);
     map.insert(lc, val);
@@ -184,6 +189,7 @@ pub fn value_to_obj_map(value: &Value) -> Option<ObjMap> {
 
 /// Set a value at a dot-separated path in an [`ObjMap`], creating
 /// intermediate `Value::Object` nodes as needed.  All keys are lowercased.
+#[allow(dead_code)] // Replaced by `path`; removed in A30.
 pub fn set_nested_lowercased(result: &mut ObjMap, path: &str, value: Value) {
     let segments: Vec<&str> = path.split('.').collect();
     if segments.is_empty() {
@@ -203,6 +209,7 @@ pub fn set_nested_lowercased(result: &mut ObjMap, path: &str, value: Value) {
 /// intermediate `Value::Object` nodes as needed.  Keys preserve their casing.
 /// Returns `false` if an intermediate value is not an object, in which case
 /// nothing is written.
+#[allow(dead_code)] // Replaced by `path`; removed in A30.
 pub fn set_nested_verbatim(result: &mut ObjMap, path: &str, value: Value) -> bool {
     let segments: Vec<&str> = path.split('.').collect();
     if segments.len() == 1 {
@@ -217,6 +224,7 @@ pub fn set_nested_verbatim(result: &mut ObjMap, path: &str, value: Value) -> boo
 
 /// Core implementation of nested-set.  Navigates the first N-1 segments,
 /// creating intermediate objects, then inserts the value at the last segment.
+#[allow(dead_code)] // Replaced by `path`; removed in A30.
 fn set_nested_inner(obj: &mut ObjMap, segments: &[&str], value: Value, lowercase: bool) -> bool {
     let Some(&first) = segments.first() else {
         return false;
@@ -263,6 +271,7 @@ fn set_nested_inner(obj: &mut ObjMap, segments: &[&str], value: Value, lowercase
 /// would clone every sibling entry at each nesting level. Returns `false`
 /// if an intermediate value is not an object, in which case nothing is
 /// written.
+#[allow(dead_code)] // Replaced by `path`; removed in A30.
 pub fn set_nested(obj: &mut Object, segments: &[&str], value: Value, lowercase: bool) -> bool {
     let Some(&first) = segments.first() else {
         return false;
@@ -354,18 +363,21 @@ pub fn collision_safe_key(short_name: &str) -> String {
 
 /// Remove the value at a dot-separated path from an element Object, matching
 /// each key exactly or else ignoring ASCII case.
+#[allow(dead_code)] // Replaced by `path`; removed in A30.
 pub fn remove_dotted_path_obj(obj: &mut Object, path: &str) {
     let segments: Vec<&str> = path.split('.').collect();
     remove_at_dotted_path_obj(obj, &segments);
 }
 
 /// [`remove_dotted_path_obj`] for an ObjMap.
+#[allow(dead_code)] // Replaced by `path`; removed in A30.
 pub fn remove_dotted_path(obj: &mut ObjMap, path: &str) {
     let segments: Vec<&str> = path.split('.').collect();
     remove_at_dotted_path(obj, &segments);
 }
 
 /// Remove the leaf segment at a dotted path directly in an Object.
+#[allow(dead_code)] // Replaced by `path`; removed in A30.
 fn remove_at_dotted_path_obj(obj: &mut Object, segments: &[&str]) {
     let Some((&leaf, parent_segs)) = segments.split_last() else {
         return;
@@ -407,6 +419,7 @@ fn remove_at_dotted_path_obj(obj: &mut Object, segments: &[&str]) {
 }
 
 /// Remove the leaf segment at a dot-separated path from an ObjMap.
+#[allow(dead_code)] // Replaced by `path`; removed in A30.
 fn remove_at_dotted_path(obj: &mut ObjMap, segments: &[&str]) {
     let Some((&leaf, parent_segs)) = segments.split_last() else {
         return;

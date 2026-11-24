@@ -431,6 +431,18 @@ fn resolve_resource_type(fq_type: &str, aliases: &[types::AliasEntry]) -> Resolv
         );
     }
 
+    let extended: BTreeSet<String> = entries
+        .values()
+        .filter_map(|entry| path::parse(&entry.short_name))
+        .flat_map(|parsed| {
+            (1..parsed.segments.len())
+                .filter_map(move |n| Some(path::render(parsed.segments.get(..n)?).to_lowercase()))
+        })
+        .collect();
+    for (key, entry) in &mut entries {
+        entry.nested_short_name &= !extended.contains(key);
+    }
+
     // Precompute aggregate fields from entries.
     let (default_aggregates, versioned_aggregates) =
         precompute_aggregates(&entries, &sub_resource_arrays);

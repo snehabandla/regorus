@@ -9,26 +9,27 @@ use alloc::vec::Vec;
 use crate::value::Object;
 use crate::Value;
 
-use super::super::obj_map::{
-    obj_get_ci, obj_get_mut_ci, obj_insert, object_get_ci, object_get_mut_ci, remove_dotted_path,
-    remove_dotted_path_obj, set_nested, set_nested_lowercased, set_nested_verbatim, ObjMap,
-};
+use super::super::obj_map::{obj_get_mut_ci, object_get_ci, object_get_mut_ci, ObjMap};
+use super::super::path::{self, Segment};
 use super::super::types::PrecomputedRemap;
 
 /// Describes a field remapping inside each element of a (possibly nested) array.
 pub struct ElementRemap {
     /// Chain of array navigations for nested `[*]` levels.
     pub(crate) array_chain: Vec<Vec<String>>,
-    /// Dot-separated path to read within the innermost array element.
-    pub(crate) source_field: String,
-    /// Dot-separated path to write within the innermost array element.
-    pub(crate) target_field: String,
+    /// Path to read within the innermost array element, matching keys
+    /// ignoring ASCII case.
+    pub(crate) source_field: Vec<Segment>,
+    /// Path to write within the innermost array element, with exact keys.
+    pub(crate) target_field: Vec<Segment>,
 }
 
 /// Apply an element-level field remap to each element of an array (or nested
-/// array chain). The value is moved: the source is removed before the target
-/// is written, so a target nested under its own source path (`cfg` to
-/// `cfg.value`) is not deleted with it.
+/// array chain). The value is moved: the source is removed (keeping the
+/// containers it empties) and the target written. A source that a target
+/// overlaps is removed first, so a target nested under its own source path
+/// (`cfg` to `cfg.value`) is not deleted with it. Otherwise an element whose
+/// target path runs through a non-object, `null` included, keeps its source.
 ///
 /// When `lowercase` is `true` (normalizer), target path segments are
 /// lowercased.  When `false` (denormalizer), they are written verbatim
@@ -44,15 +45,14 @@ pub fn apply_element_remap(result: &mut ObjMap, remap: &ElementRemap, lowercase:
     );
 }
 
-/// Apply a precomputed element remap (from [`PrecomputedRemap`]) without
-/// any per-call string splitting or allocation.
+/// Apply a precomputed element remap (from [`PrecomputedRemap`]).
 pub fn apply_element_remap_precomputed(result: &mut ObjMap, remap: &PrecomputedRemap) {
     apply_remap_at_depth(
         result,
         &remap.array_chain,
         0,
-        &remap.source_field,
-        &remap.target_field,
+        &path::alias_segments(&remap.source_field),
+        &path::alias_segments(&remap.target_field),
         true,
     );
 }
@@ -63,12 +63,12 @@ fn apply_remap_at_depth(
     obj: &mut ObjMap,
     array_chain: &[Vec<String>],
     depth: usize,
-    source_field: &str,
-    target_field: &str,
+    source_field: &[Segment],
+    target_field: &[Segment],
     lowercase: bool,
 ) {
+    // Element remaps always have an array to enter.
     let Some(nav) = array_chain.get(depth) else {
-        remap_deep_field(obj, source_field, target_field, lowercase);
         return;
     };
 
@@ -124,8 +124,8 @@ fn remap_at_depth_in_btree(
     btree: &mut Object,
     array_chain: &[Vec<String>],
     depth: usize,
-    source_field: &str,
-    target_field: &str,
+    source_field: &[Segment],
+    target_field: &[Segment],
     lowercase: bool,
 ) {
     let Some(nav) = array_chain.get(depth) else {
@@ -178,71 +178,29 @@ fn remap_at_depth_in_btree(
     }
 }
 
-/// Move a value between dotted paths directly in a BTreeMap.
-fn remap_deep_field_in_btree(btree: &mut Object, source: &str, target: &str, lowercase: bool) {
-    let val = match read_dotted_path_btree(btree, source) {
-        Some(v) => v,
-        None => return,
+/// Move a value between paths inside one array element.
+fn remap_deep_field_in_btree(
+    btree: &mut Object,
+    source: &[Segment],
+    target: &[Segment],
+    lowercase: bool,
+) {
+    let Some((Segment::Key(first), rest)) = source.split_first() else {
+        return;
     };
-    remove_dotted_path_obj(btree, source);
-
-    let segments: Vec<&str> = target.split('.').collect();
-    if segments.is_empty() {
+    let Some(val) = object_get_ci(btree, first).and_then(|value| path::get(value, rest, true))
+    else {
         return;
-    }
-    if segments.len() == 1 {
-        if let Some(seg) = segments.first() {
-            btree.insert(Value::String(crate::Rc::from(*seg)), val);
-        }
-        return;
-    }
-    set_nested(btree, &segments, val, lowercase);
-}
-
-/// Read a value at a dotted path from a BTreeMap.
-fn read_dotted_path_btree(btree: &Object, path: &str) -> Option<Value> {
-    let segments: Vec<&str> = path.split('.').collect();
-    let first = segments.first()?;
-    let mut cur: &Value = object_get_ci(btree, first)?;
-    for &seg in segments.iter().skip(1) {
-        cur = object_get_ci(cur.as_object().ok()?, seg)?;
-    }
-    Some(cur.clone())
-}
-
-/// Move a value from one (possibly nested) dot-separated path to another
-/// in an ObjMap.  Used only at the top level when `depth >= array_chain.len()`.
-fn remap_deep_field(obj: &mut ObjMap, source: &str, target: &str, lowercase: bool) {
-    let val = match read_dotted_path(obj, source) {
-        Some(v) => v,
-        None => return,
     };
-    remove_dotted_path(obj, source);
-
-    let segments: Vec<&str> = target.split('.').collect();
-    if segments.is_empty() {
-        return;
+    let val = val.clone();
+    // A target overlapping its source is cleared by removing the source.
+    let overlap = source.len().min(target.len());
+    let overlaps = matches!(
+        (source.get(..overlap), target.get(..overlap)),
+        (Some(source), Some(target)) if path::equivalent(source, target)
+    );
+    if overlaps || path::can_set_object_keys(btree, target, lowercase) {
+        path::remove_object(btree, source, false);
+        path::set_object_keys(btree, target, val, lowercase);
     }
-    if segments.len() == 1 {
-        if let Some(seg) = segments.first() {
-            obj_insert(obj, seg, val);
-        }
-        return;
-    }
-    if lowercase {
-        set_nested_lowercased(obj, target, val);
-    } else {
-        set_nested_verbatim(obj, target, val);
-    }
-}
-
-/// Read a value at a dot-separated path from an ObjMap.
-fn read_dotted_path(obj: &ObjMap, path: &str) -> Option<Value> {
-    let segments: Vec<&str> = path.split('.').collect();
-    let first = segments.first()?;
-    let mut cur: &Value = obj_get_ci(obj, first)?;
-    for &seg in segments.iter().skip(1) {
-        cur = object_get_ci(cur.as_object().ok()?, seg)?;
-    }
-    Some(cur.clone())
 }

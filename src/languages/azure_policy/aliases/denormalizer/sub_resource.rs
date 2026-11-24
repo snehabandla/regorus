@@ -113,22 +113,23 @@ pub struct Origin<'a> {
 
 impl Writes {
     /// Record writing the value of normalized key `source`, read from the
-    /// normalized key `read`, at the dotted path `keys`.
-    pub fn record(&mut self, at_root: bool, keys: &str, source: &str, read: &str) {
-        let keys = keys.split('.').map(String::from).collect();
-        self.push(at_root, keys, source, read);
-    }
-
-    /// [`Self::record`] at the single, possibly dotted, key `key`.
+    /// normalized key `read`, at the single, possibly dotted, key `key`.
     pub fn record_key(&mut self, at_root: bool, key: &str, source: &str, read: &str) {
         self.push(at_root, alloc::vec![String::from(key)], source, read);
     }
 
     /// Record phase 2b writing the plain alias `key`, read from the
     /// normalized key `read`, at `keys`.
-    pub fn record_alias(&mut self, at_root: bool, keys: &str, key: &str, read: &str) {
+    pub fn record_alias(&mut self, at_root: bool, keys: &[path::Segment], key: &str, read: &str) {
         self.aliases.insert(String::from(key));
-        self.record(at_root, keys, key, read);
+        let keys = keys
+            .iter()
+            .filter_map(|segment| match segment {
+                path::Segment::Key(name) => Some(String::from(&**name)),
+                _ => None,
+            })
+            .collect();
+        self.push(at_root, keys, key, read);
     }
 
     fn push(&mut self, at_root: bool, keys: Vec<String>, source: &str, read: &str) {

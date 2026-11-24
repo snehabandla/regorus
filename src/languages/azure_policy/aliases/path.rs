@@ -17,8 +17,8 @@
 //! and an index addresses one array element. Keys resolve to the exact key,
 //! else the smallest case-insensitive match. Writes that meet an incompatible
 //! shape do nothing; [`remove`] prunes containers it empties and arrays it
-//! leaves all-null. The normalizer and denormalizer do not call these yet,
-//! hence the `dead_code` allowances.
+//! leaves all-null. Aliases only parse plain dotted paths so far (see
+//! [`alias_segments`]), hence the `dead_code` allowances.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -282,6 +282,22 @@ pub fn renders_dotted(segments: &[Segment]) -> bool {
         .all(|segment| matches!(segment, Segment::Key(key) if !needs_subscript(key)))
 }
 
+/// The keys the normalizer and denormalizer address for an alias path:
+/// parsed when the path is plain dotted keys spelled as [`render`] spells
+/// them, else the text split on `.` into literal keys (brackets, quotes and
+/// spaces included), as such paths have always been addressed.
+pub fn alias_segments(path: &str) -> Vec<Segment> {
+    match parse(path) {
+        Some(parsed) if renders_dotted(&parsed.segments) && render(&parsed.segments) == path => {
+            parsed.segments
+        }
+        _ => path
+            .split('.')
+            .map(|key| Segment::Key(Rc::from(key)))
+            .collect(),
+    }
+}
+
 pub fn render(segments: &[Segment]) -> String {
     let mut result = String::new();
     for segment in segments {
@@ -315,7 +331,6 @@ pub fn render(segments: &[Segment]) -> String {
     result
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn get<'a>(
     mut value: &'a Value,
     segments: &[Segment],
@@ -681,6 +696,80 @@ pub fn set_object(
     written
 }
 
+/// Write `value` at plain keys the way alias values have always been
+/// written: each key exactly as given (lowercased if `lowercase`), creating
+/// missing objects. Unlike [`set`], keys that differ only in case are
+/// distinct, and anything but an object on the way, `null` included, refuses
+/// the write. Returns whether the value was written; if not, `map` is
+/// unchanged.
+pub fn set_keys(map: &mut ObjMap, segments: &[Segment], value: Value, lowercase: bool) -> bool {
+    let Some((Segment::Key(key), rest)) = segments.split_first() else {
+        return false;
+    };
+    let key = key_case(key, lowercase);
+    if rest.is_empty() {
+        map.insert(key, value);
+        return true;
+    }
+    match map.get_mut(&key) {
+        Some(Value::Object(object)) => {
+            set_object_keys(Rc::make_mut(object), rest, value, lowercase)
+        }
+        Some(_) => false,
+        None => {
+            let mut object = Object::default();
+            let written = set_object_keys(&mut object, rest, value, lowercase);
+            if written {
+                map.insert(key, Value::Object(Rc::new(object)));
+            }
+            written
+        }
+    }
+}
+
+/// [`set_keys`] for a path inside an object.
+pub fn set_object_keys(
+    object: &mut Object,
+    segments: &[Segment],
+    value: Value,
+    lowercase: bool,
+) -> bool {
+    if !can_set_object_keys(object, segments, lowercase) {
+        return false;
+    }
+    write_keys(object, segments, value, lowercase);
+    true
+}
+
+/// Whether [`set_object_keys`] would write at `segments`.
+pub fn can_set_object_keys(object: &Object, segments: &[Segment], lowercase: bool) -> bool {
+    let Some((Segment::Key(key), rest)) = segments.split_first() else {
+        return false;
+    };
+    if rest.is_empty() {
+        return true;
+    }
+    match object.get(&Value::String(key_case(key, lowercase))) {
+        None => rest
+            .iter()
+            .all(|segment| matches!(segment, Segment::Key(_))),
+        Some(Value::Object(child)) => can_set_object_keys(child, rest, lowercase),
+        Some(_) => false,
+    }
+}
+
+fn write_keys(object: &mut Object, segments: &[Segment], value: Value, lowercase: bool) {
+    let Some((Segment::Key(key), rest)) = segments.split_first() else {
+        return;
+    };
+    let key = Value::String(key_case(key, lowercase));
+    if rest.is_empty() {
+        object.insert(key, value);
+    } else if let Value::Object(child) = object.get_or_insert_with(key, || make_value(new_map())) {
+        write_keys(Rc::make_mut(child), rest, value, lowercase);
+    }
+}
+
 /// How removal treats containers it leaves empty.
 #[derive(Clone, Copy)]
 enum Prune {
@@ -691,7 +780,6 @@ enum Prune {
 }
 
 /// Remove a consumed alias leaf without discarding unrelated siblings.
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn remove(map: &mut ObjMap, segments: &[Segment]) {
     remove_with(map, segments, Prune::Empty);
 }
@@ -741,7 +829,6 @@ fn remove_value(value: &mut Value, segments: &[Segment], prune: Prune) -> bool {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn remove_object(object: &mut Object, segments: &[Segment], prune: bool) -> bool {
     remove_in_object(
         object,

@@ -5,7 +5,9 @@
 
 use super::obj_map::{make_value, new_map, ObjMap};
 use super::path::{self, Segment};
+use super::{denormalizer, normalizer, AliasRegistry};
 use crate::Value;
+use alloc::string::ToString as _;
 use alloc::vec;
 use serde_json::{json, Value as Json};
 
@@ -449,4 +451,430 @@ fn rename_lowercases_new_keys() {
     let mut map = map_of(json!({"a": 1}));
     path::rename(&mut map, "a", "New.Key", true);
     assert_eq!(make_value(map), Value::from(json!({"new": {"key": 1}})));
+}
+
+fn registry(resource_type: &str, aliases: &[(&str, &str)]) -> AliasRegistry {
+    let entries: vec::Vec<_> = aliases
+        .iter()
+        .map(|(short, arm)| {
+            json!({"name": alloc::format!("{resource_type}/{short}"), "defaultPath": arm})
+        })
+        .collect();
+    let mut registry = AliasRegistry::new();
+    let (namespace, resource) = resource_type.split_once('/').unwrap();
+    registry
+        .load_from_json(
+            &json!([{
+                "namespace": namespace,
+                "resourceTypes": [{"resourceType": resource, "aliases": entries}]
+            }])
+            .to_string(),
+        )
+        .unwrap();
+    registry
+}
+
+fn denorm(aliases: &[(&str, &str)], input: Json) -> Value {
+    let registry = registry("Test/widgets", aliases);
+    denormalizer::denormalize_with_aliases(&Value::from(input), registry.get("Test/widgets"), None)
+}
+
+fn round_trip(aliases: &[(&str, &str)], raw: Json, normalized: Option<Json>) {
+    let registry = registry("Test/widgets", aliases);
+    let raw = Value::from(raw);
+    let actual = normalizer::normalize(&raw, Some(&registry), None);
+    if let Some(normalized) = normalized {
+        assert_eq!(actual, Value::from(normalized), "{aliases:?}");
+    }
+    assert_eq!(registry.denormalize(&actual, None), raw, "{aliases:?}");
+}
+
+#[test]
+fn set_keys_uses_exact_keys_and_refuses_non_objects() {
+    let mut map = map_of(json!({"Config": {"a": 1}, "n": null, "s": 3}));
+    assert!(path::set_keys(
+        &mut map,
+        &segments("config.B"),
+        Value::from(2),
+        true
+    ));
+    for blocked in ["n.x", "s.x", "n.x.y"] {
+        assert!(!path::set_keys(
+            &mut map,
+            &segments(blocked),
+            Value::from(4),
+            false
+        ));
+    }
+    assert_eq!(
+        make_value(map),
+        Value::from(json!({"Config": {"a": 1}, "config": {"b": 2}, "n": null, "s": 3}))
+    );
+}
+
+#[test]
+fn non_dotted_alias_paths_stay_literal_keys() {
+    let literal = |text: &str| vec![Segment::Key(crate::Rc::from(text))];
+    assert_eq!(path::alias_segments("a.b"), segments("a.b"));
+    assert_eq!(path::alias_segments("['a']"), literal("['a']"));
+    assert_eq!(path::alias_segments("a[0]"), literal("a[0]"));
+    assert_eq!(
+        path::alias_segments("x. legacy"),
+        vec![Segment::Key("x".into()), Segment::Key(" legacy".into())]
+    );
+}
+
+#[test]
+fn chained_removals_precede_writes() {
+    for (input, expected) in [
+        (
+            json!({"a": 1, "b": 2}),
+            json!({"properties": {"b": 1, "c": 2}}),
+        ),
+        (
+            json!({"a": 1, "other": 2}),
+            json!({"properties": {"b": 1, "other": 2}}),
+        ),
+    ] {
+        assert_eq!(
+            denorm(&[("a", "properties.b"), ("b", "properties.c")], input),
+            Value::from(expected)
+        );
+    }
+    assert_eq!(
+        denorm(
+            &[("a.x", "properties.b.x"), ("b.x", "properties.c.x")],
+            json!({"a": {"x": 1}, "b": {"x": 2, "sibling": 3}})
+        ),
+        Value::from(json!({"properties": {"b": {"x": 1, "sibling": 3}, "c": {"x": 2}}}))
+    );
+}
+
+#[test]
+fn unsuccessful_writes_preserve_short_value() {
+    for arm in ["properties", "properties.target.x"] {
+        assert_eq!(
+            denorm(
+                &[("alias.x", arm)],
+                json!({"alias": {"x": 1, "sibling": 3}, "target": 7})
+            ),
+            Value::from(json!({"properties": {"alias": {"x": 1, "sibling": 3}, "target": 7}})),
+            "{arm}"
+        );
+    }
+    assert_eq!(
+        denorm(
+            &[("alias.x", "properties.target.x")],
+            json!({"alias": {"x": 1}, "target": {}})
+        ),
+        Value::from(json!({"properties": {"target": {"x": 1}}}))
+    );
+    assert_eq!(
+        denorm(&[("a", "properties.a.x")], json!({"a": 1})),
+        Value::from(json!({"properties": {"a": {"x": 1}}}))
+    );
+    assert_eq!(
+        denorm(
+            &[("a", "properties.target"), ("b.x", "properties.target.x")],
+            json!({"a": 1, "b": {"x": 2, "sibling": 3}})
+        ),
+        Value::from(json!({"properties": {"target": 1, "b": {"x": 2, "sibling": 3}}}))
+    );
+    assert_eq!(
+        denorm(
+            &[("z", "properties.target"), ("b.x", "properties.target.x")],
+            json!({"z": 1, "b": {"x": 2}})
+        ),
+        Value::from(json!({"properties": {"target": 1, "b": {"x": 2}}}))
+    );
+}
+
+#[test]
+fn data_plane_removes_from_phase_2a_destination() {
+    let registry = registry("Test.Data/widgets", &[("a.b", "x.b")]);
+    for (input, expected) in [
+        (
+            json!({"type": "Test.Data/widgets", "a": {"b": 1, "sibling": 2}}),
+            json!({"type": "Test.Data/widgets", "a": {"sibling": 2}, "x": {"b": 1}}),
+        ),
+        (
+            json!({"type": "Test.Data/widgets", "a": {"other": 1, "sibling": 2}}),
+            json!({"type": "Test.Data/widgets", "a": {"other": 1, "sibling": 2}}),
+        ),
+    ] {
+        assert_eq!(
+            registry.denormalize(&Value::from(input), None),
+            Value::from(expected)
+        );
+    }
+    let raw = Value::from(json!({"type": "Test.Data/widgets", "x": {"b": 1, "sibling": 2}}));
+    let normalized = normalizer::normalize(&raw, Some(&registry), None);
+    assert_eq!(
+        normalized,
+        Value::from(
+            json!({"a": {"b": 1}, "type": "Test.Data/widgets", "x": {"b": 1, "sibling": 2}})
+        )
+    );
+    assert_eq!(registry.denormalize(&normalized, None), raw);
+}
+
+#[test]
+fn dotted_aliases_round_trip() {
+    round_trip(
+        &[("Config.a", "properties.config.a")],
+        json!({"type": "Test/widgets", "properties": {"Config": {"a": 1, "b": 2}}}),
+        Some(json!({"config": {"a": 1, "b": 2}, "type": "Test/widgets"})),
+    );
+    round_trip(
+        &[("a", "properties.b"), ("b", "properties.c")],
+        json!({"type": "Test/widgets", "properties": {"b": 1, "c": 2}}),
+        Some(json!({"a": 1, "b": 2, "c": 2, "type": "Test/widgets"})),
+    );
+    round_trip(
+        &[("a.x", "properties.b.x"), ("b.x", "properties.c.x")],
+        json!({"type": "Test/widgets", "properties": {"b": {"x": 1, "sibling": 3}, "c": {"x": 2}}}),
+        None,
+    );
+}
+
+/// Normalized data at an alias's short path is read as the alias value, as
+/// Azure Policy's `field()` reads it, even when the ARM resource had a raw
+/// field there; telling the two apart is A28.
+#[test]
+fn plain_denormalize_consumes_raw_short_path_data() {
+    let registry = registry("Test/widgets", &[("settings.flag", "properties.flag")]);
+    assert_eq!(
+        registry.denormalize(
+            &Value::from(json!({"type": "Test/widgets", "settings": {"flag": true, "other": 1}})),
+            None
+        ),
+        Value::from(
+            json!({"type": "Test/widgets", "properties": {"flag": true, "settings": {"other": 1}}})
+        )
+    );
+}
+
+#[test]
+fn reverse_leaf_remaps_precede_base_renames() {
+    let aliases = [
+        ("myrules[*]", "properties.rules[*]"),
+        ("myrules[*].x", "properties.rules[*].y"),
+    ];
+    assert_eq!(
+        denorm(&aliases, json!({"myrules": [{"x": 1}]})),
+        Value::from(json!({"properties": {"rules": [{"y": 1}]}}))
+    );
+    assert_eq!(
+        denorm(
+            &[("renamed[*].leaf", "properties.original[*].arm")],
+            json!({"renamed": [{"leaf": 1, "other": 2}]})
+        ),
+        Value::from(json!({"properties": {"original": [{"arm": 1, "other": 2}]}}))
+    );
+}
+
+#[test]
+fn failed_element_remap_keeps_source() {
+    assert_eq!(
+        denorm(
+            &[("rules[*].displayName", "properties.rules[*].target.x")],
+            json!({"rules": [{"displayName": "x", "target": 5}, {"displayName": "y"}]})
+        ),
+        Value::from(json!({"properties": {"rules": [
+            {"displayName": "x", "target": 5},
+            {"target": {"x": "y"}}
+        ]}}))
+    );
+    for parent in [json!(5), json!(null)] {
+        round_trip(
+            &[("rules[*].display.name", "properties.rules[*].target.x")],
+            json!({"type": "Test/widgets", "properties": {"rules": [{"target": {"x": "v"}, "display": parent}]}}),
+            Some(
+                json!({"type": "Test/widgets", "rules": [{"target": {"x": "v"}, "display": parent}]}),
+            ),
+        );
+    }
+}
+
+#[test]
+fn whole_properties_alias_round_trips() {
+    round_trip(
+        &[("x", "properties")],
+        json!({"type": "Test/widgets", "properties": {"a": 1}}),
+        Some(json!({"type": "Test/widgets", "a": 1, "x": {"a": 1}})),
+    );
+    assert_eq!(
+        denorm(
+            &[("x", "properties")],
+            json!({"a": 1, "x": {"a": 2, "b": 3}})
+        ),
+        Value::from(json!({"properties": {"a": 2, "b": 3}}))
+    );
+    // A non-object value cannot replace `properties`.
+    assert_eq!(
+        denorm(&[("x", "properties")], json!({"x": 5, "a": 1})),
+        Value::from(json!({"properties": {"a": 1}}))
+    );
+    for value in [json!(null), json!(5)] {
+        round_trip(
+            &[("x", "properties")],
+            json!({"type": "Test/widgets", "properties": value}),
+            Some(json!({"type": "Test/widgets", "x": value})),
+        );
+    }
+}
+
+#[test]
+fn root_field_short_path_is_not_moved() {
+    // The normalizer merges into the root field, so a value there may be the
+    // resource's own.
+    round_trip(
+        &[("sku.name", "properties.sku.name")],
+        json!({"type": "Test/widgets", "sku": {"name": "S", "tier": "t"}}),
+        Some(json!({"type": "Test/widgets", "sku": {"name": "S", "tier": "t"}})),
+    );
+    assert_eq!(
+        denorm(
+            &[("sku.name", "properties.hardwareProfile.vmSize")],
+            json!({"sku": {"name": "D2"}})
+        ),
+        Value::from(json!({"sku": {"name": "D2"}}))
+    );
+}
+
+#[test]
+fn dotted_base_of_other_aliases_is_not_moved() {
+    for (aliases, raw, expected) in [
+        (
+            [
+                ("a.b", "properties.x.y"),
+                ("a.b[*].c", "properties.x.y[*].d"),
+            ],
+            json!({"x": {"y": [{"d": 1}]}}),
+            json!({"a": {"b": [{"d": 1}]}, "x": {"y": [{"d": 1}]}}),
+        ),
+        (
+            [
+                ("cfg.list", "properties.cfg.items"),
+                ("cfg.list[*].f", "properties.cfg.items[*].g"),
+            ],
+            json!({"cfg": {"items": [{"g": 1}]}}),
+            json!({"cfg": {"items": [{"g": 1}], "list": [{"g": 1}]}}),
+        ),
+        (
+            [
+                ("cfg.data", "properties.config"),
+                (
+                    "cfg.data.rules[*].x",
+                    "properties.config.rules[*].properties.x",
+                ),
+            ],
+            json!({"config": {"rules": [{"properties": {"x": 1}}]}}),
+            json!({
+                "cfg": {"data": {"rules": [{"properties": {"x": 1}}]}},
+                "config": {"rules": [{"properties": {"x": 1}}]}
+            }),
+        ),
+    ] {
+        let registry = registry("Test/widgets", &aliases);
+        let raw = Value::from(json!({"type": "Test/widgets", "properties": raw}));
+        let normalized = normalizer::normalize(&raw, Some(&registry), None);
+        assert_eq!(
+            registry.denormalize(&normalized, None),
+            Value::from(json!({"type": "Test/widgets", "properties": expected})),
+            "{aliases:?}"
+        );
+    }
+}
+
+#[test]
+fn dotted_and_non_dotted_paths_meet() {
+    let raw = json!({"type": "Test/widgets", "properties": {"a": {"b": 1}}});
+    for arm in ["properties.x[0]", "properties['a.b']"] {
+        round_trip(
+            &[("a.b", arm)],
+            raw.clone(),
+            Some(json!({"type": "Test/widgets", "a": {"b": 1}})),
+        );
+    }
+    round_trip(
+        &[("['a']", "properties.x.y")],
+        json!({"type": "Test/widgets", "properties": {"x": {"y": 1, "z": 2}}}),
+        Some(json!({"type": "Test/widgets", "['a']": 1, "x": {"y": 1, "z": 2}})),
+    );
+    let mut versioned = AliasRegistry::new();
+    versioned
+        .load_from_json(
+            &json!([{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{
+                "name": "Test/widgets/a.b",
+                "defaultPath": "properties.x.b",
+                "paths": [{"path": "properties.x[0]", "apiVersions": ["2024-01-01"]}]
+            }]}]}])
+            .to_string(),
+        )
+        .unwrap();
+    for (version, normalized) in [
+        (
+            None,
+            json!({"type": "Test/widgets", "a": {"b": 1}, "x": {"b": 1}}),
+        ),
+        (
+            Some("2024-01-01"),
+            json!({"type": "Test/widgets", "a": {"b": 1}}),
+        ),
+    ] {
+        let raw = Value::from(match version {
+            None => json!({"type": "Test/widgets", "properties": {"x": {"b": 1}}}),
+            Some(_) => raw.clone(),
+        });
+        let actual = normalizer::normalize(&raw, Some(&versioned), version);
+        assert_eq!(actual, Value::from(normalized), "{version:?}");
+        assert_eq!(versioned.denormalize(&actual, version), raw, "{version:?}");
+    }
+    let entries = &versioned.get("Test/widgets").unwrap().entries;
+    assert!(entries["a.b"].nested_short_name);
+    for (short, dotted) in [
+        ("a.b", true),
+        ("a", true),
+        ("['a']", false),
+        ("x. legacy", false),
+        ("a[0]", false),
+    ] {
+        let single = registry("Test/widgets", &[(short, "properties.x")]);
+        let entry = single
+            .get("Test/widgets")
+            .unwrap()
+            .entries
+            .values()
+            .next()
+            .unwrap();
+        assert_eq!(entry.nested_short_name, dotted, "{short}");
+    }
+}
+
+#[test]
+fn moves_skip_paths_other_phases_own() {
+    // A bracketed spelling of the short name still extends it.
+    round_trip(
+        &[
+            ("a.b", "properties.x.y"),
+            ("a['b'][*].c", "properties.x.y[*].d"),
+        ],
+        json!({"type": "Test/widgets", "properties": {"a": {"b": [{"d": 1}]}, "x": {"y": [{"d": 1}]}}}),
+        None,
+    );
+    // A collision key is phase 2a's to rename.
+    round_trip(
+        &[("_p_sku.name", "properties.foo"), ("sku", "properties.sku")],
+        json!({"type": "Test/widgets", "sku": {"name": "S"}, "properties": {"sku": {"name": "S"}}}),
+        None,
+    );
+    // Root fields stay on the data plane too.
+    let registry = registry(
+        "Test.Data/widgets",
+        &[("SKU.name", "properties.hardwareProfile.vmSize")],
+    );
+    let raw = Value::from(json!({"type": "Test.Data/widgets", "sku": {"name": "D2"}}));
+    let normalized = normalizer::normalize(&raw, Some(&registry), None);
+    assert_eq!(registry.denormalize(&normalized, None), raw);
 }

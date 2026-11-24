@@ -19,9 +19,10 @@ use crate::Value;
 use crate::Rc;
 
 use super::obj_map::{
-    extract_type_field, is_root_field_collision, make_value, new_map, obj_insert,
-    set_nested_verbatim, val_str, ROOT_FIELDS,
+    extract_type_field, is_root_field_collision, make_value, new_map, obj_insert, val_str,
+    ROOT_FIELDS,
 };
+use super::path::{self, Segment};
 use super::types::ResolvedAliases;
 use super::AliasRegistry;
 
@@ -120,8 +121,16 @@ pub fn denormalize_with_aliases(
         }
     }
 
-    // Phase 2b: Aliased scalar fields → versioned ARM paths.
+    // Phase 2b: Aliased scalar fields → versioned ARM paths. A plain dotted
+    // short name of several keys is read at its nested path and moved out of
+    // where phase 1 or 2a put it; other short names are one key, which phase
+    // 2a skipped. Short names that are not plain dotted keys (`x. legacy`)
+    // are looked up as one key, though the normalizer wrote them nested.
+    // Sources are removed before any value is written, so a write is not
+    // consumed as another alias's source. A moved value whose write fails
+    // stays at its source; a refused single-key write leaves no value.
     if let Some(entries) = entries {
+        let mut moves = Vec::new();
         for (lc_key, entry) in entries {
             if entry.is_wildcard {
                 continue;
@@ -146,21 +155,96 @@ pub fn denormalize_with_aliases(
                     val_str(k).is_some_and(|s| s.eq_ignore_ascii_case(&normalized_key))
                 })
             });
-            let Some((read, val)) = found.and_then(|(k, v)| Some((val_str(k)?, v))) else {
-                continue;
-            };
-
-            let arm_path = entry.select_path(api_version);
-            let denorm_val = denormalize_value(val, &casing_map);
-
-            // A write refused by a non-object on the way leaves no value.
-            if let Some(props_path) = arm_path.strip_prefix("properties.") {
-                if set_nested_verbatim(&mut properties, props_path, denorm_val) {
-                    writes.record_alias(false, props_path, lc_key, read);
+            let arm = entry.select_path_segments(api_version);
+            let (at_root, target) = match arm.split_first() {
+                Some((Segment::Key(key), rest)) if &**key == "properties" && !rest.is_empty() => {
+                    (false, rest)
                 }
-            } else if set_nested_verbatim(&mut result, arm_path, denorm_val) {
-                writes.record_alias(true, arm_path, lc_key, read);
+                _ => (true, arm),
+            };
+            let short = entry.short_segments.as_slice();
+            let (read, val, source) = match short {
+                [Segment::Key(first), _, ..] if entry.nested_short_name => {
+                    // Not moved: a key phase 2a skipped as another alias's or
+                    // renamed from a collision key, a root field phase 1
+                    // copied whole, and a non-dotted ARM path.
+                    let first = first.to_ascii_lowercase();
+                    if entries.contains_key(first.as_str())
+                        || first.starts_with("_p_")
+                        || ROOT_FIELDS.iter().any(|f| f.eq_ignore_ascii_case(&first))
+                        || !path::renders_dotted(arm)
+                        || arm
+                            .iter()
+                            .any(|s| matches!(s, Segment::Key(k) if k.is_empty()))
+                    {
+                        continue;
+                    }
+                    let Some(val) = path::get(normalized, short, true) else {
+                        continue;
+                    };
+                    if is_data_plane == at_root && path::equivalent(short, target) {
+                        continue;
+                    }
+                    (lc_key.clone(), val, Some(is_data_plane))
+                }
+                _ => {
+                    let Some((read, val)) = found.and_then(|(k, v)| Some((val_str(k)?, v))) else {
+                        continue;
+                    };
+                    (String::from(read), val, None)
+                }
+            };
+            let value = denormalize_value(val, &casing_map);
+            moves.push(ScalarWrite {
+                key: lc_key,
+                read,
+                short,
+                source,
+                at_root,
+                target,
+                value,
+                written: true,
+            });
+        }
+
+        // A shorter target written later would replace a longer one.
+        moves.sort_by_key(|write| write.target.len());
+        let backup = moves
+            .iter()
+            .any(|write| write.source.is_some())
+            .then(|| (properties.clone(), result.clone()));
+        loop {
+            for write in moves.iter().filter(|write| write.written) {
+                match write.source {
+                    Some(true) => path::remove(&mut result, write.short),
+                    Some(false) => path::remove(&mut properties, write.short),
+                    None => {}
+                }
             }
+            let mut retry = false;
+            for write in moves.iter_mut().filter(|write| write.written) {
+                let map = if write.at_root {
+                    &mut result
+                } else {
+                    &mut properties
+                };
+                // Phase 4 replaces a non-object `properties`.
+                let replaced = write.source.is_some()
+                    && write.at_root
+                    && matches!(write.target, [Segment::Key(key)] if &**key == "properties")
+                    && !matches!(write.value, Value::Object(_));
+                if replaced || !path::set_keys(map, write.target, write.value.clone(), false) {
+                    write.written = false;
+                    retry |= write.source.is_some();
+                }
+            }
+            match (&backup, retry) {
+                (Some((p, r)), true) => (properties, result) = (p.clone(), r.clone()),
+                _ => break,
+            }
+        }
+        for write in moves.iter().filter(|write| write.written) {
+            writes.record_alias(write.at_root, write.target, write.key, &write.read);
         }
 
         // Phase 2c + 2d: Use precomputed renames/remaps.
@@ -196,16 +280,16 @@ pub fn denormalize_with_aliases(
             for rev in &agg.reverse_element_remaps {
                 let remap = ElementRemap {
                     array_chain: rev.array_chain.clone(),
-                    source_field: rev.source_field.clone(),
-                    target_field: if rev.target_field.contains('.') {
-                        rev.target_field
-                            .split('.')
-                            .map(|segment| restore_casing(segment, &casing_map))
-                            .collect::<alloc::vec::Vec<_>>()
-                            .join(".")
-                    } else {
-                        restore_casing(&rev.target_field, &casing_map)
-                    },
+                    source_field: path::alias_segments(&rev.source_field),
+                    target_field: path::alias_segments(&rev.target_field)
+                        .into_iter()
+                        .map(|segment| match segment {
+                            Segment::Key(key) => {
+                                Segment::Key(Rc::from(restore_casing(&key, &casing_map)))
+                            }
+                            other => other,
+                        })
+                        .collect(),
                 };
                 // Follow an outer array phase 2b moved to its ARM path, or
                 // phase 2c renamed (the normalizer remapped it after renaming).
@@ -290,6 +374,22 @@ pub fn denormalize_with_aliases(
     }
 
     make_value(result)
+}
+
+/// A phase 2b write of a plain alias's value at its ARM path.
+struct ScalarWrite<'a> {
+    /// The alias's lowercase short name.
+    key: &'a str,
+    /// The normalized key the value was read from.
+    read: String,
+    short: &'a [Segment],
+    /// Where phase 1 or 2a put a value that is moved: `Some(true)` at the
+    /// ARM root, `Some(false)` in `properties`.
+    source: Option<bool>,
+    at_root: bool,
+    target: &'a [Segment],
+    value: Value,
+    written: bool,
 }
 
 /// Point an element remap's array chain at the ARM base phase 2c renamed its

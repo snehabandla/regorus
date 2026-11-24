@@ -18,8 +18,7 @@ use alloc::vec::Vec;
 
 use serde::{Deserialize, Deserializer};
 
-use crate::Rc;
-
+use super::path::Segment;
 // ---------------------------------------------------------------------------
 // Deserialization helpers
 // ---------------------------------------------------------------------------
@@ -431,13 +430,18 @@ pub struct ResolvedEntry {
     /// Quoted keys such as `['[*]']` are not wildcards. A short name that does
     /// not parse falls back to a textual `[*]` check.
     pub is_wildcard: bool,
-    /// Pre-lowercased short name as `Rc<str>` for allocation-free common-case inserts.
-    pub(crate) short_name_lc: Rc<str>,
-    /// Precomputed `default_path.split('.').collect()` for fast ARM path navigation.
-    pub(crate) default_path_segments: Vec<Rc<str>>,
-    /// Precomputed path segments for each versioned path, in the same order
-    /// as `versioned_paths`.
-    pub(crate) versioned_path_segments: Vec<Vec<Rc<str>>>,
+    /// [`super::path::alias_segments`] of `short_name`.
+    pub(crate) short_segments: Vec<Segment>,
+    /// Whether the denormalizer moves the value at the nested short path:
+    /// `short_name` is plain dotted keys and, once resolved, no other alias
+    /// extends it (later phases find those at the short path). Other short
+    /// names are read as one literal key.
+    pub(crate) nested_short_name: bool,
+    /// [`super::path::alias_segments`] of `default_path`.
+    pub(crate) default_path_segments: Vec<Segment>,
+    /// [`super::path::alias_segments`] of each versioned path, in the same
+    /// order as `versioned_paths`.
+    pub(crate) versioned_path_segments: Vec<Vec<Segment>>,
 }
 
 impl ResolvedEntry {
@@ -452,15 +456,13 @@ impl ResolvedEntry {
             || short_name.contains("[*]"),
             |path| path.segments.contains(&super::path::Segment::Wildcard),
         );
-        let short_name_lc = if short_name.bytes().all(|b| !b.is_ascii_uppercase()) {
-            Rc::from(short_name.as_str())
-        } else {
-            Rc::from(short_name.to_ascii_lowercase())
-        };
-        let default_path_segments = default_path.split('.').map(Rc::from).collect();
+        let short_segments = super::path::alias_segments(&short_name);
+        let nested_short_name =
+            super::path::parse(&short_name).is_some_and(|path| path.segments == short_segments);
+        let default_path_segments = super::path::alias_segments(&default_path);
         let versioned_path_segments = versioned_paths
             .iter()
-            .map(|(_, p)| p.split('.').map(Rc::from).collect())
+            .map(|(_, p)| super::path::alias_segments(p))
             .collect();
         Self {
             short_name,
@@ -468,7 +470,8 @@ impl ResolvedEntry {
             versioned_paths,
             metadata,
             is_wildcard,
-            short_name_lc,
+            short_segments,
+            nested_short_name,
             default_path_segments,
             versioned_path_segments,
         }
@@ -494,7 +497,7 @@ impl ResolvedEntry {
     /// Returns the versioned segments if `api_version` matches, otherwise
     /// the default segments.  This avoids per-call `split('.')` for both
     /// default and versioned scalar alias navigation.
-    pub(crate) fn select_path_segments(&self, api_version: Option<&str>) -> &[Rc<str>] {
+    pub(crate) fn select_path_segments(&self, api_version: Option<&str>) -> &[Segment] {
         if let Some(ver) = api_version {
             for (i, (v, _)) in self.versioned_paths.iter().enumerate() {
                 if v.eq_ignore_ascii_case(ver) {
