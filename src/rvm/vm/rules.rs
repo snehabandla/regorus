@@ -113,6 +113,17 @@ impl RegoVM {
                 self.loop_stack.clear();
                 self.comprehension_stack.clear();
 
+                #[cfg(feature = "explanations")]
+                if self.explain_enabled() {
+                    if let Err(e) = self.explain_begin_attempt() {
+                        self.restore_rule_state(
+                            &mut previous_loop_stack,
+                            &mut previous_comprehension_stack,
+                        );
+                        return Err(e);
+                    }
+                }
+
                 if let Some(destructuring_entry_point) =
                     rule_info.destructuring_blocks.get(def_idx).and_then(|x| *x)
                 {
@@ -135,6 +146,13 @@ impl RegoVM {
                             return Err(e);
                         }
                         Err(_e) => {
+                            #[cfg(feature = "explanations")]
+                            if self.explain_enabled() {
+                                self.explain_end_attempt(
+                                    Some(crate::explain::Outcome::Undefined),
+                                    None,
+                                );
+                            }
                             continue 'outer;
                         }
                     }
@@ -726,6 +744,11 @@ impl RegoVM {
                 self.registers
                     .resize(frame_data.num_registers, Value::Undefined);
 
+                #[cfg(feature = "explanations")]
+                if self.explain_enabled() {
+                    self.explain_begin_attempt()?;
+                }
+
                 if let Some(destructuring_entry_point) = rule_info
                     .destructuring_blocks
                     .get(frame_data.current_definition_index)
@@ -1037,6 +1060,10 @@ impl RegoVM {
         #[cfg(feature = "explanations")]
         if self.explain_enabled() && frame_data.phase == RuleFramePhase::ExecutingBody {
             self.explain_body_end(false, None);
+        }
+        #[cfg(feature = "explanations")]
+        if self.explain_enabled() && frame_data.phase == RuleFramePhase::ExecutingDestructuring {
+            self.explain_end_attempt(Some(crate::explain::Outcome::Undefined), None);
         }
         self.rule_frame_after_failure(frame_data, &rule_info)
     }

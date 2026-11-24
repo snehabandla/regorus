@@ -13,7 +13,8 @@ use core::fmt;
 
 use crate::builtins::types::get_type;
 use crate::explain::{
-    BodyEndEvent, BuiltinErrorEvent, CallEndEvent, CallResultSource, CallReusedEvent,
+    AttemptEndEvent, AttemptStartEvent, BodyEndEvent, BuiltinErrorEvent, CallEndEvent,
+    CallResultSource, CallReusedEvent,
     CallStartEvent, CheckEvent, ComprehensionElement, ComprehensionEmissionEvent, ConditionKind,
     EmissionEvent, ExplanationRecorder, HookContext, NotCapturedEvent, Operator, Outcome,
     UncapturedConstruct,
@@ -30,6 +31,7 @@ use super::machine::RegoVM;
 pub(super) struct ExplainHooks {
     recorder: Option<Box<dyn ExplanationRecorder>>,
     next_call: u64,
+    next_attempt: u64,
     calls: Vec<Invocation>,
     cached_calls: Vec<Option<u64>>,
     /// Run-to-completion only: smallest call depth whose frame was inside a
@@ -42,6 +44,7 @@ pub(super) struct ExplainHooks {
 
 struct Invocation {
     context: HookContext,
+    attempt: Option<HookContext>,
     defaulted: bool,
     cacheable: bool,
 }
@@ -119,13 +122,14 @@ impl RegoVM {
             }),
         };
         let rule = self.call_rule_stack.last();
+        let invocation = self
+            .explain
+            .calls
+            .last()
+            .filter(|call| call.context.call_depth == call_depth);
         HookContext {
-            call_instance: self
-                .explain
-                .calls
-                .last()
-                .filter(|call| call.context.call_depth == call_depth)
-                .and_then(|call| call.context.call_instance),
+            call_instance: invocation.and_then(|call| call.context.call_instance),
+            attempt: invocation.and_then(|call| call.attempt.and_then(|ctx| ctx.attempt)),
             pc,
             rule_index: rule.map(|ctx| ctx.rule_index),
             definition_index: rule.map_or(0, |ctx| ctx.current_definition_index),
@@ -186,6 +190,7 @@ impl RegoVM {
 
     pub(super) fn explain_reset_identity(&mut self) {
         self.explain.next_call = 0;
+        self.explain.next_attempt = 0;
         self.explain.cached_calls.clear();
     }
 
@@ -220,6 +225,7 @@ impl RegoVM {
         self.explain.next_call = id;
         let context = HookContext {
             call_instance: Some(id),
+            attempt: None,
             rule_index: Some(rule_index),
             definition_index: 0,
             body_index: 0,
@@ -228,6 +234,7 @@ impl RegoVM {
         };
         self.explain.calls.push(Invocation {
             context,
+            attempt: None,
             defaulted: false,
             cacheable,
         });
@@ -291,6 +298,15 @@ impl RegoVM {
     }
 
     fn explain_deliver_call_end(&mut self, call: Invocation, result: Option<&Value>) {
+        if let Some(context) = call.attempt {
+            // An invocation ending with an open attempt has no captured
+            // completion for that attempt (including mixed-mode unwind).
+            let event = AttemptEndEvent {
+                outcome: None,
+                result: None,
+            };
+            self.explain_deliver(|_, recorder| recorder.attempt_end(&context, &event));
+        }
         let source = result.map(|value| {
             if call.defaulted {
                 CallResultSource::Default
@@ -317,6 +333,61 @@ impl RegoVM {
     pub(super) fn explain_abort_calls(&mut self) {
         while let Some(call) = self.explain.calls.pop() {
             self.explain_deliver_call_end(call, None);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub(super) fn explain_begin_attempt(&mut self) -> Result<()> {
+        let mut context = self.explain_context();
+        if context.call_instance.is_none() {
+            return Ok(());
+        }
+        let id = self
+            .explain
+            .next_attempt
+            .checked_add(1)
+            .filter(|id| *id < (1_u64 << 53))
+            .ok_or(VmError::NumericOverflow {
+                operation: "explanation attempt id",
+                pc: self.pc,
+            })?;
+        self.explain.next_attempt = id;
+        self.explain_end_attempt(None, None);
+        context.attempt = Some(id);
+        if let Some(call) = self.explain.calls.last_mut() {
+            call.attempt = Some(context);
+        }
+        let event = AttemptStartEvent { attempt: id };
+        self.explain_deliver(|_, recorder| recorder.attempt_start(&context, &event));
+        Ok(())
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub(super) fn explain_end_attempt(
+        &mut self,
+        outcome: Option<Outcome>,
+        result_reg: Option<u8>,
+    ) {
+        let depth = self.call_rule_stack.len();
+        let context = self
+            .explain
+            .calls
+            .last_mut()
+            .filter(|call| call.context.call_depth == depth)
+            .and_then(|call| call.attempt.take());
+        if let Some(mut context) = context {
+            context.pc = self.pc;
+            self.explain_deliver(|vm, recorder| {
+                let event = AttemptEndEvent {
+                    outcome,
+                    result: result_reg
+                        .filter(|_| outcome == Some(Outcome::Success))
+                        .map(|reg| vm.explain_register(reg)),
+                };
+                recorder.attempt_end(&context, &event);
+            });
         }
     }
 
@@ -773,6 +844,7 @@ impl RegoVM {
             };
             recorder.body_end(&vm.explain_context(), &event);
         });
+        self.explain_end_attempt(Some(passed_outcome(succeeded)), result_reg);
     }
 
     #[cold]

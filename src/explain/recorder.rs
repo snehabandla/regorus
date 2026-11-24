@@ -65,6 +65,15 @@ pub trait ExplanationRecorder: Send + Sync {
     /// A caller uses a cached rule result. No new invocation is created.
     fn call_reused(&mut self, _context: &HookContext, _event: &CallReusedEvent) {}
 
+    /// A definition/body attempt starts, before parameter matching.
+    /// `context` identifies the callee invocation, definition, body and attempt.
+    /// Each `else` body starts a separate attempt.
+    fn attempt_start(&mut self, _context: &HookContext, _event: &AttemptStartEvent) {}
+
+    /// An attempt completes or aborts, before its invocation ends.
+    /// A rejected parameter match is undefined, not a failed body.
+    fn attempt_end(&mut self, _context: &HookContext, _event: &AttemptEndEvent<'_>) {}
+
     /// A check in a rule body was executed.
     fn check(&mut self, _context: &HookContext, _event: &CheckEvent<'_>) {}
 
@@ -105,6 +114,9 @@ pub struct HookContext {
     /// invocation (including a call already active when capture was installed,
     /// or one whose capture was aborted).
     pub call_instance: Option<u64>,
+    /// Evaluation-local body attempt, or `None` outside a captured attempt.
+    /// Includes parameter matching; query checks and invocation ends have none.
+    pub attempt: Option<u64>,
     /// Program counter of the instruction that produced the event, except
     /// for [`check`](ExplanationRecorder::check), where it is the pc of the
     /// check's site in a Rego program's
@@ -180,6 +192,28 @@ pub struct CallReusedEvent {
     pub call_instance: Option<u64>,
     /// Cached rule's index in the program's rule table.
     pub rule_index: u16,
+}
+
+/// A fresh try of one definition/body within an invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct AttemptStartEvent {
+    /// Sequential evaluation-local identifier, starting at one, independent
+    /// of invocation identifiers. Suspension retains the sequence.
+    pub attempt: u64,
+}
+
+/// A terminal attempt event.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub struct AttemptEndEvent<'a> {
+    /// Success means the body completed, even if its returned value is false.
+    /// Failure means the body failed; undefined means parameter matching
+    /// rejected this attempt. `None` means aborted, never ordinary no-match.
+    pub outcome: Option<Outcome>,
+    /// Complete-rule/function value on success. Partial bodies, failed or
+    /// rejected attempts and aborts have no returned value.
+    pub result: Option<&'a Value>,
 }
 
 /// A check in a rule body.
