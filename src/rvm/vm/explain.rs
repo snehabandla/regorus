@@ -378,7 +378,9 @@ impl RegoVM {
             .filter(|call| call.context.call_depth == depth)
             .and_then(|call| call.attempt.take());
         if let Some(mut context) = context {
-            context.pc = self.pc;
+            if outcome.is_some() {
+                context.pc = self.pc;
+            }
             self.explain_deliver(|vm, recorder| {
                 let event = AttemptEndEvent {
                     outcome,

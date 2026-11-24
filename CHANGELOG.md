@@ -6,6 +6,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- *(explain)* Record invocation-owned body attempts before parameter matching in both RVM modes, including separate `else` attempts, rejected matches, successful false values, and aborted attempts.
+
 ### Changed
 
 - *(parser)* [**breaking**] Reject direct negated assignment (`not x := value`) and negated unification (`not x = value`), including previously accepted OPA-compatible policies. For negated equality, migrate `not input.kind = "Pod"` to `not input.kind == "Pod"`. Positive bindings inside nested comprehensions and `every` bodies remain supported. See the [grammar restriction](docs/grammar.md).

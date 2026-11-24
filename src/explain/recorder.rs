@@ -6,7 +6,8 @@
 //! An [`ExplanationRecorder`] installed on a
 //! [`RegoVM`](crate::rvm::RegoVM) with
 //! [`set_explanation_recorder`](crate::rvm::RegoVM::set_explanation_recorder)
-//! receives one call per executed check, rule-body end, rule emission, comprehension yield,
+//! receives invocation and pre-match attempt lifecycle events, plus one call
+//! per executed check, rule-body end, rule emission, comprehension yield,
 //! builtin error and construct whose contributions are not captured. Events
 //! borrow the VM's values; a recorder copies what it keeps.
 //!
@@ -22,14 +23,16 @@
 //! - Likewise, a builtin call answered from the evaluation's cache reports
 //!   no error again.
 //! - Matching a rule's or function's parameter patterns, such as the `1` in
-//!   `f(1)`, is not reported as checks of its body.
+//!   `f(1)`, is not reported as checks of its body. A rejected match ends its
+//!   attempt with [`Outcome::Undefined`].
 //! - Destructuring an array checks its length, which is reported as a
 //!   comparison of the array's length with the pattern's.
 //! - Iterating an empty collection, or a value that is not a collection,
 //!   runs no iteration and reports no iteration body checks. A guarded loop
 //!   can still report a loop-level [`Iteration`](ConditionKind::Iteration) check.
 //! - Errors that end the evaluation, such as exceeded limits or numeric
-//!   overflow, have no dedicated error event; active invocations end aborted.
+//!   overflow, have no dedicated error event; active attempts and invocations
+//!   end aborted.
 //! - Azure Policy conditions and their logical combinations
 //!   (`allOf`, `anyOf`, `not`) are not reported.
 //!
@@ -124,8 +127,11 @@ pub struct HookContext {
     /// [`site_at`](crate::explain::Provenance::site_at). A check of a value
     /// that must be defined ([`Existence`](ConditionKind::Existence)) has no
     /// site. For [`body_end`](ExplanationRecorder::body_end) it is the
-    /// instruction at which the body ended. Lifecycle start/reuse events
-    /// identify the caller's call site; end events retain that same site.
+    /// instruction at which the body ended. Invocation start/reuse events
+    /// identify the caller's call site; invocation ends retain that site.
+    /// Attempt starts identify the pre-match dispatch site, and completed
+    /// attempt ends identify the instruction where matching/body execution
+    /// ended. Aborted attempts retain their start site.
     pub pc: usize,
     /// Index of the executing rule in the program's rule table, or `None`
     /// outside any rule.

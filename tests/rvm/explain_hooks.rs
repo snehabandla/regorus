@@ -8,7 +8,8 @@
 
 use anyhow::{bail, Result};
 use regorus::explain::{
-    BodyEndEvent, BuiltinErrorEvent, CallEndEvent, CallResultSource, CallReusedEvent,
+    AttemptEndEvent, AttemptStartEvent, BodyEndEvent, BuiltinErrorEvent, CallEndEvent,
+    CallResultSource, CallReusedEvent,
     CallStartEvent, CheckEvent, CheckSite, ComprehensionElement, ComprehensionEmissionEvent,
     ConditionKind, EmissionEvent, ExplanationRecorder, HookContext, NotCapturedEvent, Operator,
     Outcome, Provenance, UncapturedConstruct,
@@ -62,7 +63,17 @@ struct Recorded {
 }
 
 #[derive(Clone, Default)]
-struct Fixture(Arc<Mutex<Vec<Recorded>>>, Arc<Mutex<Vec<CallRecord>>>);
+struct Fixture(
+    Arc<Mutex<Vec<Recorded>>>,
+    Arc<Mutex<Vec<CallRecord>>>,
+    Arc<Mutex<Vec<AttemptRecord>>>,
+);
+
+#[derive(Debug, Clone, PartialEq)]
+enum AttemptRecord {
+    Start(HookContext, AttemptStartEvent),
+    End(HookContext, Option<Outcome>, Option<Value>),
+}
 
 #[derive(Debug, Clone, PartialEq)]
 enum CallRecord {
@@ -85,6 +96,10 @@ impl Fixture {
 
     fn calls(&self) -> Vec<CallRecord> {
         std::mem::take(&mut *self.1.lock().unwrap())
+    }
+
+    fn attempts(&self) -> Vec<AttemptRecord> {
+        std::mem::take(&mut *self.2.lock().unwrap())
     }
 }
 
@@ -113,6 +128,21 @@ impl ExplanationRecorder for Fixture {
             .lock()
             .unwrap()
             .push(CallRecord::Reused(*context, *event));
+    }
+
+    fn attempt_start(&mut self, context: &HookContext, event: &AttemptStartEvent) {
+        self.2
+            .lock()
+            .unwrap()
+            .push(AttemptRecord::Start(*context, *event));
+    }
+
+    fn attempt_end(&mut self, context: &HookContext, event: &AttemptEndEvent<'_>) {
+        self.2.lock().unwrap().push(AttemptRecord::End(
+            *context,
+            event.outcome,
+            event.result.cloned(),
+        ));
     }
 
     fn check(&mut self, context: &HookContext, event: &CheckEvent<'_>) {
@@ -191,6 +221,7 @@ struct Run {
     events: Vec<Recorded>,
     program: Arc<Program>,
     calls: Vec<CallRecord>,
+    attempts: Vec<AttemptRecord>,
 }
 
 fn compile(policy: &str, query: &str) -> Result<Arc<Program>> {
@@ -228,6 +259,7 @@ fn run_program(program: &Arc<Program>, input: &str, mode: ExecutionMode, strict:
         events: fixture.take(),
         program: program.clone(),
         calls: fixture.calls(),
+        attempts: fixture.attempts(),
     }
 }
 
@@ -257,6 +289,25 @@ fn run(policy: &str, query: &str, input: &str) -> Run {
 }
 
 impl Run {
+    fn attempt_ends(&self, call: u64) -> Vec<(usize, usize, Option<Outcome>, Option<Value>)> {
+        self.attempts
+            .iter()
+            .filter_map(|record| match record {
+                AttemptRecord::End(context, outcome, value)
+                    if context.call_instance == Some(call) =>
+                {
+                    Some((
+                        context.definition_index,
+                        context.body_index,
+                        *outcome,
+                        value.clone(),
+                    ))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     fn call_ids(&self, name: &str) -> Vec<u64> {
         self.calls
             .iter()
@@ -1254,6 +1305,186 @@ fn recorder_is_reset_for_each_evaluation() {
 }
 
 #[test]
+fn attempt_matching_rejection_and_false_success_preserve_recorder_off_results() {
+    let program = compile(
+        "package t\nf(1) := false\nf(2) := false\nr := f(input.x)\n",
+        "data.t.r",
+    )
+    .unwrap();
+    for (input, expected, outcomes) in [
+        (
+            r#"{"x":1}"#,
+            Value::Bool(false),
+            vec![(0, 0, Some(Outcome::Success), Some(Value::Bool(false)))],
+        ),
+        (
+            r#"{"x":2}"#,
+            Value::Bool(false),
+            vec![
+                (0, 0, Some(Outcome::Undefined), None),
+                (1, 0, Some(Outcome::Success), Some(Value::Bool(false))),
+            ],
+        ),
+        (
+            r#"{"x":3}"#,
+            Value::Undefined,
+            vec![
+                (0, 0, Some(Outcome::Undefined), None),
+                (1, 0, Some(Outcome::Undefined), None),
+            ],
+        ),
+    ] {
+        for mode in MODES {
+            let r = run_program(&program, input, mode, false);
+            assert_eq!(r.result.as_ref().unwrap(), &expected);
+            let mut baseline = RegoVM::new();
+            baseline.load_program(program.clone());
+            baseline.set_execution_mode(mode);
+            baseline.set_input(v(input));
+            assert_eq!(execute(&mut baseline, mode).unwrap(), expected);
+            assert_eq!(r.attempt_ends(r.call_ids("data.t.f")[0]), outcomes);
+            assert_attempt_pairs(&r.attempts);
+        }
+    }
+}
+
+fn assert_attempt_pairs(records: &[AttemptRecord]) {
+    let mut active = Vec::new();
+    let mut next = 1;
+    for record in records {
+        match record {
+            AttemptRecord::Start(context, event) => {
+                assert_eq!(event.attempt, next);
+                next += 1;
+                assert_eq!(context.attempt, Some(event.attempt));
+                assert!(context.call_instance.is_some());
+                active.push(*context);
+            }
+            AttemptRecord::End(context, _, _) => {
+                let start = active.pop().expect("attempt end without start");
+                assert_eq!(context.attempt, start.attempt);
+                assert_eq!(context.call_instance, start.call_instance);
+                assert_eq!(context.rule_index, start.rule_index);
+                assert_eq!(context.definition_index, start.definition_index);
+                assert_eq!(context.body_index, start.body_index);
+            }
+        }
+    }
+    assert!(active.is_empty(), "unterminated attempts: {active:?}");
+}
+
+#[test]
+fn attempt_else_bodies_have_separate_ownership_and_outcomes() {
+    let program = compile(
+        r#"package t
+f(x) := false if x == 1 else := true if x == 2 else := false if x == 3
+r := [f(input.x),f(input.x)]
+"#,
+        "data.t.r",
+    )
+    .unwrap();
+    for (x, values, bodies) in [
+        (1, "[false,false]", vec![Outcome::Success]),
+        (2, "[true,true]", vec![Outcome::Failure, Outcome::Success]),
+        (
+            3,
+            "[false,false]",
+            vec![Outcome::Failure, Outcome::Failure, Outcome::Success],
+        ),
+        (
+            0,
+            "null",
+            vec![Outcome::Failure, Outcome::Failure, Outcome::Failure],
+        ),
+    ] {
+        for mode in MODES {
+            let input = format!(r#"{{"x":{x}}}"#);
+            let r = run_program(&program, &input, mode, false);
+            let expected = if x == 0 {
+                Value::Undefined
+            } else {
+                v(values)
+            };
+            assert_eq!(r.result.as_ref().unwrap(), &expected);
+            let mut baseline = RegoVM::new();
+            baseline.load_program(program.clone());
+            baseline.set_execution_mode(mode);
+            baseline.set_input(v(&input));
+            assert_eq!(execute(&mut baseline, mode).unwrap(), expected);
+            for id in r.call_ids("data.t.f") {
+                let ends = r.attempt_ends(id);
+                assert_eq!(ends.len(), bodies.len());
+                for (body, (definition, index, outcome, _)) in ends.iter().enumerate() {
+                    assert_eq!(
+                        (*definition, *index, *outcome),
+                        (0, body, Some(bodies[body]))
+                    );
+                }
+            }
+            assert_attempt_pairs(&r.attempts);
+            for record in &r.events {
+                if let Some(context) = record.context {
+                    assert!(context.attempt.is_some(), "{record:?}");
+                }
+            }
+            for record in &r.calls {
+                match record {
+                    CallRecord::Start(context, event) if event.call_instance != 1 => {
+                        assert_eq!(context.call_instance, Some(1));
+                        assert_eq!(context.attempt, Some(1));
+                    }
+                    CallRecord::End(context, _, _) => assert_eq!(context.attempt, None),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn attempt_default_only_and_undefined_arguments_do_not_invent_attempts() {
+    let r = run(
+        "package t\ndefault p := false\nf(x) := x\nr := [p,p,f(input.missing)]\n",
+        "data.t.r",
+        "{}",
+    );
+    assert!(r.attempt_ends(r.call_ids("data.t.p")[0]).is_empty());
+    assert!(r.attempt_ends(r.call_ids("data.t.f")[0]).is_empty());
+    assert_attempt_pairs(&r.attempts);
+}
+
+#[test]
+fn attempt_malformed_destructuring_keeps_recorder_off_semantics() {
+    let compiled = compile("package t\nf(1) := true\nr := f(input.x)\n", "data.t.r").unwrap();
+    let mut program = (*compiled).clone();
+    let function = program
+        .rule_infos
+        .iter()
+        .find(|rule| rule.name == "data.t.f")
+        .unwrap();
+    let matching_pc = function.destructuring_blocks[0].unwrap() as usize;
+    program.instructions[matching_pc] = Instruction::CallRule {
+        dest: 0,
+        rule_index: u16::MAX,
+    };
+    let program = Arc::new(program);
+    for mode in MODES {
+        let mut baseline = RegoVM::new();
+        baseline.load_program(program.clone());
+        baseline.set_execution_mode(mode);
+        baseline.set_input(v(r#"{"x":1}"#));
+        assert_eq!(execute(&mut baseline, mode).unwrap(), Value::Undefined);
+        let r = run_program(&program, r#"{"x":1}"#, mode, false);
+        assert_eq!(r.result.as_ref().unwrap(), &Value::Undefined);
+        assert_eq!(
+            r.attempt_ends(r.call_ids("data.t.f")[0]),
+            [(0, 0, Some(Outcome::Undefined), None)]
+        );
+        assert_attempt_pairs(&r.attempts);
+    }
+}
+
+#[test]
 fn invocation_ids_separate_repeated_calls_and_rejected_parameters() {
     let policy = r#"
 package t
@@ -1613,6 +1844,16 @@ fn invocation_abort_is_not_undefined_and_fresh_evaluation_restarts_ids() {
             })
             .collect();
         assert_eq!(ends, [(Some(2), None, None), (Some(1), None, None)]);
+        let attempts = fixture.attempts();
+        assert_attempt_pairs(&attempts);
+        let aborted: Vec<_> = attempts
+            .iter()
+            .filter_map(|record| match record {
+                AttemptRecord::End(context, None, None) => context.attempt,
+                _ => None,
+            })
+            .collect();
+        assert_eq!(aborted, [2, 1]);
         vm.set_input(v(r#"{"x":1}"#));
         assert_eq!(execute(&mut vm, mode).unwrap(), v("2"));
         let calls = fixture.calls();
@@ -1624,6 +1865,7 @@ fn invocation_abort_is_not_undefined_and_fresh_evaluation_restarts_ids() {
             })
             .collect();
         assert_eq!(starts, [1, 2]);
+        assert_attempt_pairs(&fixture.attempts());
         assert_eq!(
             calls
                 .iter()
@@ -1665,6 +1907,7 @@ fn invocation_identity_survives_host_await_and_late_installation_is_explicit() {
             ExecutionState::Suspended { .. }
         ));
         let before = fixture.calls();
+        let before_attempts = fixture.attempts();
         assert_eq!(
             before
                 .iter()
@@ -1682,6 +1925,18 @@ fn invocation_identity_survives_host_await_and_late_installation_is_explicit() {
             matches!(vm.execution_state(), ExecutionState::Completed { result } if result == &v("[1,7,1]"))
         );
         let after = fixture.calls();
+        let after_attempts = fixture.attempts();
+        if late {
+            assert!(before_attempts.is_empty());
+            assert!(after_attempts.is_empty());
+        } else {
+            assert!(!after_attempts
+                .iter()
+                .any(|record| matches!(record, AttemptRecord::Start(_, _))));
+            let mut attempts = before_attempts;
+            attempts.extend(after_attempts);
+            assert_attempt_pairs(&attempts);
+        }
         let reused: Vec<_> = after
             .iter()
             .filter_map(|record| match record {
@@ -3213,6 +3468,63 @@ fn failed_writes_to_a_partial_rule_result_are_not_emitted() {
             );
         }
     }
+}
+
+struct SlowAttemptStart(Fixture);
+
+impl ExplanationRecorder for SlowAttemptStart {
+    fn call_start(&mut self, context: &HookContext, event: &CallStartEvent) {
+        self.0.call_start(context, event);
+    }
+
+    fn call_end(&mut self, context: &HookContext, event: &CallEndEvent<'_>) {
+        self.0.call_end(context, event);
+    }
+
+    fn attempt_start(&mut self, context: &HookContext, event: &AttemptStartEvent) {
+        self.0.attempt_start(context, event);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    fn attempt_end(&mut self, context: &HookContext, event: &AttemptEndEvent<'_>) {
+        self.0.attempt_end(context, event);
+    }
+}
+
+#[test]
+fn attempt_callback_time_counts_toward_deadline_and_aborts() -> Result<()> {
+    use regorus::utils::limits::ExecutionTimerConfig;
+    use std::num::NonZeroU32;
+
+    let program = compile("package t\nallow if input.a\n", "data.t.allow")?;
+    for mode in MODES {
+        let fixture = Fixture::default();
+        let mut vm = RegoVM::new();
+        vm.load_program(program.clone());
+        vm.set_execution_mode(mode);
+        vm.set_input(v(r#"{"a":true}"#));
+        vm.set_execution_timer_config(Some(ExecutionTimerConfig {
+            limit: std::time::Duration::from_millis(20),
+            check_interval: NonZeroU32::MIN,
+        }));
+        vm.set_explanation_recorder(Box::new(SlowAttemptStart(fixture.clone())));
+        let outcome = vm.execute();
+        assert!(
+            matches!(&outcome, Err(VmError::TimeLimitExceeded { .. })),
+            "{mode:?}: expected a typed deadline error, got {outcome:?}"
+        );
+        let attempts = fixture.attempts();
+        assert_attempt_pairs(&attempts);
+        assert!(matches!(
+            attempts.as_slice(),
+            [AttemptRecord::Start(_, _), AttemptRecord::End(_, None, None)]
+        ));
+        assert!(matches!(
+            fixture.calls().as_slice(),
+            [CallRecord::Start(_, _), CallRecord::End(_, None, None)]
+        ));
+    }
+    Ok(())
 }
 
 struct SlowCallStart(Fixture);
