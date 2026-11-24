@@ -164,16 +164,6 @@ fn segment(key: &Value) -> Option<PathSegment> {
     }
 }
 
-/// The value at `segment` of `value`, as Rego indexes it: a key also
-/// selects a set member and an index an object's number key, so any value a
-/// policy could read at an unknown path counts as supplied.
-fn index(value: &Value, segment: &PathSegment) -> Value {
-    match *segment {
-        PathSegment::Key(ref key) => value[&Value::from(key.as_str())].clone(),
-        PathSegment::Index(i) => value[&Value::from(i)].clone(),
-    }
-}
-
 const fn root_name(root: UnknownRoot) -> &'static str {
     match root {
         UnknownRoot::Input => "input",
