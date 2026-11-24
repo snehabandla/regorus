@@ -42,7 +42,7 @@ fn compile(policy: &str) -> Result<Arc<Program>> {
     let mut engine = Engine::new();
     engine.add_policy("origins.rego".into(), policy.into())?;
     let compiled = engine.compile_with_entrypoint(&Rc::from("data.t.r"))?;
-    Compiler::compile_from_policy(&compiled, &["data.t.r"])
+    Ok(Compiler::compile_from_policy(&compiled, &["data.t.r"])?)
 }
 
 #[test]
@@ -431,6 +431,7 @@ fn overflowing_array_index_never_claims_a_nonexistent_source_slot() -> Result<()
 }
 
 #[test]
+#[cfg(feature = "std")]
 #[allow(clippy::panic_in_result_fn)]
 fn bounded_large_chained_index_observes_deadlines_with_and_without_origins() -> Result<()> {
     use core::num::NonZeroU32;
