@@ -112,7 +112,9 @@ impl RegoVM {
             Move { dest, src } => {
                 let value = self.get_register(src)?.clone();
                 #[cfg(feature = "explanations")]
-                let origin = self.explain_enabled().then(|| self.explain.origins.get(src));
+                let origin = self
+                    .explain_enabled()
+                    .then(|| self.explain.origins.get(src));
                 self.set_register(dest, value)?;
                 #[cfg(feature = "explanations")]
                 if let Some(origin) = origin {

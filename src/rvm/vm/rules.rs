@@ -749,10 +749,9 @@ impl RegoVM {
                     .resize(frame_data.num_registers, Value::Undefined);
                 #[cfg(feature = "explanations")]
                 if self.explain_enabled() {
-                    self.explain.origins.resize(
-                        frame_data.num_retained_registers,
-                        frame_data.num_registers,
-                    );
+                    self.explain
+                        .origins
+                        .resize(frame_data.num_retained_registers, frame_data.num_registers);
                 }
 
                 if let Some(destructuring_entry_point) = rule_info

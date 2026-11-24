@@ -12,8 +12,8 @@ use crate::rvm::instructions::{Instruction, LiteralOrRegister};
 use crate::rvm::program::Program;
 use crate::{Engine, Rc};
 
-use super::{ConcretePath, PathRoot, PathSegment, RegoVM, RuntimeOrigin, Value};
 use super::super::execution_model::{ExecutionMode, ExecutionState};
+use super::{ConcretePath, PathRoot, PathSegment, RegoVM, RuntimeOrigin, Value};
 
 struct Recorder;
 impl ExplanationRecorder for Recorder {}
@@ -38,8 +38,12 @@ fn instruction(vm: &mut RegoVM, program: &Program, instruction: Instruction) {
 
 fn compile(policy: &str) -> Arc<Program> {
     let mut engine = Engine::new();
-    engine.add_policy("origins.rego".into(), policy.into()).unwrap();
-    let compiled = engine.compile_with_entrypoint(&Rc::from("data.t.r")).unwrap();
+    engine
+        .add_policy("origins.rego".into(), policy.into())
+        .unwrap();
+    let compiled = engine
+        .compile_with_entrypoint(&Rc::from("data.t.r"))
+        .unwrap();
     Compiler::compile_from_policy(&compiled, &["data.t.r"]).unwrap()
 }
 
@@ -55,9 +59,15 @@ fn source_identity_is_typed_and_moves_preserve_it_without_value_matching() {
     instruction(&mut vm, &program, Instruction::LoadInput { dest: 0 });
     let epoch = vm.explain.origins.epoch;
     for (dest, literal_idx) in [(1, 0), (2, 1), (3, 2)] {
-        instruction(&mut vm, &program, Instruction::IndexLiteral {
-            dest, container: 0, literal_idx,
-        });
+        instruction(
+            &mut vm,
+            &program,
+            Instruction::IndexLiteral {
+                dest,
+                container: 0,
+                literal_idx,
+            },
+        );
     }
     assert_eq!(vm.get_register(1).unwrap(), vm.get_register(2).unwrap());
     let a = vm.explain.origins.get(1);
@@ -66,12 +76,39 @@ fn source_identity_is_typed_and_moves_preserve_it_without_value_matching() {
     instruction(&mut vm, &program, Instruction::Move { dest: 4, src: 1 });
     instruction(&mut vm, &program, Instruction::Move { dest: 4, src: 4 });
     assert_eq!(a, vm.explain.origins.get(4));
-    instruction(&mut vm, &program, Instruction::Load { dest: 5, literal_idx: 3 });
-    instruction(&mut vm, &program, Instruction::Index { dest: 3, container: 3, key: 5 });
-    assert_eq!(vm.explain.origins.get(3), source(epoch, vec![
-        PathSegment::Key("0".into()), PathSegment::Index(0),
-    ]));
-    instruction(&mut vm, &program, Instruction::Index { dest: 6, container: 0, key: 5 });
+    instruction(
+        &mut vm,
+        &program,
+        Instruction::Load {
+            dest: 5,
+            literal_idx: 3,
+        },
+    );
+    instruction(
+        &mut vm,
+        &program,
+        Instruction::Index {
+            dest: 3,
+            container: 3,
+            key: 5,
+        },
+    );
+    assert_eq!(
+        vm.explain.origins.get(3),
+        source(
+            epoch,
+            vec![PathSegment::Key("0".into()), PathSegment::Index(0),]
+        )
+    );
+    instruction(
+        &mut vm,
+        &program,
+        Instruction::Index {
+            dest: 6,
+            container: 0,
+            key: 5,
+        },
+    );
     assert_eq!(vm.explain.origins.get(6), RuntimeOrigin::Unknown);
     let equal_value = vm.get_register(1).unwrap().clone();
     vm.set_register(4, equal_value).unwrap();
@@ -88,20 +125,47 @@ fn computed_instances_are_fresh_and_members_are_not_claimed_as_source_values() {
     let mut vm = RegoVM::new();
     vm.load_program(Arc::new(program.clone()));
     vm.set_explanation_recorder(Box::new(Recorder));
-    instruction(&mut vm, &program, Instruction::Load { dest: 0, literal_idx: 0 });
+    instruction(
+        &mut vm,
+        &program,
+        Instruction::Load {
+            dest: 0,
+            literal_idx: 0,
+        },
+    );
     let first = vm.explain.origins.get(0);
-    instruction(&mut vm, &program, Instruction::Load { dest: 1, literal_idx: 0 });
+    instruction(
+        &mut vm,
+        &program,
+        Instruction::Load {
+            dest: 1,
+            literal_idx: 0,
+        },
+    );
     assert_eq!(vm.get_register(0).unwrap(), vm.get_register(1).unwrap());
     assert!(matches!(first, RuntimeOrigin::Computed { .. }));
     assert_ne!(first, vm.explain.origins.get(1));
     instruction(&mut vm, &program, Instruction::Move { dest: 2, src: 0 });
     assert_eq!(first, vm.explain.origins.get(2));
-    instruction(&mut vm, &program, Instruction::IndexLiteral {
-        dest: 2, container: 2, literal_idx: 1,
-    });
+    instruction(
+        &mut vm,
+        &program,
+        Instruction::IndexLiteral {
+            dest: 2,
+            container: 2,
+            literal_idx: 1,
+        },
+    );
     assert_eq!(vm.get_register(2).unwrap(), &v("1"));
     assert_eq!(vm.explain.origins.get(2), RuntimeOrigin::Unknown);
-    instruction(&mut vm, &program, Instruction::Load { dest: 0, literal_idx: 0 });
+    instruction(
+        &mut vm,
+        &program,
+        Instruction::Load {
+            dest: 0,
+            literal_idx: 0,
+        },
+    );
     assert_ne!(first, vm.explain.origins.get(0));
 }
 
@@ -125,13 +189,23 @@ fn chained_paths_preserve_punctuation_and_unrepresentable_members_stay_unknown()
     vm.set_input(v(r#"{"a.[\"0\"]":[{"x":7}]}"#));
     vm.set_explanation_recorder(Box::new(Recorder));
     instruction(&mut vm, &program, Instruction::LoadInput { dest: 0 });
-    instruction(&mut vm, &program, Instruction::ChainedIndex { params_index });
+    instruction(
+        &mut vm,
+        &program,
+        Instruction::ChainedIndex { params_index },
+    );
     assert_eq!(vm.get_register(1).unwrap(), &v("7"));
-    assert_eq!(vm.explain.origins.get(1), source(vm.explain.origins.epoch, vec![
-        PathSegment::Key("a.[\"0\"]".into()),
-        PathSegment::Index(0),
-        PathSegment::Key("x".into()),
-    ]));
+    assert_eq!(
+        vm.explain.origins.get(1),
+        source(
+            vm.explain.origins.epoch,
+            vec![
+                PathSegment::Key("a.[\"0\"]".into()),
+                PathSegment::Index(0),
+                PathSegment::Key("x".into()),
+            ]
+        )
+    );
     let root = vm.explain.origins.source(PathRoot::Input);
     let mut object = Value::new_object();
     object.as_object_mut().unwrap().insert(v("0"), v("[]"));
@@ -143,27 +217,60 @@ fn chained_paths_preserve_punctuation_and_unrepresentable_members_stay_unknown()
 #[test]
 fn native_invocation_restores_the_callers_origin_window() {
     let program = compile("package t\ninner := input.inside\nr := inner\n");
-    let mut vm = RegoVM::new();
-    vm.load_program(program.clone());
-    vm.set_input(v(r#"{"inside":[1],"outside":[2]}"#));
-    vm.set_explanation_recorder(Box::new(Recorder));
-    instruction(&mut vm, &program, Instruction::LoadInput { dest: 0 });
-    let outer = vm.explain.origins.get(0);
-    let info = program.rule_infos.iter().find(|info| info.name == "data.t.inner").unwrap();
-    let (result, inconsistent) = vm.execute_rule_definitions_common(
-        &info.definitions, info, None,
-    ).unwrap();
-    assert_eq!(result, v("[1]"));
-    assert!(!inconsistent);
-    assert_eq!(outer, vm.explain.origins.get(0));
-    assert!(vm.explain.origins.windows.is_empty());
+    let rule_index = program
+        .rule_infos
+        .iter()
+        .position(|info| info.name == "data.t.inner")
+        .unwrap();
+    let info = &program.rule_infos[rule_index];
+    assert!(!info.definitions.is_empty());
+    assert!(info.result_reg < info.num_registers);
+    let input = v(r#"{"inside":[1],"outside":[2]}"#);
+    let mut baseline = None;
+    for recording in [false, true] {
+        let mut vm = RegoVM::new();
+        vm.load_program(program.clone());
+        vm.set_input(input.clone());
+        assert!(vm.registers.len() >= 2);
+        if recording {
+            vm.set_explanation_recorder(Box::new(Recorder));
+        }
+        instruction(&mut vm, &program, Instruction::LoadInput { dest: 0 });
+        let outer = vm.explain.origins.get(0);
+        // RuleInit requires the context installed by normal call dispatch.
+        instruction(
+            &mut vm,
+            &program,
+            Instruction::CallRule {
+                dest: 1,
+                rule_index: u16::try_from(rule_index).unwrap(),
+            },
+        );
+        let result = vm.get_register(1).unwrap().clone();
+        assert_eq!(result, v("[1]"));
+        assert_eq!(vm.get_register(0).unwrap(), &input);
+        assert!(vm.call_rule_stack.is_empty());
+        assert!(vm.register_stack.is_empty());
+        assert!(vm.explain.origins.windows.is_empty());
+        if recording {
+            assert_eq!(Some(result), baseline);
+            assert_eq!(outer, source(vm.explain.origins.epoch, Vec::new()));
+            assert_eq!(outer, vm.explain.origins.get(0));
+            assert_eq!(vm.explain.origins.get(1), RuntimeOrigin::Unknown);
+        } else {
+            baseline = Some(result);
+            assert!(vm.explain.origins.registers.is_empty());
+        }
+    }
 }
 
 fn contains_key(origins: &[RuntimeOrigin], key: &str) -> bool {
-    origins.iter().any(|origin| matches!(origin,
-        RuntimeOrigin::Source { path: ConcretePath::Captured { segments, .. }, .. }
-            if segments == &[PathSegment::Key(key.into())]
-    ))
+    origins.iter().any(|origin| {
+        matches!(origin,
+            RuntimeOrigin::Source { path: ConcretePath::Captured { segments, .. }, .. }
+                if segments == &[PathSegment::Key(key.into())]
+        )
+    })
 }
 
 #[test]
@@ -181,15 +288,22 @@ fn suspension_preserves_nested_windows_and_reset_partitions_evaluations() {
     let first_epoch = vm.explain.origins.epoch;
     assert_eq!(vm.get_host_await_identifier(), Some(&v(r#""inner""#)));
     assert!(contains_key(&vm.explain.origins.registers, "inside"));
-    assert!(vm.explain.origins.windows.iter().any(|window| contains_key(window, "outside")));
+    assert!(vm
+        .explain
+        .origins
+        .windows
+        .iter()
+        .any(|window| contains_key(window, "outside")));
     vm.resume(Some(Value::Bool(true))).unwrap();
     assert_eq!(vm.explain.origins.epoch, first_epoch);
     assert_eq!(vm.get_host_await_identifier(), Some(&v(r#""outer""#)));
     assert!(contains_key(&vm.explain.origins.registers, "outside"));
     assert!(!contains_key(&vm.explain.origins.registers, "inside"));
     vm.resume(Some(Value::Bool(false))).unwrap();
-    assert!(matches!(vm.execution_state(), ExecutionState::Completed { result }
-        if result == &v("[[2],[[1],true],false]")));
+    assert!(
+        matches!(vm.execution_state(), ExecutionState::Completed { result }
+        if result == &v("[[2],[[1],true],false]"))
+    );
     assert!(vm.explain.origins.windows.is_empty());
     vm.execute().unwrap();
     assert_ne!(vm.explain.origins.epoch, first_epoch);
@@ -219,8 +333,10 @@ fn replacing_a_recorder_while_suspended_does_not_recover_old_origins_by_equality
     assert_eq!(vm.get_host_await_identifier(), Some(&v(r#""outer""#)));
     assert!(!contains_key(&vm.explain.origins.registers, "outside"));
     vm.resume(Some(Value::Bool(false))).unwrap();
-    assert!(matches!(vm.execution_state(), ExecutionState::Completed { result }
-        if result == &v("[[1],[[1],true],false]")));
+    assert!(
+        matches!(vm.execution_state(), ExecutionState::Completed { result }
+        if result == &v("[[1],[[1],true],false]"))
+    );
     assert!(vm.explain.origins.windows.is_empty());
 }
 
