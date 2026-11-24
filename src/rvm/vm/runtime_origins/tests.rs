@@ -405,12 +405,6 @@ fn overflowing_array_index_never_claims_a_nonexistent_source_slot() {
             );
             assert_eq!(vm.explain.origins.get(1), zero_origin);
             let overflow_origin = vm.explain.origins.get(2);
-            #[cfg(target_pointer_width = "32")]
-            assert!(
-                overflow_origin == RuntimeOrigin::Unknown || overflow_origin == zero_origin,
-                "truncated lookup must identify actual slot zero or stay unknown, got {overflow_origin:?}"
-            );
-            #[cfg(target_pointer_width = "64")]
             assert_eq!(overflow_origin, RuntimeOrigin::Unknown);
         } else {
             baseline = Some(overflow_value);

@@ -54,8 +54,10 @@ impl RuntimeOrigin {
         let segment = match (container, key) {
             (Value::Object(_), Value::String(key)) => PathSegment::Key(key.to_string()),
             (Value::Array(_), Value::Number(index)) => match index.as_u64() {
-                Some(index) => PathSegment::Index(index),
-                None => return Self::Unknown,
+                // Value lookup historically casts to usize. Do not attribute
+                // its truncated result to an unaddressable full-u64 slot.
+                Some(index) if usize::try_from(index).is_ok() => PathSegment::Index(index),
+                _ => return Self::Unknown,
             },
             // Unrepresentable paths cannot be used as shared identities:
             // different non-string keys or set members would collide.
