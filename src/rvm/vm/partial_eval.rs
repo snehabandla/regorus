@@ -204,7 +204,10 @@ const fn is_unused(taint: &Taint) -> bool {
 fn segment(key: &Value) -> Option<PathSegment> {
     match *key {
         Value::String(ref s) => Some(PathSegment::Key(s.to_string())),
-        Value::Number(ref n) => n.as_u64().map(PathSegment::Index),
+        Value::Number(ref n) => n
+            .as_u64()
+            .filter(|index| *n == crate::number::Number::from(*index))
+            .map(PathSegment::Index),
         _ => None,
     }
 }
@@ -300,12 +303,7 @@ fn render_path(
                 } else {
                     let key_value = Value::from(key.as_str());
                     checkpoint()?;
-                    #[cfg(all(feature = "allocator-memory-limits", not(miri)))]
-                    let quoted = key_value.to_json_str_with_checkpoint(checkpoint)?;
-                    #[cfg(any(not(feature = "allocator-memory-limits"), miri))]
-                    let quoted = key_value
-                        .to_json_str_compact()
-                        .map_err(super::VmError::from)?;
+                    let quoted = key_value.json_string_with_checkpoint(false, checkpoint)?;
                     checkpoint()?;
                     drop(key_value);
                     let _ = write!(text, "[{quoted}]");
