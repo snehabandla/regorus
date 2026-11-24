@@ -13,9 +13,10 @@ use core::fmt;
 
 use crate::builtins::types::get_type;
 use crate::explain::{
-    BodyEndEvent, BuiltinErrorEvent, CallEndEvent, CallResultSource, CallReusedEvent, CallStartEvent,
-    CheckEvent, ComprehensionElement, ComprehensionEmissionEvent, ConditionKind, EmissionEvent,
-    ExplanationRecorder, HookContext, NotCapturedEvent, Operator, Outcome, UncapturedConstruct,
+    BodyEndEvent, BuiltinErrorEvent, CallEndEvent, CallResultSource, CallReusedEvent,
+    CallStartEvent, CheckEvent, ComprehensionElement, ComprehensionEmissionEvent, ConditionKind,
+    EmissionEvent, ExplanationRecorder, HookContext, NotCapturedEvent, Operator, Outcome,
+    UncapturedConstruct,
 };
 use crate::rvm::instructions::{ComprehensionMode, GuardMode, Instruction, LoopMode};
 use crate::rvm::program::{Program, RuleType};
