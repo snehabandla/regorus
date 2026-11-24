@@ -1406,7 +1406,13 @@ fn assert_attempt_pairs(records: &[AttemptRecord]) {
                 active.push(*context);
             }
             AttemptRecord::End(context, _, _) => {
-                let start = active.pop().expect("attempt end without start");
+                // A mixed-mode parent can finish while a queued child remains
+                // open. Normal nesting is checked by the callback timeline.
+                let index = active
+                    .iter()
+                    .position(|start| start.attempt == context.attempt)
+                    .expect("attempt end without start");
+                let start = active.remove(index);
                 assert_eq!(context.attempt, start.attempt);
                 assert_eq!(context.call_instance, start.call_instance);
                 assert_eq!(context.rule_index, start.rule_index);
@@ -1878,6 +1884,43 @@ fn invocation_mixed_mode_error_keeps_terminal_events_for_every_started_call() {
                     "pending helper attempt must abort, not complete: {attempts:?}"
                 );
             }
+            let parent = calls
+                .iter()
+                .find_map(|record| match record {
+                    CallRecord::Start(_, event)
+                        if program.rule_infos[usize::from(event.rule_index)].name
+                            == "data.helpers.p" =>
+                    {
+                        Some(event.call_instance)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert!(
+                attempts.iter().any(|record| matches!(
+                    record, AttemptRecord::End(context, Some(Failure), None)
+                        if context.call_instance == Some(parent)
+                )),
+                "executed parent body failure lost its owner: {attempts:?}"
+            );
+            let root = calls
+                .iter()
+                .find_map(|record| match record {
+                    CallRecord::Start(_, event)
+                        if program.rule_infos[usize::from(event.rule_index)].name == "data.t.r" =>
+                    {
+                        Some(event.call_instance)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert!(
+                attempts.iter().any(|record| matches!(
+                    record, AttemptRecord::End(context, None, None)
+                        if context.call_instance == Some(root)
+                )),
+                "outstanding root attempt must abort: {attempts:?}"
+            );
         }
     }
 }

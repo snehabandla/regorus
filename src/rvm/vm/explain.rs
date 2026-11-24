@@ -337,11 +337,30 @@ impl RegoVM {
 
     #[cold]
     #[inline(never)]
-    pub(super) fn explain_begin_attempt(&mut self) -> Result<()> {
-        let mut context = self.explain_context();
-        if context.call_instance.is_none() {
-            return Ok(());
-        }
+    pub(super) fn explain_begin_attempt(
+        &mut self,
+        call: Option<u64>,
+        definition: usize,
+        body: usize,
+    ) -> Result<Option<(u64, u64)>> {
+        let Some(id) = call else {
+            return Ok(None);
+        };
+        let Some(mut context) = self
+            .explain
+            .calls
+            .iter()
+            .rev()
+            .find(|call| call.context.call_instance == Some(id))
+            .map(|call| call.context)
+        else {
+            return Ok(None);
+        };
+        context.pc = self.pc;
+        context.definition_index = definition;
+        context.body_index = body;
+        context.in_comprehension = self.explain_context().in_comprehension;
+        let previous = self.explain_attempt_owner(Some(id));
         let id = self
             .explain
             .next_attempt
@@ -352,25 +371,53 @@ impl RegoVM {
                 pc: self.pc,
             })?;
         self.explain.next_attempt = id;
-        self.explain_end_attempt(None, None);
+        self.explain_end_attempt(previous, None, None);
         context.attempt = Some(id);
-        if let Some(call) = self.explain.calls.last_mut() {
+        if let Some(call) = self
+            .explain
+            .calls
+            .iter_mut()
+            .rev()
+            .find(|call| call.context.call_instance == context.call_instance)
+        {
             call.attempt = Some(context);
         }
         let event = AttemptStartEvent { attempt: id };
         self.explain_deliver(|_, recorder| recorder.attempt_start(&context, &event));
-        Ok(())
+        Ok(context.call_instance.zip(context.attempt))
+    }
+
+    pub(super) fn explain_attempt_owner(&self, call: Option<u64>) -> Option<(u64, u64)> {
+        let id = call?;
+        self.explain
+            .calls
+            .iter()
+            .rev()
+            .find(|call| call.context.call_instance == Some(id))
+            .and_then(|call| call.attempt.and_then(|context| context.attempt))
+            .map(|attempt| (id, attempt))
     }
 
     #[cold]
     #[inline(never)]
-    pub(super) fn explain_end_attempt(&mut self, outcome: Option<Outcome>, result_reg: Option<u8>) {
-        let depth = self.call_rule_stack.len();
+    pub(super) fn explain_end_attempt(
+        &mut self,
+        owner: Option<(u64, u64)>,
+        outcome: Option<Outcome>,
+        result_reg: Option<u8>,
+    ) {
+        let Some((id, attempt)) = owner else {
+            return;
+        };
         let context = self
             .explain
             .calls
-            .last_mut()
-            .filter(|call| call.context.call_depth == depth)
+            .iter_mut()
+            .rev()
+            .find(|call| {
+                call.context.call_instance == Some(id)
+                    && call.attempt.and_then(|context| context.attempt) == Some(attempt)
+            })
             .and_then(|call| call.attempt.take());
         if let Some(mut context) = context {
             if outcome.is_some() {
@@ -828,10 +875,16 @@ impl RegoVM {
     }
 
     /// `result_reg` is the register holding a complete rule's or a
-    /// function's value, if the body succeeded.
+    /// function's value, if the body succeeded. `owner` belongs to the
+    /// executing body, not a child queued by legacy mixed-mode dispatch.
     #[cold]
     #[inline(never)]
-    pub(super) fn explain_body_end(&mut self, succeeded: bool, result_reg: Option<u8>) {
+    pub(super) fn explain_body_end(
+        &mut self,
+        owner: Option<(u64, u64)>,
+        succeeded: bool,
+        result_reg: Option<u8>,
+    ) {
         self.explain_deliver(|vm, recorder| {
             let event = BodyEndEvent {
                 outcome: passed_outcome(succeeded),
@@ -841,7 +894,7 @@ impl RegoVM {
             };
             recorder.body_end(&vm.explain_context(), &event);
         });
-        self.explain_end_attempt(Some(passed_outcome(succeeded)), result_reg);
+        self.explain_end_attempt(owner, Some(passed_outcome(succeeded)), result_reg);
     }
 
     #[cold]

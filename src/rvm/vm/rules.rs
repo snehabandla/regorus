@@ -57,6 +57,7 @@ impl RegoVM {
         rule_definitions: &[Vec<u32>],
         rule_info: &RuleInfo,
         function_call_params: Option<&FunctionCallParams>,
+        #[cfg(feature = "explanations")] explain_call: Option<u64>,
     ) -> Result<(Value, bool)> {
         let mut first_successful_result: Option<Value> = None;
         let mut rule_failed_due_to_inconsistency = false;
@@ -114,15 +115,20 @@ impl RegoVM {
                 self.comprehension_stack.clear();
 
                 #[cfg(feature = "explanations")]
-                if self.explain_enabled() {
-                    if let Err(e) = self.explain_begin_attempt() {
-                        self.restore_rule_state(
-                            &mut previous_loop_stack,
-                            &mut previous_comprehension_stack,
-                        );
-                        return Err(e);
+                let attempt_owner = if self.explain_enabled() {
+                    match self.explain_begin_attempt(explain_call, def_idx, body_entry_point_idx) {
+                        Ok(owner) => owner,
+                        Err(e) => {
+                            self.restore_rule_state(
+                                &mut previous_loop_stack,
+                                &mut previous_comprehension_stack,
+                            );
+                            return Err(e);
+                        }
                     }
-                }
+                } else {
+                    None
+                };
 
                 if let Some(destructuring_entry_point) =
                     rule_info.destructuring_blocks.get(def_idx).and_then(|x| *x)
@@ -149,6 +155,7 @@ impl RegoVM {
                             #[cfg(feature = "explanations")]
                             if self.explain_enabled() {
                                 self.explain_end_attempt(
+                                    attempt_owner,
                                     Some(crate::explain::Outcome::Undefined),
                                     None,
                                 );
@@ -163,6 +170,7 @@ impl RegoVM {
                 if self.explain_enabled() {
                     match body_result {
                         Ok(_) => self.explain_body_end(
+                            attempt_owner,
                             true,
                             (matches!(rule_info.rule_type, RuleType::Complete) || is_function_call)
                                 .then_some(result_reg),
@@ -172,7 +180,7 @@ impl RegoVM {
                             // its entries, which would misplace the body end.
                             self.loop_stack.clear();
                             self.comprehension_stack.clear();
-                            self.explain_body_end(false, None);
+                            self.explain_body_end(attempt_owner, false, None);
                         }
                         Err(_) => {}
                     }
@@ -405,6 +413,8 @@ impl RegoVM {
             &rule_definitions,
             &rule_info,
             function_call_params,
+            #[cfg(feature = "explanations")]
+            call,
         );
 
         let call_context = self.call_rule_stack.pop();
@@ -746,7 +756,11 @@ impl RegoVM {
 
                 #[cfg(feature = "explanations")]
                 if self.explain_enabled() {
-                    self.explain_begin_attempt()?;
+                    let _ = self.explain_begin_attempt(
+                        frame_data.explain_call,
+                        frame_data.current_definition_index,
+                        frame_data.current_body_index,
+                    )?;
                 }
 
                 if let Some(destructuring_entry_point) = rule_info
@@ -1041,7 +1055,8 @@ impl RegoVM {
         if self.explain_enabled() && frame_data.phase == RuleFramePhase::ExecutingBody {
             let has_result =
                 matches!(frame_data.rule_type, RuleType::Complete) || frame_data.is_function_rule;
-            self.explain_body_end(true, has_result.then_some(frame_data.result_reg));
+            let owner = self.explain_attempt_owner(frame_data.explain_call);
+            self.explain_body_end(owner, true, has_result.then_some(frame_data.result_reg));
         }
         match frame_data.phase {
             RuleFramePhase::ExecutingDestructuring => {
@@ -1059,11 +1074,13 @@ impl RegoVM {
         let rule_info = self.get_rule_info(frame_data.rule_index)?;
         #[cfg(feature = "explanations")]
         if self.explain_enabled() && frame_data.phase == RuleFramePhase::ExecutingBody {
-            self.explain_body_end(false, None);
+            let owner = self.explain_attempt_owner(frame_data.explain_call);
+            self.explain_body_end(owner, false, None);
         }
         #[cfg(feature = "explanations")]
         if self.explain_enabled() && frame_data.phase == RuleFramePhase::ExecutingDestructuring {
-            self.explain_end_attempt(Some(crate::explain::Outcome::Undefined), None);
+            let owner = self.explain_attempt_owner(frame_data.explain_call);
+            self.explain_end_attempt(owner, Some(crate::explain::Outcome::Undefined), None);
         }
         self.rule_frame_after_failure(frame_data, &rule_info)
     }
