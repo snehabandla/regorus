@@ -61,11 +61,14 @@ struct Recorded {
     event: Event,
 }
 
+type Lifecycle = (&'static str, Option<u64>, Option<u64>);
+
 #[derive(Clone, Default)]
 struct Fixture(
     Arc<Mutex<Vec<Recorded>>>,
     Arc<Mutex<Vec<CallRecord>>>,
     Arc<Mutex<Vec<AttemptRecord>>>,
+    Arc<Mutex<Vec<Lifecycle>>>,
 );
 
 #[derive(Debug, Clone, PartialEq)]
@@ -100,6 +103,14 @@ impl Fixture {
     fn attempts(&self) -> Vec<AttemptRecord> {
         std::mem::take(&mut *self.2.lock().unwrap())
     }
+
+    fn lifecycle(&self) -> Vec<Lifecycle> {
+        std::mem::take(&mut *self.3.lock().unwrap())
+    }
+
+    fn lifecycle_event(&self, name: &'static str, call: Option<u64>, attempt: Option<u64>) {
+        self.3.lock().unwrap().push((name, call, attempt));
+    }
 }
 
 impl ExplanationRecorder for Fixture {
@@ -108,6 +119,7 @@ impl ExplanationRecorder for Fixture {
     }
 
     fn call_start(&mut self, context: &HookContext, event: &CallStartEvent) {
+        self.lifecycle_event("call_start", Some(event.call_instance), None);
         self.1
             .lock()
             .unwrap()
@@ -115,6 +127,7 @@ impl ExplanationRecorder for Fixture {
     }
 
     fn call_end(&mut self, context: &HookContext, event: &CallEndEvent<'_>) {
+        self.lifecycle_event("call_end", context.call_instance, context.attempt);
         self.1.lock().unwrap().push(CallRecord::End(
             *context,
             event.source,
@@ -130,6 +143,7 @@ impl ExplanationRecorder for Fixture {
     }
 
     fn attempt_start(&mut self, context: &HookContext, event: &AttemptStartEvent) {
+        self.lifecycle_event("attempt_start", context.call_instance, context.attempt);
         self.2
             .lock()
             .unwrap()
@@ -137,6 +151,7 @@ impl ExplanationRecorder for Fixture {
     }
 
     fn attempt_end(&mut self, context: &HookContext, event: &AttemptEndEvent<'_>) {
+        self.lifecycle_event("attempt_end", context.call_instance, context.attempt);
         self.2.lock().unwrap().push(AttemptRecord::End(
             *context,
             event.outcome,
@@ -158,6 +173,7 @@ impl ExplanationRecorder for Fixture {
     }
 
     fn body_end(&mut self, context: &HookContext, event: &BodyEndEvent<'_>) {
+        self.lifecycle_event("body_end", context.call_instance, context.attempt);
         self.push(
             Some(context),
             Event::BodyEnd {
@@ -1304,6 +1320,36 @@ fn recorder_is_reset_for_each_evaluation() {
 }
 
 #[test]
+fn attempt_lifecycle_callbacks_are_nested_and_end_before_invocations() {
+    let program = compile("package t\nf(x) := x\nr := f(1)\n", "data.t.r").unwrap();
+    for mode in MODES {
+        let fixture = Fixture::default();
+        let mut vm = RegoVM::new();
+        vm.load_program(program.clone());
+        vm.set_execution_mode(mode);
+        vm.set_explanation_recorder(Box::new(fixture.clone()));
+        assert_eq!(execute(&mut vm, mode).unwrap(), v("1"));
+        assert_attempt_pairs(&fixture.attempts());
+        assert_eq!(
+            fixture.lifecycle(),
+            [
+                ("call_start", Some(1), None),
+                ("attempt_start", Some(1), Some(1)),
+                ("call_start", Some(2), None),
+                ("attempt_start", Some(2), Some(2)),
+                ("body_end", Some(2), Some(2)),
+                ("attempt_end", Some(2), Some(2)),
+                ("call_end", Some(2), None),
+                ("body_end", Some(1), Some(1)),
+                ("attempt_end", Some(1), Some(1)),
+                ("call_end", Some(1), None),
+            ],
+            "{mode:?}: cross-callback lifecycle ordering changed"
+        );
+    }
+}
+
+#[test]
 fn attempt_matching_rejection_and_false_success_preserve_recorder_off_results() {
     let program = compile(
         "package t\nf(1) := false\nf(2) := false\nr := f(input.x)\n",
@@ -1760,6 +1806,8 @@ fn invocation_mixed_mode_error_keeps_terminal_events_for_every_started_call() {
         // terminate any remaining captured invocations without losing one.
         vm.load_program(program.clone());
         let calls = fixture.calls();
+        let attempts = fixture.attempts();
+        assert_attempt_pairs(&attempts);
         assert!(
             calls.iter().any(|record| matches!(
                 record,
@@ -1808,6 +1856,28 @@ fn invocation_mixed_mode_error_keeps_terminal_events_for_every_started_call() {
                 )),
                 "pending helper must abort, not fabricate completion: {calls:?}"
             );
+            let child_attempts: Vec<_> = attempts
+                .iter()
+                .filter_map(|record| match record {
+                    AttemptRecord::Start(context, event)
+                        if context.call_instance == Some(child) =>
+                    {
+                        Some(event.attempt)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(!child_attempts.is_empty(), "pending helper has no attempt");
+            for id in child_attempts {
+                assert!(
+                    attempts.iter().any(|record| matches!(
+                        record, AttemptRecord::End(context, None, None)
+                            if context.attempt == Some(id)
+                                && context.call_instance == Some(child)
+                    )),
+                    "pending helper attempt must abort, not complete: {attempts:?}"
+                );
+            }
         }
     }
 }
