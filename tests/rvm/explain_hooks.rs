@@ -8,10 +8,10 @@
 
 use anyhow::{bail, Result};
 use regorus::explain::{
-    BodyEndEvent, BuiltinErrorEvent, CallEndEvent, CallResultSource, CallReusedEvent, CallStartEvent,
-    CheckEvent, CheckSite, ComprehensionElement, ComprehensionEmissionEvent, ConditionKind,
-    EmissionEvent, ExplanationRecorder, HookContext, NotCapturedEvent, Operator, Outcome, Provenance,
-    UncapturedConstruct,
+    BodyEndEvent, BuiltinErrorEvent, CallEndEvent, CallResultSource, CallReusedEvent,
+    CallStartEvent, CheckEvent, CheckSite, ComprehensionElement, ComprehensionEmissionEvent,
+    ConditionKind, EmissionEvent, ExplanationRecorder, HookContext, NotCapturedEvent, Operator,
+    Outcome, Provenance, UncapturedConstruct,
 };
 use regorus::languages::rego::compiler::Compiler;
 use regorus::rvm::instructions::FunctionCallParams;
