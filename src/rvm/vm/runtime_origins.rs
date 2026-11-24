@@ -13,6 +13,7 @@
 //! and returned values remain unknown pending helper propagation. Body resets
 //! retain exactly the slots the VM retains. Collection mutation currently
 //! invalidates the destination rather than claiming complete member tracking.
+//! Chained origin work samples the existing timer only while recording.
 
 use alloc::string::ToString as _;
 use alloc::vec::Vec;

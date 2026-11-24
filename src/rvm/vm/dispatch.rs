@@ -1303,6 +1303,7 @@ impl RegoVM {
 
                     #[cfg(feature = "explanations")]
                     if let Some(ref mut origin) = origin {
+                        self.execution_timer_tick(1)?;
                         *origin = Self::explain_chained_origin(origin, &current_value, &key_value);
                     }
                     current_value = current_value[&key_value].clone();

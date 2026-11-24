@@ -465,22 +465,43 @@ fn bounded_large_chained_index_observes_deadlines_with_and_without_origins() {
                 vm.set_execution_timer_config(Some(ExecutionTimerConfig {
                     limit,
                     // Three opcodes cannot reach this interval by dispatch
-                    // alone; the long traversal must account for its work.
+                    // alone; recording must account for its added work.
                     check_interval: NonZeroU32::new(8).unwrap(),
                 }));
                 let started = Instant::now();
                 let outcome = vm.execute();
                 let elapsed = started.elapsed();
-                if limit.is_zero() {
+                if limit.is_zero() && recording {
                     if !matches!(outcome, Err(VmError::TimeLimitExceeded { pc: 1, .. })) {
                         missed.push((mode, recording, elapsed, outcome));
+                    } else {
+                        assert!(matches!(vm.execution_state(), ExecutionState::Error {
+                            error: VmError::TimeLimitExceeded { pc: 1, .. },
+                        }));
+                        assert!(vm.registers.is_empty());
+                        assert!(vm.explain.origins.registers.is_empty());
+                        assert!(vm.explain.origins.windows.is_empty());
                     }
                 } else {
+                    // The unrecorded zero-limit outcome is an established
+                    // baseline gap, not changed by origin-only instrumentation.
                     assert_eq!(outcome, Ok(v("7")));
                     assert!(matches!(vm.execution_state(), ExecutionState::Completed { result }
                         if result == &v("7")));
+                    if recording {
+                        assert_eq!(
+                            vm.explain.origins.get(1),
+                            source(
+                                vm.explain.origins.epoch,
+                                vec![PathSegment::Index(0); DEPTH],
+                            ),
+                        );
+                    } else {
+                        assert!(vm.explain.origins.registers.is_empty());
+                        assert!(vm.explain.origins.windows.is_empty());
+                    }
                     std::eprintln!(
-                        "bounded chain depth={DEPTH} mode={mode:?} origins={recording} elapsed={elapsed:?}"
+                        "bounded chain depth={DEPTH} mode={mode:?} origins={recording} limit={limit:?} elapsed={elapsed:?}"
                     );
                 }
             }
