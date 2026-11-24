@@ -77,6 +77,16 @@ impl<'a> Compiler<'a> {
         stmts: &[&LiteralStmt],
         loops: &[HoistedLoop],
     ) -> Result<()> {
+        #[cfg(feature = "explanations")]
+        if !loops.is_empty() {
+            if let Some(stmt) = stmts.first() {
+                if matches!(&stmt.literal, ast::Literal::NotExpr { .. }) {
+                    // Collection preparation precedes compile_single_statement.
+                    self.hoisted_negations
+                        .insert((self.current_module_index, stmt.sidx));
+                }
+            }
+        }
         if loops.is_empty() {
             if !stmts.is_empty() {
                 self.compile_single_statement(stmts[0])?;

@@ -199,6 +199,9 @@ impl<'a> Compiler<'a> {
 
         self.program.instruction_spans = self.spans.into_iter().map(Some).collect();
         self.program.entry_points = self.entry_points;
+        #[cfg(feature = "explanations")]
+        crate::explain::negation::finish(&mut self.program, self.negation_boundaries)
+            .map_err(|error| CompilerError::from(anyhow!(error)))?;
 
         if !self.program.builtin_info_table.is_empty() {
             self.program

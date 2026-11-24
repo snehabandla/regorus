@@ -146,6 +146,10 @@ pub struct Compiler<'a> {
     current_call_stack: Vec<u16>,
     entry_points: IndexMap<String, usize>,
     soft_assert_mode: bool,
+    #[cfg(feature = "explanations")]
+    negation_boundaries: Vec<crate::explain::negation::NegationBoundary>,
+    #[cfg(feature = "explanations")]
+    hoisted_negations: BTreeSet<(u32, u32)>,
     /// Registered host-awaitable builtins: name → expected arg count.
     /// When the compiler encounters a call to one of these names, it emits a
     /// `HostAwait` instruction instead of a regular function or builtin call.
@@ -197,6 +201,10 @@ impl<'a> Compiler<'a> {
             current_call_stack: Vec::new(),
             entry_points: IndexMap::new(),
             soft_assert_mode: false,
+            #[cfg(feature = "explanations")]
+            negation_boundaries: Vec::new(),
+            #[cfg(feature = "explanations")]
+            hoisted_negations: BTreeSet::new(),
             host_await_builtins: BTreeMap::new(),
         }
     }

@@ -108,6 +108,7 @@
 //! nested-scope loop evidence can still contribute through conditions.
 
 mod error;
+pub(crate) mod negation;
 mod provenance;
 mod recorder;
 mod report;

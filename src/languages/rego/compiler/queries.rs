@@ -280,11 +280,15 @@ impl<'a> Compiler<'a> {
                 }
             }
             ast::Literal::NotExpr { expr, .. } => {
+                #[cfg(feature = "explanations")]
+                let entry_pc = self.program.instructions.len();
                 let expr_reg = self.with_soft_assert_mode(true, |compiler| {
                     compiler.compile_rego_expr_with_span(expr, expr.span(), false)
                 })?;
 
                 let negated_reg = self.alloc_register()?;
+                #[cfg(feature = "explanations")]
+                let not_pc = self.program.instructions.len();
                 self.emit_instruction(
                     Instruction::Not {
                         dest: negated_reg,
@@ -293,6 +297,8 @@ impl<'a> Compiler<'a> {
                     &stmt.span,
                 );
 
+                #[cfg(feature = "explanations")]
+                let check_pc = self.program.instructions.len();
                 self.emit_instruction(
                     Instruction::Guard {
                         register: negated_reg,
@@ -300,6 +306,23 @@ impl<'a> Compiler<'a> {
                     },
                     &stmt.span,
                 );
+                #[cfg(feature = "explanations")]
+                {
+                    use crate::explain::negation::NegationBoundary;
+                    let boundary = if self
+                        .hoisted_negations
+                        .contains(&(self.current_module_index, stmt.sidx))
+                    {
+                        NegationBoundary::HoistedOperand { not_pc, check_pc }
+                    } else {
+                        NegationBoundary::Operand {
+                            entry_pc,
+                            not_pc,
+                            check_pc,
+                        }
+                    };
+                    self.negation_boundaries.push(boundary);
+                }
             }
         }
         Ok(())

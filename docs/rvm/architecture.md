@@ -295,6 +295,35 @@ include formatted state snapshots where possible.
    cleared. `RuleReturn` is a specialised variant used by rule execution
    helpers.
 
+### Logical-negation metadata (partial capture checkpoint)
+
+With `explanations` enabled, the Rego compiler writes the optional
+`regorus.explain.negation` annotation. Its shallow integer schema is
+`[1, program_identity, rows]`: ordinary rows are
+`[0, operand_entry_pc, not_pc, guard_pc]`; hoisted-operand rows are
+`[1, not_pc, guard_pc]` and explicitly declare unavailable scope capture.
+The identity is a signed-integer-compatible FNV-1a checksum of postcard-encoded
+instructions, instruction parameters, spans, sources and rule owners. It detects
+accidental stale metadata, not malicious artifact tampering.
+
+No boundary opcodes are emitted, and existing Guard provenance/site identities
+are retained. The internal decoder distinguishes missing metadata, captured
+empty metadata, supported sites, unsupported hoisted operands and malformed
+metadata errors. Missing metadata requires recompiling retained source before
+logical-scope capture is available. Ordinary execution does not consult this
+annotation, even when it is malformed.
+
+Feature-off compilation emits no annotation. JSON and binary version 6 preserve
+the existing annotation carrier across feature builds without changing the
+serialized Program or Instruction layout. An annotated program still incurs
+the existing annotation loading/metadata-conversion costs in feature-off
+readers; unchanged opcode execution cost does not imply free program loading.
+
+This checkpoint supplies static boundaries only, not runtime scope events.
+Hoisted collection preparation and per-iteration re-entry ownership remain
+unresolved: these sites deliberately have no operand-entry PC. Logical-scope
+capture is incomplete until that ownership and runtime delivery are implemented.
+
 Throughout execution, diagnostics (register snapshots, loop counters, cache
 hits) can be collected via `RegoVM` accessors. Integration tests in
 `tests/rvm/vm/suites` exercise the most complex combinations of loops,
