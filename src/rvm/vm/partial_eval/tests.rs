@@ -945,12 +945,12 @@ fn b33_review_numeric_object_keys_and_exact_array_numbers() -> anyhow::Result<()
 
     let source = "package test\nallow if input.xs[input.key] == 1";
     for key in [
-        Value::from(4_294_967_296u64),
+        Value::from(4_294_967_296_u64),
         Value::from(u64::MAX),
         Value::from(u128::MAX),
         Value::from(-1),
-        Value::from(1.5f64),
-        Value::from(1.0f64),
+        Value::from(1.5_f64),
+        Value::from(1.0_f64),
     ] {
         let input = Value::from(BTreeMap::from([
             (Value::from("key"), key.clone()),
@@ -970,8 +970,8 @@ fn b33_review_numeric_object_keys_and_exact_array_numbers() -> anyhow::Result<()
     }
     for (key, want) in [
         (Value::from(-1), Value::Undefined),
-        (Value::from(1.5f64), Value::Undefined),
-        (Value::from(1.0f64), Value::Bool(true)),
+        (Value::from(1.5_f64), Value::Undefined),
+        (Value::from(1.0_f64), Value::Bool(true)),
     ] {
         let mut machine = vm(source)?;
         machine.set_input(Value::from(BTreeMap::from([
@@ -995,7 +995,7 @@ fn b33_review_numeric_object_keys_and_exact_array_numbers() -> anyhow::Result<()
 fn b33_review_large_numeric_object_unknowns_still_fail_closed() -> anyhow::Result<()> {
     use alloc::collections::BTreeMap;
 
-    for index in [4_294_967_296u64, u64::MAX] {
+    for index in [4_294_967_296_u64, u64::MAX] {
         let mut machine = vm("package test\nallow := input.xs[input.key]")?;
         let input = |xs| {
             Value::from(BTreeMap::from([
@@ -1034,7 +1034,7 @@ fn b33_review_32bit_array_overflow_is_not_an_in_range_index() -> anyhow::Result<
     use alloc::collections::BTreeMap;
 
     let mut machine = vm("package test\nallow := input.xs[input.key]")?;
-    for key in [4_294_967_296u64, 4_294_967_297u64] {
+    for key in [4_294_967_296_u64, 4_294_967_297_u64] {
         machine.set_input(Value::from(BTreeMap::from([
             (Value::from("key"), Value::from(key)),
             (
