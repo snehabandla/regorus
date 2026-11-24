@@ -1941,7 +1941,9 @@ fn invocation_undefined_argument_to_nonfunction_does_not_report_a_call_or_reuse(
             .unwrap(),
     )
     .unwrap();
-    assert!(compiled.rule_infos[usize::from(rule_index)].function_info.is_none());
+    assert!(compiled.rule_infos[usize::from(rule_index)]
+        .function_info
+        .is_none());
     for cached in [true, false] {
         let mut program = (*compiled).clone();
         program.dispatch_window_size = program.dispatch_window_size.max(2);
@@ -1991,10 +1993,8 @@ fn invocation_undefined_argument_to_nonfunction_does_not_report_a_call_or_reuse(
                 }
                 let calls = fixture.calls();
                 if recording && cached {
-                    let [
-                        CallRecord::Start(caller, start),
-                        CallRecord::End(owner, Some(CallResultSource::Body), Some(result)),
-                    ] = calls.as_slice()
+                    let [CallRecord::Start(caller, start), CallRecord::End(owner, Some(CallResultSource::Body), Some(result))] =
+                        calls.as_slice()
                     else {
                         panic!("{mode:?}: only the cache-filling invocation is real: {calls:?}");
                     };
@@ -2005,7 +2005,10 @@ fn invocation_undefined_argument_to_nonfunction_does_not_report_a_call_or_reuse(
                     assert_eq!(owner.rule_index, Some(rule_index));
                     assert_eq!(result, &v("7"));
                 } else {
-                    assert!(calls.is_empty(), "{mode:?}: target was not invoked: {calls:?}");
+                    assert!(
+                        calls.is_empty(),
+                        "{mode:?}: target was not invoked: {calls:?}"
+                    );
                 }
             }
         }
