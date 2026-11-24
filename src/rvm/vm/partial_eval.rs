@@ -281,6 +281,7 @@ const KEYWORDS: &[&str] = &[
 ];
 
 /// Renders a path as Rego, such as `input.user.role` or `input["a.b"][0]`.
+/// Long identifiers use quoted encoding to keep scans and copies checkpointed.
 fn render_path(
     root: UnknownRoot,
     segments: &[PathSegment],
@@ -291,10 +292,11 @@ fn render_path(
     for segment in segments {
         match *segment {
             PathSegment::Key(ref key) => {
-                let ident = key
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                let ident = key.len() <= 4096
+                    && key
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
                     && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
                     && !KEYWORDS.contains(&key.as_str());
                 if ident {

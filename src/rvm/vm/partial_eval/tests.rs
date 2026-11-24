@@ -700,8 +700,18 @@ fn residual_path_serialization_checks_the_execution_timer() -> anyhow::Result<()
         ("x", "x".repeat(96 * 1024), "input.x"),
     ] {
         let short = PathSegment::Key(short_key.into());
+        let expected_long = format!("input[\"{long_key}\"]");
+        let long = PathSegment::Key(long_key);
+        assert_eq!(
+            render_path(
+                UnknownRoot::Input,
+                core::slice::from_ref(&long),
+                &mut || Ok(())
+            )?,
+            expected_long
+        );
         let mut machine = vm(TWO_CONDITIONS)?;
-        for (key, should_expire) in [(short, false), (PathSegment::Key(long_key), true)] {
+        for (key, should_expire) in [(short, false), (long, true)] {
             // Only extra work for the long key may reach the expired deadline.
             machine.set_execution_timer_config(Some(ExecutionTimerConfig {
                 limit: Duration::ZERO,
