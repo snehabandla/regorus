@@ -540,7 +540,11 @@ fn numeric_residual_paths_preserve_object_key_identity() -> anyhow::Result<()> {
         ("18446744073709549568.0", Some(18_446_744_073_709_549_568)),
         ("18446744073709551616.0", None),
     ] {
-        let key = Value::from(literal.parse::<crate::number::Number>()?);
+        let key = Value::from(
+            literal
+                .parse::<crate::number::Number>()
+                .map_err(|error| anyhow::anyhow!("invalid numeric literal {literal}: {error:?}"))?,
+        );
         let projected_key = Value::from(index.unwrap_or(u64::MAX));
         let object = Value::from(BTreeMap::from([(projected_key.clone(), Value::from(1))]));
         assert_eq!(object[&projected_key], Value::from(1));
