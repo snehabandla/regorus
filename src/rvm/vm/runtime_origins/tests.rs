@@ -931,8 +931,14 @@ fn recorder_off_has_no_origin_storage_and_preserves_outcomes_in_both_modes() -> 
 #[allow(clippy::panic_in_result_fn)]
 fn overflowing_array_index_never_claims_a_nonexistent_source_slot() -> Result<()> {
     let mut program = Program::new();
-    program.dispatch_window_size = 3;
+    program.dispatch_window_size = 6;
     program.literals = vec![v("0")?, v("4294967296")?];
+    let constructed = program
+        .instruction_data
+        .add_array_create_params(crate::rvm::instructions::ArrayCreateParams {
+            dest: 3,
+            elements: vec![1],
+        });
     let mut baseline = None;
     for recording in [false, true] {
         let mut vm = RegoVM::new();
@@ -953,7 +959,27 @@ fn overflowing_array_index_never_claims_a_nonexistent_source_slot() -> Result<()
                 },
             )?;
         }
+        instruction(
+            &mut vm,
+            &program,
+            Instruction::ArrayCreate {
+                params_index: constructed,
+            },
+        )?;
+        for (dest, literal_idx) in [(4, 0), (5, 1)] {
+            instruction(
+                &mut vm,
+                &program,
+                Instruction::IndexLiteral {
+                    dest,
+                    container: 3,
+                    literal_idx,
+                },
+            )?;
+        }
         assert_eq!(vm.get_register(1)?, &v("[]")?);
+        assert_eq!(vm.get_register(4)?, vm.get_register(1)?);
+        assert_eq!(vm.get_register(5)?, vm.get_register(2)?);
         let overflow_value = vm.get_register(2)?.clone();
         #[cfg(target_pointer_width = "32")]
         assert_eq!(overflow_value, v("[]")?);
@@ -963,8 +989,10 @@ fn overflowing_array_index_never_claims_a_nonexistent_source_slot() -> Result<()
             assert_eq!(Some(overflow_value), baseline);
             let zero_origin = source(vm.explain.origins.epoch, vec![PathSegment::Index(0)]);
             assert_eq!(vm.explain.origins.get(1), zero_origin);
+            assert_eq!(vm.explain.origins.get(4), zero_origin);
             let overflow_origin = vm.explain.origins.get(2);
             assert_eq!(overflow_origin, RuntimeOrigin::Unknown);
+            assert_eq!(vm.explain.origins.get(5), RuntimeOrigin::Unknown);
         } else {
             baseline = Some(overflow_value);
             assert!(vm.explain.origins.registers.is_empty());
