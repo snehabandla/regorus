@@ -340,7 +340,9 @@ fn replacing_a_recorder_while_suspended_does_not_recover_old_origins_by_equality
     vm.set_execution_mode(ExecutionMode::Suspendable);
     vm.set_explanation_recorder(Box::new(Recorder));
     vm.execute()?;
-    let recorder = vm.take_explanation_recorder().context("installed recorder")?;
+    let recorder = vm
+        .take_explanation_recorder()
+        .context("installed recorder")?;
     vm.set_explanation_recorder(recorder);
     assert!(vm.explain.origins.registers.is_empty());
     assert!(vm.explain.origins.windows.is_empty());
@@ -372,7 +374,9 @@ fn recorder_off_has_no_origin_storage_and_preserves_outcomes_in_both_modes() -> 
         vm.set_explanation_recorder(Box::new(Recorder));
         vm.execute()?;
         assert_eq!(vm.execution_state(), &off);
-        let recorder = vm.take_explanation_recorder().context("installed recorder")?;
+        let recorder = vm
+            .take_explanation_recorder()
+            .context("installed recorder")?;
         assert!(vm.explain.origins.registers.is_empty());
         vm.execute()?;
         assert_eq!(vm.execution_state(), &off);

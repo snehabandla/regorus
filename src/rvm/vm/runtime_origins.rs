@@ -51,14 +51,18 @@ impl RuntimeOrigin {
         if matches!(container[key], Value::Undefined) {
             return Self::Unknown;
         }
-        let segment = match (container, key) {
-            (&Value::Object(_), &Value::String(ref key)) => PathSegment::Key(key.to_string()),
-            (&Value::Array(_), &Value::Number(ref index)) => match index.as_u64() {
-                // Value lookup historically casts to usize. Do not attribute
-                // its truncated result to an unaddressable full-u64 slot.
-                Some(index) if usize::try_from(index).is_ok() => PathSegment::Index(index),
-                _ => return Self::Unknown,
-            },
+        let segment = match *key {
+            Value::String(ref key) if matches!(container, &Value::Object(_)) => {
+                PathSegment::Key(key.to_string())
+            }
+            Value::Number(ref index) if matches!(container, &Value::Array(_)) => {
+                match index.as_u64() {
+                    // Value lookup historically casts to usize. Do not attribute
+                    // its truncated result to an unaddressable full-u64 slot.
+                    Some(index) if usize::try_from(index).is_ok() => PathSegment::Index(index),
+                    _ => return Self::Unknown,
+                }
+            }
             // Unrepresentable paths cannot be used as shared identities:
             // different non-string keys or set members would collide.
             _ => return Self::Unknown,
@@ -67,10 +71,7 @@ impl RuntimeOrigin {
         segments.push(segment);
         Self::Source {
             epoch,
-            path: ConcretePath::Captured {
-                root,
-                segments,
-            },
+            path: ConcretePath::Captured { root, segments },
         }
     }
 }
