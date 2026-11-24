@@ -57,6 +57,10 @@ impl RegoVM {
             Load { dest, literal_idx } => {
                 if let Some(value) = program.literals.get(usize::from(literal_idx)) {
                     self.set_register(dest, value.clone())?;
+                    #[cfg(feature = "explanations")]
+                    if self.explain_enabled() {
+                        self.explain_computed_origin(dest);
+                    }
                     Ok(InstructionOutcome::Continue)
                 } else {
                     Err(VmError::LiteralIndexOutOfBounds {
@@ -83,10 +87,18 @@ impl RegoVM {
             }
             LoadData { dest } => {
                 self.set_register(dest, self.data.clone())?;
+                #[cfg(feature = "explanations")]
+                if self.explain_enabled() {
+                    self.explain_source_origin(dest, crate::explain::PathRoot::Data);
+                }
                 Ok(InstructionOutcome::Continue)
             }
             LoadInput { dest } => {
                 self.set_register(dest, self.input.clone())?;
+                #[cfg(feature = "explanations")]
+                if self.explain_enabled() {
+                    self.explain_source_origin(dest, crate::explain::PathRoot::Input);
+                }
                 Ok(InstructionOutcome::Continue)
             }
             LoadContext { dest } => {
@@ -99,7 +111,13 @@ impl RegoVM {
             }
             Move { dest, src } => {
                 let value = self.get_register(src)?.clone();
+                #[cfg(feature = "explanations")]
+                let origin = self.explain_enabled().then(|| self.explain.origins.get(src));
                 self.set_register(dest, value)?;
+                #[cfg(feature = "explanations")]
+                if let Some(origin) = origin {
+                    self.explain.origins.set(dest, origin);
+                }
                 Ok(InstructionOutcome::Continue)
             }
             other => self.execute_arithmetic_instruction(program, other),
@@ -657,6 +675,10 @@ impl RegoVM {
                     }
 
                     self.set_register(params.dest, obj_value)?;
+                    #[cfg(feature = "explanations")]
+                    if self.explain_enabled() {
+                        self.explain_computed_origin(params.dest);
+                    }
                 }
                 Ok(InstructionOutcome::Continue)
             }
@@ -668,7 +690,15 @@ impl RegoVM {
                 let key_value = self.get_register(key)?;
                 let container_value = self.get_register(container)?;
                 let result = container_value[key_value].clone();
+                #[cfg(feature = "explanations")]
+                let origin = self
+                    .explain_enabled()
+                    .then(|| self.explain_index_origin(container, key_value));
                 self.set_register(dest, result)?;
+                #[cfg(feature = "explanations")]
+                if let Some(origin) = origin {
+                    self.explain.origins.set(dest, origin);
+                }
                 Ok(InstructionOutcome::Continue)
             }
             IndexLiteral {
@@ -680,7 +710,15 @@ impl RegoVM {
 
                 if let Some(key_value) = program.literals.get(usize::from(literal_idx)) {
                     let result = container_value[key_value].clone();
+                    #[cfg(feature = "explanations")]
+                    let origin = self
+                        .explain_enabled()
+                        .then(|| self.explain_index_origin(container, key_value));
                     self.set_register(dest, result)?;
+                    #[cfg(feature = "explanations")]
+                    if let Some(origin) = origin {
+                        self.explain.origins.set(dest, origin);
+                    }
                     Ok(InstructionOutcome::Continue)
                 } else {
                     Err(VmError::LiteralIndexOutOfBounds {
@@ -692,6 +730,10 @@ impl RegoVM {
             ArrayNew { dest } => {
                 let empty_array = Value::new_array();
                 self.set_register(dest, empty_array)?;
+                #[cfg(feature = "explanations")]
+                if self.explain_enabled() {
+                    self.explain_computed_origin(dest);
+                }
                 Ok(InstructionOutcome::Continue)
             }
             ArrayPush { arr, value } => {
@@ -765,6 +807,10 @@ impl RegoVM {
 
                         let array_value = Value::from_array(elements);
                         self.set_register(params.dest, array_value)?;
+                        #[cfg(feature = "explanations")]
+                        if self.explain_enabled() {
+                            self.explain_computed_origin(params.dest);
+                        }
                     }
                     Ok(InstructionOutcome::Continue)
                 } else {
@@ -778,6 +824,10 @@ impl RegoVM {
             SetNew { dest } => {
                 let empty_set = Value::new_set();
                 self.set_register(dest, empty_set)?;
+                #[cfg(feature = "explanations")]
+                if self.explain_enabled() {
+                    self.explain_computed_origin(dest);
+                }
                 Ok(InstructionOutcome::Continue)
             }
             SetAdd { set, value } => {
@@ -829,6 +879,10 @@ impl RegoVM {
 
                         let set_value = Value::from(set);
                         self.set_register(params.dest, set_value)?;
+                        #[cfg(feature = "explanations")]
+                        if self.explain_enabled() {
+                            self.explain_computed_origin(params.dest);
+                        }
                     }
                     Ok(InstructionOutcome::Continue)
                 } else {
@@ -1227,6 +1281,10 @@ impl RegoVM {
                     })?;
 
                 let mut current_value = self.get_register(params.root)?.clone();
+                #[cfg(feature = "explanations")]
+                let mut origin = self
+                    .explain_enabled()
+                    .then(|| self.explain.origins.get(params.root));
 
                 for component in &params.path_components {
                     let key_value = match *component {
@@ -1241,6 +1299,10 @@ impl RegoVM {
                         LiteralOrRegister::Register(reg) => self.get_register(reg)?.clone(),
                     };
 
+                    #[cfg(feature = "explanations")]
+                    if let Some(ref mut origin) = origin {
+                        *origin = Self::explain_chained_origin(origin, &current_value, &key_value);
+                    }
                     current_value = current_value[&key_value].clone();
 
                     if current_value == Value::Undefined {
@@ -1249,6 +1311,10 @@ impl RegoVM {
                 }
 
                 self.set_register(params.dest, current_value)?;
+                #[cfg(feature = "explanations")]
+                if let Some(origin) = origin {
+                    self.explain.origins.set(params.dest, origin);
+                }
                 Ok(InstructionOutcome::Continue)
             }
             ComprehensionBegin { params_index } => {

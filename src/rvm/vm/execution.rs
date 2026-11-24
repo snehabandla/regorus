@@ -397,6 +397,10 @@ impl RegoVM {
                 if let Some(slot) = self.registers.get_mut(dest_index) {
                     *slot = value;
                 }
+                #[cfg(feature = "explanations")]
+                if self.explain_enabled() {
+                    self.explain.origins.clear_register(dest);
+                }
                 self.check_memory_budget()?;
             }
             other_reason => {
@@ -672,6 +676,10 @@ impl RegoVM {
                     if let Some(slot) = self.registers.get_mut(result_index) {
                         *slot = value.clone();
                     }
+                    #[cfg(feature = "explanations")]
+                    if self.explain_enabled() {
+                        self.explain.origins.clear_register(data.result_reg);
+                    }
                     data.accumulated_result = Some(value.clone());
                     data.any_body_succeeded = true;
 
@@ -693,6 +701,10 @@ impl RegoVM {
                     }
                     if let Some(slot) = self.registers.get_mut(ret_index) {
                         *slot = value.clone();
+                    }
+                    #[cfg(feature = "explanations")]
+                    if self.explain_enabled() {
+                        self.explain.origins.clear_register(return_value_register);
                     }
                     *last_result = value;
                     return Ok(());

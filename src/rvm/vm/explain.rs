@@ -29,6 +29,7 @@ use super::machine::RegoVM;
 #[derive(Default)]
 pub(super) struct ExplainHooks {
     recorder: Option<Box<dyn ExplanationRecorder>>,
+    pub(super) origins: super::runtime_origins::RuntimeOrigins,
     next_call: u64,
     calls: Vec<Invocation>,
     cached_calls: Vec<Option<u64>>,
@@ -81,12 +82,14 @@ impl RegoVM {
     /// recorder, evaluation is unaffected.
     #[cfg_attr(docsrs, doc(cfg(feature = "explanations")))]
     pub fn set_explanation_recorder(&mut self, recorder: Box<dyn ExplanationRecorder>) {
+        self.explain.origins.reset();
         self.explain.recorder = Some(recorder);
     }
 
     /// Removes and returns the installed recorder.
     #[cfg_attr(docsrs, doc(cfg(feature = "explanations")))]
     pub fn take_explanation_recorder(&mut self) -> Option<Box<dyn ExplanationRecorder>> {
+        self.explain.origins.reset();
         self.explain.recorder.take()
     }
 
@@ -185,6 +188,7 @@ impl RegoVM {
     }
 
     pub(super) fn explain_reset_identity(&mut self) {
+        self.explain.origins.reset();
         self.explain.next_call = 0;
         self.explain.cached_calls.clear();
     }

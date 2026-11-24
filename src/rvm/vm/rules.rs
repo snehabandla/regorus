@@ -47,6 +47,10 @@ impl RegoVM {
             mem::swap(&mut current_register_window, &mut self.registers);
             self.return_register_window(current_register_window);
             self.registers = restored_registers;
+            #[cfg(feature = "explanations")]
+            if self.explain_enabled() {
+                self.explain.origins.leave_window();
+            }
         }
         mem::swap(&mut self.loop_stack, previous_loop_stack);
         mem::swap(&mut self.comprehension_stack, previous_comprehension_stack);
@@ -97,6 +101,10 @@ impl RegoVM {
 
         self.register_stack.push(previous_registers);
         self.registers = register_window;
+        #[cfg(feature = "explanations")]
+        if self.explain_enabled() {
+            self.explain.origins.enter_window();
+        }
 
         'outer: for (def_idx, definition_bodies) in rule_definitions.iter().enumerate() {
             for (body_entry_point_idx, body_entry_point) in definition_bodies.iter().enumerate() {
@@ -108,6 +116,12 @@ impl RegoVM {
                 self.registers
                     .resize(num_retained_registers, Value::Undefined);
                 self.registers.resize(num_registers, Value::Undefined);
+                #[cfg(feature = "explanations")]
+                if self.explain_enabled() {
+                    self.explain
+                        .origins
+                        .resize(num_retained_registers, num_registers);
+                }
                 // A body that failed with an error inside a loop or
                 // comprehension leaves its entries behind.
                 self.loop_stack.clear();
@@ -232,6 +246,10 @@ impl RegoVM {
             self.return_register_window(current_register_window);
 
             self.registers = restored_registers;
+            #[cfg(feature = "explanations")]
+            if self.explain_enabled() {
+                self.explain.origins.leave_window();
+            }
         }
 
         self.loop_stack = previous_loop_stack;
@@ -595,6 +613,10 @@ impl RegoVM {
         let mut saved_registers = Vec::default();
         mem::swap(&mut saved_registers, &mut self.registers);
         self.registers = register_window;
+        #[cfg(feature = "explanations")]
+        if self.explain_enabled() {
+            self.explain.origins.enter_window();
+        }
 
         let mut saved_loop_stack = Vec::default();
         mem::swap(&mut saved_loop_stack, &mut self.loop_stack);
@@ -725,6 +747,13 @@ impl RegoVM {
                     .resize(frame_data.num_retained_registers, Value::Undefined);
                 self.registers
                     .resize(frame_data.num_registers, Value::Undefined);
+                #[cfg(feature = "explanations")]
+                if self.explain_enabled() {
+                    self.explain.origins.resize(
+                        frame_data.num_retained_registers,
+                        frame_data.num_registers,
+                    );
+                }
 
                 if let Some(destructuring_entry_point) = rule_info
                     .destructuring_blocks
@@ -820,6 +849,10 @@ impl RegoVM {
                             self.registers.get_mut(usize::from(frame_data.result_reg))
                         {
                             *result_slot = Value::Undefined;
+                        }
+                        #[cfg(feature = "explanations")]
+                        if self.explain_enabled() {
+                            self.explain.origins.clear_register(frame_data.result_reg);
                         }
                     }
                 } else {
@@ -992,6 +1025,11 @@ impl RegoVM {
         }
 
         self.registers = parent_registers;
+        #[cfg(feature = "explanations")]
+        if self.explain_enabled() {
+            self.explain.origins.leave_window();
+            self.explain.origins.clear_register(dest_reg);
+        }
 
         // Underflow here means malformed/poisoned program state; surface as a
         // typed error rather than a debug-only panic so the public load_program

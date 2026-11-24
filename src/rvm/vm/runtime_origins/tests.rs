@@ -1,0 +1,250 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT License.
+
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use alloc::vec;
+use alloc::vec::Vec;
+
+use crate::explain::ExplanationRecorder;
+use crate::languages::rego::compiler::Compiler;
+use crate::rvm::instructions::{Instruction, LiteralOrRegister};
+use crate::rvm::program::Program;
+use crate::{Engine, Rc};
+
+use super::{ConcretePath, PathRoot, PathSegment, RegoVM, RuntimeOrigin, Value};
+use super::super::execution_model::{ExecutionMode, ExecutionState};
+
+struct Recorder;
+impl ExplanationRecorder for Recorder {}
+
+fn v(json: &str) -> Value {
+    Value::from_json_str(json).unwrap()
+}
+
+fn source(epoch: u64, segments: Vec<PathSegment>) -> RuntimeOrigin {
+    RuntimeOrigin::Source {
+        epoch,
+        path: ConcretePath::Captured {
+            root: PathRoot::Input,
+            segments,
+        },
+    }
+}
+
+fn instruction(vm: &mut RegoVM, program: &Program, instruction: Instruction) {
+    vm.execute_instruction(program, instruction).unwrap();
+}
+
+fn compile(policy: &str) -> Arc<Program> {
+    let mut engine = Engine::new();
+    engine.add_policy("origins.rego".into(), policy.into()).unwrap();
+    let compiled = engine.compile_with_entrypoint(&Rc::from("data.t.r")).unwrap();
+    Compiler::compile_from_policy(&compiled, &["data.t.r"]).unwrap()
+}
+
+#[test]
+fn source_identity_is_typed_and_moves_preserve_it_without_value_matching() {
+    let mut program = Program::new();
+    program.dispatch_window_size = 8;
+    program.literals = vec![v(r#""a""#), v(r#""b""#), v(r#""0""#), v("0")];
+    let mut vm = RegoVM::new();
+    vm.load_program(Arc::new(program.clone()));
+    vm.set_input(v(r#"{"a":[],"b":[],"0":[9]}"#));
+    vm.set_explanation_recorder(Box::new(Recorder));
+    instruction(&mut vm, &program, Instruction::LoadInput { dest: 0 });
+    let epoch = vm.explain.origins.epoch;
+    for (dest, literal_idx) in [(1, 0), (2, 1), (3, 2)] {
+        instruction(&mut vm, &program, Instruction::IndexLiteral {
+            dest, container: 0, literal_idx,
+        });
+    }
+    assert_eq!(vm.get_register(1).unwrap(), vm.get_register(2).unwrap());
+    let a = vm.explain.origins.get(1);
+    assert_eq!(a, source(epoch, vec![PathSegment::Key("a".into())]));
+    assert_ne!(a, vm.explain.origins.get(2));
+    instruction(&mut vm, &program, Instruction::Move { dest: 4, src: 1 });
+    instruction(&mut vm, &program, Instruction::Move { dest: 4, src: 4 });
+    assert_eq!(a, vm.explain.origins.get(4));
+    instruction(&mut vm, &program, Instruction::Load { dest: 5, literal_idx: 3 });
+    instruction(&mut vm, &program, Instruction::Index { dest: 3, container: 3, key: 5 });
+    assert_eq!(vm.explain.origins.get(3), source(epoch, vec![
+        PathSegment::Key("0".into()), PathSegment::Index(0),
+    ]));
+    instruction(&mut vm, &program, Instruction::Index { dest: 6, container: 0, key: 5 });
+    assert_eq!(vm.explain.origins.get(6), RuntimeOrigin::Unknown);
+    let equal_value = vm.get_register(1).unwrap().clone();
+    vm.set_register(4, equal_value).unwrap();
+    assert_eq!(vm.explain.origins.get(4), RuntimeOrigin::Unknown);
+    vm.take_register(1).unwrap();
+    assert_eq!(vm.explain.origins.get(1), RuntimeOrigin::Unknown);
+}
+
+#[test]
+fn computed_instances_are_fresh_and_members_are_not_claimed_as_source_values() {
+    let mut program = Program::new();
+    program.dispatch_window_size = 4;
+    program.literals = vec![v("[1]"), v("0")];
+    let mut vm = RegoVM::new();
+    vm.load_program(Arc::new(program.clone()));
+    vm.set_explanation_recorder(Box::new(Recorder));
+    instruction(&mut vm, &program, Instruction::Load { dest: 0, literal_idx: 0 });
+    let first = vm.explain.origins.get(0);
+    instruction(&mut vm, &program, Instruction::Load { dest: 1, literal_idx: 0 });
+    assert_eq!(vm.get_register(0).unwrap(), vm.get_register(1).unwrap());
+    assert!(matches!(first, RuntimeOrigin::Computed { .. }));
+    assert_ne!(first, vm.explain.origins.get(1));
+    instruction(&mut vm, &program, Instruction::Move { dest: 2, src: 0 });
+    assert_eq!(first, vm.explain.origins.get(2));
+    instruction(&mut vm, &program, Instruction::IndexLiteral {
+        dest: 2, container: 2, literal_idx: 1,
+    });
+    assert_eq!(vm.get_register(2).unwrap(), &v("1"));
+    assert_eq!(vm.explain.origins.get(2), RuntimeOrigin::Unknown);
+    instruction(&mut vm, &program, Instruction::Load { dest: 0, literal_idx: 0 });
+    assert_ne!(first, vm.explain.origins.get(0));
+}
+
+#[test]
+fn chained_paths_preserve_punctuation_and_unrepresentable_members_stay_unknown() {
+    let mut program = Program::new();
+    program.dispatch_window_size = 4;
+    program.literals = vec![v(r#""a.[\"0\"]""#), v("0"), v(r#""x""#)];
+    let params = crate::rvm::instructions::ChainedIndexParams {
+        dest: 1,
+        root: 0,
+        path_components: vec![
+            LiteralOrRegister::Literal(0),
+            LiteralOrRegister::Literal(1),
+            LiteralOrRegister::Literal(2),
+        ],
+    };
+    let params_index = program.instruction_data.add_chained_index_params(params);
+    let mut vm = RegoVM::new();
+    vm.load_program(Arc::new(program.clone()));
+    vm.set_input(v(r#"{"a.[\"0\"]":[{"x":7}]}"#));
+    vm.set_explanation_recorder(Box::new(Recorder));
+    instruction(&mut vm, &program, Instruction::LoadInput { dest: 0 });
+    instruction(&mut vm, &program, Instruction::ChainedIndex { params_index });
+    assert_eq!(vm.get_register(1).unwrap(), &v("7"));
+    assert_eq!(vm.explain.origins.get(1), source(vm.explain.origins.epoch, vec![
+        PathSegment::Key("a.[\"0\"]".into()),
+        PathSegment::Index(0),
+        PathSegment::Key("x".into()),
+    ]));
+    let root = vm.explain.origins.source(PathRoot::Input);
+    let mut object = Value::new_object();
+    object.as_object_mut().unwrap().insert(v("0"), v("[]"));
+    assert_eq!(root.indexed(&object, &v("0")), RuntimeOrigin::Unknown);
+    let set = Value::from(alloc::collections::BTreeSet::from([v("1")]));
+    assert_eq!(root.indexed(&set, &v("1")), RuntimeOrigin::Unknown);
+}
+
+#[test]
+fn native_invocation_restores_the_callers_origin_window() {
+    let program = compile("package t\ninner := input.inside\nr := inner\n");
+    let mut vm = RegoVM::new();
+    vm.load_program(program.clone());
+    vm.set_input(v(r#"{"inside":[1],"outside":[2]}"#));
+    vm.set_explanation_recorder(Box::new(Recorder));
+    instruction(&mut vm, &program, Instruction::LoadInput { dest: 0 });
+    let outer = vm.explain.origins.get(0);
+    let info = program.rule_infos.iter().find(|info| info.name == "data.t.inner").unwrap();
+    let (result, inconsistent) = vm.execute_rule_definitions_common(
+        &info.definitions, info, None,
+    ).unwrap();
+    assert_eq!(result, v("[1]"));
+    assert!(!inconsistent);
+    assert_eq!(outer, vm.explain.origins.get(0));
+    assert!(vm.explain.origins.windows.is_empty());
+}
+
+fn contains_key(origins: &[RuntimeOrigin], key: &str) -> bool {
+    origins.iter().any(|origin| matches!(origin,
+        RuntimeOrigin::Source { path: ConcretePath::Captured { segments, .. }, .. }
+            if segments == &[PathSegment::Key(key.into())]
+    ))
+}
+
+#[test]
+fn suspension_preserves_nested_windows_and_reset_partitions_evaluations() {
+    let program = compile(
+        "package t\ninner := [input.inside, __builtin_host_await(input.flag,\"inner\")]\n\
+         r := [input.outside, inner, __builtin_host_await(input.flag,\"outer\")]\n",
+    );
+    let mut vm = RegoVM::new();
+    vm.load_program(program);
+    vm.set_input(v(r#"{"inside":[1],"outside":[2],"flag":true}"#));
+    vm.set_execution_mode(ExecutionMode::Suspendable);
+    vm.set_explanation_recorder(Box::new(Recorder));
+    vm.execute().unwrap();
+    let first_epoch = vm.explain.origins.epoch;
+    assert_eq!(vm.get_host_await_identifier(), Some(&v(r#""inner""#)));
+    assert!(contains_key(&vm.explain.origins.registers, "inside"));
+    assert!(vm.explain.origins.windows.iter().any(|window| contains_key(window, "outside")));
+    vm.resume(Some(Value::Bool(true))).unwrap();
+    assert_eq!(vm.explain.origins.epoch, first_epoch);
+    assert_eq!(vm.get_host_await_identifier(), Some(&v(r#""outer""#)));
+    assert!(contains_key(&vm.explain.origins.registers, "outside"));
+    assert!(!contains_key(&vm.explain.origins.registers, "inside"));
+    vm.resume(Some(Value::Bool(false))).unwrap();
+    assert!(matches!(vm.execution_state(), ExecutionState::Completed { result }
+        if result == &v("[[2],[[1],true],false]")));
+    assert!(vm.explain.origins.windows.is_empty());
+    vm.execute().unwrap();
+    assert_ne!(vm.explain.origins.epoch, first_epoch);
+    vm.set_max_instructions(1);
+    assert!(vm.resume(Some(Value::Bool(true))).is_err());
+    assert!(vm.explain.origins.registers.is_empty());
+    assert!(vm.explain.origins.windows.is_empty());
+}
+
+#[test]
+fn replacing_a_recorder_while_suspended_does_not_recover_old_origins_by_equality() {
+    let program = compile(
+        "package t\ninner := [input.inside, __builtin_host_await(input.flag,\"inner\")]\n\
+         r := [input.outside, inner, __builtin_host_await(input.flag,\"outer\")]\n",
+    );
+    let mut vm = RegoVM::new();
+    vm.load_program(program);
+    vm.set_input(v(r#"{"inside":[1],"outside":[1],"flag":true}"#));
+    vm.set_execution_mode(ExecutionMode::Suspendable);
+    vm.set_explanation_recorder(Box::new(Recorder));
+    vm.execute().unwrap();
+    let recorder = vm.take_explanation_recorder().unwrap();
+    vm.set_explanation_recorder(recorder);
+    assert!(vm.explain.origins.registers.is_empty());
+    assert!(vm.explain.origins.windows.is_empty());
+    vm.resume(Some(Value::Bool(true))).unwrap();
+    assert_eq!(vm.get_host_await_identifier(), Some(&v(r#""outer""#)));
+    assert!(!contains_key(&vm.explain.origins.registers, "outside"));
+    vm.resume(Some(Value::Bool(false))).unwrap();
+    assert!(matches!(vm.execution_state(), ExecutionState::Completed { result }
+        if result == &v("[[1],[[1],true],false]")));
+    assert!(vm.explain.origins.windows.is_empty());
+}
+
+#[test]
+fn recorder_off_has_no_origin_storage_and_preserves_outcomes_in_both_modes() {
+    let program = compile("package t\nr := [input.a, input.b]\n");
+    for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
+        let mut vm = RegoVM::new();
+        vm.load_program(program.clone());
+        vm.set_input(v(r#"{"a":[1],"b":[1]}"#));
+        vm.set_execution_mode(mode);
+        vm.execute().unwrap();
+        let off = vm.execution_state().clone();
+        assert!(vm.explain.origins.registers.is_empty());
+        assert!(vm.explain.origins.windows.is_empty());
+        vm.set_explanation_recorder(Box::new(Recorder));
+        vm.execute().unwrap();
+        assert_eq!(vm.execution_state(), &off);
+        let recorder = vm.take_explanation_recorder().unwrap();
+        assert!(vm.explain.origins.registers.is_empty());
+        vm.execute().unwrap();
+        assert_eq!(vm.execution_state(), &off);
+        vm.set_explanation_recorder(recorder);
+        vm.execute().unwrap();
+        assert_eq!(vm.execution_state(), &off);
+    }
+}

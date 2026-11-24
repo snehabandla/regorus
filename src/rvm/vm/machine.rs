@@ -345,6 +345,8 @@ impl RegoVM {
     /// Load a complete program for execution
     pub fn load_program(&mut self, program: Arc<Program>) {
         #[cfg(feature = "explanations")]
+        self.explain.origins.reset();
+        #[cfg(feature = "explanations")]
         self.explain_abort_calls();
         #[cfg(all(feature = "allocator-memory-limits", not(miri)))]
         if matches!(
@@ -418,6 +420,12 @@ impl RegoVM {
         if !self.registers.is_empty() {
             self.registers
                 .resize(self.base_register_count, Value::Undefined);
+            #[cfg(feature = "explanations")]
+            if self.explain_enabled() {
+                self.explain
+                    .origins
+                    .resize(self.base_register_count, self.base_register_count);
+            }
         }
     }
 
@@ -427,12 +435,16 @@ impl RegoVM {
         self.program.check_rule_data_conflicts(&data)?;
 
         self.data = data;
+        #[cfg(feature = "explanations")]
+        self.explain.origins.reset();
         Ok(())
     }
 
     /// Set the global input object
     pub fn set_input(&mut self, input: Value) {
         self.input = input;
+        #[cfg(feature = "explanations")]
+        self.explain.origins.reset();
     }
 
     /// Set the evaluation context (host-supplied ambient data)
@@ -1104,7 +1116,12 @@ impl RegoVM {
                 register_count,
             },
         )?;
-        Ok(core::mem::replace(slot, Value::Undefined))
+        let value = core::mem::replace(slot, Value::Undefined);
+        #[cfg(feature = "explanations")]
+        if self.explain_enabled() {
+            self.explain.origins.clear_register(index);
+        }
+        Ok(value)
     }
 
     #[inline]
@@ -1120,6 +1137,10 @@ impl RegoVM {
             },
         )?;
         *slot = value;
+        #[cfg(feature = "explanations")]
+        if self.explain_enabled() {
+            self.explain.origins.clear_register(index);
+        }
         Ok(())
     }
 

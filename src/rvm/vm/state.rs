@@ -27,6 +27,8 @@ impl RegoVM {
 
     pub(super) fn release_previous_execution_state(&mut self) {
         #[cfg(feature = "explanations")]
+        self.explain.origins.reset();
+        #[cfg(feature = "explanations")]
         self.explain_abort_calls();
         self.evaluated = Value::Undefined;
         self.execution_state = ExecutionState::Ready;
@@ -83,6 +85,8 @@ impl RegoVM {
     #[cfg(all(feature = "allocator-memory-limits", not(miri)))]
     pub(super) fn fail_suspendable_execution(&mut self, error: VmError) -> VmError {
         #[cfg(feature = "explanations")]
+        self.explain.origins.reset();
+        #[cfg(feature = "explanations")]
         self.explain_abort_calls();
         if matches!(
             error,
@@ -107,6 +111,8 @@ impl RegoVM {
 
     #[cfg(any(miri, not(feature = "allocator-memory-limits")))]
     pub(super) fn fail_suspendable_execution(&mut self, error: VmError) -> VmError {
+        #[cfg(feature = "explanations")]
+        self.explain.origins.reset();
         #[cfg(feature = "explanations")]
         self.explain_abort_calls();
         if matches!(

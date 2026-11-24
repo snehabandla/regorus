@@ -17,6 +17,8 @@ mod machine;
 #[cfg(feature = "explanations")]
 mod partial_eval;
 mod rules;
+#[cfg(feature = "explanations")]
+mod runtime_origins;
 mod state;
 mod virtual_data;
 
