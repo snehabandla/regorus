@@ -896,7 +896,10 @@ fn b33_review_chained_undefined_prefix_skips_unreachable_register() -> anyhow::R
         machine.execute_entry_point_by_name("entry"),
         Err(expected.clone())
     );
-    assert_eq!(machine.partial_eval("entry"), Err(ExplainError::Vm(expected)));
+    assert_eq!(
+        machine.partial_eval("entry"),
+        Err(ExplainError::Vm(expected))
+    );
     Ok(())
 }
 
@@ -1008,7 +1011,11 @@ fn b33_review_large_numeric_object_unknowns_still_fail_closed() -> anyhow::Resul
         )];
         machine.set_partial_eval_settings(settings);
         let report = machine.partial_eval("data.test.allow")?;
-        assert_eq!(report.status, ResidualStatus::Unsupported, "{index}: {report:?}");
+        assert_eq!(
+            report.status,
+            ResidualStatus::Unsupported,
+            "{index}: {report:?}"
+        );
         machine.set_input(input(Value::from(BTreeMap::from([(
             Value::from(index),
             Value::from(1),
