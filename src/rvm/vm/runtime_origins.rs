@@ -41,9 +41,9 @@ impl RuntimeOrigin {
     /// Index only a tracked direct source. A computed collection's member
     /// might itself be a source value; without a member map it is unknown.
     fn indexed(&self, container: &Value, key: &Value) -> Self {
-        let Self::Source {
+        let &Self::Source {
             epoch,
-            path: ConcretePath::Captured { root, segments },
+            path: ConcretePath::Captured { root, ref segments },
         } = self
         else {
             return Self::Unknown;
@@ -52,8 +52,8 @@ impl RuntimeOrigin {
             return Self::Unknown;
         }
         let segment = match (container, key) {
-            (Value::Object(_), Value::String(key)) => PathSegment::Key(key.to_string()),
-            (Value::Array(_), Value::Number(index)) => match index.as_u64() {
+            (&Value::Object(_), &Value::String(ref key)) => PathSegment::Key(key.to_string()),
+            (&Value::Array(_), &Value::Number(ref index)) => match index.as_u64() {
                 // Value lookup historically casts to usize. Do not attribute
                 // its truncated result to an unaddressable full-u64 slot.
                 Some(index) if usize::try_from(index).is_ok() => PathSegment::Index(index),
@@ -66,9 +66,9 @@ impl RuntimeOrigin {
         let mut segments = segments.clone();
         segments.push(segment);
         Self::Source {
-            epoch: *epoch,
+            epoch,
             path: ConcretePath::Captured {
-                root: *root,
+                root,
                 segments,
             },
         }
@@ -106,7 +106,9 @@ impl RuntimeOrigins {
         let index = usize::from(register);
         self.registers
             .resize(self.registers.len().max(index + 1), RuntimeOrigin::Unknown);
-        self.registers[index] = origin;
+        if let Some(slot) = self.registers.get_mut(index) {
+            *slot = origin;
+        }
     }
 
     pub(super) fn clear_register(&mut self, register: u8) {
@@ -130,7 +132,7 @@ impl RuntimeOrigins {
         self.registers = self.windows.pop().unwrap_or_default();
     }
 
-    fn source(&self, root: PathRoot) -> RuntimeOrigin {
+    const fn source(&self, root: PathRoot) -> RuntimeOrigin {
         if self.exhausted {
             RuntimeOrigin::Unknown
         } else {
@@ -144,7 +146,7 @@ impl RuntimeOrigins {
         }
     }
 
-    fn computed(&mut self) -> RuntimeOrigin {
+    const fn computed(&mut self) -> RuntimeOrigin {
         if self.exhausted {
             return RuntimeOrigin::Unknown;
         }
