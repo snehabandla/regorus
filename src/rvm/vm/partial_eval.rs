@@ -284,10 +284,7 @@ fn render_path(
     checkpoint: &mut impl FnMut() -> Result<()>,
 ) -> core::result::Result<String, ExplainError> {
     checkpoint()?;
-    let mut text = String::from(match root {
-        UnknownRoot::Context => "context",
-        _ => "input",
-    });
+    let mut text = String::from(root_name(root));
     for segment in segments {
         match *segment {
             PathSegment::Key(ref key) => {

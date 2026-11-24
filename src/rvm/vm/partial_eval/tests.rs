@@ -1208,22 +1208,28 @@ fn unknowns_index_values_as_rego_does() -> anyhow::Result<()> {
 }
 
 #[test]
-fn indexed_unknown_reads_fail_closed() -> anyhow::Result<()> {
-    for (input, unknowns, status, result) in [
+fn indexed_unknown_reads_are_residualized() -> anyhow::Result<()> {
+    for (input, unknowns, result, conditions) in [
         (
             r#"{"xs":[]}"#,
             vec![UnknownPath::new(
                 UnknownRoot::Input,
                 [PathSegment::Key("xs".into()), PathSegment::Index(1)],
             )],
-            ResidualStatus::Unsupported,
             Value::Undefined,
+            vec![vec!["input.xs[1] == 1"]],
         ),
         (
             r#"{"xs":[0,1]}"#,
             vec![],
-            ResidualStatus::Exact,
             Value::Bool(true),
+            vec![],
+        ),
+        (
+            r#"{"xs":[0,2]}"#,
+            vec![],
+            Value::Undefined,
+            vec![],
         ),
     ] {
         let mut machine = vm("package test\nallow if input.xs[1] == 1")?;
@@ -1232,8 +1238,18 @@ fn indexed_unknown_reads_fail_closed() -> anyhow::Result<()> {
         settings.unknowns = unknowns;
         machine.set_partial_eval_settings(settings);
         let report = machine.partial_eval("data.test.allow")?;
-        assert_eq!(report.status, status, "{report:?}");
+        assert_eq!(report.status, ResidualStatus::Exact, "{report:?}");
         assert_eq!(report.result, result);
+        assert_eq!(texts(&report), conditions);
+        if let Some(query) = report.residual_queries.first() {
+            assert_eq!(query.status, ResidualAlternativeStatus::Exact);
+            assert_eq!(query.value, Value::Bool(true));
+            let condition = &query.conditions[0];
+            assert_eq!(condition.kind, ResidualKind::ConditionHolds);
+            assert_eq!(condition.operator, Some(Operator::Eq));
+            assert_eq!(condition.input_path.as_deref(), Some("input.xs[1]"));
+            assert_eq!(condition.value, Some(Value::from(1)));
+        }
     }
     Ok(())
 }
