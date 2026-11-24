@@ -122,7 +122,7 @@ impl RuntimeOrigin {
         {
             return Self::Unknown;
         }
-        if let &Self::Collection { ref snapshot, .. } = self {
+        if let Self::Collection { ref snapshot, .. } = *self {
             return snapshot
                 .members
                 .get(key)
