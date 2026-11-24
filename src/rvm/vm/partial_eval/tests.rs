@@ -856,6 +856,11 @@ fn b33_review_chained_undefined_prefix_skips_unreachable_register() -> anyhow::R
         let result = machine.partial_eval("entry")?;
         assert_eq!(result.status, status, "{result:?}");
         assert_eq!(result.result, Value::Undefined);
+        assert!(result.residual_queries.is_empty());
+        assert_eq!(
+            result.warnings.len(),
+            usize::from(status == ResidualStatus::Unsupported)
+        );
     }
 
     // With a defined intermediate object, the same bad register is reachable.
@@ -875,6 +880,22 @@ fn b33_review_chained_undefined_prefix_skips_unreachable_register() -> anyhow::R
     let mut settings = PartialEvalSettings::default();
     settings.unknowns = keys(&["missing.child"]);
     machine.set_partial_eval_settings(settings);
+    assert_eq!(
+        machine.partial_eval("entry"),
+        Err(ExplainError::Vm(expected.clone()))
+    );
+
+    // An undefined root does not skip the first key: dispatch tries it before
+    // deciding whether later keys are unreachable.
+    let mut first_key_program = machine.get_program().as_ref().clone();
+    first_key_program.instruction_data.chained_index_params[usize::from(params_index)]
+        .path_components = vec![LiteralOrRegister::Register(255)];
+    machine.load_program(Arc::new(first_key_program));
+    machine.set_input(Value::Undefined);
+    assert_eq!(
+        machine.execute_entry_point_by_name("entry"),
+        Err(expected.clone())
+    );
     assert_eq!(machine.partial_eval("entry"), Err(ExplainError::Vm(expected)));
     Ok(())
 }
