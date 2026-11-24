@@ -1136,6 +1136,7 @@ fn comprehension_yields_survive_suspension_without_replaying() {
         vm.execution_state(),
         ExecutionState::Suspended { .. }
     ));
+    let mut call_segments = vec![fixture.calls()];
     let mut events = fixture.take();
     assert!(!events
         .iter()
@@ -1145,12 +1146,42 @@ fn comprehension_yields_survive_suspension_without_replaying() {
         vm.execution_state(),
         ExecutionState::Suspended { .. }
     ));
+    call_segments.push(fixture.calls());
     events.extend(fixture.take());
     vm.resume(Some(v("20"))).unwrap();
     assert!(
         matches!(vm.execution_state(), ExecutionState::Completed { result } if result == &v("[[10,20],9]"))
     );
+    call_segments.push(fixture.calls());
     events.extend(fixture.take());
+    let mut last_started = 0;
+    let mut active_calls = Vec::new();
+    for (segment_index, calls) in call_segments.iter().enumerate() {
+        if segment_index == 1 {
+            assert!(calls
+                .iter()
+                .any(|call| matches!(call, CallRecord::Start(_, _))));
+        }
+        for call in calls {
+            match call {
+                CallRecord::Start(_, event) => {
+                    assert!(event.call_instance > last_started);
+                    last_started = event.call_instance;
+                    active_calls.push((Some(event.call_instance), Some(event.rule_index)));
+                }
+                CallRecord::End(context, source, result) => {
+                    assert_eq!(
+                        active_calls.pop(),
+                        Some((context.call_instance, context.rule_index))
+                    );
+                    assert!(source.is_some());
+                    assert!(result.is_some());
+                }
+                CallRecord::Reused(_, _) => {}
+            }
+        }
+        assert_eq!(active_calls.is_empty(), segment_index == 2);
+    }
     let yields: Vec<_> = events
         .iter()
         .filter_map(|e| match &e.event {
