@@ -44,8 +44,9 @@ fn negation_annotations_preserve_feature_independent_bytecode_and_execution() ->
     unannotated.metadata.annotations.remove(key);
     let original_bytecode = bytecode(&original)?;
     for program in [&annotated, &unannotated] {
-        let json = Program::deserialize_json(&program.serialize_json().map_err(anyhow::Error::msg)?)
-            .map_err(anyhow::Error::msg)?;
+        let json =
+            Program::deserialize_json(&program.serialize_json().map_err(anyhow::Error::msg)?)
+                .map_err(anyhow::Error::msg)?;
         let binary = program.serialize_binary().map_err(anyhow::Error::msg)?;
         assert_eq!(binary.get(4..8), Some(6_u32.to_le_bytes().as_slice()));
         let binary = match Program::deserialize_binary(&binary).map_err(anyhow::Error::msg)? {
@@ -89,10 +90,129 @@ fn negation_annotations_preserve_feature_independent_bytecode_and_execution() ->
                         vm.set_max_instructions(limit);
                         results.push(vm.execute());
                     }
-                    assert_eq!(results.first(), results.get(1), "instruction budget {limit}");
+                    assert_eq!(
+                        results.first(),
+                        results.get(1),
+                        "instruction budget {limit}"
+                    );
                 }
             }
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn negation_raw_unicode_and_multiline_layout_match_feature_off_execution() -> Result<()> {
+    for source in [
+        "package t\nallow if { x := `é`; not input.blocked }\n",
+        "package t\nallow if { not\n input.blocked }\n",
+    ] {
+        let mut engine = Engine::new();
+        engine.add_policy("layout.rego".into(), source.into())?;
+        let entry: Rc<str> = "data.t.allow".into();
+        let compiled_policy = engine.compile_with_entrypoint(&entry)?;
+        let program = Compiler::compile_from_policy(&compiled_policy, &["data.t.allow"])?;
+        for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
+            let mut vm = RegoVM::new();
+            vm.load_program(program.clone());
+            vm.set_execution_mode(mode);
+            let returned = vm.execute()?;
+            let actual = if mode == ExecutionMode::RunToCompletion {
+                returned
+            } else {
+                match vm.execution_state() {
+                    ExecutionState::Completed { result } => result.clone(),
+                    other => bail!("did not complete: {other:?}"),
+                }
+            };
+            assert_eq!(actual, Value::Bool(true));
+        }
+    }
+    Ok(())
+}
+
+fn exchange_prefix(name: &str) -> Result<Option<std::path::PathBuf>> {
+    let Some(value) = std::env::var_os(name) else {
+        return Ok(None);
+    };
+    let prefix = std::path::PathBuf::from(value);
+    anyhow::ensure!(
+        !prefix.as_os_str().is_empty()
+            && prefix
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "artifact prefix must be relative and contained in the working directory"
+    );
+    Ok(Some(prefix))
+}
+
+#[test]
+fn negation_artifact_exchange_between_feature_builds() -> Result<()> {
+    let export_prefix = exchange_prefix("B29C_EXPORT_PREFIX")?;
+    let import_prefix = exchange_prefix("B29C_IMPORT_PREFIX")?;
+    if export_prefix.is_none() && import_prefix.is_none() {
+        return Ok(());
+    }
+    let mut engine = Engine::new();
+    engine.add_policy(
+        "exchange.rego".into(),
+        "package t\nhelper(x) := x\nallow if { not helper(input.blocked) }\n".into(),
+    )?;
+    let entry: Rc<str> = "data.t.allow".into();
+    let compiled_policy = engine.compile_with_entrypoint(&entry)?;
+    let local = Compiler::compile_from_policy(&compiled_policy, &["data.t.allow"])?;
+    let local_bytecode = bytecode(&local)?;
+    let artifact = if let Some(prefix) = import_prefix {
+        let json =
+            Program::deserialize_json(&std::fs::read_to_string(prefix.with_extension("json"))?)
+                .map_err(anyhow::Error::msg)?;
+        let bytes = std::fs::read(prefix.with_extension("bin"))?;
+        let binary = match Program::deserialize_binary(&bytes).map_err(anyhow::Error::msg)? {
+            DeserializationResult::Complete(restored) => restored,
+            DeserializationResult::Partial(_) => bail!("external artifact unexpectedly partial"),
+        };
+        assert_eq!(std::fs::read(prefix.with_extension("bytecode"))?, local_bytecode);
+        assert_eq!(bytecode(&json)?, local_bytecode);
+        assert_eq!(bytecode(&binary)?, local_bytecode);
+        assert_eq!(
+            json.metadata.annotations.get("regorus.explain.negation"),
+            binary.metadata.annotations.get("regorus.explain.negation"),
+        );
+        for candidate in [&json, &binary] {
+            for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
+                let mut vm = RegoVM::new();
+                vm.load_program(Arc::new(candidate.clone()));
+                vm.set_execution_mode(mode);
+                let returned = vm.execute()?;
+                let actual = if mode == ExecutionMode::RunToCompletion {
+                    returned
+                } else {
+                    match vm.execution_state() {
+                        ExecutionState::Completed { result } => result.clone(),
+                        other => bail!("did not complete: {other:?}"),
+                    }
+                };
+                assert_eq!(actual, Value::Bool(true));
+            }
+        }
+        binary
+    } else {
+        local.as_ref().clone()
+    };
+    if let Some(prefix) = export_prefix {
+        if let Some(parent) = prefix.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(
+            prefix.with_extension("json"),
+            artifact.serialize_json().map_err(anyhow::Error::msg)?,
+        )?;
+        std::fs::write(
+            prefix.with_extension("bin"),
+            artifact.serialize_binary().map_err(anyhow::Error::msg)?,
+        )?;
+        std::fs::write(prefix.with_extension("bytecode"), bytecode(&artifact)?)?;
     }
     Ok(())
 }

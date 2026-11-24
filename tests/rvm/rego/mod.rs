@@ -19,9 +19,9 @@ use test_generator::test_resources;
 
 mod comprehension_failure_differential;
 mod every_binding_differential;
-mod negation_metadata_compat;
 #[path = "../../native_depth_support/mod.rs"]
 mod native_depth_support;
+mod negation_metadata_compat;
 mod package_value_differential;
 
 #[derive(Serialize, Deserialize, PartialEq, Debug)]

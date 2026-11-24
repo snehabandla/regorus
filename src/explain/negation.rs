@@ -14,11 +14,11 @@ use alloc::vec;
 use alloc::vec::Vec;
 use thiserror::Error;
 
-pub(crate) const ANNOTATION: &str = "regorus.explain.negation";
+pub const ANNOTATION: &str = "regorus.explain.negation";
 const VERSION: u64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum NegationBoundary {
+pub enum NegationBoundary {
     Operand {
         entry_pc: usize,
         not_pc: usize,
@@ -39,13 +39,13 @@ impl NegationBoundary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum NegationMetadata {
+pub enum NegationMetadata {
     Absent,
     Present(Vec<NegationBoundary>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub(crate) enum MetadataError {
+pub enum MetadataError {
     #[error("invalid logical-negation metadata shape or integer")]
     Shape,
     #[error("unsupported logical-negation metadata version")]
@@ -84,7 +84,7 @@ fn identity(program: &Program) -> Result<u64, MetadataError> {
     Ok(hash & 0x7fff_ffff_ffff_ffff)
 }
 
-pub(crate) fn encode(
+pub fn encode(
     program: &Program,
     boundaries: &[NegationBoundary],
 ) -> Result<Value, MetadataError> {
@@ -133,8 +133,8 @@ fn validate_site(program: &Program, not_pc: usize, check_pc: usize) -> Result<()
         return Err(MetadataError::Instruction);
     }
     match (
-        program.instructions.get(not_pc),
-        program.instructions.get(check_pc),
+        program.instructions.get(not_pc).copied(),
+        program.instructions.get(check_pc).copied(),
     ) {
         (
             Some(Instruction::Not { dest, operand }),
@@ -199,7 +199,7 @@ fn validate_site(program: &Program, not_pc: usize, check_pc: usize) -> Result<()
     Ok(())
 }
 
-pub(crate) fn decode(program: &Program) -> Result<NegationMetadata, MetadataError> {
+pub fn decode(program: &Program) -> Result<NegationMetadata, MetadataError> {
     let Some(annotation) = program.metadata.annotations.get(ANNOTATION) else {
         return Ok(NegationMetadata::Absent);
     };
@@ -267,7 +267,7 @@ pub(crate) fn decode(program: &Program) -> Result<NegationMetadata, MetadataErro
         boundaries.push(boundary);
     }
     for (pc, instruction) in program.instructions.iter().enumerate() {
-        let Instruction::Not { dest, operand } = instruction else {
+        let Instruction::Not { dest, operand } = *instruction else {
             continue;
         };
         if dest == operand {
@@ -275,7 +275,7 @@ pub(crate) fn decode(program: &Program) -> Result<NegationMetadata, MetadataErro
         }
         let check_pc = pc.checked_add(1).ok_or(MetadataError::Bounds)?;
         if matches!(
-            program.instructions.get(check_pc),
+            program.instructions.get(check_pc).copied(),
             Some(Instruction::Guard {
                 register,
                 mode: GuardMode::Condition,
@@ -293,7 +293,7 @@ pub(crate) fn decode(program: &Program) -> Result<NegationMetadata, MetadataErro
     Ok(NegationMetadata::Present(boundaries))
 }
 
-pub(crate) fn finish(
+pub fn finish(
     program: &mut Program,
     mut boundaries: Vec<NegationBoundary>,
 ) -> Result<(), MetadataError> {
