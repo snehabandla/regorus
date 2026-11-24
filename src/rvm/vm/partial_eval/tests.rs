@@ -540,11 +540,10 @@ fn numeric_residual_paths_preserve_object_key_identity() -> anyhow::Result<()> {
         ("18446744073709549568.0", Some(18_446_744_073_709_549_568)),
         ("18446744073709551616.0", None),
     ] {
-        let key = Value::from(
-            literal
-                .parse::<crate::number::Number>()
-                .map_err(|error| anyhow::anyhow!("invalid numeric literal {literal}: {error:?}"))?,
-        );
+        let key =
+            Value::from(literal.parse::<crate::number::Number>().map_err(|error| {
+                anyhow::anyhow!("invalid numeric literal {literal}: {error:?}")
+            })?);
         let projected_key = Value::from(index.unwrap_or(u64::MAX));
         let object = Value::from(BTreeMap::from([(projected_key.clone(), Value::from(1))]));
         assert_eq!(object[&projected_key], Value::from(1));
@@ -1331,18 +1330,8 @@ fn indexed_unknown_reads_are_residualized() -> anyhow::Result<()> {
             Value::Undefined,
             vec![vec!["input.xs[1] == 1"]],
         ),
-        (
-            r#"{"xs":[0,1]}"#,
-            vec![],
-            Value::Bool(true),
-            vec![],
-        ),
-        (
-            r#"{"xs":[0,2]}"#,
-            vec![],
-            Value::Undefined,
-            vec![],
-        ),
+        (r#"{"xs":[0,1]}"#, vec![], Value::Bool(true), vec![]),
+        (r#"{"xs":[0,2]}"#, vec![], Value::Undefined, vec![]),
     ] {
         let mut machine = vm("package test\nallow if input.xs[1] == 1")?;
         machine.set_input(Value::from_json_str(input)?);
