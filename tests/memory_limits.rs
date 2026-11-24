@@ -2969,7 +2969,7 @@ fn partial_eval_temporary_lookup_peak_is_accounted() {
 fn partial_eval_temporary_path_rendering_peak_is_accounted() {
     use regorus::explain::{ExplainError, PartialEvalSettings, UnknownPath};
 
-    for key in ["λ\"\\\n".into(), "x".repeat(20 * 1024)] {
+    for key in ["λ\"\\\n".into(), ".".repeat(20 * 1024)] {
         std::thread::spawn(move || {
             let guard = LimitGuard::lock();
             let mut vm = partial_eval_temporary_vm(None);
