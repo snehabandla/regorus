@@ -2835,9 +2835,9 @@ fn partial_eval_temporary_vm(filename: Option<String>) -> RegoVM {
         } else {
             Instruction::LoadTrue { dest: 0 }
         },
-        span,
+        span.clone(),
     );
-    program.add_instruction(Instruction::Return { value: 0 }, None);
+    program.add_instruction(Instruction::Return { value: 0 }, span);
     program.add_entry_point("entry".into(), 0);
     let mut vm = RegoVM::new();
     vm.load_program(Arc::new(program));
@@ -3010,7 +3010,7 @@ fn partial_eval_temporary_warning_peak_is_accounted() {
             assert_eq!(
                 report.warnings,
                 vec![format!(
-                    "partial evaluation unsupported: `input` has unknown paths and is read at {}:1:1",
+                    "partial evaluation unsupported: `Return` reads a value that depends on unknown input at {}:1:1",
                     "p".repeat(filename_len)
                 )]
             );

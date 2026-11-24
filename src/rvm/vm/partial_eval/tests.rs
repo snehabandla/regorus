@@ -830,6 +830,37 @@ fn unknowns_index_values_as_rego_does() -> anyhow::Result<()> {
 }
 
 #[test]
+fn indexed_unknown_reads_fail_closed() -> anyhow::Result<()> {
+    for (input, unknowns, status, result) in [
+        (
+            r#"{"xs":[]}"#,
+            vec![UnknownPath::new(
+                UnknownRoot::Input,
+                [PathSegment::Key("xs".into()), PathSegment::Index(1)],
+            )],
+            ResidualStatus::Unsupported,
+            Value::Undefined,
+        ),
+        (
+            r#"{"xs":[0,1]}"#,
+            vec![],
+            ResidualStatus::Exact,
+            Value::Bool(true),
+        ),
+    ] {
+        let mut machine = vm("package test\nallow if input.xs[1] == 1")?;
+        machine.set_input(Value::from_json_str(input)?);
+        let mut settings = PartialEvalSettings::default();
+        settings.unknowns = unknowns;
+        machine.set_partial_eval_settings(settings);
+        let report = machine.partial_eval("data.test.allow")?;
+        assert_eq!(report.status, status, "{report:?}");
+        assert_eq!(report.result, result);
+    }
+    Ok(())
+}
+
+#[test]
 fn context_and_index_unknowns_are_validated() -> anyhow::Result<()> {
     let run = |unknowns: Vec<UnknownPath>, input: &str, context: Option<&str>| {
         let mut vm = vm(TWO_CONDITIONS)?;
