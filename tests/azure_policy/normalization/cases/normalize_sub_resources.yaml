@@ -2130,3 +2130,136 @@ cases:
       ]
     input: {"type": "Test/widgets", "rules": [{"rawstatus": 1}, {"Other": {"Code": "c"}}]}
     expected_denormalized: {"type": "Test/widgets", "properties": {"rules": [{"rawstatus": 1}, {"properties": {"other": {}, "rawstatus": {"code": "c"}}}]}}
+
+  # Element remaps are rooted at the alias name, so they must run after the
+  # array is renamed from its ARM name.
+  - note: a wildcard-only array rename applies its element remaps
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                {
+                  "name": "Test/widgets/x[*].z",
+                  "defaultPath": "properties.items[*].rawz",
+                  "paths": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "properties": {"items": [{"rawz": 1}, {"other": 2}]}}
+    expected_normalized: {"type": "Test/widgets", "x": [{"z": 1}, {"other": 2}]}
+    round_trip: true
+
+  - note: a wildcard-only array rename applies nested and sibling element remaps
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                {
+                  "name": "Test/widgets/x[*].z",
+                  "defaultPath": "properties.items[*].rawz",
+                  "paths": []
+                },
+                {
+                  "name": "Test/widgets/x[*].w",
+                  "defaultPath": "properties.items[*].raww",
+                  "paths": []
+                },
+                {
+                  "name": "Test/widgets/x[*].ys[*].v",
+                  "defaultPath": "properties.items[*].ys[*].rawv",
+                  "paths": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "properties": {"Items": [{"RawZ": 1, "raww": 2, "ys": [{"rawv": 3}]}]}}
+    expected_normalized: {"type": "Test/widgets", "x": [{"z": 1, "w": 2, "ys": [{"v": 3}]}]}
+    round_trip: true
+    expected_round_trip: {"type": "Test/widgets", "properties": {"items": [{"rawz": 1, "raww": 2, "ys": [{"rawv": 3}]}]}}
+
+  - note: a wildcard-only array rename reverses its element remaps
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                {
+                  "name": "Test/widgets/x[*].z",
+                  "defaultPath": "properties.items[*].rawz",
+                  "paths": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "x": [{"z": 1}, {"other": 2}]}
+    expected_denormalized: {"type": "Test/widgets", "properties": {"items": [{"rawz": 1}, {"other": 2}]}}
+    reverse_round_trip: true
+
+  - note: a later array rename to the same ARM base keeps its own field names
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                {
+                  "name": "Test/widgets/x[*].z",
+                  "defaultPath": "properties.items[*].rawz",
+                  "paths": []
+                },
+                {
+                  "name": "Test/widgets/y[*].w",
+                  "defaultPath": "properties.items[*].raww",
+                  "paths": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "x": [{"z": 1}], "y": [{"w": 2, "z": 3}]}
+    expected_denormalized: {"type": "Test/widgets", "properties": {"items": [{"raww": 2, "z": 3}]}}
+
+  # The rename moves a literal `a.b` key, which the remap (rooted at nested
+  # `a` then `b`) does not reach, so neither direction remaps the field.
+  - note: a dotted wildcard-only array rename leaves its element fields alone
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                {
+                  "name": "Test/widgets/a.b[*].z",
+                  "defaultPath": "properties.items[*].rawz",
+                  "paths": []
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "properties": {"items": [{"rawz": 1, "z": 2}]}}
+    round_trip: true

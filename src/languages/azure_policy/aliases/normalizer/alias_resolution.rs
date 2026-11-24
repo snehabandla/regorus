@@ -98,14 +98,14 @@ pub fn apply_alias_entries(
                             Some(sub_resource_set),
                         ))
                     });
-                let Some(resolved) = resolved else {
+                if let Some(resolved) = resolved {
+                    // Keep the ARM-named key, as the loop above does when the
+                    // casing matches.
+                    obj_insert(result, source_lc, val);
+                    obj_insert(result, target_lc, resolved);
+                } else {
                     obj_insert(result, target_lc, val);
-                    continue;
-                };
-                // Keep the ARM-named key, as the loop above does when the
-                // casing matches.
-                obj_insert(result, source_lc, val);
-                obj_insert(result, target_lc, resolved);
+                }
                 // The remaps above ran before this value had its alias name.
                 for remap in &agg.element_remaps {
                     let root = remap.array_chain.first().and_then(|nav| nav.first());

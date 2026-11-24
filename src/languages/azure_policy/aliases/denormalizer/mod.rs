@@ -11,6 +11,8 @@ mod sub_resource;
 mod tests;
 
 use alloc::collections::BTreeSet;
+use alloc::string::String;
+use alloc::vec::Vec;
 
 use crate::Value;
 
@@ -174,10 +176,13 @@ pub fn denormalize_with_aliases(
             });
 
             // Phase 2c: Precomputed array base renames.
+            // Each rename as (alias base, ARM base), in order.
+            let mut renamed: Vec<(&str, &str)> = Vec::new();
             for (alias_base_lc, arm_base) in &agg.array_renames_denormalize {
                 if let Some(key) = find_key_ci(&properties, alias_base_lc) {
                     if let Some(val) = properties.remove(key.as_ref()) {
                         obj_insert(&mut properties, arm_base, val);
+                        renamed.push((alias_base_lc, arm_base));
                         // The normalizer flattened and remapped this value under its ARM name.
                         let read = writes
                             .read_at(&key)
@@ -202,21 +207,33 @@ pub fn denormalize_with_aliases(
                         restore_casing(&rev.target_field, &casing_map)
                     },
                 };
-                // Follow an outer array phase 2b moved to its ARM path.
+                // Follow an outer array phase 2b moved to its ARM path, or
+                // phase 2c renamed (the normalizer remapped it after renaming).
                 // Otherwise phase 2a wrote it: at the root of a data-plane
                 // resource when the alias's arrays are there under the same
                 // names, else in `properties`.
-                let (at_root, array_chain) =
+                // Phase 2c records a rename under the ARM base's name.
+                let alias_name = remap.array_chain.first().cloned();
+                let (at_root, array_chain, name) =
                     sub_resource::redirect_chain(&remap.array_chain, entries, api_version, &writes)
+                        .map(|(at_root, chain)| (at_root, chain, alias_name.clone()))
+                        .or_else(|| {
+                            renamed_chain(&remap.array_chain, &renamed).map(|(arm_base, chain)| {
+                                (false, chain, Some(alloc::vec![String::from(arm_base)]))
+                            })
+                        })
                         .unwrap_or_else(|| {
-                            (is_data_plane && rev.at_root, remap.array_chain.clone())
+                            (
+                                is_data_plane && rev.at_root,
+                                remap.array_chain.clone(),
+                                alias_name,
+                            )
                         });
                 // Another alias's value replaced this one there; it was not
                 // remapped with this alias's names.
                 // Check the keys the remap will reach, so an older write to an
                 // exact ancestor does not hide a later write that differs in case.
-                if let (Some(outer), Some(name)) = (array_chain.first(), remap.array_chain.first())
-                {
+                if let (Some(outer), Some(name)) = (array_chain.first(), name.as_ref()) {
                     let map = if at_root { &result } else { &properties };
                     let outer: alloc::vec::Vec<&str> =
                         outer.iter().map(|key| key.as_str()).collect();
@@ -273,4 +290,36 @@ pub fn denormalize_with_aliases(
     }
 
     make_value(result)
+}
+
+/// Point an element remap's array chain at the ARM base phase 2c renamed its
+/// outer array to: the ARM base, plus the chain with its first key replaced.
+/// `None` if phase 2c did not rename it, or a later rename replaced or moved
+/// it. A dotted base is a literal key to the rename but nested keys to the
+/// normalizer's remaps, which therefore never applied; it is `None` too.
+fn renamed_chain<'a>(
+    chain: &[Vec<String>],
+    renamed: &[(&str, &'a str)],
+) -> Option<(&'a str, Vec<Vec<String>>)> {
+    let (outer, inner) = chain.split_first()?;
+    let [alias_base] = outer.as_slice() else {
+        return None;
+    };
+    let at = renamed
+        .iter()
+        .rposition(|(alias, _)| alias.eq_ignore_ascii_case(alias_base))?;
+    let &(_, arm_base) = renamed.get(at)?;
+    let later = renamed.get(at.saturating_add(1)..).unwrap_or_default();
+    if later.iter().any(|(alias, arm)| {
+        arm.eq_ignore_ascii_case(arm_base) || alias.eq_ignore_ascii_case(arm_base)
+    }) {
+        return None;
+    }
+    let redirected = alloc::vec![String::from(arm_base)];
+    Some((
+        arm_base,
+        core::iter::once(redirected)
+            .chain(inner.iter().cloned())
+            .collect(),
+    ))
 }
