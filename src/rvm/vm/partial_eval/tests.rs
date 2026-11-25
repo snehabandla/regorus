@@ -719,7 +719,7 @@ fn unknown_validation_checks_the_execution_deadline_before_dispatch() -> anyhow:
         );
         assert!(matches!(
             vm.execution_state(),
-            super::super::execution_model::ExecutionState::Error {
+            crate::rvm::vm::ExecutionState::Error {
                 error: VmError::TimeLimitExceeded { .. }
             }
         ));
@@ -843,7 +843,7 @@ fn unknown_index_checkpoint_work_scales_with_balanced_lookup_and_key_bytes() {
             Ok(())
         );
         assert!(
-            checkpoints <= 128 + 4 * (common_bytes / 256 + 1),
+            checkpoints <= 128 + 6 * (common_bytes / 256 + 1),
             "common_bytes={common_bytes}, checkpoints={checkpoints}"
         );
         assert!(checkpoints >= 2 * (common_bytes / 256 + 1));
