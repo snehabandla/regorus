@@ -183,8 +183,8 @@ mod tests {
         let _guard = acquire_limits_test_lock();
         let mut vm = RegoVM::new();
         vm.registers = vec![Value::Undefined; 8];
-        vm.registers[1] = Value::from("k");
-        vm.registers[2] = Value::from(vec![Value::Null; 128]);
+        vm.set_register(1, Value::from("k"))?;
+        vm.set_register(2, Value::from(vec![Value::Null; 128]))?;
         vm.execute_comprehension_begin(&ComprehensionBeginParams {
             mode: ComprehensionMode::Object,
             collection_reg: 0,
@@ -196,9 +196,9 @@ mod tests {
         })?;
         vm.execute_comprehension_yield(2, Some(1))?;
         let previous = vm.get_register(0)?.clone();
-        let mut next = vec![Value::Null; 128];
-        next[127] = Value::Bool(true);
-        vm.registers[2] = Value::from(next);
+        let mut next = vec![Value::Null; 127];
+        next.push(Value::Bool(true));
+        vm.set_register(2, Value::from(next))?;
         vm.set_execution_timer_config(Some(timer(Duration::ZERO)));
         let result = vm.execute_comprehension_yield(2, Some(1));
         assert!(
