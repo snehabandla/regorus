@@ -88,10 +88,7 @@ fn identity(program: &Program) -> Result<u64, MetadataError> {
     Ok(hash & 0x7fff_ffff_ffff_ffff)
 }
 
-pub fn encode(
-    program: &Program,
-    boundaries: &[NegationBoundary],
-) -> Result<Value, MetadataError> {
+pub fn encode(program: &Program, boundaries: &[NegationBoundary]) -> Result<Value, MetadataError> {
     let rows: Vec<Value> = boundaries
         .iter()
         .map(|boundary| match *boundary {

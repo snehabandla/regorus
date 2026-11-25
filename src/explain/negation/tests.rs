@@ -395,10 +395,7 @@ fn stale_program_identity_and_inconsistent_spans_are_explicit_errors() -> Result
 
 #[test]
 fn raw_unicode_before_not_preserves_lexer_source_coordinates() -> Result<()> {
-    let program = compile(
-        "package t\nallow if { x := `é`; not input.blocked }\n",
-        &[],
-    )?;
+    let program = compile("package t\nallow if { x := `é`; not input.blocked }\n", &[])?;
     assert_eq!(boundaries(&program)?.len(), 1);
     for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
         assert_eq!(execute(&program, "{}", mode)?, Value::Bool(true));
@@ -416,11 +413,7 @@ fn multiline_not_preserves_a_valid_logical_boundary() -> Result<()> {
     Ok(())
 }
 
-fn replace_annotation_number(
-    program: &Program,
-    path: &[usize],
-    number: Value,
-) -> Result<Program> {
+fn replace_annotation_number(program: &Program, path: &[usize], number: Value) -> Result<Program> {
     let mut altered = program.clone();
     let mut slot = altered
         .metadata
@@ -557,7 +550,8 @@ fn negation_growing_source_prefix_measurements() -> Result<()> {
 #[test]
 #[ignore = "requires an artifact produced/re-emitted by separate feature-build processes"]
 fn negation_external_artifact_capture_disposition() -> Result<()> {
-    let prefix = std::env::var_os("B29C_DECODE_PREFIX").context("B29C_DECODE_PREFIX is required")?;
+    let prefix =
+        std::env::var_os("B29C_DECODE_PREFIX").context("B29C_DECODE_PREFIX is required")?;
     let prefix = std::path::PathBuf::from(prefix);
     anyhow::ensure!(
         !prefix.as_os_str().is_empty()

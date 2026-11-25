@@ -174,7 +174,10 @@ fn negation_artifact_exchange_between_feature_builds() -> Result<()> {
             DeserializationResult::Complete(restored) => restored,
             DeserializationResult::Partial(_) => bail!("external artifact unexpectedly partial"),
         };
-        assert_eq!(std::fs::read(prefix.with_extension("bytecode"))?, local_bytecode);
+        assert_eq!(
+            std::fs::read(prefix.with_extension("bytecode"))?,
+            local_bytecode
+        );
         assert_eq!(bytecode(&json)?, local_bytecode);
         assert_eq!(bytecode(&binary)?, local_bytecode);
         assert_eq!(
@@ -213,7 +216,10 @@ fn negation_artifact_exchange_between_feature_builds() -> Result<()> {
         );
     }
     if let Some(prefix) = export_prefix {
-        if let Some(parent) = prefix.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if let Some(parent) = prefix
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
             std::fs::create_dir_all(parent)?;
         }
         std::fs::write(
@@ -263,8 +269,13 @@ fn reserved_negation_float_marker_does_not_change_other_annotations_or_execution
     );
     for restored in [json, binary] {
         assert_eq!(
-            restored.metadata.annotations.get("regorus.explain.negation"),
-            Some(&Value::from("regorus.explain.negation:invalid_representation")),
+            restored
+                .metadata
+                .annotations
+                .get("regorus.explain.negation"),
+            Some(&Value::from(
+                "regorus.explain.negation:invalid_representation"
+            )),
         );
         assert_eq!(bytecode(&restored)?, bytecode(&program)?);
         for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
