@@ -829,8 +829,8 @@ fn unknown_index_checkpoint_work_scales_with_balanced_lookup_and_key_bytes() {
             );
             // Three AVL traversals per declaration, with height < 2*log2(n+1).
             // These depth-one keys fit in one checked byte chunk.
-            let levels = usize::try_from(usize::BITS - width.leading_zeros())
-                .expect("bit width fits usize");
+            let levels =
+                usize::try_from(usize::BITS - width.leading_zeros()).expect("bit width fits usize");
             assert!(
                 checkpoints <= 32 * width * levels,
                 "width={width}, checkpoints={checkpoints}"
