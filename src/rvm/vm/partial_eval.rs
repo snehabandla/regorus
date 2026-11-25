@@ -212,9 +212,9 @@ impl RegoVM {
     #[allow(clippy::indexing_slicing)]
     fn unknown_key(&mut self, path: usize, segment: usize) -> Result<Value> {
         self.execution_timer_tick(1)?;
-        match &self.pe_settings.unknowns[path].segments[segment] {
-            PathSegment::Index(index) => Ok(Value::from(*index)),
-            PathSegment::Key(key) => {
+        match self.pe_settings.unknowns[path].segments[segment] {
+            PathSegment::Index(index) => Ok(Value::from(index)),
+            PathSegment::Key(ref key) => {
                 if self.execution_timer.config().is_some() {
                     for _ in key.as_bytes().chunks(256) {
                         Self::tick_execution_timer(&mut self.execution_timer, self.pc, 1)?;
@@ -264,10 +264,10 @@ impl RegoVM {
         for i in 0..self.pe_settings.unknowns.len() {
             self.pe_checkpoint()?;
             let root = self.pe_settings.unknowns[i].root;
-            let pc = self.pc;
-            let timer = &mut self.execution_timer;
+            let overlap_pc = self.pc;
+            let overlap_timer = &mut self.execution_timer;
             if let Some(other) = paths.overlap(&self.pe_settings.unknowns, i, &mut || {
-                Self::tick_execution_timer(timer, pc, 1)
+                Self::tick_execution_timer(overlap_timer, overlap_pc, 1)
             })? {
                 return Err(ExplainError::InvalidUnknownPath {
                     path: self.render_unknown(i)?,
@@ -295,10 +295,10 @@ impl RegoVM {
                 });
             }
             self.pe_checkpoint()?;
-            let pc = self.pc;
-            let timer = &mut self.execution_timer;
+            let insertion_pc = self.pc;
+            let insertion_timer = &mut self.execution_timer;
             let inserted = paths.insert(&self.pe_settings.unknowns, i, &mut || {
-                Self::tick_execution_timer(timer, pc, 1)
+                Self::tick_execution_timer(insertion_timer, insertion_pc, 1)
             });
             self.check_initial_memory_limit()?;
             inserted?;

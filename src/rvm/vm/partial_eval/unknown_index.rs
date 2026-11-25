@@ -52,17 +52,17 @@ impl UnknownIndex {
                 }
                 // A new ancestor can cover several siblings. Scan once, only
                 // on this terminating error, to retain declaration-order diagnostics.
-                for node in &self.nodes {
+                for candidate in &self.nodes {
                     checkpoint()?;
                     if compare(
                         &paths[path],
-                        &paths[node.path],
+                        &paths[candidate.path],
                         self.checked_bytes,
                         checkpoint,
                     )?
                     .1
                     {
-                        return Ok(Some(node.path));
+                        return Ok(Some(candidate.path));
                     }
                 }
             }
@@ -115,7 +115,7 @@ impl UnknownIndex {
         self.update_height(root);
         let left = self.nodes[root].left;
         let right = self.nodes[root].right;
-        if self.height(left) > self.height(right) + 1 {
+        if self.height(left) > self.height(right).saturating_add(1) {
             if let Some(left) = left {
                 if self.height(self.nodes[left].right) > self.height(self.nodes[left].left) {
                     self.nodes[root].left = Some(self.rotate_left(left));
@@ -123,7 +123,7 @@ impl UnknownIndex {
             }
             return Ok(self.rotate_right(root));
         }
-        if self.height(right) > self.height(left) + 1 {
+        if self.height(right) > self.height(left).saturating_add(1) {
             if let Some(right) = right {
                 if self.height(self.nodes[right].left) > self.height(self.nodes[right].right) {
                     self.nodes[root].right = Some(self.rotate_right(right));
@@ -139,9 +139,10 @@ impl UnknownIndex {
     }
 
     fn update_height(&mut self, index: usize) {
-        self.nodes[index].height = 1 + self
+        self.nodes[index].height = self
             .height(self.nodes[index].left)
-            .max(self.height(self.nodes[index].right));
+            .max(self.height(self.nodes[index].right))
+            .saturating_add(1);
     }
 
     fn rotate_left(&mut self, root: usize) -> usize {
@@ -178,30 +179,32 @@ fn compare<E>(
     if !root.is_eq() {
         return Ok((root, false));
     }
-    for (left, right) in left.segments.iter().zip(&right.segments) {
+    for (left_segment, right_segment) in left.segments.iter().zip(&right.segments) {
         checkpoint()?;
-        let order = match (left, right) {
-            (PathSegment::Index(left), PathSegment::Index(right)) => left.cmp(right),
-            (PathSegment::Key(left), PathSegment::Key(right)) => {
+        let order = match (left_segment, right_segment) {
+            (&PathSegment::Index(left_index), &PathSegment::Index(right_index)) => {
+                left_index.cmp(&right_index)
+            }
+            (&PathSegment::Key(ref left_key), &PathSegment::Key(ref right_key)) => {
                 if checked_bytes {
-                    for (left, right) in left
+                    for (left_chunk, right_chunk) in left_key
                         .as_bytes()
                         .chunks(256)
-                        .zip(right.as_bytes().chunks(256))
+                        .zip(right_key.as_bytes().chunks(256))
                     {
                         checkpoint()?;
-                        let order = left.cmp(right);
+                        let order = left_chunk.cmp(right_chunk);
                         if !order.is_eq() {
                             return Ok((order, false));
                         }
                     }
-                    left.len().cmp(&right.len())
+                    left_key.len().cmp(&right_key.len())
                 } else {
-                    left.cmp(right)
+                    left_key.cmp(right_key)
                 }
             }
-            (PathSegment::Key(_), PathSegment::Index(_)) => Ordering::Less,
-            (PathSegment::Index(_), PathSegment::Key(_)) => Ordering::Greater,
+            (&PathSegment::Key(_), &PathSegment::Index(_)) => Ordering::Less,
+            (&PathSegment::Index(_), &PathSegment::Key(_)) => Ordering::Greater,
         };
         if !order.is_eq() {
             return Ok((order, false));

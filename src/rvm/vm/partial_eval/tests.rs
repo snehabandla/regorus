@@ -814,7 +814,7 @@ fn index_unknowns_checked<E>(
 fn unknown_index_checkpoint_work_scales_with_balanced_lookup_and_key_bytes() {
     use core::convert::Infallible;
 
-    for width in [1usize, 64, 1024] {
+    for width in [1_usize, 64, 1024] {
         let mut paths: Vec<_> = (0..width)
             .map(|i| UnknownPath::input_keys([format!("sibling-{i:04}").as_str()]))
             .collect();
@@ -829,7 +829,8 @@ fn unknown_index_checkpoint_work_scales_with_balanced_lookup_and_key_bytes() {
             );
             // Three AVL traversals per declaration, with height < 2*log2(n+1).
             // These depth-one keys fit in one checked byte chunk.
-            let levels = (usize::BITS - width.leading_zeros()) as usize;
+            let levels = usize::try_from(usize::BITS - width.leading_zeros())
+                .expect("bit width fits usize");
             assert!(
                 checkpoints <= 32 * width * levels,
                 "width={width}, checkpoints={checkpoints}"
