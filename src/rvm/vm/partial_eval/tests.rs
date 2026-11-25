@@ -680,16 +680,21 @@ fn unknown_validation_checks_the_execution_deadline_before_dispatch() -> anyhow:
     let timer = |limit| ExecutionTimerConfig {
         limit,
         // The two-opcode constant program cannot reach this work checkpoint.
-        check_interval: NonZeroU32::new(8).unwrap_or(NonZeroU32::MIN),
+        check_interval: NonZeroU32::new(64).unwrap_or(NonZeroU32::MIN),
     };
     let siblings: Vec<_> = (0..64)
         .map(|i| UnknownPath::input_keys([format!("sibling-{i}").as_str()]))
         .collect();
     let deep = UnknownPath::input_keys(core::iter::repeat_n("child", 64));
+    let shared_key = "x".repeat(16 * 1024);
+    let long_siblings = vec![
+        UnknownPath::input_keys([format!("{shared_key}a").as_str()]),
+        UnknownPath::input_keys([format!("{shared_key}b").as_str()]),
+    ];
     let mut overlapping = siblings.clone();
     overlapping.push(siblings[0].clone());
 
-    for unknowns in [siblings, vec![deep], overlapping] {
+    for unknowns in [siblings, vec![deep], long_siblings, overlapping] {
         let mut vm = RegoVM::new();
         vm.load_program(program.clone());
         let mut settings = PartialEvalSettings::default();
@@ -709,6 +714,10 @@ fn unknown_validation_checks_the_execution_deadline_before_dispatch() -> anyhow:
             "{result:?}"
         );
         vm.set_partial_eval_settings(PartialEvalSettings::default());
+        assert_eq!(vm.partial_eval("entry")?.result, Value::Bool(true));
+        let mut settings = PartialEvalSettings::default();
+        settings.unknowns = keys(&["short-a", "short-b"]);
+        vm.set_partial_eval_settings(settings);
         assert_eq!(vm.partial_eval("entry")?.result, Value::Bool(true));
     }
     let mut vm = RegoVM::new();
