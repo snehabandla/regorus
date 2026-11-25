@@ -938,6 +938,73 @@ fn comprehension_yields_handle_raw_undefined_keys_values_and_result_aliases() {
 }
 
 #[test]
+fn object_comprehension_conflict_stops_before_failed_emission() {
+    use regorus::rvm::instructions::{ComprehensionBeginParams, ComprehensionMode};
+
+    let mut outcomes = Vec::new();
+    for alias_value in [false, true] {
+        let mut program = Program::new();
+        program.literals = vec![v(r#""k""#), v("2"), v("3")];
+        let params_index = program.add_comprehension_begin_params(ComprehensionBeginParams {
+            mode: ComprehensionMode::Object,
+            collection_reg: 0,
+            result_reg: 0,
+            key_reg: 1,
+            value_reg: 2,
+            body_start: 3,
+            comprehension_end: 7,
+        });
+        let yield_instruction = Instruction::ComprehensionYield {
+            value_reg: if alias_value { 0 } else { 2 },
+            key_reg: Some(1),
+        };
+        program.instructions = vec![
+            Instruction::Load {
+                dest: 1,
+                literal_idx: 0,
+            },
+            Instruction::Load {
+                dest: 2,
+                literal_idx: 1,
+            },
+            Instruction::ComprehensionBegin { params_index },
+            yield_instruction.clone(),
+            Instruction::Load {
+                dest: 2,
+                literal_idx: 2,
+            },
+            yield_instruction,
+            Instruction::ComprehensionEnd {},
+            Instruction::Return { value: 0 },
+        ];
+        program.max_rule_window_size = 8;
+        program.dispatch_window_size = 8;
+        let program = Arc::new(program);
+        for mode in MODES {
+            let run = run_program(&program, "{}", mode, false);
+            let emissions: Vec<_> = run
+                .events
+                .iter()
+                .filter_map(|recorded| match &recorded.event {
+                    Event::ComprehensionEmission { key, value, .. } => {
+                        Some((key.clone(), value.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            outcomes.push((alias_value, mode, run.result.is_err(), emissions));
+        }
+    }
+    assert!(
+        outcomes.iter().all(|(alias, _, failed, emissions)| {
+            *failed
+                && *emissions == vec![(Some(v(r#""k""#)), if *alias { v("{}") } else { v("2") })]
+        }),
+        "{outcomes:?}"
+    );
+}
+
+#[test]
 fn comprehension_yields_follow_auto_iteration_and_skip_failed_writes() {
     use regorus::rvm::instructions::{ComprehensionBeginParams, ComprehensionMode};
     for mode in [
