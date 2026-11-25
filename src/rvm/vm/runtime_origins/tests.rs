@@ -836,7 +836,10 @@ fn g2_literal(program: &mut Program, json: &str) -> Result<u16> {
 fn g2_call(program: &mut Program, name: &str, dest: u8, arg: u8) -> Result<Instruction> {
     let func_rule_index = g2_rule(program, name)?;
     anyhow::ensure!(
-        program.rule_infos[usize::from(func_rule_index)]
+        program
+            .rule_infos
+            .get(usize::from(func_rule_index))
+            .context("fixture function")?
             .function_info
             .is_some(),
         "fixture must dispatch an actual function"
@@ -1094,8 +1097,12 @@ fn g2_boolean_identity_and_cached_default_boundaries() -> Result<()> {
 fn g2_cache_keeps_first_selected_value_not_last_equal_definition() -> Result<()> {
     let program = (*compile("package t\np := input.a\np := input.b\nr := [p,p]\n")?).clone();
     let p = g2_rule(&program, "data.t.p")?;
-    assert_eq!(program.rule_infos[usize::from(p)].definitions.len(), 2);
-    assert!(!program.rule_infos[usize::from(p)].early_exit_on_first_success);
+    let info = program
+        .rule_infos
+        .get(usize::from(p))
+        .context("fixture rule")?;
+    assert_eq!(info.definitions.len(), 2);
+    assert!(!info.early_exit_on_first_success);
     let program = g2_driver(
         program,
         vec![
@@ -1114,7 +1121,15 @@ fn g2_cache_keeps_first_selected_value_not_last_equal_definition() -> Result<()>
     let mut partial =
         (*compile("package t\ns contains input.a\ns contains input.b\nr := [s,s]\n")?).clone();
     let s = g2_rule(&partial, "data.t.s")?;
-    assert_eq!(partial.rule_infos[usize::from(s)].definitions.len(), 2);
+    assert_eq!(
+        partial
+            .rule_infos
+            .get(usize::from(s))
+            .context("fixture partial rule")?
+            .definitions
+            .len(),
+        2
+    );
     let a = g2_literal(&mut partial, "[1]")?;
     let b = g2_literal(&mut partial, "[2]")?;
     let partial = g2_driver(
@@ -1168,8 +1183,12 @@ fn g2_cache_keeps_first_selected_value_not_last_equal_definition() -> Result<()>
                 };
                 assert_eq!(vm.get_register(1)?, &expected);
                 assert_eq!(vm.get_register(2)?, &expected);
-                assert!(vm.rule_cache[usize::from(p)].0);
-                assert_eq!(vm.rule_cache[usize::from(p)].1, expected);
+                let cached = vm
+                    .rule_cache
+                    .get(usize::from(p))
+                    .context("fixture cached rule")?;
+                assert!(cached.0);
+                assert_eq!(cached.1, expected);
                 if recording {
                     let expected_origin = if conflict {
                         RuntimeOrigin::Unknown
@@ -1328,7 +1347,10 @@ fn g2_explicit_return_tracks_each_modes_actual_value_selection() -> Result<()> {
             } else {
                 program.instructions.push(Instruction::Return { value: 2 });
             }
-            let info = &mut program.rule_infos[usize::from(p)];
+            let info = program
+                .rule_infos
+                .get_mut(usize::from(p))
+                .context("fixture rule")?;
             info.result_reg = 0;
             info.num_registers = 3;
             info.definitions = Rc::new(vec![vec![entry]]);
@@ -1383,7 +1405,13 @@ fn g2_accumulated_returns_and_cache_do_not_cross_capture_epochs() -> Result<()> 
     )?)
     .clone();
     let p = g2_rule(&program, "data.t.p")?;
-    assert!(!program.rule_infos[usize::from(p)].early_exit_on_first_success);
+    assert!(
+        !program
+            .rule_infos
+            .get(usize::from(p))
+            .context("fixture rule")?
+            .early_exit_on_first_success
+    );
     let mut cached = program.clone();
     let after = g2_literal(&mut cached, r#""after-cache""#)?;
     let cached = g2_driver(
@@ -1440,8 +1468,8 @@ fn g2_accumulated_returns_and_cache_do_not_cross_capture_epochs() -> Result<()> 
                     vm.execute_entry_point_by_index(0)?;
                     assert_eq!(vm.get_host_await_identifier(), Some(&v(r#""pause""#)?));
                     let accumulated = (0..vm.execution_stack.len()).find_map(|index| {
-                        match &vm.execution_stack.get(index)?.kind {
-                            FrameKind::Rule(data) if data.rule_index == p => {
+                        match vm.execution_stack.get(index)?.kind {
+                            FrameKind::Rule(ref data) if data.rule_index == p => {
                                 data.accumulated_result.as_ref()
                             }
                             _ => None,
@@ -1540,8 +1568,12 @@ fn g2_accumulated_returns_and_cache_do_not_cross_capture_epochs() -> Result<()> 
             vm.get_host_await_identifier(),
             Some(&v(r#""after-cache""#)?)
         );
-        assert!(vm.rule_cache[usize::from(p)].0);
-        assert_eq!(vm.rule_cache[usize::from(p)].1, v("[1]")?);
+        let cached = vm
+            .rule_cache
+            .get(usize::from(p))
+            .context("fixture cached rule")?;
+        assert!(cached.0);
+        assert_eq!(cached.1, v("[1]")?);
         if install {
             vm.set_explanation_recorder(Box::new(Recorder));
         }

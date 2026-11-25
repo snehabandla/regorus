@@ -231,11 +231,11 @@ impl RuntimeOrigins {
     }
 
     fn current(&self, origin: RuntimeOrigin) -> RuntimeOrigin {
-        let epoch = match &origin {
+        let epoch = match origin {
             RuntimeOrigin::Unknown => return origin,
             RuntimeOrigin::Source { epoch, .. }
             | RuntimeOrigin::Computed { epoch, .. }
-            | RuntimeOrigin::Collection { epoch, .. } => *epoch,
+            | RuntimeOrigin::Collection { epoch, .. } => epoch,
         };
         if self.exhausted || epoch != self.epoch {
             RuntimeOrigin::Unknown
@@ -251,7 +251,7 @@ impl RuntimeOrigins {
     pub(super) fn cache_rule(&mut self, rule: usize, origin: RuntimeOrigin) {
         let origin = self.current(origin);
         self.cached_rules.resize(
-            self.cached_rules.len().max(rule + 1),
+            self.cached_rules.len().max(rule.saturating_add(1)),
             RuntimeOrigin::Unknown,
         );
         if let Some(slot) = self.cached_rules.get_mut(rule) {
