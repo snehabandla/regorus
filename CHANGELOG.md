@@ -8,10 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- *(rvm)* [**breaking**] Add `VmError::ObjectComprehensionConflict`; exhaustive Rust matches must handle the new variant.
 - *(parser)* [**breaking**] Reject direct negated assignment (`not x := value`) and negated unification (`not x = value`), including previously accepted OPA-compatible policies. For negated equality, migrate `not input.kind = "Pod"` to `not input.kind == "Pod"`. Positive bindings inside nested comprehensions and `every` bodies remain supported. See the [grammar restriction](docs/grammar.md).
 
 ### Fixed
 
+- *(rvm)* Reject unequal values for duplicate object-comprehension keys in both execution modes, without absorbing conflicts into defaults or negation. Equal duplicates remain valid.
 - *(rvm)* Package values such as `data.pkg` omit undefined rules and include subpackages that have no rules (as `{}`), matching OPA and the interpreter.
 
 ## [0.15.0](https://github.com/microsoft/regorus/compare/regorus-v0.14.1...regorus-v0.15.0) - 2026-11-07

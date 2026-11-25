@@ -226,6 +226,35 @@ impl RegoVM {
         }
     }
 
+    fn check_object_comprehension_value(
+        &mut self,
+        result_reg: u8,
+        key: Option<&Value>,
+        value: &Value,
+    ) -> Result<()> {
+        let Some(key) = key else {
+            return Ok(());
+        };
+        if matches!(key, Value::Undefined) || matches!(value, Value::Undefined) {
+            return Ok(());
+        }
+        let previous = match self.get_register(result_reg)? {
+            Value::Object(object) => object.get(key).cloned(),
+            _ => None,
+        };
+        if let Some(previous) = previous {
+            if !self.compare_values(&previous, value, true)?.is_eq() {
+                return Err(VmError::ObjectComprehensionConflict {
+                    key: key.clone().into(),
+                    previous: previous.into(),
+                    value: value.clone().into(),
+                    pc: self.pc,
+                });
+            }
+        }
+        Ok(())
+    }
+
     #[allow(clippy::if_then_some_else_none)]
     fn execute_comprehension_yield_run_to_completion(
         &mut self,
@@ -255,6 +284,14 @@ impl RegoVM {
             .explain_enabled()
             .then(|| (key_value.clone(), value_to_add.clone()));
         let result_reg = comprehension_context.result_reg;
+        if matches!(comprehension_context.mode, ComprehensionMode::Object) {
+            if let Err(error) =
+                self.check_object_comprehension_value(result_reg, key_value.as_ref(), &value_to_add)
+            {
+                self.comprehension_stack.push(comprehension_context);
+                return Err(error);
+            }
+        }
         // Take ownership of the result register so Rc refcount stays at 1,
         // allowing Rc::make_mut to mutate in-place instead of deep-cloning.
         let mut current_result = self.take_register(result_reg)?;
@@ -391,6 +428,13 @@ impl RegoVM {
             }
         };
 
+        if matches!(mode, ComprehensionMode::Object) {
+            self.check_object_comprehension_value(
+                result_reg_idx,
+                key_value.as_ref(),
+                &value_to_add,
+            )?;
+        }
         // Take ownership of the result register so Rc refcount stays at 1,
         // allowing Rc::make_mut to mutate in-place instead of deep-cloning.
         let mut current_result = self.take_register(result_reg_idx)?;

@@ -219,6 +219,14 @@ pub enum VmError {
     #[error("Cannot iterate over {value:?} (pc={pc})")]
     InvalidIteration { value: DiagnosticValue, pc: usize },
 
+    #[error("Object comprehension key {key:?} generated multiple times with different values ({previous:?}, {value:?}, pc={pc})")]
+    ObjectComprehensionConflict {
+        key: DiagnosticValue,
+        previous: DiagnosticValue,
+        value: DiagnosticValue,
+        pc: usize,
+    },
+
     #[error("HostAwait executed but no response provided for destination register {dest} (id: {identifier:?}, pc={pc})")]
     HostAwaitResponseMissing {
         dest: u8,
@@ -383,6 +391,7 @@ impl core::fmt::Debug for VmError {
             Self::ModuloOnFloat { .. } => "ModuloOnFloat",
             Self::InvalidModulo { .. } => "InvalidModulo",
             Self::InvalidIteration { .. } => "InvalidIteration",
+            Self::ObjectComprehensionConflict { .. } => "ObjectComprehensionConflict",
             Self::HostAwaitResponseMissing { .. } => "HostAwaitResponseMissing",
             Self::AssertionFailed { .. } => "AssertionFailed",
             Self::RuleDataConflict { .. } => "RuleDataConflict",
