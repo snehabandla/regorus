@@ -84,7 +84,7 @@ pub fn object_get_mut_ci<'a>(obj: &'a mut Object, key: &str) -> Option<&'a mut V
 
 /// Remove `key` from an Object, falling back to a key that differs only in
 /// ASCII case.
-fn object_remove_ci(obj: &mut Object, key: &str) -> Option<Value> {
+pub fn object_remove_ci(obj: &mut Object, key: &str) -> Option<Value> {
     let found = object_key_ci(obj, key)?;
     obj.remove(&found)
 }

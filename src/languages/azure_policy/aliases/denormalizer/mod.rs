@@ -12,13 +12,14 @@ mod tests;
 
 use alloc::collections::BTreeSet;
 
+use crate::value::Object;
 use crate::Value;
 
 use crate::Rc;
 
 use super::obj_map::{
     extract_type_field, is_root_field_collision, make_value, new_map, obj_insert,
-    set_nested_verbatim, val_str, ROOT_FIELDS,
+    object_get_mut_ci, object_remove_ci, set_nested_verbatim, val_str, ObjMap, ROOT_FIELDS,
 };
 use super::types::ResolvedAliases;
 use super::AliasRegistry;
@@ -174,6 +175,7 @@ pub fn denormalize_with_aliases(
             });
 
             // Phase 2c: Precomputed array base renames.
+            let mut nested_renames = alloc::vec::Vec::new();
             for (alias_base_lc, arm_base) in &agg.array_renames_denormalize {
                 if let Some(key) = find_key_ci(&properties, alias_base_lc) {
                     if let Some(val) = properties.remove(key.as_ref()) {
@@ -184,6 +186,11 @@ pub fn denormalize_with_aliases(
                             .unwrap_or_else(|| alloc::string::String::from(&*key));
                         writes.record_key(false, arm_base, arm_base, &read);
                     }
+                } else if alias_base_lc.split_once('.').is_some_and(|(first, _)| {
+                    !ROOT_FIELDS.iter().any(|f| f.eq_ignore_ascii_case(first))
+                }) {
+                    // The normalizer nested it; phase 2d remaps it there first.
+                    nested_renames.push((alias_base_lc, arm_base));
                 }
             }
 
@@ -236,6 +243,24 @@ pub fn denormalize_with_aliases(
                 };
                 apply_element_remap(map, &remap, false);
             }
+
+            for (alias_base_lc, arm_base) in nested_renames {
+                // Only the normalized key's own value: not another alias's.
+                let keys: alloc::vec::Vec<&str> = alias_base_lc.split('.').collect();
+                let reached = sub_resource::output_keys(&properties, &keys);
+                let reached: alloc::vec::Vec<&str> =
+                    reached.iter().map(|key| key.as_str()).collect();
+                if writes
+                    .origin(false, &reached)
+                    .is_none_or(|origin| origin.name != *alias_base_lc)
+                {
+                    continue;
+                }
+                if let Some(val) = take_nested_ci(&mut properties, alias_base_lc) {
+                    obj_insert(&mut properties, arm_base, val);
+                    writes.record_key(false, arm_base, arm_base, alias_base_lc);
+                }
+            }
         }
     }
 
@@ -273,4 +298,35 @@ pub fn denormalize_with_aliases(
     }
 
     make_value(result)
+}
+
+/// Remove the value at the dot-separated `path` in `map` (keys in any case),
+/// and the objects it leaves empty.
+fn take_nested_ci(map: &mut ObjMap, path: &str) -> Option<Value> {
+    let (first, rest) = path.split_once('.')?;
+    let key = find_key_ci(map, first)?;
+    let Some(Value::Object(obj)) = map.get_mut(key.as_ref()) else {
+        return None;
+    };
+    let obj = Rc::make_mut(obj);
+    let taken = take_in_object(obj, rest)?;
+    if obj.is_empty() {
+        map.remove(key.as_ref());
+    }
+    Some(taken)
+}
+
+fn take_in_object(obj: &mut Object, path: &str) -> Option<Value> {
+    let Some((first, rest)) = path.split_once('.') else {
+        return object_remove_ci(obj, path);
+    };
+    let Value::Object(inner) = object_get_mut_ci(obj, first)? else {
+        return None;
+    };
+    let inner = Rc::make_mut(inner);
+    let taken = take_in_object(inner, rest)?;
+    if inner.is_empty() {
+        object_remove_ci(obj, first);
+    }
+    Some(taken)
 }

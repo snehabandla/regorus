@@ -1334,6 +1334,289 @@ cases:
                 properties:
                   rawz: 1
 
+  - note: a renaming plain alias with a differently cased ARM key and a dotted name is written nested
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                { "name": "Test/widgets/cfg.a", "defaultPath": "properties.items", "paths": [] },
+                { "name": "Test/widgets/cfg.a[*].z", "defaultPath": "properties.items[*].rawz", "paths": [] }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "properties": {"Items": [{"rawz": 1}]}}
+    expected_normalized: {"type": "Test/widgets", "items": [{"rawz": 1}], "cfg": {"a": [{"z": 1}]}}
+    round_trip: true
+    # The key comes back with the casing of the alias's ARM path.
+    expected_round_trip: {"type": "Test/widgets", "properties": {"items": [{"rawz": 1}]}}
+
+  - note: a renaming plain alias with a matching ARM key and a dotted name adds no literal dotted key
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                { "name": "Test/widgets/cfg.a", "defaultPath": "properties.items", "paths": [] },
+                { "name": "Test/widgets/cfg.a[*].z", "defaultPath": "properties.items[*].rawz", "paths": [] }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "properties": {"items": [{"rawz": 1}]}}
+    expected_normalized: {"type": "Test/widgets", "items": [{"rawz": 1}], "cfg": {"a": [{"z": 1}]}}
+    round_trip: true
+
+  - note: a dotted array rename is written nested and renamed back
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                { "name": "Test/widgets/cfg.a[*].z", "defaultPath": "properties.items[*].rawz", "paths": [] }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "properties": {"items": [{"rawz": 1}]}}
+    expected_normalized: {"type": "Test/widgets", "cfg": {"a": [{"rawz": 1}]}}
+    round_trip: true
+
+  - note: a dotted array rename beside an ARM object with its first key keeps its literal key
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                { "name": "Test/widgets/cfg.a[*].z", "defaultPath": "properties.items[*].z", "paths": [] }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "properties": {"cfg": {"a": [{"z": 2}], "keep": 3}, "items": [{"z": 1}]}}
+    # Nested, it would replace the ARM `cfg.a` and be taken for it.
+    expected_normalized: {"type": "Test/widgets", "cfg": {"a": [{"z": 2}], "keep": 3}, "cfg.a": [{"z": 1}]}
+    round_trip: true
+
+  - note: an ARM object at a dotted array rename's nested path is read as the alias's value
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                { "name": "Test/widgets/cfg.a[*].z", "defaultPath": "properties.items[*].z", "paths": [] }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "properties": {"cfg": {"a": [{"z": 2}], "keep": 3}}}
+    expected_normalized: {"type": "Test/widgets", "cfg": {"a": [{"z": 2}], "keep": 3}}
+    # As with an undotted `a` beside no `items`; escaping raw keys is A28.
+    round_trip: true
+    expected_round_trip: {"type": "Test/widgets", "properties": {"cfg": {"keep": 3}, "items": [{"z": 2}]}}
+
+  - note: a dotted array rename beside an empty ARM object with its first key keeps its literal key
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                { "name": "Test/widgets/cfg.a[*].z", "defaultPath": "properties.items[*].z", "paths": [] }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "properties": {"cfg": {}, "items": [{"z": 1}]}}
+    expected_normalized: {"type": "Test/widgets", "cfg": {}, "cfg.a": [{"z": 1}]}
+    round_trip: true
+
+  - note: a dotted array rename under a plain alias's name keeps its literal key
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                { "name": "Test/widgets/cfg.a[*].z", "defaultPath": "properties.items[*].z", "paths": [] },
+                { "name": "Test/widgets/cfg", "defaultPath": "properties.conf", "paths": [] }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "properties": {"conf": {"x": 1}, "items": [{"z": 1}]}}
+    expected_normalized: {"type": "Test/widgets", "cfg": {"x": 1}, "conf": {"x": 1}, "cfg.a": [{"z": 1}]}
+    round_trip: true
+
+  - note: a dotted array rename does not take its array out of another alias's value
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                { "name": "Test/widgets/cfg.a[*].z", "defaultPath": "properties.items[*].z", "paths": [] },
+                { "name": "Test/widgets/holder", "defaultPath": "properties.cfg", "paths": [] }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "properties": {"cfg": {"a": [{"z": 1}], "keep": 2}}}
+    round_trip: true
+
+  - note: a dotted array rename leaves an edited value of another alias whole
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                { "name": "Test/widgets/cfg.a[*].z", "defaultPath": "properties.items[*].z", "paths": [] },
+                { "name": "Test/widgets/holder", "defaultPath": "properties.cfg", "paths": [] }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "holder": {"a": [{"z": 1}], "keep": 2}}
+    expected_denormalized: {"type": "Test/widgets", "properties": {"cfg": {"a": [{"z": 1}], "keep": 2}}}
+
+  - note: a dotted array rename prefers the literal key to the nested one
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                { "name": "Test/widgets/cfg.a[*].z", "defaultPath": "properties.items[*].z", "paths": [] }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "cfg.a": [{"z": 1}], "cfg": {"a": [{"z": 2}]}}
+    expected_denormalized: {"type": "Test/widgets", "properties": {"items": [{"z": 1}], "cfg": {"a": [{"z": 2}]}}}
+
+  - note: a dotted array rename under a non-object keeps its literal key
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                { "name": "Test/widgets/cfg.a[*].z", "defaultPath": "properties.items[*].rawz", "paths": [] }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "properties": {"cfg": null, "items": [{"rawz": 1}]}}
+    # The array cannot be nested under `cfg`, so it keeps the literal key
+    # rather than being dropped.
+    expected_normalized: {"type": "Test/widgets", "cfg": null, "cfg.a": [{"rawz": 1}]}
+    round_trip: true
+
+  - note: a dotted array rename under a root field keeps its literal key
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                { "name": "Test/widgets/name.a[*].z", "defaultPath": "properties.items[*].rawz", "paths": [] }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "name": "w1", "properties": {"items": [{"rawz": 1}]}}
+    expected_normalized: {"type": "Test/widgets", "name": "w1", "name.a": [{"rawz": 1}]}
+    round_trip: true
+
+  - note: a dotted array rename under a root field object keeps its literal key
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                { "name": "Test/widgets/tags.a[*].z", "defaultPath": "properties.items[*].rawz", "paths": [] }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "tags": {"k": "v"}, "properties": {"items": [{"rawz": 1}]}}
+    # Nesting it would make it a tag.
+    expected_normalized: {"type": "Test/widgets", "tags": {"k": "v"}, "tags.a": [{"rawz": 1}]}
+    round_trip: true
+
+  - note: dotted renaming plain aliases sharing a parent each get only their own remaps
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                { "name": "Test/widgets/cfg.a", "defaultPath": "properties.items", "paths": [] },
+                { "name": "Test/widgets/cfg.a[*].z", "defaultPath": "properties.items[*].rawz", "paths": [] },
+                { "name": "Test/widgets/cfg.b", "defaultPath": "properties.others", "paths": [] },
+                { "name": "Test/widgets/cfg.b[*].v.inner", "defaultPath": "properties.others[*].v", "paths": [] }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "properties": {"Items": [{"rawz": 1}], "others": [{"v": 4}]}}
+    # `cfg.b` was remapped before `cfg.a` got its value; remapping it again
+    # would nest `inner` twice.
+    expected_normalized: {"type": "Test/widgets", "items": [{"rawz": 1}], "others": [{"v": 4}], "cfg": {"a": [{"z": 1}], "b": [{"v": {"inner": 4}}]}}
+    round_trip: true
+    # The key comes back with the casing of the alias's ARM path.
+    expected_round_trip: {"type": "Test/widgets", "properties": {"items": [{"rawz": 1}], "others": [{"v": 4}]}}
+
   - note: a renaming plain alias with a differently cased ARM key keeps the wrappers under a mixed-case inner array
     aliases_json: |
       [

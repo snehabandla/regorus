@@ -8,8 +8,8 @@ use crate::Rc;
 use crate::Value;
 
 use super::super::obj_map::{
-    collision_safe_key, is_root_field_collision, obj_contains, obj_insert, obj_insert_rc,
-    obj_remove, set_nested_lowercased, ObjMap,
+    collision_safe_key, is_root_field_collision, obj_insert, obj_insert_rc, obj_remove,
+    object_get_ci, set_nested_lowercased, ObjMap, ROOT_FIELDS,
 };
 use super::super::types::ResolvedAliases;
 use super::element_remap::apply_element_remap_precomputed;
@@ -75,7 +75,12 @@ pub fn apply_alias_entries(
     }
 
     for (source_lc, target_lc) in &agg.array_renames_normalize {
-        if !obj_contains(result, target_lc.as_str()) {
+        let present = if nestable(result, raw, aliases, target_lc) {
+            contains_dotted(result, target_lc)
+        } else {
+            result.contains_key(target_lc.as_str())
+        };
+        if !present {
             if let Some(val) = obj_remove(result, source_lc.as_str()) {
                 // A plain alias the loop above did not resolve (for example,
                 // its ARM key has different casing) gets its value here.
@@ -99,23 +104,84 @@ pub fn apply_alias_entries(
                         ))
                     });
                 let Some(resolved) = resolved else {
-                    obj_insert(result, target_lc, val);
+                    insert_target(result, raw, aliases, target_lc, val);
                     continue;
                 };
                 // Keep the ARM-named key, as the loop above does when the
                 // casing matches.
                 obj_insert(result, source_lc, val);
-                obj_insert(result, target_lc, resolved);
+                insert_target(result, raw, aliases, target_lc, resolved);
                 // The remaps above ran before this value had its alias name.
                 for remap in &agg.element_remaps {
-                    let root = remap.array_chain.first().and_then(|nav| nav.first());
-                    if root.is_some_and(|root| root == target_lc) {
+                    let nav = remap.array_chain.first();
+                    if nav.is_some_and(|nav| nav.iter().eq(target_lc.split('.'))) {
                         apply_element_remap_precomputed(result, remap);
                     }
                 }
             }
         }
     }
+}
+
+/// Whether `map` has a value at the dot-separated `path` (exact keys).
+fn contains_dotted(map: &ObjMap, path: &str) -> bool {
+    let mut segments = path.split('.');
+    let mut current = segments.next().and_then(|first| map.get(first));
+    for segment in segments {
+        current = current.and_then(|v| v.as_object().ok()?.get(&Value::from(segment)));
+    }
+    current.is_some()
+}
+
+/// Write `value` at the dot-separated `path`, or at the literal key `path`
+/// when that would nest it under an ARM root field, an ARM key, a plain
+/// alias's value or a non-object.
+fn insert_target(
+    map: &mut ObjMap,
+    raw: &Value,
+    aliases: &ResolvedAliases,
+    path: &str,
+    value: Value,
+) {
+    if nestable(map, raw, aliases, path) {
+        set_nested_lowercased(map, path, value);
+    } else {
+        obj_insert(map, path, value);
+    }
+}
+
+fn nestable(map: &ObjMap, raw: &Value, aliases: &ResolvedAliases, path: &str) -> bool {
+    let mut parents = path.split('.');
+    parents.next_back();
+    let Some(first) = parents.next() else {
+        return true;
+    };
+    let in_arm = |obj: Option<&Value>| {
+        obj.and_then(|v| v.as_object().ok()).is_some_and(|obj| {
+            obj.keys()
+                .any(|k| matches!(k, Value::String(k) if k.eq_ignore_ascii_case(first)))
+        })
+    };
+    if ROOT_FIELDS.iter().any(|f| f.eq_ignore_ascii_case(first))
+        || aliases.entries.contains_key(first)
+        || in_arm(Some(raw))
+        || in_arm(
+            raw.as_object()
+                .ok()
+                .and_then(|obj| object_get_ci(obj, "properties")),
+        )
+    {
+        return false;
+    }
+    let mut current = map.get(first);
+    for segment in parents {
+        match current {
+            Some(Value::Object(obj)) => current = obj.get(&Value::from(segment)),
+            Some(_) => return false,
+            None => return true,
+        }
+    }
+    matches!(current, None | Some(Value::Object(_)))
 }
 
 /// Navigate an ARM path using precomputed segments (avoids per-call split).
