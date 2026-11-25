@@ -238,8 +238,8 @@ impl RegoVM {
         if matches!(key, Value::Undefined) || matches!(value, Value::Undefined) {
             return Ok(());
         }
-        let previous = match self.get_register(result_reg)? {
-            Value::Object(object) => object.get(key).cloned(),
+        let previous = match *self.get_register(result_reg)? {
+            Value::Object(ref object) => object.get(key).cloned(),
             _ => None,
         };
         if let Some(previous) = previous {
