@@ -10,57 +10,12 @@ use alloc::vec::Vec;
 use crate::value::Object;
 use crate::Value;
 
-use super::super::obj_map::{make_value, new_map, obj_insert, obj_key_ci, val_str, ObjMap};
-use super::super::path;
-use super::super::types::ResolvedEntry;
+use super::super::obj_map::{
+    is_element_envelope_field, obj_key_ci, set_nested, take_dotted_path_obj, val_str, ObjMap,
+    ROOT_FIELDS,
+};
+use super::super::types::{ElementFields, ResolvedEntry};
 use super::casing::restore_casing;
-
-/// Sub-resource array element envelope fields that remain at the element root.
-const ELEMENT_ENVELOPE_FIELDS: &[&str] = &["name", "type", "id", "etag"];
-
-/// The fields of a sub-resource array's elements that stay at the element
-/// root, from the aliases over the array.
-#[derive(Clone, Debug, Default)]
-struct Fields {
-    /// Fields that stay at the element root.
-    envelope: BTreeSet<String>,
-    /// Fields that both a wrapped and an unwrapped alias give the same name,
-    /// with the element-level short-name keys of the wrapped aliases. Such a
-    /// field came from a wrapped alias, and is wrapped, when the element had
-    /// one of them.
-    shared: BTreeMap<String, BTreeSet<Vec<String>>>,
-}
-
-impl Fields {
-    fn extend(&mut self, other: &Self) {
-        self.envelope.extend(other.envelope.iter().cloned());
-        for (field, names) in &other.shared {
-            self.shared
-                .entry(field.clone())
-                .or_default()
-                .extend(names.iter().cloned());
-        }
-    }
-
-    /// Whether `field` stays at the root of an element whose normalized
-    /// value was `input`.
-    fn at_root(&self, field: &str, input: Option<&Value>) -> bool {
-        let field = field.to_ascii_lowercase();
-        if self.envelope.contains(&field) {
-            return true;
-        }
-        let Some(names) = self.shared.get(&field) else {
-            return false;
-        };
-        let Some(Value::Object(input)) = input else {
-            return false;
-        };
-        !names.iter().any(|name| has_keys(input, name))
-    }
-}
-
-/// The fields of each sub-resource short name that resolves to one array.
-type Target<'a> = BTreeMap<&'a str, Fields>;
 
 /// The denormalization state that re-wrapping reads.
 pub struct Context<'a> {
@@ -74,8 +29,8 @@ pub struct Context<'a> {
     pub is_data_plane: bool,
     /// The key casing phases 2a and 2b restored.
     pub casing_map: &'a BTreeMap<String, String>,
-    /// The normalized resource being denormalized.
-    pub normalized: &'a Object,
+    /// The aliased fields of each sub-resource array's elements.
+    pub fields: &'a BTreeMap<String, ElementFields>,
 }
 
 /// The writes of phases 2a, 2b and 2c, in order.
@@ -101,14 +56,10 @@ struct Write {
 }
 
 /// The write that left a value in the output.
-pub struct Origin<'a> {
+pub struct Origin {
     /// The value's normalized name: the write's source, followed by the keys
     /// below the write.
     pub name: String,
-    /// The normalized key the write read.
-    pub read: &'a str,
-    /// How many output keys the write covered.
-    pub depth: usize,
 }
 
 impl Writes {
@@ -166,7 +117,7 @@ impl Writes {
     /// above `keys`. `None` if nothing was written there. Writes to exactly
     /// `keys` come first; keys from normalized names match the written keys
     /// in any case.
-    pub fn origin(&self, at_root: bool, keys: &[&str]) -> Option<Origin<'_>> {
+    pub fn origin(&self, at_root: bool, keys: &[&str]) -> Option<Origin> {
         let last_write = |same: fn(&str, &str) -> bool| {
             self.log.iter().rev().find(|write| {
                 write.at_root == at_root
@@ -186,8 +137,6 @@ impl Writes {
             .collect();
         Some(Origin {
             name: name.join(".").to_ascii_lowercase(),
-            read: &write.read,
-            depth: write.keys.len(),
         })
     }
 }
@@ -203,25 +152,12 @@ pub fn rewrap_sub_resource_arrays(
     if sub_arrays.is_empty() {
         return;
     }
-    // Parse once per call; only wildcard aliases can address array elements.
-    let parsed: Vec<(path::Path, path::Path)> = cx
-        .entries
-        .values()
-        .filter(|entry| entry.is_wildcard)
-        .filter_map(|entry| {
-            Some((
-                path::parse(&entry.short_name)?,
-                path::parse(entry.select_path(cx.api_version))?,
-            ))
-        })
-        .collect();
-
     // Several short names can resolve to the same array (two plain aliases
     // with one ARM path). Wrap each array once. Keys differing only in case
     // are different arrays, so group by the keys actually in the output.
-    let mut targets: BTreeMap<(bool, Vec<String>), Target<'_>> = BTreeMap::new();
+    let mut targets: BTreeMap<(bool, Vec<String>), BTreeMap<&str, ElementFields>> = BTreeMap::new();
     for sub_array_path in sub_arrays {
-        let fields = classify_envelope_fields(sub_array_path, &parsed);
+        let fields = cx.fields.get(sub_array_path).cloned().unwrap_or_default();
         let (at_root, keys) = written_keys(sub_array_path, cx);
         let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
         let map = if at_root { &*result } else { &*properties };
@@ -247,27 +183,19 @@ pub fn rewrap_sub_resource_arrays(
         {
             continue;
         }
-        // Classify by the name whose value is there. Otherwise keep a field
-        // at the element root if any of the names leaves it there.
+        // Wrap by the name whose value is there. Otherwise by all the names.
         let fields = origin
             .as_ref()
             .and_then(|origin| by_name.get(origin.name.as_str()))
-            .map_or_else(
-                || {
-                    let mut all = Fields::default();
-                    for fields in by_name.values() {
-                        all.extend(fields);
-                    }
-                    all
-                },
-                Fields::clone,
-            );
-        // The normalized value the write read, for the fields whose origin
-        // its elements decide. Below the write, the keys are the same.
-        let (input, skip) = origin.as_ref().map_or((None, 0), |origin| {
-            let read = Value::String(crate::Rc::from(origin.read));
-            (cx.normalized.get(&read), origin.depth.saturating_sub(1))
-        });
+            .cloned()
+            .unwrap_or_else(|| {
+                let mut all = ElementFields::default();
+                for fields in by_name.values() {
+                    all.fields.extend(fields.fields.iter().cloned());
+                    all.root.extend(fields.root.iter().cloned());
+                }
+                all
+            });
         let Some((first, rest)) = keys.split_first() else {
             continue;
         };
@@ -277,7 +205,7 @@ pub fn rewrap_sub_resource_arrays(
             &mut *properties
         };
         if let Some(value) = obj_key_ci(map, first).and_then(|key| map.get_mut(key.as_ref())) {
-            rewrap_at(value, rest, &fields, input, skip);
+            rewrap_at(value, rest, &fields, cx.casing_map);
         }
     }
 }
@@ -342,7 +270,11 @@ fn written_keys(sub_array_path: &str, cx: &Context<'_>) -> (bool, Vec<String>) {
             keys.extend(restore(rest));
             (at_root, keys)
         }
-        None => (cx.is_data_plane, restore(&names)),
+        // Phase 2a writes root fields (`sku`) at the root.
+        None => {
+            let root = ROOT_FIELDS.iter().any(|f| f.eq_ignore_ascii_case(first));
+            (cx.is_data_plane || root, restore(&names))
+        }
     }
 }
 
@@ -391,138 +323,23 @@ pub fn redirect_chain(
     ))
 }
 
-/// Determine which element-level fields are envelope fields for a given
-/// sub-resource array, from parsed `(short name, ARM path)` pairs. Entries
-/// whose short name or selected ARM path does not parse are excluded.
-fn classify_envelope_fields(sub_array_path: &str, parsed: &[(path::Path, path::Path)]) -> Fields {
-    let mut envelope = BTreeSet::new();
-    for &f in ELEMENT_ENVELOPE_FIELDS {
-        envelope.insert(f.to_ascii_lowercase());
-    }
-
-    let array_keys: Vec<&str> = sub_array_path.split('.').collect();
-    // ARM names of the element's root fields, and of the fields under its
-    // `properties` wrapper.
-    let mut unwrapped = BTreeSet::new();
-    let mut wrapped: BTreeMap<String, BTreeSet<Vec<String>>> = BTreeMap::new();
-    for (short, arm_path) in parsed {
-        let parts = short.parts();
-        let Some(level) = array_level(&array_keys, &parts) else {
-            continue;
-        };
-        let Some(short_part) = parts.get(level) else {
-            continue;
-        };
-        let Some(path::Segment::Key(first_segment)) = short_part.segments.first() else {
-            continue;
-        };
-        // Classify by the ARM part at this array's element level, not by the
-        // deepest part of a nested field. The array is flattened, so a quoted
-        // `['properties']` there is the same wrapper.
-        let arm_parts = arm_path.parts();
-        let arm_part = arm_parts.get(level);
-        if let Some(part) = arm_part.filter(|part| part.has_flattened_wrapper()) {
-            if let Some(path::Segment::Key(key)) = part.segments.get(1) {
-                let name = short_part
-                    .segments
-                    .iter()
-                    .map_while(|segment| match segment {
-                        path::Segment::Key(segment_key) => Some(segment_key.to_ascii_lowercase()),
-                        _ => None,
-                    })
-                    .collect();
-                wrapped
-                    .entry(key.to_ascii_lowercase())
-                    .or_default()
-                    .insert(name);
-            }
-            continue;
-        }
-        // Phase 2d gives the field its ARM name when it finds the array, and
-        // leaves the short name when it does not.
-        envelope.insert(first_segment.to_ascii_lowercase());
-        if let Some(path::Segment::Key(key)) = arm_part.and_then(|part| part.segments.first()) {
-            unwrapped.insert(key.to_ascii_lowercase());
-        }
-    }
-    // A name that is also a wrapped field's ARM name may have come from
-    // either alias; the element decides. The standard envelope fields stay.
-    envelope.extend(unwrapped);
-    let mut shared = BTreeMap::new();
-    envelope.retain(|field| match wrapped.get(field) {
-        Some(names) if !ELEMENT_ENVELOPE_FIELDS.contains(&field.as_str()) => {
-            shared.insert(field.clone(), names.clone());
-            false
-        }
-        _ => true,
-    });
-
-    Fields { envelope, shared }
-}
-
-/// Whether `keys` lead somewhere in `object`, matching keys in any case.
-fn has_keys(object: &Object, keys: &[String]) -> bool {
-    let Some((first, rest)) = keys.split_first() else {
-        return true;
-    };
-    let Some(child) = find_key_ci_btree(object, first).and_then(|key| object.get(&key)) else {
-        return false;
-    };
-    match child {
-        Value::Object(child) => has_keys(child, rest),
-        _ => rest.is_empty(),
-    }
-}
-
-/// Number of leading short-name parts whose keys spell `array_keys`, i.e.
-/// the part index of the array's elements; `None` if the alias is outside
-/// the array. A part may hold several keys (`a.b[*]`).
-fn array_level(array_keys: &[&str], parts: &[path::Part<'_>]) -> Option<usize> {
-    let mut remaining = array_keys;
-    for (level, part) in parts.iter().enumerate() {
-        if remaining.is_empty() {
-            return Some(level);
-        }
-        for segment in part.segments {
-            let path::Segment::Key(key) = segment else {
-                return None;
-            };
-            let (name, rest) = remaining.split_first()?;
-            if !key.eq_ignore_ascii_case(name) {
-                return None;
-            }
-            remaining = rest;
-        }
-    }
-    None
-}
-
 /// Follow `keys` from `value` and re-wrap the elements of the array there.
 /// Like the normalizer's path tracking, arrays along the way are walked
 /// element by element and objects by key, so a name such as `a.b.c` matches
-/// `a.b[*].c[*]` and `a[*].b[*].c[*]` alike. `input` follows along in the
-/// normalized value once the first `skip` keys, which have no counterpart
-/// there, are passed.
+/// `a.b[*].c[*]` and `a[*].b[*].c[*]` alike.
 fn rewrap_at(
     value: &mut Value,
     keys: &[&str],
-    fields: &Fields,
-    input: Option<&Value>,
-    skip: usize,
+    fields: &ElementFields,
+    casing: &BTreeMap<String, String>,
 ) {
     match value {
         Value::Array(arr) => {
-            let inner = crate::Rc::make_mut(arr);
-            for (index, elem) in inner.iter_mut().enumerate() {
-                let input = if skip == 0 {
-                    input.and_then(|input| input.as_array().ok()?.get(index))
-                } else {
-                    input
-                };
+            for elem in crate::Rc::make_mut(arr).iter_mut() {
                 if keys.is_empty() {
-                    *elem = rewrap_element(elem, fields, input);
+                    *elem = rewrap_element(elem, fields, casing);
                 } else {
-                    rewrap_at(elem, keys, fields, input, skip);
+                    rewrap_at(elem, keys, fields, casing);
                 }
             }
         }
@@ -530,17 +347,10 @@ fn rewrap_at(
             let Some((first, rest)) = keys.split_first() else {
                 return;
             };
-            let input = match skip.checked_sub(1) {
-                Some(_) => input,
-                None => input.and_then(|input| {
-                    let input = input.as_object().ok()?;
-                    input.get(&find_key_ci_btree(input, first)?)
-                }),
-            };
             let obj = crate::Rc::make_mut(obj);
             if let Some(key) = find_key_ci_btree(obj, first) {
                 if let Some(child) = obj.get_mut(&key) {
-                    rewrap_at(child, rest, fields, input, skip.saturating_sub(1));
+                    rewrap_at(child, rest, fields, casing);
                 }
             }
         }
@@ -560,32 +370,72 @@ fn find_key_ci_btree(btree: &Object, key: &str) -> Option<Value> {
         .cloned()
 }
 
-/// Re-wrap a single sub-resource array element by moving non-envelope
-/// fields back under a `properties` object.
-fn rewrap_element(element: &Value, fields: &Fields, input: Option<&Value>) -> Value {
-    let obj = match element.as_object() {
-        Ok(o) => o,
-        Err(_) => return element.clone(),
+/// Re-wrap a single sub-resource array element, the reverse of the
+/// normalizer's `flatten_element`: aliased fields go back to their ARM names
+/// inside or outside the `properties` wrapper, `_p_<name>` fields inside it,
+/// and other fields inside it unless an alias reads them at the root or they
+/// are standard envelope fields (`name`).
+fn rewrap_element(
+    element: &Value,
+    fields: &ElementFields,
+    casing: &BTreeMap<String, String>,
+) -> Value {
+    let Ok(obj) = element.as_object() else {
+        return element.clone();
     };
 
-    let mut envelope = new_map();
-    let mut props = new_map();
+    let mut rest = obj.clone();
+    let mut envelope = Object::new();
+    let mut props = Object::new();
+    for field in &fields.fields {
+        if let Some(value) = take_dotted_path_obj(&mut rest, &field.short) {
+            let keys: Vec<&str> = field.arm.split('.').collect();
+            let target = if field.wrapped {
+                &mut props
+            } else {
+                &mut envelope
+            };
+            set_nested(target, &keys, value, false);
+        }
+    }
 
-    for (key, val) in obj.iter() {
-        let key_s = match val_str(key) {
-            Some(s) => s,
-            None => continue,
+    // Escaped wrapped fields first, so they win over an unescaped namesake.
+    let mut leftovers: Vec<(&Value, &Value)> = rest.iter().collect();
+    leftovers.sort_by_key(|(key, _)| !val_str(key).is_some_and(|k| k.starts_with("_p_")));
+    for (key, val) in leftovers {
+        let Some(key_s) = val_str(key) else {
+            continue;
         };
-        if fields.at_root(key_s, input) {
-            obj_insert(&mut envelope, key_s, val.clone());
+        if let Some(name) = key_s.strip_prefix("_p_") {
+            merge_absent(&mut props, restore_casing(name, casing), val.clone());
+        } else if is_element_envelope_field(key_s)
+            || fields.root.contains(&key_s.to_ascii_lowercase())
+        {
+            merge_absent(&mut envelope, String::from(key_s), val.clone());
         } else {
-            obj_insert(&mut props, key_s, val.clone());
+            merge_absent(&mut props, String::from(key_s), val.clone());
         }
     }
 
     if !props.is_empty() {
-        obj_insert(&mut envelope, "properties", make_value(props));
+        envelope.insert(Value::from("properties"), Value::from(props));
     }
+    Value::from(envelope)
+}
 
-    make_value(envelope)
+/// Insert `value` at `key` unless the key is there, merging objects.
+fn merge_absent(obj: &mut Object, key: String, value: Value) {
+    let key = Value::from(key);
+    let Some(existing) = obj.get_mut(&key) else {
+        obj.insert(key, value);
+        return;
+    };
+    if let (Value::Object(existing), Value::Object(value)) = (existing, &value) {
+        let existing = crate::Rc::make_mut(existing);
+        for (k, v) in value.iter() {
+            if let Some(k) = val_str(k) {
+                merge_absent(existing, String::from(k), v.clone());
+            }
+        }
+    }
 }

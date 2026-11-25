@@ -347,6 +347,37 @@ pub fn collision_safe_key(short_name: &str) -> String {
     alloc::format!("_p_{}", short_name.to_ascii_lowercase())
 }
 
+/// Sub-resource array element envelope fields, which stay at the element
+/// root rather than under its `properties` wrapper.
+const ELEMENT_ENVELOPE_FIELDS: &[&str] = &["name", "type", "id", "etag"];
+
+/// Whether `key` is a sub-resource array element envelope field, in any case.
+pub fn is_element_envelope_field(key: &str) -> bool {
+    ELEMENT_ENVELOPE_FIELDS
+        .iter()
+        .any(|field| field.eq_ignore_ascii_case(key))
+}
+
+/// Remove and return the value at the dotted `path` in an element Object,
+/// matching each key exactly or else ignoring ASCII case. Objects on the way
+/// stay, even when left empty, as element remaps leave them.
+pub fn take_dotted_path_obj(obj: &mut Object, path: &str) -> Option<Value> {
+    let segments: Vec<&str> = path.split('.').collect();
+    take_at(obj, &segments)
+}
+
+fn take_at(obj: &mut Object, segments: &[&str]) -> Option<Value> {
+    let (first, rest) = segments.split_first()?;
+    let key = object_key_ci(obj, first)?;
+    if rest.is_empty() {
+        return obj.remove(&key);
+    }
+    let Some(Value::Object(child)) = obj.get_mut(&key) else {
+        return None;
+    };
+    take_at(Rc::make_mut(child), rest)
+}
+
 // ─── Element-level field removal ────────────────────────────────────────────
 //
 // Shared by both normalizer (stale source cleanup after remap) and

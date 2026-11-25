@@ -377,6 +377,45 @@ pub struct VersionedAggregates {
     pub array_renames_normalize: Vec<(String, String)>,
     /// Deduplicated array base renames for denormalization: `(short_base_lc, arm_base)`.
     pub array_renames_denormalize: Vec<(String, String)>,
+    /// The aliased fields of each sub-resource array's elements, by the
+    /// array's name in [`ResolvedAliases::sub_resource_arrays`]. These
+    /// fields are moved while elements are flattened or re-wrapped, rather
+    /// than by `element_remaps`, so that the `properties` wrapper decides
+    /// which alias a value belongs to.
+    pub element_fields: BTreeMap<String, ElementFields>,
+}
+
+/// The aliased fields of a sub-resource array's elements.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ElementFields {
+    /// Fields of aliases whose innermost array is this one, renamed from
+    /// their ARM names.
+    pub fields: Vec<ElementField>,
+    /// Lowercase first short-name keys of aliases that read this array's
+    /// elements outside their `properties` wrapper. Normalized keys with these
+    /// names stay at the element root when re-wrapped, so a wrapped value with
+    /// one of these names is normalized as `_p_<name>`.
+    pub root: BTreeSet<String>,
+}
+
+/// An aliased field of a sub-resource array's elements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ElementField {
+    /// Whether the field is under the element's `properties` wrapper.
+    pub wrapped: bool,
+    /// Dotted short-name path within the normalized element, lowercase.
+    pub short: String,
+    /// Dotted ARM path within the element, without the wrapper.
+    pub arm: String,
+}
+
+impl ResolvedAliases {
+    /// The precomputed aggregates for `api_version`, or the defaults.
+    pub(crate) fn aggregates(&self, api_version: Option<&str>) -> &VersionedAggregates {
+        api_version
+            .and_then(|ver| self.versioned_aggregates.get(&ver.to_ascii_lowercase()))
+            .unwrap_or(&self.default_aggregates)
+    }
 }
 
 /// A precomputed element-level field remap, stored at `ResolvedAliases` level
