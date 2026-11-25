@@ -783,6 +783,15 @@ fn unknown_validation_and_dispatch_share_one_execution_timer() -> anyhow::Result
     // alone. Removing unknowns must recover with a fresh per-call timer.
     vm.set_partial_eval_settings(PartialEvalSettings::default());
     assert_eq!(vm.partial_eval("entry")?.result, Value::Bool(true));
+    vm.set_execution_timer_config(Some(ExecutionTimerConfig {
+        limit: Duration::ZERO,
+        check_interval: NonZeroU32::new(128).unwrap_or(NonZeroU32::MIN),
+    }));
+    let mut settings = PartialEvalSettings::default();
+    settings.unknowns = keys(&["short-a", "short-b"]);
+    vm.set_partial_eval_settings(settings);
+    assert_eq!(vm.partial_eval("entry")?.result, Value::Bool(true));
+    assert_eq!(vm.execute()?, Value::Bool(true));
     Ok(())
 }
 
@@ -848,6 +857,15 @@ fn unknown_index_checkpoint_work_scales_with_balanced_lookup_and_key_bytes() {
         );
         assert!(checkpoints >= 2 * (common_bytes / 256 + 1));
     }
+    let common = "x".repeat(255);
+    let paths = vec![
+        UnknownPath::input_keys([format!("{common}\u{e9}a").as_str()]),
+        UnknownPath::input_keys([format!("{common}\u{ea}a").as_str()]),
+    ];
+    assert_eq!(
+        index_unknowns_checked(&paths, &mut || Ok::<(), Infallible>(())),
+        Ok(())
+    );
 }
 
 #[test]
