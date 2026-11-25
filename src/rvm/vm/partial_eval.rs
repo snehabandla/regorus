@@ -34,7 +34,8 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 
-type Path = (UnknownRoot, Vec<PathSegment>);
+mod unknown_index;
+use unknown_index::UnknownIndex;
 
 #[derive(Debug, Clone, Copy)]
 enum Reason {
@@ -54,40 +55,6 @@ const fn root_name(root: UnknownRoot) -> &'static str {
         UnknownRoot::Input => "input",
         UnknownRoot::Context => "context",
     }
-}
-
-/// Renders a path as Rego, such as `input["user"]["role"]` or
-/// `input["xs"][0]`.
-fn render_path(
-    root: UnknownRoot,
-    segments: &[PathSegment],
-    checkpoint: &mut impl FnMut() -> Result<()>,
-) -> core::result::Result<String, ExplainError> {
-    checkpoint()?;
-    let mut text = String::from(root_name(root));
-    for segment in segments {
-        match *segment {
-            PathSegment::Key(ref key) => {
-                let key_value = Value::from(key.as_str());
-                checkpoint()?;
-                #[cfg(all(feature = "allocator-memory-limits", not(miri)))]
-                let quoted = key_value.to_json_str_with_checkpoint(checkpoint)?;
-                #[cfg(any(not(feature = "allocator-memory-limits"), miri))]
-                let quoted = key_value
-                    .to_json_str_compact()
-                    .map_err(super::VmError::from)?;
-                checkpoint()?;
-                drop(key_value);
-                let _ = write!(text, "[{quoted}]");
-                checkpoint()?;
-            }
-            PathSegment::Index(i) => {
-                let _ = write!(text, "[{i}]");
-            }
-        }
-        checkpoint()?;
-    }
-    Ok(text)
 }
 
 struct PartialEvaluation<'a>(&'a mut RegoVM);
@@ -155,8 +122,9 @@ impl RegoVM {
     /// Rule defaults are evaluated at compile time with undefined `input`.
     /// Dependencies read by a default are not recorded, so an input-dependent
     /// default can produce an `Exact` result even when it depends on an unknown.
-    /// Memory limits cover validation, execution and report construction.
-    /// Memory failures release execution values and leave the VM in its error state.
+    /// Memory limits and the execution timer cover validation, execution and
+    /// report construction. Validation work does not count as VM instructions.
+    /// Resource failures release execution values and leave the VM in its error state.
     pub fn partial_eval(
         &mut self,
         entry: &str,
@@ -169,6 +137,8 @@ impl RegoVM {
         }
         crate::utils::limits::without_memory_budget_scope(|| {
             self.release_previous_execution_state();
+            self.pc = 0;
+            self.reset_execution_timer_state();
             #[cfg(all(feature = "allocator-memory-limits", not(miri)))]
             {
                 self.reset_memory_budget_state();
@@ -177,15 +147,16 @@ impl RegoVM {
             }
             let evaluation = PartialEvaluation(self);
             let result = (|| {
-                evaluation.0.check_initial_memory_limit()?;
+                evaluation.0.pe_checkpoint()?;
                 let result = evaluation.0.partial_eval_inner(entry);
-                evaluation.0.check_initial_memory_limit()?;
+                evaluation.0.pe_checkpoint()?;
                 result
             })();
             result.map_err(|error| match error {
                 ExplainError::Vm(
                     error @ (VmError::MemoryLimitExceeded { .. }
-                    | VmError::MemoryBudgetExceeded { .. }),
+                    | VmError::MemoryBudgetExceeded { .. }
+                    | VmError::TimeLimitExceeded { .. }),
                 ) => evaluation.0.fail_run_to_completion(error).into(),
                 error => error,
             })
@@ -233,57 +204,110 @@ impl RegoVM {
         })
     }
 
+    fn pe_checkpoint(&mut self) -> Result<()> {
+        self.check_initial_memory_limit()?;
+        self.execution_timer_tick(1)
+    }
+
+    #[allow(clippy::indexing_slicing)]
+    fn unknown_key(&mut self, path: usize, segment: usize) -> Result<Value> {
+        self.execution_timer_tick(1)?;
+        match self.pe_settings.unknowns[path].segments[segment] {
+            PathSegment::Index(index) => Ok(Value::from(index)),
+            PathSegment::Key(ref key) => {
+                if self.execution_timer.config().is_some() {
+                    for _ in key.as_bytes().chunks(256) {
+                        Self::tick_execution_timer(&mut self.execution_timer, self.pc, 1)?;
+                    }
+                }
+                Ok(Value::from(key.as_str()))
+            }
+        }
+    }
+
+    /// Render only the failing declaration, without copying its path metadata.
+    #[allow(clippy::indexing_slicing)]
+    fn render_unknown(&mut self, path: usize) -> core::result::Result<String, ExplainError> {
+        self.pe_checkpoint()?;
+        let mut text = String::from(root_name(self.pe_settings.unknowns[path].root));
+        for segment in 0..self.pe_settings.unknowns[path].segments.len() {
+            match self.pe_settings.unknowns[path].segments[segment] {
+                PathSegment::Index(index) => {
+                    let _ = write!(text, "[{index}]");
+                }
+                PathSegment::Key(_) => {
+                    let key = self.unknown_key(path, segment)?;
+                    self.pe_checkpoint()?;
+                    #[cfg(all(feature = "allocator-memory-limits", not(miri)))]
+                    let quoted = key.to_json_str_with_checkpoint(&mut || self.pe_checkpoint())?;
+                    #[cfg(any(not(feature = "allocator-memory-limits"), miri))]
+                    let quoted = key.to_json_str_compact().map_err(super::VmError::from)?;
+                    self.pe_checkpoint()?;
+                    drop(key);
+                    let _ = write!(text, "[{quoted}]");
+                    self.pe_checkpoint()?;
+                }
+            }
+            self.pe_checkpoint()?;
+        }
+        Ok(text)
+    }
+
+    #[allow(clippy::indexing_slicing)]
     fn validate_unknowns(&mut self) -> core::result::Result<PeState, ExplainError> {
-        let mut paths: Vec<Path> = Vec::new();
+        let mut paths = UnknownIndex::new(self.execution_timer.config().is_some());
+        let mut state = PeState {
+            input_has_unknowns: false,
+            context_has_unknowns: false,
+            unsupported: None,
+        };
         for i in 0..self.pe_settings.unknowns.len() {
-            #[allow(clippy::indexing_slicing)]
-            let unknown = self.pe_settings.unknowns[i].clone();
-            self.check_initial_memory_limit()?;
-            let (root, segments) = (unknown.root, &unknown.segments);
-            if let Some(other) = paths
-                .iter()
-                .find(|p| p.0 == root && (p.1.starts_with(segments) || segments.starts_with(&p.1)))
-            {
+            self.pe_checkpoint()?;
+            let root = self.pe_settings.unknowns[i].root;
+            let overlap_pc = self.pc;
+            let overlap_timer = &mut self.execution_timer;
+            if let Some(other) = paths.overlap(&self.pe_settings.unknowns, i, &mut || {
+                Self::tick_execution_timer(overlap_timer, overlap_pc, 1)
+            })? {
                 return Err(ExplainError::InvalidUnknownPath {
-                    path: render_path(root, segments, &mut || self.check_initial_memory_limit())?,
-                    reason: format!(
-                        "overlaps `{}`",
-                        render_path(other.0, &other.1, &mut || self.check_initial_memory_limit())?
-                    ),
+                    path: self.render_unknown(i)?,
+                    reason: format!("overlaps `{}`", self.render_unknown(other)?),
                 });
             }
             let mut value = match root {
                 UnknownRoot::Input => self.input.clone(),
                 UnknownRoot::Context => self.context.clone(),
             };
-            for segment in segments {
+            let depth = self.pe_settings.unknowns[i].segments.len();
+            for segment in 0..depth {
                 // Rego keys also select set members, and indices select numeric object keys.
-                let key = match *segment {
-                    PathSegment::Key(ref key) => Value::from(key.as_str()),
-                    PathSegment::Index(index) => Value::from(index),
-                };
-                self.check_initial_memory_limit()?;
+                let key = self.unknown_key(i, segment)?;
+                self.pe_checkpoint()?;
                 value = value[&key].clone();
-                self.check_initial_memory_limit()?;
+                self.pe_checkpoint()?;
             }
             // The VM's input is null until it is set; its context is undefined.
             let absent = matches!(value, Value::Undefined)
-                || (root == UnknownRoot::Input
-                    && segments.is_empty()
-                    && matches!(value, Value::Null));
+                || (root == UnknownRoot::Input && depth == 0 && matches!(value, Value::Null));
             if !absent {
                 return Err(ExplainError::UnknownValueSupplied {
-                    path: render_path(root, segments, &mut || self.check_initial_memory_limit())?,
+                    path: self.render_unknown(i)?,
                 });
             }
-            paths.push((root, unknown.segments));
+            self.pe_checkpoint()?;
+            let insertion_pc = self.pc;
+            let insertion_timer = &mut self.execution_timer;
+            let inserted = paths.insert(&self.pe_settings.unknowns, i, &mut || {
+                Self::tick_execution_timer(insertion_timer, insertion_pc, 1)
+            });
             self.check_initial_memory_limit()?;
+            inserted?;
+            match root {
+                UnknownRoot::Input => state.input_has_unknowns = true,
+                UnknownRoot::Context => state.context_has_unknowns = true,
+            }
         }
-        Ok(PeState {
-            input_has_unknowns: paths.iter().any(|p| p.0 == UnknownRoot::Input),
-            context_has_unknowns: paths.iter().any(|p| p.0 == UnknownRoot::Context),
-            unsupported: None,
-        })
+        Ok(state)
     }
 
     /// Handles an instruction that involves unknown paths. Returns `None`

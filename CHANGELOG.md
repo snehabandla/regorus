@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- *(rvm)* Bound partial-evaluation unknown-path overlap checks with an index, avoid retaining path copies, and include validation in the configured execution deadline while preserving typed paths, first-error diagnostics, and opcode-only instruction counting.
 - *(rvm)* Package values such as `data.pkg` omit undefined rules and include subpackages that have no rules (as `{}`), matching OPA and the interpreter.
 
 ## [0.15.0](https://github.com/microsoft/regorus/compare/regorus-v0.14.1...regorus-v0.15.0) - 2026-11-07
