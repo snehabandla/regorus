@@ -652,13 +652,7 @@ fn source_identity_is_typed_and_moves_preserve_it_without_value_matching() -> Re
     vm.set_register(4, equal_value)?;
     assert_eq!(vm.explain.origins.get(4), RuntimeOrigin::Unknown);
     vm.take_register(1)?;
-    assert_eq!(
-        vm.explain.origins.get(1),
-        source(
-            vm.explain.origins.epoch,
-            vec![PathSegment::Key("inside".into())]
-        )
-    );
+    assert_eq!(vm.explain.origins.get(1), RuntimeOrigin::Unknown);
     Ok(())
 }
 
@@ -809,7 +803,13 @@ fn native_invocation_restores_the_callers_origin_window() -> Result<()> {
             assert_eq!(Some(result), baseline);
             assert_eq!(outer, source(vm.explain.origins.epoch, Vec::new()));
             assert_eq!(outer, vm.explain.origins.get(0));
-            assert_eq!(vm.explain.origins.get(1), RuntimeOrigin::Unknown);
+            assert_eq!(
+                vm.explain.origins.get(1),
+                source(
+                    vm.explain.origins.epoch,
+                    vec![PathSegment::Key("inside".into())]
+                )
+            );
         } else {
             baseline = Some(result);
             assert!(vm.explain.origins.registers.is_empty());
@@ -911,6 +911,7 @@ fn g2_helper_arguments_returns_and_nested_members() -> Result<()> {
         program,
         vec![
             Instruction::LoadInput { dest: 0 },
+            Instruction::Move { dest: 10, src: 0 },
             Instruction::IndexLiteral {
                 dest: 1,
                 container: 0,
@@ -945,13 +946,13 @@ fn g2_helper_arguments_returns_and_nested_members() -> Result<()> {
         for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
             let mut vm = g2_vm(program.clone(), input.clone(), mode, recording);
             g2_execute(&mut vm)?;
-            assert_eq!(vm.get_register(0)?, &input);
+            assert_eq!(vm.get_register(10)?, &input);
             assert_eq!(vm.get_register(3)?, &v("[[[1],[1]]]")?);
             assert_eq!(vm.get_register(5)?, &v("[1]")?);
             assert_eq!(vm.get_register(6)?, &v("[1]")?);
             if recording {
                 let epoch = vm.explain.origins.epoch;
-                assert_eq!(vm.explain.origins.get(0), source(epoch, vec![]));
+                assert_eq!(vm.explain.origins.get(10), source(epoch, vec![]));
                 assert_eq!(
                     vm.explain.origins.get(5),
                     source(epoch, vec![PathSegment::Key("a".into())])
@@ -1413,6 +1414,7 @@ fn g2_accumulated_returns_and_cache_do_not_cross_capture_epochs() -> Result<()> 
         program,
         vec![
             Instruction::LoadInput { dest: 0 },
+            Instruction::Move { dest: 10, src: 0 },
             Instruction::CallRule {
                 dest: 1,
                 rule_index: p,
@@ -1473,7 +1475,15 @@ fn g2_accumulated_returns_and_cache_do_not_cross_capture_epochs() -> Result<()> 
                     );
                     assert!(vm.explain.origins.windows.is_empty());
                 }
-                assert_eq!(vm.get_register(0)?, &input);
+                assert_eq!(vm.get_register(10)?, &input);
+                assert_eq!(
+                    vm.explain.origins.get(10),
+                    if recording && scenario == "keep" {
+                        source(vm.explain.origins.epoch, vec![])
+                    } else {
+                        RuntimeOrigin::Unknown
+                    }
+                );
                 for dest in [1, 2] {
                     assert_eq!(vm.get_register(dest)?, &v("[1]")?);
                     let expected = if recording && scenario == "keep" {
@@ -1497,6 +1507,13 @@ fn g2_accumulated_returns_and_cache_do_not_cross_capture_epochs() -> Result<()> 
                     vm.resume(Some(Value::Bool(true)))?;
                 }
                 assert_ne!(vm.explain.origins.epoch, epoch);
+                assert_eq!(vm.get_register(10)?, &v(r#"{"a":[2],"b":[2]}"#)?);
+                if vm.explain_enabled() {
+                    assert_eq!(
+                        vm.explain.origins.get(10),
+                        source(vm.explain.origins.epoch, vec![])
+                    );
+                }
                 for dest in [1, 2] {
                     assert_eq!(vm.get_register(dest)?, &v("[2]")?);
                     if vm.explain_enabled() {
