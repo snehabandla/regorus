@@ -97,7 +97,20 @@ impl RegoVM {
         let pc = self.pc;
         let (left, right) = operands(&self.registers, pc, left, right)?;
         let (left, right) = (left.clone(), right.clone());
-        compare_checked(&left, &right, equality, &mut || {
+        self.compare_values(&left, &right, equality)
+    }
+
+    pub(super) fn compare_values(
+        &mut self,
+        left: &Value,
+        right: &Value,
+        equality: bool,
+    ) -> Result<Ordering> {
+        if !self.needs_checked_comparison() {
+            return Ok(compare_unchecked(left, right, equality));
+        }
+        let pc = self.pc;
+        compare_checked(left, right, equality, &mut || {
             Self::tick_execution_timer(&mut self.execution_timer, pc, 1)?;
             self.check_initial_memory_limit()
         })
@@ -160,6 +173,44 @@ mod tests {
 
     fn set(value: Value) -> Value {
         Set::from_iter([value]).into_value()
+    }
+
+    #[test]
+    fn object_comprehension_duplicate_comparison_checks_deadline_before_write() -> anyhow::Result<()>
+    {
+        use crate::rvm::instructions::{ComprehensionBeginParams, ComprehensionMode};
+
+        let _guard = acquire_limits_test_lock();
+        let mut vm = RegoVM::new();
+        vm.registers = vec![Value::Undefined; 8];
+        vm.set_register(1, Value::from("k"))?;
+        vm.set_register(2, Value::from(vec![Value::Null; 128]))?;
+        vm.execute_comprehension_begin(&ComprehensionBeginParams {
+            mode: ComprehensionMode::Object,
+            collection_reg: 0,
+            result_reg: 0,
+            key_reg: 1,
+            value_reg: 2,
+            body_start: 1,
+            comprehension_end: 4,
+        })?;
+        vm.execute_comprehension_yield(2, Some(1))?;
+        let previous = vm.get_register(0)?.clone();
+        let mut next = vec![Value::Null; 127];
+        next.push(Value::Bool(true));
+        vm.set_register(2, Value::from(next))?;
+        vm.set_execution_timer_config(Some(timer(Duration::ZERO)));
+        let result = vm.execute_comprehension_yield(2, Some(1));
+        assert!(
+            matches!(result, Err(VmError::TimeLimitExceeded { .. })),
+            "{result:?}"
+        );
+        assert_eq!(vm.get_register(0)?, &previous);
+        assert_eq!(vm.comprehension_stack.len(), 1);
+        vm.set_execution_timer_config(None);
+        assert!(vm.execute_comprehension_yield(2, Some(1)).is_err());
+        assert_eq!(vm.get_register(0)?, &previous);
+        Ok(())
     }
 
     #[test]
