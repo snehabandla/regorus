@@ -3546,6 +3546,7 @@ fn invocation_subtree_direct_cached_providers_check_deadline() -> Result<()> {
     let compiled = engine.compile_with_entrypoint(&Rc::from("data.t.r"))?;
     let program = Compiler::compile_from_policy(&compiled, &["data.t.r"])?;
     let expected = v(r#"[0,1,2,3,{"p0":0,"p1":1,"p2":2,"p3":3}]"#);
+    let mut expired_provider_counts = Vec::new();
     for mode in MODES {
         let control = Fixture::default();
         let mut vm = RegoVM::new();
@@ -3576,14 +3577,13 @@ fn invocation_subtree_direct_cached_providers_check_deadline() -> Result<()> {
             "{mode:?}: expected deadline error, got {outcome:?}"
         );
         let calls = fixture.calls();
-        assert_eq!(
+        expired_provider_counts.push((
+            mode,
             calls
                 .iter()
                 .filter(|call| matches!(call, CallRecord::Reused(_, _)))
                 .count(),
-            1,
-            "{mode:?}: callbacks must stop after the first expired provider: {calls:?}"
-        );
+        ));
         assert!(calls
             .iter()
             .any(|call| matches!(call, CallRecord::End(_, None, None))));
@@ -3592,6 +3592,10 @@ fn invocation_subtree_direct_cached_providers_check_deadline() -> Result<()> {
         vm.set_explanation_recorder(Box::new(Fixture::default()));
         assert_eq!(execute(&mut vm, mode)?, expected);
     }
+    assert!(
+        expired_provider_counts.iter().all(|&(_, count)| count == 1),
+        "callbacks must stop after the first expired provider: {expired_provider_counts:?}"
+    );
     Ok(())
 }
 
@@ -3628,6 +3632,7 @@ fn invocation_subtree_default_only_providers_check_deadline() -> Result<()> {
     let compiled = engine.compile_with_entrypoint(&Rc::from("data.t.r"))?;
     let program = Compiler::compile_from_policy(&compiled, &["data.t.r"])?;
     let expected = v(r#"{"p0":0,"p1":1,"p2":2,"p3":3}"#);
+    let mut expired_provider_counts = Vec::new();
     for mode in MODES {
         let control = Fixture::default();
         let mut vm = RegoVM::new();
@@ -3661,17 +3666,15 @@ fn invocation_subtree_default_only_providers_check_deadline() -> Result<()> {
             "{mode:?}: expected deadline error, got {outcome:?}"
         );
         let calls = fixture.calls();
-        assert_eq!(
+        expired_provider_counts.push((
+            mode,
             calls
                 .iter()
-                .filter(|call| matches!(
-                    call,
-                    CallRecord::End(_, Some(CallResultSource::Default), _)
-                ))
+                .filter(|call| {
+                    matches!(call, CallRecord::End(_, Some(CallResultSource::Default), _))
+                })
                 .count(),
-            1,
-            "{mode:?}: defaults must stop after the first expired provider: {calls:?}"
-        );
+        ));
         assert!(calls
             .iter()
             .any(|call| matches!(call, CallRecord::End(_, None, None))));
@@ -3680,6 +3683,10 @@ fn invocation_subtree_default_only_providers_check_deadline() -> Result<()> {
         vm.set_explanation_recorder(Box::new(Fixture::default()));
         assert_eq!(execute(&mut vm, mode)?, expected);
     }
+    assert!(
+        expired_provider_counts.iter().all(|&(_, count)| count == 1),
+        "defaults must stop after the first expired provider: {expired_provider_counts:?}"
+    );
     Ok(())
 }
 
