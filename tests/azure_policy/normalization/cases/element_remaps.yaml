@@ -1,0 +1,242 @@
+# Element remaps rebuild each element from a snapshot of it, so remaps that
+# swap or chain field names keep every value whatever the alias order.
+
+cases:
+  - note: element remaps that swap two field names keep both values
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/rules[*].state", "defaultPath": "properties.rules[*].status", "paths": []}, {"name": "Test/widgets/rules[*].status", "defaultPath": "properties.rules[*].state", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "properties": {"rules": [{"status": "r", "state": "on"}]}}
+    expected_normalized: {"type": "Test/widgets", "rules": [{"state": "r", "status": "on"}]}
+    round_trip: true
+
+  - note: element remaps that swap field names in a data-plane root array keep both values
+    aliases_json: |
+      [{"namespace": "Test.Data", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test.Data/widgets/rules[*].state", "defaultPath": "rules[*].status", "paths": []}, {"name": "Test.Data/widgets/rules[*].status", "defaultPath": "rules[*].state", "paths": []}]}]}]
+    input: {"type": "Test.Data/widgets", "rules": [{"status": "r", "state": "on"}]}
+    expected_normalized: {"type": "Test.Data/widgets", "rules": [{"state": "r", "status": "on"}]}
+    round_trip: true
+
+  - note: element remaps that swap dotted field names keep both values
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/rules[*].config.state", "defaultPath": "properties.rules[*].config.status", "paths": []}, {"name": "Test/widgets/rules[*].config.status", "defaultPath": "properties.rules[*].config.state", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "properties": {"rules": [{"config": {"status": "r", "state": "on"}}]}}
+    expected_normalized: {"type": "Test/widgets", "rules": [{"config": {"state": "r", "status": "on"}}]}
+    round_trip: true
+
+  - note: element remaps that swap field names in a nested sub-resource array keep both values
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/x[*].y[*].a", "defaultPath": "properties.x[*].y[*].properties.b", "paths": []}, {"name": "Test/widgets/x[*].y[*].b", "defaultPath": "properties.x[*].y[*].properties.a", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "properties": {"x": [{"y": [{"name": "n", "properties": {"a": 1, "b": 2}}]}]}}
+    expected_normalized: {"type": "Test/widgets", "x": [{"y": [{"name": "n", "a": 2, "b": 1}]}]}
+    round_trip: true
+
+  - note: element remaps that swap mixed-case field names keep both values and their casing
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/Rules[*].A", "defaultPath": "properties.Rules[*].B", "paths": []}, {"name": "Test/widgets/Rules[*].B", "defaultPath": "properties.Rules[*].A", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "properties": {"Rules": [{"A": 1, "B": 2}]}}
+    expected_normalized: {"type": "Test/widgets", "rules": [{"a": 2, "b": 1}]}
+    round_trip: true
+
+  - note: an element remap does not read the field another remap wrote
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/rules[*].a", "defaultPath": "properties.rules[*].c", "paths": []}, {"name": "Test/widgets/rules[*].b", "defaultPath": "properties.rules[*].a", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "properties": {"rules": [{"c": 1, "a": 2}]}}
+    expected_normalized: {"type": "Test/widgets", "rules": [{"a": 1, "b": 2}]}
+    round_trip: true
+
+  - note: an element remap named after another remap's ARM field keeps both values
+    # Normalizing was already right; only the round trip failed.
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/rules[*].a", "defaultPath": "properties.rules[*].b", "paths": []}, {"name": "Test/widgets/rules[*].b", "defaultPath": "properties.rules[*].c", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "properties": {"rules": [{"b": 1, "c": 2}]}}
+    expected_normalized: {"type": "Test/widgets", "rules": [{"a": 1, "b": 2}]}
+    round_trip: true
+
+  - note: an element remap blocked by a scalar keeps its field where it was
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/rules[*].meta.x", "defaultPath": "properties.rules[*].rawx", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "properties": {"rules": [{"meta": 5, "rawx": 2}]}}
+    expected_normalized: {"type": "Test/widgets", "rules": [{"meta": 5, "rawx": 2}]}
+    round_trip: true
+
+  - note: an element remap prunes the parent it empties
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/rules[*].state", "defaultPath": "properties.rules[*].config.status", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "properties": {"rules": [{"config": {"status": "x"}}, {"config": {"status": "y", "k": 1}}]}}
+    expected_normalized: {"type": "Test/widgets", "rules": [{"state": "x"}, {"config": {"k": 1}, "state": "y"}]}
+    round_trip: true
+
+  - note: element remaps sharing an ARM field each get its value
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/rules[*].a", "defaultPath": "properties.rules[*].raw", "paths": []}, {"name": "Test/widgets/rules[*].b", "defaultPath": "properties.rules[*].raw", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "properties": {"rules": [{"raw": 1}]}}
+    expected_normalized: {"type": "Test/widgets", "rules": [{"a": 1, "b": 1}]}
+    round_trip: true
+
+  - note: element remaps sharing an ARM field each get its value, the first alias's value when denormalizing
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/rules[*].a", "defaultPath": "properties.rules[*].raw", "paths": []}, {"name": "Test/widgets/rules[*].b", "defaultPath": "properties.rules[*].raw", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "rules": [{"a": 1, "b": 2}]}
+    # Denormalizing, the first alias in order supplies the shared field.
+    expected_denormalized: {"type": "Test/widgets", "properties": {"rules": [{"raw": 1}]}}
+
+  - note: an element remap under another remap's target applies inside its value
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/rules[*].settings", "defaultPath": "properties.rules[*].config", "paths": []}, {"name": "Test/widgets/rules[*].settings.mode", "defaultPath": "properties.rules[*].config.legacymode", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "properties": {"rules": [{"config": {"legacymode": "s", "x": 1}}]}}
+    expected_normalized: {"type": "Test/widgets", "rules": [{"settings": {"mode": "s", "x": 1}}]}
+    round_trip: true
+
+  - note: an element remap under another remap's target from elsewhere is dropped
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/rules[*].settings", "defaultPath": "properties.rules[*].configuration", "paths": []}, {"name": "Test/widgets/rules[*].settings.mode", "defaultPath": "properties.rules[*].legacymode", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "properties": {"rules": [{"configuration": {"mode": "strict"}, "legacymode": "lax"}]}}
+    # `settings` wins; `legacymode` stays an ordinary field.
+    expected_normalized: {"type": "Test/widgets", "rules": [{"settings": {"mode": "strict"}, "legacymode": "lax"}]}
+    round_trip: true
+
+  - note: element remaps inside a renamed nested array follow the rename
+    # Normalizing was already right; only the round trip failed.
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/x[*].ys", "defaultPath": "properties.x[*].y", "paths": []}, {"name": "Test/widgets/x[*].ys[*].z", "defaultPath": "properties.x[*].y[*].rawz", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "properties": {"x": [{"y": [{"rawz": 1}]}]}}
+    expected_normalized: {"type": "Test/widgets", "x": [{"ys": [{"z": 1}]}]}
+    round_trip: true
+
+  - note: element remaps under identity round-trip
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/identity.rules[*].a", "defaultPath": "identity.rules[*].Raw", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "identity": {"rules": [{"Raw": 1}]}}
+    expected_normalized: {"type": "Test/widgets", "identity": {"rules": [{"a": 1}]}}
+    round_trip: true
+
+  - note: an element remap overwrites an unaliased field with its target's name
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/rules[*].state", "defaultPath": "properties.rules[*].status", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "properties": {"rules": [{"status": "x", "state": "y"}]}}
+    # Documents a known loss: the unaliased `state` is overwritten, so this
+    # does not round-trip until targets are escaped (A28).
+    expected_normalized: {"type": "Test/widgets", "rules": [{"state": "x"}]}
+
+  - note: an element remap and one under it reading the same ARM field keep the ancestor's value
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/rules[*].a", "defaultPath": "properties.rules[*].raw", "paths": []}, {"name": "Test/widgets/rules[*].a.b", "defaultPath": "properties.rules[*].raw", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "properties": {"rules": [{"raw": {"x": 1}}]}}
+    expected_normalized: {"type": "Test/widgets", "rules": [{"a": {"x": 1}}]}
+    round_trip: true
+
+  - note: an element remap of a nested array level leaves an object of that name alone
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/x[*].y[*].z", "defaultPath": "properties.x[*].y[*].rawz", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "properties": {"x": [{"y": {"rawz": 1}}]}}
+    expected_normalized: {"type": "Test/widgets", "x": [{"y": {"rawz": 1}}]}
+    round_trip: true
+
+  - note: an element remap under another remap's target leaves an array value alone
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/rules[*].settings", "defaultPath": "properties.rules[*].config", "paths": []}, {"name": "Test/widgets/rules[*].settings.mode", "defaultPath": "properties.rules[*].config.legacymode", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "properties": {"rules": [{"config": [{"legacymode": 1}]}]}}
+    expected_normalized: {"type": "Test/widgets", "rules": [{"settings": [{"legacymode": 1}]}]}
+    round_trip: true
+
+  - note: a reverse element remap keeps an empty ARM object it writes into
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/Rules[*].Cfg.Mode", "defaultPath": "properties.Rules[*].level", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "properties": {"Rules": [{"level": 1, "Cfg": {}}]}}
+    expected_normalized: {"type": "Test/widgets", "rules": [{"cfg": {"mode": 1}}]}
+    round_trip: true
+
+  - note: a reverse element remap keeps an empty ARM object of its alias's parent
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/rules[*].settings.mode", "defaultPath": "properties.rules[*].legacymode", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "properties": {"rules": [{"legacymode": 1, "settings": {}}]}}
+    expected_normalized: {"type": "Test/widgets", "rules": [{"settings": {"mode": 1}}]}
+    round_trip: true
+
+  - note: element remaps sharing an ARM field at different depths take the first alias's value when denormalizing
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/rules[*].a.deep", "defaultPath": "properties.rules[*].raw", "paths": []}, {"name": "Test/widgets/rules[*].b", "defaultPath": "properties.rules[*].raw", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "rules": [{"a": {"deep": 1}, "b": 2}]}
+    # The first alias in order supplies `raw`, though `b` is shallower.
+    expected_denormalized: {"type": "Test/widgets", "properties": {"rules": [{"a": {}, "raw": 1}]}}
+
+  - note: an element remap nested under another's target from elsewhere is dropped (R6)
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/rules[*].settings.profile", "defaultPath": "properties.rules[*].configuration", "paths": []}, {"name": "Test/widgets/rules[*]['settings']", "defaultPath": "properties.rules[*].configuration.defaults", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "properties": {"rules": [{"configuration": {"defaults": {}, "enabled": true}}]}}
+    expected_normalized: {"type": "Test/widgets", "rules": [{"configuration": {"enabled": true}, "settings": {}}]}
+    round_trip: true
+
+  - note: an explicit element remap beats a nested array level of the same name (R7)
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/rules[*].action", "defaultPath": "properties.rules[*].rawaction", "paths": []}, {"name": "Test/widgets/rules[*].conditions[*].state", "defaultPath": "properties.rules[*].conditions[*].rawstate", "paths": []}, {"name": "Test/widgets/rules[*]['conditions']", "defaultPath": "properties.rules[*].legacyconditions", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "properties": {"rules": [{"rawaction": "allow", "legacyconditions": [{"rawstate": "ready"}]}]}}
+    # `state` is relative to ARM `conditions`, not `legacyconditions`.
+    expected_normalized: {"type": "Test/widgets", "rules": [{"action": "allow", "conditions": [{"rawstate": "ready"}]}]}
+    round_trip: true
+
+  - note: element remaps sharing an ARM field each get a copy, and one under a copy from elsewhere is dropped (R9)
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/rules[*].a", "defaultPath": "properties.rules[*].raw", "paths": []}, {"name": "Test/widgets/rules[*].b.z", "defaultPath": "properties.rules[*].other", "paths": []}, {"name": "Test/widgets/rules[*]['b']", "defaultPath": "properties.rules[*].raw", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "properties": {"rules": [{"raw": {"z": 7}}]}}
+    expected_normalized: {"type": "Test/widgets", "rules": [{"a": {"z": 7}, "b": {"z": 7}}]}
+    round_trip: true
+
+  - note: an element remap under a later remap's target from elsewhere is dropped (R10)
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/rules[*].a.x", "defaultPath": "properties.rules[*].rawone", "paths": []}, {"name": "Test/widgets/rules[*].b", "defaultPath": "properties.rules[*].a", "paths": []}, {"name": "Test/widgets/rules[*]['a']", "defaultPath": "properties.rules[*].rawtwo", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "properties": {"rules": [{"rawone": 1, "rawtwo": {"x": 1}}]}}
+    expected_normalized: {"type": "Test/widgets", "rules": [{"rawone": 1, "a": {"x": 1}}]}
+    round_trip: true
+
+  - note: element remaps into the same alias object each write their field (R11)
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/rules[*].a.b", "defaultPath": "properties.rules[*].a", "paths": []}, {"name": "Test/widgets/rules[*].a.x", "defaultPath": "properties.rules[*].raw", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "properties": {"rules": [{"a": {}, "raw": 1}]}}
+    expected_normalized: {"type": "Test/widgets", "rules": [{"a": {"b": {}, "x": 1}}]}
+    round_trip: true
+
+  - note: element remaps with the same target keep the first, the rest stay ordinary fields (R12)
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/rules[*].c", "defaultPath": "properties.rules[*].a", "paths": []}, {"name": "Test/widgets/rules[*]['c']", "defaultPath": "properties.rules[*].d", "paths": []}, {"name": "Test/widgets/rules[*]['b']", "defaultPath": "properties.rules[*].c", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "properties": {"rules": [{"a": 1, "d": 1}]}}
+    expected_normalized: {"type": "Test/widgets", "rules": [{"c": 1, "d": 1}]}
+    round_trip: true
+
+  - note: a nested array level applies only to its own ARM field, not to a copy from another (R13)
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/rules[*].a", "defaultPath": "properties.rules[*].b", "paths": []}, {"name": "Test/widgets/rules[*].b", "defaultPath": "properties.rules[*].a", "paths": []}, {"name": "Test/widgets/rules[*]['a'][*].state", "defaultPath": "properties.rules[*].a[*].rawstate", "paths": []}, {"name": "Test/widgets/rules[*]['c']", "defaultPath": "properties.rules[*].b", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "properties": {"rules": [{"b": [{"rawstate": 1}]}]}}
+    # `a` and `c` share ARM `b`, so each gets a copy; `state` is relative to
+    # ARM `a`, so neither copy is remapped.
+    expected_normalized: {"type": "Test/widgets", "rules": [{"a": [{"rawstate": 1}], "c": [{"rawstate": 1}]}]}
+    round_trip: true
+
+  - note: element remaps that swap fields in an array renamed by wildcard aliases apply once
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/x[*].a", "defaultPath": "properties.items[*].b", "paths": []}, {"name": "Test/widgets/x[*].b", "defaultPath": "properties.items[*].a", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "properties": {"items": [{"a": 1, "b": 2}]}}
+    expected_normalized: {"type": "Test/widgets", "x": [{"a": 2, "b": 1}]}
+    round_trip: true
+
+  - note: element remaps under tags keep mixed-case keys
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test/widgets/tags.rules[*].a", "defaultPath": "tags.rules[*].Raw", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "tags": {"rules": [{"Raw": 1, "Other": 2}]}}
+    expected_normalized: {"type": "Test/widgets", "tags": {"rules": [{"a": 1, "Other": 2}]}}
+    round_trip: true
+
+  - note: a nested element remap under properties leaves a root field of its short name alone
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "apiVersions": ["v1", "v2"], "aliases": [{"name": "Test/widgets/tags.groups[*].rules[*].a", "defaultPath": "properties.tags.groups[*].rules[*].Raw", "paths": []}]}]}]
+    input: {"type": "Test/widgets", "tags": {"groups": [{"rules": [{"a": 1}]}]}}
+    expected_normalized: {"type": "Test/widgets", "tags": {"groups": [{"rules": [{"a": 1}]}]}}
+    round_trip: true
+
+  - note: a nested element remap whose API version moves it under properties leaves a root field alone
+    aliases_json: |
+      [{"namespace": "Test", "resourceTypes": [{"resourceType": "widgets", "apiVersions": ["v1", "v2"], "aliases": [{"name": "Test/widgets/tags.groups[*].rules[*].a", "defaultPath": "tags.groups[*].rules[*].Raw", "paths": [{"path": "properties.tags.groups[*].rules[*].Raw", "apiVersions": ["v2"]}]}]}]}]
+    api_version: "v2"
+    input: {"type": "Test/widgets", "tags": {"groups": [{"rules": [{"a": 1}]}]}}
+    expected_normalized: {"type": "Test/widgets", "tags": {"groups": [{"rules": [{"a": 1}]}]}}
+    round_trip: true

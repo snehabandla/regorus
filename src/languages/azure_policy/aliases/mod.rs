@@ -49,8 +49,8 @@ use alloc::vec::Vec;
 use anyhow::Result;
 
 use types::{
-    AliasEntry, AliasPath, DataPolicyManifest, PrecomputedRemap, PrecomputedReverseRemap,
-    ProviderAliases, ResolvedAliases, ResolvedEntry, VersionedAggregates,
+    AliasEntry, AliasPath, DataPolicyManifest, ElementMove, ElementPlan, ProviderAliases,
+    ResolvedAliases, ResolvedEntry, VersionedAggregates,
 };
 
 use obj_map::{collision_safe_key, is_root_field_collision};
@@ -488,8 +488,7 @@ fn compute_aggregates_for_version(
     sub_resource_arrays: &BTreeSet<String>,
     api_version: Option<&str>,
 ) -> VersionedAggregates {
-    let mut element_remaps = Vec::new();
-    let mut reverse_element_remaps = Vec::new();
+    let mut element_plans: Vec<ElementPlan> = Vec::new();
     let mut renames_norm: Vec<(String, String)> = Vec::new();
     let mut renames_denorm: Vec<(String, String)> = Vec::new();
 
@@ -497,7 +496,7 @@ fn compute_aggregates_for_version(
     let mut seen_norm = alloc::collections::BTreeSet::new();
     let mut seen_denorm = alloc::collections::BTreeSet::new();
 
-    for entry in entries.values() {
+    for (order, entry) in entries.values().enumerate() {
         if !entry.is_wildcard {
             continue;
         }
@@ -565,48 +564,80 @@ fn compute_aggregates_for_version(
                     && path::renders_dotted(arm_leaf)
                     && !path::equivalent(short_leaf, arm_leaf)
                 {
-                    // The forward remap runs before base renames, so it
-                    // reaches root-level ARM arrays only along a chain with
-                    // the same names once sub-resource elements are flattened.
+                    // The ARM keys of each array level, flattened as the
+                    // normalizer flattens sub-resource elements; `None` for an
+                    // outer array under a `properties` wrapper.
                     let mut prefix = String::new();
-                    let at_root = short_parts.len() == arm_parts.len()
-                        && short_parts.iter().zip(&arm_parts).zip(&array_chain).all(
-                            |((short, arm), keys)| {
-                                let arm = if prefix.is_empty() {
-                                    (!arm.has_flattened_wrapper()).then_some(arm.segments)
-                                } else if sub_resource_arrays.contains(&prefix) {
-                                    Some(arm.without_flattened_wrapper())
-                                } else {
-                                    Some(arm.segments)
-                                };
-                                if !prefix.is_empty() {
-                                    prefix.push('.');
-                                }
-                                prefix.push_str(&keys.join("."));
-                                arm.is_some_and(|arm| path::equivalent(short, arm))
-                            },
-                        );
-                    let arm_leaf = path::render(arm_leaf);
-                    let source_lc = arm_leaf.to_ascii_lowercase();
-                    let target_lc = path::render(short_leaf).to_ascii_lowercase();
-                    let exact = !array_chain
+                    let levels: Vec<Option<&[path::Segment]>> = arm_parts
+                        .iter()
+                        .zip(&array_chain)
+                        .map(|(arm, keys)| {
+                            let arm = if prefix.is_empty() {
+                                (!arm.has_flattened_wrapper()).then_some(arm.segments)
+                            } else if sub_resource_arrays.contains(&prefix) {
+                                Some(arm.without_flattened_wrapper())
+                            } else {
+                                Some(arm.segments)
+                            };
+                            if !prefix.is_empty() {
+                                prefix.push('.');
+                            }
+                            prefix.push_str(&keys.join("."));
+                            arm
+                        })
+                        .collect();
+                    let same_shape = short_parts.len() == arm_parts.len();
+                    let at_root = same_shape
+                        && short_parts.iter().zip(&levels).all(|(short, arm)| {
+                            arm.is_some_and(|arm| path::equivalent(short, arm))
+                        });
+                    let leaf = ElementMove {
+                        source: lowercase_keys(arm_leaf),
+                        target: lowercase_keys(short_leaf),
+                        implied: false,
+                        at_root: Some(at_root),
+                        order,
+                        moves: Vec::new(),
+                    };
+                    // Nested array levels, innermost first. A level the ARM
+                    // path spells differently is a rename, kept only if an
+                    // alias renames it too.
+                    let arm_levels = levels.get(1..).unwrap_or_default();
+                    let nested = short_parts
+                        .get(1..array_chain.len())
+                        .unwrap_or_default()
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .try_fold(leaf, |inner, (depth, short)| {
+                            let source = if same_shape {
+                                arm_levels.get(depth).copied().flatten()?
+                            } else {
+                                *short
+                            };
+                            Some(ElementMove {
+                                source: lowercase_keys(source),
+                                target: lowercase_keys(short),
+                                implied: true,
+                                at_root: None,
+                                order,
+                                moves: alloc::vec![inner],
+                            })
+                        });
+                    let base = array_chain.first().cloned().unwrap_or_default();
+                    let exact = !base
                         .first()
-                        .and_then(|nav| nav.first())
                         .is_some_and(|root| root == "tags" || root == "identity");
-                    element_remaps.push(PrecomputedRemap {
-                        array_chain: array_chain.clone(),
-                        source_field: source_lc.clone(),
-                        target_field: target_lc.clone(),
-                        exact,
-                    });
-
-                    reverse_element_remaps.push(PrecomputedReverseRemap {
-                        array_chain,
-                        source_field: target_lc.clone(),
-                        target_field: arm_leaf,
-                        cleanup_field: target_lc,
-                        at_root,
-                    });
+                    if let Some(nested) = nested {
+                        match element_plans.iter_mut().find(|plan| plan.base == base) {
+                            Some(plan) => plan.moves.push(nested),
+                            None => element_plans.push(ElementPlan {
+                                base,
+                                exact,
+                                moves: alloc::vec![nested],
+                            }),
+                        }
+                    }
                 }
             }
         }
@@ -638,12 +669,78 @@ fn compute_aggregates_for_version(
         }
     }
 
+    for plan in &mut element_plans {
+        plan.moves = resolve_moves(core::mem::take(&mut plan.moves));
+    }
+
     VersionedAggregates {
-        element_remaps,
-        reverse_element_remaps,
+        element_plans,
         array_renames_normalize: renames_norm,
         array_renames_denormalize: renames_denorm,
     }
+}
+
+fn lowercase_keys(segments: &[path::Segment]) -> Vec<path::Segment> {
+    segments
+        .iter()
+        .map(|segment| match segment {
+            path::Segment::Key(key) => path::Segment::Key(key.to_ascii_lowercase().into()),
+            other => other.clone(),
+        })
+        .collect()
+}
+
+/// Settle which moves of one element level apply, so their targets are
+/// pairwise disjoint and the result does not depend on alias order. Moves
+/// are taken by target depth, then leaves before nested array levels, then
+/// alias order:
+/// - A move whose target an earlier move already writes is dropped, unless
+///   it is a nested array level with the same source too: its moves join.
+/// - A move whose target is under an earlier move's target nests in that
+///   move when its source is under the earlier source too (`settings` from
+///   `config`, `settings.mode` from `config.legacyMode`), and is dropped
+///   otherwise (also when it reads the same field): the ancestor wins.
+/// - A nested array level that renames the array is dropped unless an alias
+///   renames it the same way.
+fn resolve_moves(mut moves: Vec<ElementMove>) -> Vec<ElementMove> {
+    moves.sort_by_key(|m| (m.target.len(), m.implied, m.order));
+    let mut resolved: Vec<ElementMove> = Vec::new();
+    'moves: for mut m in moves {
+        for prior in &mut resolved {
+            if prior.target == m.target {
+                if m.implied && prior.source == m.source {
+                    // A leaf that renames the array: its moves now apply to
+                    // the elements.
+                    prior.implied = true;
+                    prior.moves.append(&mut m.moves);
+                }
+                continue 'moves;
+            }
+            if m.target.starts_with(&prior.target) {
+                let nested = m
+                    .target
+                    .get(prior.target.len()..)
+                    .zip(m.source.strip_prefix(prior.source.as_slice()))
+                    .filter(|(target, source)| !target.is_empty() && !source.is_empty())
+                    .map(|(target, source)| (target.to_vec(), source.to_vec()));
+                if let (Some((target, source)), false) = (nested, prior.implied) {
+                    prior.moves.push(ElementMove {
+                        source,
+                        target,
+                        ..m
+                    });
+                }
+                continue 'moves;
+            }
+        }
+        if !m.implied || m.source == m.target {
+            resolved.push(m);
+        }
+    }
+    for m in &mut resolved {
+        m.moves = resolve_moves(core::mem::take(&mut m.moves));
+    }
+    resolved
 }
 
 /// Detect sub-resource arrays from alias naming patterns.

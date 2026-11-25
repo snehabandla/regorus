@@ -42,20 +42,9 @@ pub fn obj_key_ci(map: &ObjMap, key: &str) -> Option<Rc<str>> {
 }
 
 /// Look up `key`, falling back to a key that differs only in ASCII case.
-pub fn obj_get_ci<'a>(map: &'a ObjMap, key: &str) -> Option<&'a Value> {
-    map.get(obj_key_ci(map, key)?.as_ref())
-}
-
-/// Mutable [`obj_get_ci`].
 pub fn obj_get_mut_ci<'a>(map: &'a mut ObjMap, key: &str) -> Option<&'a mut Value> {
     let found = obj_key_ci(map, key)?;
     map.get_mut(found.as_ref())
-}
-
-/// [`obj_remove`], falling back to a key that differs only in ASCII case.
-pub fn obj_remove_ci(map: &mut ObjMap, key: &str) -> Option<Value> {
-    let found = obj_key_ci(map, key)?;
-    map.remove(found.as_ref())
 }
 
 /// Find the key matching `key` in an Object, as [`obj_key_ci`] does (keys
@@ -72,21 +61,9 @@ fn object_key_ci(obj: &Object, key: &str) -> Option<Value> {
 
 /// Look up `key` in an Object, falling back to a key that differs only in
 /// ASCII case.
-pub fn object_get_ci<'a>(obj: &'a Object, key: &str) -> Option<&'a Value> {
-    obj.get(&object_key_ci(obj, key)?)
-}
-
-/// Mutable [`object_get_ci`].
 pub fn object_get_mut_ci<'a>(obj: &'a mut Object, key: &str) -> Option<&'a mut Value> {
     let found = object_key_ci(obj, key)?;
     obj.get_mut(&found)
-}
-
-/// Remove `key` from an Object, falling back to a key that differs only in
-/// ASCII case.
-fn object_remove_ci(obj: &mut Object, key: &str) -> Option<Value> {
-    let found = object_key_ci(obj, key)?;
-    obj.remove(&found)
 }
 
 /// Insert a key-value pair.
@@ -345,104 +322,4 @@ pub fn is_root_field_collision(short_name: &str, default_path: &str) -> bool {
 /// root ARM field.  The key is `_p_` + the lowercased short name.
 pub fn collision_safe_key(short_name: &str) -> String {
     alloc::format!("_p_{}", short_name.to_ascii_lowercase())
-}
-
-// ─── Element-level field removal ────────────────────────────────────────────
-//
-// Shared by both normalizer (stale source cleanup after remap) and
-// denormalizer (cleanup after reverse remap).
-
-/// Remove the value at a dot-separated path from an element Object, matching
-/// each key exactly or else ignoring ASCII case.
-pub fn remove_dotted_path_obj(obj: &mut Object, path: &str) {
-    let segments: Vec<&str> = path.split('.').collect();
-    remove_at_dotted_path_obj(obj, &segments);
-}
-
-/// [`remove_dotted_path_obj`] for an ObjMap.
-pub fn remove_dotted_path(obj: &mut ObjMap, path: &str) {
-    let segments: Vec<&str> = path.split('.').collect();
-    remove_at_dotted_path(obj, &segments);
-}
-
-/// Remove the leaf segment at a dotted path directly in an Object.
-fn remove_at_dotted_path_obj(obj: &mut Object, segments: &[&str]) {
-    let Some((&leaf, parent_segs)) = segments.split_last() else {
-        return;
-    };
-    if parent_segs.is_empty() {
-        object_remove_ci(obj, leaf);
-        return;
-    }
-
-    let Some(&first) = parent_segs.first() else {
-        return;
-    };
-    let parent_val = match object_get_mut_ci(obj, first) {
-        Some(v) => v,
-        None => return,
-    };
-
-    if parent_segs.len() == 1 {
-        if let Value::Object(inner_rc) = parent_val {
-            let inner_btree = Rc::make_mut(inner_rc);
-            object_remove_ci(inner_btree, leaf);
-        }
-    } else {
-        let mut cur = parent_val;
-        for &seg in parent_segs.iter().skip(1) {
-            cur = match cur.as_object_mut() {
-                Ok(inner) => match object_get_mut_ci(inner, seg) {
-                    Some(v) => v,
-                    None => return,
-                },
-                Err(_) => return,
-            };
-        }
-        if let Value::Object(inner_rc) = cur {
-            let inner_btree = Rc::make_mut(inner_rc);
-            object_remove_ci(inner_btree, leaf);
-        }
-    }
-}
-
-/// Remove the leaf segment at a dot-separated path from an ObjMap.
-fn remove_at_dotted_path(obj: &mut ObjMap, segments: &[&str]) {
-    let Some((&leaf, parent_segs)) = segments.split_last() else {
-        return;
-    };
-    if parent_segs.is_empty() {
-        obj_remove_ci(obj, leaf);
-        return;
-    }
-
-    let Some(&first) = parent_segs.first() else {
-        return;
-    };
-    let parent_val = match obj_get_mut_ci(obj, first) {
-        Some(v) => v,
-        None => return,
-    };
-
-    if parent_segs.len() == 1 {
-        if let Value::Object(inner_rc) = parent_val {
-            let inner_btree = Rc::make_mut(inner_rc);
-            object_remove_ci(inner_btree, leaf);
-        }
-    } else {
-        let mut cur = parent_val;
-        for &seg in parent_segs.iter().skip(1) {
-            cur = match cur.as_object_mut() {
-                Ok(inner) => match object_get_mut_ci(inner, seg) {
-                    Some(v) => v,
-                    None => return,
-                },
-                Err(_) => return,
-            };
-        }
-        if let Value::Object(inner_rc) = cur {
-            let inner_btree = Rc::make_mut(inner_rc);
-            object_remove_ci(inner_btree, leaf);
-        }
-    }
 }

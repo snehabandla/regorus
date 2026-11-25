@@ -25,7 +25,7 @@ use super::obj_map::{
 use super::types::ResolvedAliases;
 use super::AliasRegistry;
 
-use super::normalizer::{apply_element_remap, ElementRemap};
+use super::normalizer::{apply_element_plan, Direction};
 
 use casing::{build_casing_map, default_casing_map, denormalize_value, restore_casing};
 use helpers::find_key_ci;
@@ -192,66 +192,62 @@ pub fn denormalize_with_aliases(
                 }
             }
 
-            // Phase 2d: Precomputed reverse element-level field remaps.
-            for rev in &agg.reverse_element_remaps {
-                let remap = ElementRemap {
-                    array_chain: rev.array_chain.clone(),
-                    source_field: rev.source_field.clone(),
-                    target_field: if rev.target_field.contains('.') {
-                        rev.target_field
-                            .split('.')
-                            .map(|segment| restore_casing(segment, &casing_map))
-                            .collect::<alloc::vec::Vec<_>>()
-                            .join(".")
-                    } else {
-                        restore_casing(&rev.target_field, &casing_map)
-                    },
-                };
+            // Phase 2d: Element-level field remaps, each element rebuilt from
+            // a snapshot of itself.
+            for plan in &agg.element_plans {
                 // Follow an outer array phase 2b moved to its ARM path, or
                 // phase 2c renamed (the normalizer remapped it after renaming).
-                // Otherwise phase 2a wrote it: at the root of a data-plane
-                // resource when the alias's arrays are there under the same
-                // names, else in `properties`.
                 // Phase 2c records a rename under the ARM base's name.
-                let alias_name = remap.array_chain.first().cloned();
-                let (at_root, array_chain, name) =
-                    sub_resource::redirect_chain(&remap.array_chain, entries, api_version, &writes)
-                        .map(|(at_root, chain)| (at_root, chain, alias_name.clone()))
+                let alias_chain = [plan.base.clone()];
+                let located =
+                    sub_resource::redirect_chain(&alias_chain, entries, api_version, &writes)
+                        .map(|(at_root, chain)| (at_root, chain, plan.base.clone()))
                         .or_else(|| {
-                            renamed_chain(&remap.array_chain, &renamed).map(|(arm_base, chain)| {
-                                (false, chain, Some(alloc::vec![String::from(arm_base)]))
+                            renamed_chain(&alias_chain, &renamed).map(|(arm_base, chain)| {
+                                (false, chain, alloc::vec![String::from(arm_base)])
                             })
-                        })
-                        .unwrap_or_else(|| {
-                            (
-                                is_data_plane && rev.at_root,
-                                remap.array_chain.clone(),
-                                alias_name,
-                            )
                         });
-                // Another alias's value replaced this one there; it was not
-                // remapped with this alias's names.
-                // Check the keys the remap will reach, so an older write to an
-                // exact ancestor does not hide a later write that differs in case.
-                if let (Some(outer), Some(name)) = (array_chain.first(), name.as_ref()) {
-                    let map = if at_root { &result } else { &properties };
-                    let outer: alloc::vec::Vec<&str> =
-                        outer.iter().map(|key| key.as_str()).collect();
-                    let reached = sub_resource::output_keys(map, &outer);
-                    if writes.replaced(at_root, &reached, name) {
+                // Otherwise it is at the root if it is a root field (phase 1)
+                // or in a data-plane resource (phase 2a), where it is
+                // remapped only with the aliases whose arrays are there under
+                // the same names (the others look in `properties`), else in
+                // `properties`.
+                let root_field = plan
+                    .base
+                    .first()
+                    .is_some_and(|first| ROOT_FIELDS.iter().any(|f| f.eq_ignore_ascii_case(first)));
+                let split = located.is_none() && (is_data_plane || root_field);
+                let (at_root, chain, name) = located.unwrap_or_else(|| {
+                    (
+                        root_field || is_data_plane,
+                        alias_chain.to_vec(),
+                        plan.base.clone(),
+                    )
+                });
+                let base = chain.into_iter().next().unwrap_or_default();
+                let places = [(at_root, split.then_some(true)), (false, Some(false))];
+                for (root, only) in places
+                    .into_iter()
+                    .filter(|&(_, only)| split || only.is_none())
+                {
+                    // Another alias's value replaced this one there; it was
+                    // not remapped with this alias's names. Check the keys the
+                    // remap will reach, so an older write to an exact ancestor
+                    // does not hide a later write that differs in case.
+                    let keys: Vec<&str> = base.iter().map(String::as_str).collect();
+                    let reached =
+                        sub_resource::output_keys(if root { &result } else { &properties }, &keys);
+                    if writes.replaced(root, &reached, &name) {
                         continue;
                     }
+                    let map = if root { &mut result } else { &mut properties };
+                    let dir = Direction {
+                        casing: Some(&casing_map),
+                        exact: false,
+                        at_root: only,
+                    };
+                    apply_element_plan(map, &base, &plan.moves, dir);
                 }
-                let map = if at_root {
-                    &mut result
-                } else {
-                    &mut properties
-                };
-                let remap = ElementRemap {
-                    array_chain,
-                    ..remap
-                };
-                apply_element_remap(map, &remap, false);
             }
         }
     }

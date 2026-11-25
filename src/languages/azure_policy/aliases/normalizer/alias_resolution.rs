@@ -11,8 +11,8 @@ use super::super::obj_map::{
     collision_safe_key, is_root_field_collision, obj_contains, obj_insert, obj_insert_rc,
     obj_remove, set_nested_lowercased, ObjMap,
 };
-use super::super::types::ResolvedAliases;
-use super::element_remap::apply_element_remap_precomputed;
+use super::super::types::{ElementPlan, ResolvedAliases};
+use super::element_remap::{apply_element_plan, Direction};
 use super::flatten::normalize_value;
 
 /// Apply per-alias path resolution to the normalized result.
@@ -68,10 +68,8 @@ pub fn apply_alias_entries(
             .unwrap_or(&aliases.default_aggregates)
     });
 
-    for remap in &agg.element_remaps {
-        // Moves the value, so the stale ARM source key does not survive to
-        // produce a duplicate during casing restoration.
-        apply_element_remap_precomputed(result, remap);
+    for plan in &agg.element_plans {
+        apply_plan(result, plan);
     }
 
     for (source_lc, target_lc) in &agg.array_renames_normalize {
@@ -107,15 +105,25 @@ pub fn apply_alias_entries(
                     obj_insert(result, target_lc, val);
                 }
                 // The remaps above ran before this value had its alias name.
-                for remap in &agg.element_remaps {
-                    let root = remap.array_chain.first().and_then(|nav| nav.first());
-                    if root.is_some_and(|root| root == target_lc) {
-                        apply_element_remap_precomputed(result, remap);
+                for plan in &agg.element_plans {
+                    if plan.base.first() == Some(target_lc) {
+                        apply_plan(result, plan);
                     }
                 }
             }
         }
     }
+}
+
+/// Rename the fields of each element of the array at `plan.base` to their
+/// alias names.
+fn apply_plan(result: &mut ObjMap, plan: &ElementPlan) {
+    let dir = Direction {
+        casing: None,
+        exact: plan.exact,
+        at_root: None,
+    };
+    apply_element_plan(result, &plan.base, &plan.moves, dir);
 }
 
 /// Navigate an ARM path using precomputed segments (avoids per-call split).

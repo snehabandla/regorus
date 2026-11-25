@@ -20,6 +20,8 @@ use serde::{Deserialize, Deserializer};
 
 use crate::Rc;
 
+use super::path::Segment;
+
 // ---------------------------------------------------------------------------
 // Deserialization helpers
 // ---------------------------------------------------------------------------
@@ -369,49 +371,52 @@ pub struct ResolvedAliases {
 /// time rather than reconstructed on every normalize/denormalize call.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VersionedAggregates {
-    /// Precomputed element-level field remaps for wildcard aliases.
-    pub element_remaps: Vec<PrecomputedRemap>,
-    /// Precomputed reverse element remaps for denormalization.
-    pub reverse_element_remaps: Vec<PrecomputedReverseRemap>,
+    /// Element-level field remaps for wildcard aliases, one per outer array.
+    pub element_plans: Vec<ElementPlan>,
     /// Deduplicated array base renames for normalization: `(arm_base_lc, short_base_lc)`.
     pub array_renames_normalize: Vec<(String, String)>,
     /// Deduplicated array base renames for denormalization: `(short_base_lc, arm_base)`.
     pub array_renames_denormalize: Vec<(String, String)>,
 }
 
-/// A precomputed element-level field remap, stored at `ResolvedAliases` level
-/// so it's computed once at registry-load time rather than per-call.
+/// The element remaps of the wildcard aliases over one outer array. Each
+/// element is rebuilt from a snapshot of itself: every move reads the
+/// unchanged element, so remaps that swap or chain field names keep every
+/// value whatever the alias order.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrecomputedRemap {
-    /// Chain of array navigations for nested `[*]` levels.
-    pub array_chain: Vec<Vec<String>>,
-    /// Field to read within each element.
-    pub source_field: String,
-    /// Field to write within each element.
-    pub target_field: String,
-    /// Whether the keys the remap reads are lowercase, so it can look them
+pub struct ElementPlan {
+    /// Lowercase alias keys of the outer array.
+    pub base: Vec<String>,
+    /// Whether the keys the plan reads are lowercase, so it can look them
     /// up exactly. The normalizer lowercases every key except those below
     /// the first level of `tags` and `identity`.
     pub exact: bool,
+    /// Moves within each element, with pairwise disjoint targets.
+    pub(crate) moves: Vec<ElementMove>,
 }
 
-/// A precomputed reverse remap for denormalization, including the forward
-/// target field name for cleanup after remapping.
+/// One field of an element: its ARM `source` becomes its alias `target`
+/// (lowercase keys, relative to the element), and `moves` then apply within
+/// the value.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PrecomputedReverseRemap {
-    /// Chain of array navigations for nested `[*]` levels.
-    pub array_chain: Vec<Vec<String>>,
-    /// Field to read within each element (was the forward target).
-    pub source_field: String,
-    /// Field to write within each element (was the forward source).
-    pub target_field: String,
-    /// The forward target field, which the remap removes from each element as
-    /// it moves the value (the same path as `source_field`).
-    pub cleanup_field: String,
-    /// Whether the alias's arrays sit at the resource root rather than under
-    /// `properties` (any ASCII case, quoted or not), with the same names as
-    /// in its normalized short name once sub-resource elements are flattened.
-    pub at_root: bool,
+pub(crate) struct ElementMove {
+    pub(super) source: Vec<Segment>,
+    pub(super) target: Vec<Segment>,
+    /// A nested array level of the alias rather than its leaf (or a leaf
+    /// that renames one): `moves` apply to each element of an array value,
+    /// and otherwise to an object value. Implied moves that rename the
+    /// array are dropped unless an alias renames it too.
+    pub implied: bool,
+    /// For leaves, whether the alias's arrays sit at the resource root rather
+    /// than under `properties` (any ASCII case, quoted or not), with the same
+    /// names as in its normalized short name once sub-resource elements are
+    /// flattened.
+    pub at_root: Option<bool>,
+    /// The alias's position in entry order, which breaks precedence ties and,
+    /// denormalizing, picks the value for an ARM field several aliases share.
+    pub order: usize,
+    /// The moves within the value, relative to it (or to each element).
+    pub moves: Vec<ElementMove>,
 }
 
 /// A resolved alias entry with its default path and optional versioned paths.

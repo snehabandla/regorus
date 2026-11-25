@@ -221,3 +221,17 @@ cases:
         - y:
             - properties:
                 z: 1
+
+  - note: a nested element remap under properties leaves a root-level array of its short name alone
+    aliases_json: |
+      [{"namespace": "Test.Data", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test.Data/widgets/v[*].y[*].state", "defaultPath": "properties.v[*].y[*].rawstate", "paths": []}]}]}]
+    input: {"type": "Test.Data/widgets", "v": [{"y": [{"state": "s"}]}]}
+    expected_normalized: {"type": "Test.Data/widgets", "v": [{"y": [{"state": "s"}]}]}
+    round_trip: true
+
+  - note: nested element remaps at the root and under properties of one array each apply to their own fields
+    aliases_json: |
+      [{"namespace": "Test.Data", "resourceTypes": [{"resourceType": "widgets", "aliases": [{"name": "Test.Data/widgets/v[*].y[*].state", "defaultPath": "properties.v[*].y[*].rawstate", "paths": []}, {"name": "Test.Data/widgets/v[*].y[*].label", "defaultPath": "v[*].y[*].rawlabel", "paths": []}]}]}]
+    input: {"type": "Test.Data/widgets", "v": [{"y": [{"rawlabel": "l", "state": "s"}]}]}
+    expected_normalized: {"type": "Test.Data/widgets", "v": [{"y": [{"label": "l", "state": "s"}]}]}
+    round_trip: true

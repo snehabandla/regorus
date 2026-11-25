@@ -459,10 +459,8 @@ cases:
       ]
     input: {"type": "Microsoft.Network/frontDoors", "routingrules": [{"name": "r1", "forwardingprotocol": "HttpsOnly"}]}
     expected_denormalized: {"type": "Microsoft.Network/frontDoors", "properties": {"routingRules": [{"name": "r1", "properties": {"routeConfiguration": {"forwardingProtocol": "HttpsOnly"}}}]}}
+    # Normalizing back prunes the emptied `routeconfiguration`.
     reverse_round_trip: true
-    # Normalizing back leaves an empty `routeconfiguration` until element
-    # remaps prune emptied parents.
-    expected_reverse_round_trip: {"type": "Microsoft.Network/frontDoors", "routingrules": [{"name": "r1", "forwardingprotocol": "HttpsOnly", "routeconfiguration": {}}]}
 
   - note: reverse element remap whose ARM leaf nests under the alias leaf
     aliases_json: |
@@ -507,7 +505,7 @@ cases:
         }
       ]
     input: {"type": "Test/widgets", "rules": [{"cfg": {"mode": 1}}]}
-    # The emptied `Cfg` object stays until element remaps prune emptied parents.
+    # The emptied `Cfg` object stays: it may have been in the ARM resource.
     expected_denormalized: {"type": "Test/widgets", "properties": {"Rules": [{"Cfg": {}, "level": 1}]}}
 
   - note: reverse element remap through an object prefix inside a mixed-case array

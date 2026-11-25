@@ -3,287 +3,167 @@
 
 //! Element-level field remapping for array aliases with versioned paths.
 
+use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::value::Object;
-use crate::Value;
+use crate::{Rc, Value};
 
-use super::super::obj_map::{
-    obj_get_ci, obj_get_mut_ci, obj_insert, object_get_ci, object_get_mut_ci, remove_dotted_path,
-    remove_dotted_path_obj, set_nested, set_nested_lowercased, set_nested_verbatim, ObjMap,
-};
-use super::super::types::PrecomputedRemap;
+use super::super::obj_map::{obj_get_mut_ci, object_get_mut_ci, ObjMap};
+use super::super::path::{self, Segment};
+use super::super::types::ElementMove;
 
-/// Describes a field remapping inside each element of a (possibly nested) array.
-pub struct ElementRemap {
-    /// Chain of array navigations for nested `[*]` levels.
-    pub(crate) array_chain: Vec<Vec<String>>,
-    /// Dot-separated path to read within the innermost array element.
-    pub(crate) source_field: String,
-    /// Dot-separated path to write within the innermost array element.
-    pub(crate) target_field: String,
+/// How [`apply_element_plan`] applies an element plan.
+#[derive(Debug, Clone, Copy)]
+pub struct Direction<'a> {
+    /// `None` to normalize (each ARM source becomes its alias target). To
+    /// denormalize, the casing to restore on the ARM keys written back.
+    pub casing: Option<&'a BTreeMap<String, String>>,
+    /// Whether keys are looked up exactly rather than in any ASCII case.
+    pub exact: bool,
+    /// If set, skip the alias leaves whose arrays are elsewhere.
+    pub at_root: Option<bool>,
 }
 
-/// Apply an element-level field remap to each element of an array (or nested
-/// array chain). The value is moved: the source is removed before the target
-/// is written, so a target nested under its own source path (`cfg` to
-/// `cfg.value`) is not deleted with it.
-///
-/// When `lowercase` is `true` (normalizer), target path segments are
-/// lowercased.  When `false` (denormalizer), they are written verbatim
-/// so that restored casing is preserved.
-pub fn apply_element_remap(result: &mut ObjMap, remap: &ElementRemap, lowercase: bool) {
-    apply_remap_at_depth(
-        result,
-        &remap.array_chain,
-        0,
-        &remap.source_field,
-        &remap.target_field,
-        lowercase,
-        false,
-    );
-}
-
-/// Apply a precomputed element remap (from [`PrecomputedRemap`]) without
-/// any per-call string splitting or allocation. Keys are looked up exactly
-/// when the remap's keys are known to be lowercase.
-pub fn apply_element_remap_precomputed(result: &mut ObjMap, remap: &PrecomputedRemap) {
-    apply_remap_at_depth(
-        result,
-        &remap.array_chain,
-        0,
-        &remap.source_field,
-        &remap.target_field,
-        true,
-        remap.exact,
-    );
-}
-
-/// Recursively navigate nested arrays via `array_chain` and apply a field
-/// remap in each innermost element.
-fn apply_remap_at_depth(
-    obj: &mut ObjMap,
-    array_chain: &[Vec<String>],
-    depth: usize,
-    source_field: &str,
-    target_field: &str,
-    lowercase: bool,
-    exact: bool,
+/// Apply element `moves` to each element of the array at `base` in `map`.
+pub fn apply_element_plan(
+    map: &mut ObjMap,
+    base: &[String],
+    moves: &[ElementMove],
+    dir: Direction<'_>,
 ) {
-    let Some(nav) = array_chain.get(depth) else {
-        remap_deep_field(obj, source_field, target_field, lowercase, exact);
+    let Some((first, rest)) = base.split_first() else {
         return;
     };
-
-    let first = match nav.first() {
-        Some(f) => f.as_str(),
-        None => return,
-    };
-
-    // Navigate through intermediate segments to reach the array value.
-    let arr_val = if nav.len() == 1 {
-        match obj_get_mut(obj, first, exact) {
-            Some(v) => v,
-            None => return,
-        }
+    let found = if dir.exact {
+        map.get_mut(first.as_str())
     } else {
-        let mut cur: &mut Value = match obj_get_mut(obj, first, exact) {
-            Some(v) => v,
-            None => return,
-        };
-        for segment in nav.iter().skip(1) {
-            cur = match cur.as_object_mut() {
-                Ok(inner) => match object_get_mut(inner, segment, exact) {
-                    Some(v) => v,
-                    None => return,
-                },
-                Err(_) => return,
-            };
-        }
-        cur
+        obj_get_mut_ci(map, first)
     };
+    let Some(mut value) = found else {
+        return;
+    };
+    for key in rest {
+        value = match value.as_object_mut() {
+            Ok(object) => match object_get_mut(object, key, dir.exact) {
+                Some(child) => child,
+                None => return,
+            },
+            Err(_) => return,
+        };
+    }
+    apply_moves(value, moves, true, dir);
+}
 
-    if let Value::Array(elements) = arr_val {
-        let inner = crate::Rc::make_mut(elements);
-        for elem in inner.iter_mut() {
-            if let Value::Object(obj_rc) = elem {
-                let inner_btree = crate::Rc::make_mut(obj_rc);
-                remap_at_depth_in_btree(
-                    inner_btree,
-                    array_chain,
-                    depth.saturating_add(1),
-                    source_field,
-                    target_field,
-                    lowercase,
-                    exact,
-                );
+/// Apply `moves` to each element of an array value if `array`, otherwise to
+/// an object value.
+fn apply_moves(value: &mut Value, moves: &[ElementMove], array: bool, dir: Direction<'_>) {
+    if moves.is_empty() {
+        return;
+    }
+    match value {
+        Value::Array(elements) if array => {
+            for element in Rc::make_mut(elements).iter_mut() {
+                rebuild(element, moves, dir);
             }
         }
+        Value::Object(_) if !array => rebuild(value, moves, dir),
+        _ => {}
     }
 }
 
-/// BTreeMap-native recursion for element-level remap, avoiding ObjMap
-/// round-trips on each array element.
-fn remap_at_depth_in_btree(
-    btree: &mut Object,
-    array_chain: &[Vec<String>],
-    depth: usize,
-    source_field: &str,
-    target_field: &str,
-    lowercase: bool,
-    exact: bool,
-) {
-    let Some(nav) = array_chain.get(depth) else {
-        remap_deep_field_in_btree(btree, source_field, target_field, lowercase, exact);
+/// Rebuild one object from a snapshot of it. Every move reads the snapshot,
+/// so it never sees another move's result: all sources are removed (pruning
+/// the ARM parents they empty when normalizing), then each value is written
+/// at its target. The targets are disjoint, so the order of writes only
+/// matters when denormalizing: shallower ARM paths are written first, and
+/// for an ARM path several aliases share, the first alias's value wins.
+/// Fields no move reads pass through, unless a move writes over them.
+fn rebuild(element: &mut Value, moves: &[ElementMove], dir: Direction<'_>) {
+    let snapshot = element.clone();
+    let Value::Object(object) = element else {
         return;
     };
-
-    let first = match nav.first() {
-        Some(f) => f.as_str(),
-        None => return,
-    };
-
-    let arr_val = if nav.len() == 1 {
-        match object_get_mut(btree, first, exact) {
-            Some(v) => v,
-            None => return,
-        }
-    } else {
-        let mut cur: &mut Value = match object_get_mut(btree, first, exact) {
-            Some(v) => v,
-            None => return,
-        };
-        for segment in nav.iter().skip(1) {
-            cur = match cur.as_object_mut() {
-                Ok(inner) => match object_get_mut(inner, segment, exact) {
-                    Some(v) => v,
-                    None => return,
-                },
-                Err(_) => return,
-            };
-        }
-        cur
-    };
-
-    if let Value::Array(elements) = arr_val {
-        let inner = crate::Rc::make_mut(elements);
-        for elem in inner.iter_mut() {
-            if let Value::Object(obj_rc) = elem {
-                let inner_btree = crate::Rc::make_mut(obj_rc);
-                remap_at_depth_in_btree(
-                    inner_btree,
-                    array_chain,
-                    depth.saturating_add(1),
-                    source_field,
-                    target_field,
-                    lowercase,
-                    exact,
-                );
+    let object = Rc::make_mut(object);
+    let reverse = dir.casing.is_some();
+    let active = moves
+        .iter()
+        .filter(|m| dir.at_root.is_none() || m.at_root.is_none() || m.at_root == dir.at_root);
+    let mut values: Vec<(&ElementMove, Value)> = Vec::new();
+    for m in active {
+        let (read, _) = ends(m, reverse);
+        if m.source == m.target {
+            // A nested array level (or a relative leaf) that keeps its name.
+            if let Some(child) = child_mut(object, read, dir.exact) {
+                apply_moves(child, &m.moves, m.implied, dir);
             }
+        } else if let Some(value) = path::get(&snapshot, read, !dir.exact) {
+            values.push((m, value.clone()));
+            path::remove_object(object, read, !reverse);
+        }
+    }
+    values.sort_by_key(|(m, _)| (ends(m, reverse).1.len(), m.order));
+    let mut written: Vec<&[Segment]> = Vec::new();
+    for (m, mut value) in values {
+        let (read, write) = ends(m, reverse);
+        if written.contains(&write) {
+            continue;
+        }
+        apply_moves(&mut value, &m.moves, m.implied, dir);
+        if path::set_object(object, &cased(write, dir.casing), value, !reverse) {
+            written.push(write);
+        } else if let Some(original) = path::get(&snapshot, read, !dir.exact) {
+            // A non-object is in the way: keep the value where it was.
+            path::set_object(object, &cased(read, dir.casing), original.clone(), !reverse);
         }
     }
 }
 
-/// Move a value between dotted paths directly in a BTreeMap.
-fn remap_deep_field_in_btree(
-    btree: &mut Object,
-    source: &str,
-    target: &str,
-    lowercase: bool,
+/// The path a move reads and the path it writes.
+fn ends(m: &ElementMove, reverse: bool) -> (&[Segment], &[Segment]) {
+    if reverse {
+        (&m.target, &m.source)
+    } else {
+        (&m.source, &m.target)
+    }
+}
+
+/// `segments` with the casing restored, if any.
+fn cased(segments: &[Segment], casing: Option<&BTreeMap<String, String>>) -> Vec<Segment> {
+    segments
+        .iter()
+        .map(|segment| match (segment, casing) {
+            (Segment::Key(key), Some(map)) => map.get(&**key).map_or_else(
+                || segment.clone(),
+                |restored| Segment::Key(restored.as_str().into()),
+            ),
+            _ => segment.clone(),
+        })
+        .collect()
+}
+
+/// The value at the object keys `segments` below `object`.
+fn child_mut<'a>(
+    object: &'a mut Object,
+    segments: &[Segment],
     exact: bool,
-) {
-    let val = match read_dotted_path_btree(btree, source, exact) {
-        Some(v) => v,
-        None => return,
+) -> Option<&'a mut Value> {
+    let Some((Segment::Key(first), rest)) = segments.split_first() else {
+        return None;
     };
-    remove_dotted_path_obj(btree, source);
-
-    let segments: Vec<&str> = target.split('.').collect();
-    if segments.is_empty() {
-        return;
+    let mut value = object_get_mut(object, first, exact)?;
+    for segment in rest {
+        let Segment::Key(key) = segment else {
+            return None;
+        };
+        value = object_get_mut(value.as_object_mut().ok()?, key, exact)?;
     }
-    if segments.len() == 1 {
-        if let Some(seg) = segments.first() {
-            btree.insert(Value::String(crate::Rc::from(*seg)), val);
-        }
-        return;
-    }
-    set_nested(btree, &segments, val, lowercase);
-}
-
-/// Read a value at a dotted path from a BTreeMap.
-fn read_dotted_path_btree(btree: &Object, path: &str, exact: bool) -> Option<Value> {
-    let segments: Vec<&str> = path.split('.').collect();
-    let first = segments.first()?;
-    let mut cur: &Value = object_get(btree, first, exact)?;
-    for &seg in segments.iter().skip(1) {
-        cur = object_get(cur.as_object().ok()?, seg, exact)?;
-    }
-    Some(cur.clone())
-}
-
-/// Move a value from one (possibly nested) dot-separated path to another
-/// in an ObjMap.  Used only at the top level when `depth >= array_chain.len()`.
-fn remap_deep_field(obj: &mut ObjMap, source: &str, target: &str, lowercase: bool, exact: bool) {
-    let val = match read_dotted_path(obj, source, exact) {
-        Some(v) => v,
-        None => return,
-    };
-    remove_dotted_path(obj, source);
-
-    let segments: Vec<&str> = target.split('.').collect();
-    if segments.is_empty() {
-        return;
-    }
-    if segments.len() == 1 {
-        if let Some(seg) = segments.first() {
-            obj_insert(obj, seg, val);
-        }
-        return;
-    }
-    if lowercase {
-        set_nested_lowercased(obj, target, val);
-    } else {
-        set_nested_verbatim(obj, target, val);
-    }
-}
-
-/// Read a value at a dot-separated path from an ObjMap.
-fn read_dotted_path(obj: &ObjMap, path: &str, exact: bool) -> Option<Value> {
-    let segments: Vec<&str> = path.split('.').collect();
-    let first = segments.first()?;
-    let mut cur: &Value = if exact {
-        obj.get(*first)?
-    } else {
-        obj_get_ci(obj, first)?
-    };
-    for &seg in segments.iter().skip(1) {
-        cur = object_get(cur.as_object().ok()?, seg, exact)?;
-    }
-    Some(cur.clone())
+    Some(value)
 }
 
 /// Look up `key` exactly if `exact`, otherwise falling back to a key that
 /// differs only in ASCII case.
-fn obj_get_mut<'a>(obj: &'a mut ObjMap, key: &str, exact: bool) -> Option<&'a mut Value> {
-    if exact {
-        obj.get_mut(key)
-    } else {
-        obj_get_mut_ci(obj, key)
-    }
-}
-
-/// [`obj_get_mut`] in an Object.
-fn object_get<'a>(obj: &'a Object, key: &str, exact: bool) -> Option<&'a Value> {
-    if exact {
-        obj.get(&Value::from(key))
-    } else {
-        object_get_ci(obj, key)
-    }
-}
-
-/// Mutable [`object_get`].
 fn object_get_mut<'a>(obj: &'a mut Object, key: &str, exact: bool) -> Option<&'a mut Value> {
     if exact {
         obj.get_mut(&Value::from(key))

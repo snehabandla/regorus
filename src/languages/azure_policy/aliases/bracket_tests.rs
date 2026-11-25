@@ -550,7 +550,7 @@ fn unparseable_paths_are_inert() {
     ] {
         let resolved = registry(&aliases);
         let resolved = resolved.get("Test/widgets").unwrap();
-        assert_eq!(resolved.default_aggregates.element_remaps.len(), remaps);
+        assert_eq!(resolved.default_aggregates.element_plans.len(), remaps);
         assert!(resolved.sub_resource_arrays.is_empty());
         let mut expected = serde_json::Map::new();
         expected.insert(casing.into(), json!(1));
@@ -578,7 +578,7 @@ fn slash_wrapper_must_be_unquoted() {
         ),
         Value::from(json!({
             "type": "Test/widgets",
-            "rules": [{"properties": {"kept": 1}, "foo": {}, "x": 2}]
+            "rules": [{"properties": {"kept": 1}, "x": 2}]
         }))
     );
     // The quoted key is an ordinary element field: the leaf is remapped as
@@ -588,7 +588,7 @@ fn slash_wrapper_must_be_unquoted() {
         normalized(&quoted, json!({"rules": [element]})),
         Value::from(json!({
             "type": "Test/widgets",
-            "rules": [{"properties": {"kept": 1}, "properties/foo": {}, "x": 2}]
+            "rules": [{"properties": {"kept": 1}, "x": 2}]
         }))
     );
 }
