@@ -174,7 +174,7 @@ mod tests {
         vm.registers[2] = Value::from(vec![Value::Null; 128]);
         vm.execute_comprehension_begin(&ComprehensionBeginParams {
             mode: ComprehensionMode::Object,
-            collection_reg: 7,
+            collection_reg: 0,
             result_reg: 0,
             key_reg: 1,
             value_reg: 2,
@@ -187,10 +187,11 @@ mod tests {
         next[127] = Value::Bool(true);
         vm.registers[2] = Value::from(next);
         vm.set_execution_timer_config(Some(timer(Duration::ZERO)));
-        assert!(matches!(
-            vm.execute_comprehension_yield(2, Some(1)),
-            Err(VmError::TimeLimitExceeded { .. })
-        ));
+        let result = vm.execute_comprehension_yield(2, Some(1));
+        assert!(
+            matches!(result, Err(VmError::TimeLimitExceeded { .. })),
+            "{result:?}"
+        );
         assert_eq!(vm.get_register(0)?, &previous);
         assert_eq!(vm.comprehension_stack.len(), 1);
         vm.set_execution_timer_config(None);
