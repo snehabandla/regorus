@@ -1129,6 +1129,64 @@ fn comprehension_yields_follow_auto_iteration_and_skip_failed_writes() {
 }
 
 #[test]
+fn object_comprehension_conflict_after_resume_is_terminal_and_reusable() {
+    let mut engine = Engine::new();
+    engine
+        .add_policy(
+            "test.rego".into(),
+            "package t\nh(y) := lookup(y)\nc := {\"k\": h(y) | some y in input.xs}\n".into(),
+        )
+        .unwrap();
+    let compiled = engine
+        .compile_with_entrypoint(&Rc::from("data.t.c"))
+        .unwrap();
+    let program =
+        Compiler::compile_from_policy_with_host_await(&compiled, &["data.t.c"], &[("lookup", 1)])
+            .unwrap();
+    let fixture = Fixture::default();
+    let mut vm = RegoVM::new();
+    vm.load_program(program);
+    vm.set_execution_mode(ExecutionMode::Suspendable);
+    vm.set_explanation_recorder(Box::new(fixture.clone()));
+    vm.set_input(v(r#"{"xs":[1,2]}"#));
+    vm.execute().unwrap();
+    assert!(matches!(
+        vm.execution_state(),
+        ExecutionState::Suspended { .. }
+    ));
+    vm.resume(Some(v("10"))).unwrap();
+    assert!(matches!(
+        vm.execution_state(),
+        ExecutionState::Suspended { .. }
+    ));
+    let error = vm.resume(Some(v("20"))).unwrap_err();
+    assert!(matches!(
+        error,
+        regorus::rvm::vm::VmError::ObjectComprehensionConflict { .. }
+    ));
+    let events = fixture.take();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|recorded| matches!(recorded.event, Event::ComprehensionEmission { .. }))
+            .count(),
+        1,
+    );
+    assert!(
+        matches!(vm.execution_state(), ExecutionState::Error { error: state_error } if state_error == &error),
+        "{:?}",
+        vm.execution_state()
+    );
+    vm.set_input(v(r#"{"xs":[1,1]}"#));
+    vm.execute().unwrap();
+    vm.resume(Some(v("10"))).unwrap();
+    vm.resume(Some(v("10"))).unwrap();
+    assert!(
+        matches!(vm.execution_state(), ExecutionState::Completed { result } if result == &v(r#"{"k":10}"#))
+    );
+}
+
+#[test]
 fn comprehension_yields_survive_suspension_without_replaying() {
     let mut engine = Engine::new();
     engine
