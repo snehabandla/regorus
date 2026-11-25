@@ -998,13 +998,26 @@ fn object_comprehension_conflict_stops_before_failed_emission() {
                     _ => None,
                 })
                 .collect();
-            outcomes.push((alias_value, mode, run.result.is_err(), emissions));
+            let error = run
+                .result
+                .as_ref()
+                .err()
+                .and_then(|error| error.downcast_ref::<regorus::rvm::vm::VmError>())
+                .cloned();
+            outcomes.push((alias_value, mode, error, emissions));
         }
     }
     assert!(
-        outcomes.iter().all(|(alias, _, failed, emissions)| {
-            *failed
-                && *emissions == vec![(Some(v(r#""k""#)), if *alias { v("{}") } else { v("2") })]
+        outcomes.iter().all(|(alias, _, error, emissions)| {
+            let previous = if *alias { v("{}") } else { v("2") };
+            error.as_ref()
+                == Some(&regorus::rvm::vm::VmError::ObjectComprehensionConflict {
+                    key: v(r#""k""#).into(),
+                    previous: previous.clone().into(),
+                    value: if *alias { v(r#"{"k":{}}"#) } else { v("3") }.into(),
+                    pc: 5,
+                })
+                && *emissions == vec![(Some(v(r#""k""#)), previous)]
         }),
         "{outcomes:?}"
     );
