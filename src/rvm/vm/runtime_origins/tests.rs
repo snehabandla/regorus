@@ -344,7 +344,7 @@ fn constructed_members_keep_nested_alias_snapshots_in_both_modes() -> Result<()>
                 assert_eq!(vm.explain.origins.get(12), RuntimeOrigin::Unknown);
                 assert_eq!(vm.explain.origins.get(13), RuntimeOrigin::Unknown);
                 let snapshot = vm.explain.origins.get(1);
-                vm.explain.origins.enter_window();
+                vm.explain.origins.enter_window(&[]);
                 assert!(vm.explain.origins.registers.is_empty());
                 vm.explain.origins.leave_window();
                 assert_eq!(vm.explain.origins.get(1), snapshot);
@@ -654,7 +654,10 @@ fn source_identity_is_typed_and_moves_preserve_it_without_value_matching() -> Re
     vm.take_register(1)?;
     assert_eq!(
         vm.explain.origins.get(1),
-        source(vm.explain.origins.epoch, vec![PathSegment::Key("inside".into())])
+        source(
+            vm.explain.origins.epoch,
+            vec![PathSegment::Key("inside".into())]
+        )
     );
     Ok(())
 }
@@ -833,17 +836,18 @@ fn g2_literal(program: &mut Program, json: &str) -> Result<u16> {
 fn g2_call(program: &mut Program, name: &str, dest: u8, arg: u8) -> Result<Instruction> {
     let func_rule_index = g2_rule(program, name)?;
     anyhow::ensure!(
-        program.rule_infos[usize::from(func_rule_index)].function_info.is_some(),
+        program.rule_infos[usize::from(func_rule_index)]
+            .function_info
+            .is_some(),
         "fixture must dispatch an actual function"
     );
-    let params_index = program.add_function_call_params(
-        crate::rvm::instructions::FunctionCallParams {
+    let params_index =
+        program.add_function_call_params(crate::rvm::instructions::FunctionCallParams {
             dest,
             func_rule_index,
             num_args: 1,
             args: [arg, 0, 0, 0, 0, 0, 0, 0],
-        },
-    );
+        });
     Ok(Instruction::FunctionCall { params_index })
 }
 
@@ -855,19 +859,16 @@ fn g2_driver(mut program: Program, instructions: Vec<Instruction>) -> Arc<Progra
         Instruction::LoadTrue { dest: 15 },
         Instruction::Return { value: 15 },
     ]);
-    program.instruction_spans.resize(program.instructions.len(), None);
+    program
+        .instruction_spans
+        .resize(program.instructions.len(), None);
     program.dispatch_window_size = 16;
     program.entry_points.clear();
     program.entry_points.insert("g2-driver".into(), entry);
     Arc::new(program)
 }
 
-fn g2_vm(
-    program: Arc<Program>,
-    input: Value,
-    mode: ExecutionMode,
-    recording: bool,
-) -> RegoVM {
+fn g2_vm(program: Arc<Program>, input: Value, mode: ExecutionMode, recording: bool) -> RegoVM {
     let mut vm = RegoVM::new();
     vm.load_program(program);
     vm.set_input(input);
@@ -892,9 +893,9 @@ fn g2_execute(vm: &mut RegoVM) -> Result<()> {
 #[test]
 #[allow(clippy::panic_in_result_fn)]
 fn g2_helper_arguments_returns_and_nested_members() -> Result<()> {
-    let mut program = (*compile(
-        "package t\nid(x) := x\nwrap(x) := [id(x)]\nr := wrap([input.a,input.b])\n",
-    )?).clone();
+    let mut program =
+        (*compile("package t\nid(x) := x\nwrap(x) := [id(x)]\nr := wrap([input.a,input.b])\n")?)
+            .clone();
     let a = g2_literal(&mut program, r#""a""#)?;
     let b = g2_literal(&mut program, r#""b""#)?;
     let zero = g2_literal(&mut program, "0")?;
@@ -906,19 +907,42 @@ fn g2_helper_arguments_returns_and_nested_members() -> Result<()> {
         },
     );
     let wrap = g2_call(&mut program, "data.t.wrap", 3, 3)?;
-    let program = g2_driver(program, vec![
-        Instruction::LoadInput { dest: 0 },
-        Instruction::IndexLiteral { dest: 1, container: 0, literal_idx: a },
-        Instruction::IndexLiteral { dest: 2, container: 0, literal_idx: b },
-        Instruction::ArrayCreate { params_index: pair },
-        wrap,
-        Instruction::IndexLiteral { dest: 4, container: 3, literal_idx: zero },
-        Instruction::IndexLiteral { dest: 5, container: 4, literal_idx: zero },
-        Instruction::IndexLiteral { dest: 6, container: 4, literal_idx: one },
-    ]);
+    let program = g2_driver(
+        program,
+        vec![
+            Instruction::LoadInput { dest: 0 },
+            Instruction::IndexLiteral {
+                dest: 1,
+                container: 0,
+                literal_idx: a,
+            },
+            Instruction::IndexLiteral {
+                dest: 2,
+                container: 0,
+                literal_idx: b,
+            },
+            Instruction::ArrayCreate { params_index: pair },
+            wrap,
+            Instruction::IndexLiteral {
+                dest: 4,
+                container: 3,
+                literal_idx: zero,
+            },
+            Instruction::IndexLiteral {
+                dest: 5,
+                container: 4,
+                literal_idx: zero,
+            },
+            Instruction::IndexLiteral {
+                dest: 6,
+                container: 4,
+                literal_idx: one,
+            },
+        ],
+    );
     let input = v(r#"{"a":[1],"b":[1]}"#)?;
-    for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
-        for recording in [false, true] {
+    for recording in [false, true] {
+        for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
             let mut vm = g2_vm(program.clone(), input.clone(), mode, recording);
             g2_execute(&mut vm)?;
             assert_eq!(vm.get_register(0)?, &input);
@@ -928,8 +952,14 @@ fn g2_helper_arguments_returns_and_nested_members() -> Result<()> {
             if recording {
                 let epoch = vm.explain.origins.epoch;
                 assert_eq!(vm.explain.origins.get(0), source(epoch, vec![]));
-                assert_eq!(vm.explain.origins.get(5), source(epoch, vec![PathSegment::Key("a".into())]));
-                assert_eq!(vm.explain.origins.get(6), source(epoch, vec![PathSegment::Key("b".into())]));
+                assert_eq!(
+                    vm.explain.origins.get(5),
+                    source(epoch, vec![PathSegment::Key("a".into())])
+                );
+                assert_eq!(
+                    vm.explain.origins.get(6),
+                    source(epoch, vec![PathSegment::Key("b".into())])
+                );
             }
         }
     }
@@ -942,29 +972,67 @@ fn g2_boolean_identity_and_cached_default_boundaries() -> Result<()> {
     let mut program = (*compile(
         "package t\nid(x) := x\ncomputed(x) := x == true\n\
          default p := [false]\np := input.a if input.choose\n\
-         default q := [false]\nr := [id(input.flag),computed(input.flag),p,q]\n",
-    )?).clone();
+         default q := [false]\ndefault scalar := false\n\
+         r := [id(input.flag),computed(input.flag),p,q,scalar]\n",
+    )?)
+    .clone();
     let flag = g2_literal(&mut program, r#""flag""#)?;
     let zero = g2_literal(&mut program, "0")?;
     let id = g2_call(&mut program, "data.t.id", 2, 1)?;
     let computed = g2_call(&mut program, "data.t.computed", 3, 1)?;
     let p = g2_rule(&program, "data.t.p")?;
     let q = g2_rule(&program, "data.t.q")?;
-    let program = g2_driver(program, vec![
-        Instruction::LoadInput { dest: 0 },
-        Instruction::IndexLiteral { dest: 1, container: 0, literal_idx: flag },
-        id,
-        computed,
-        Instruction::CallRule { dest: 6, rule_index: p },
-        Instruction::CallRule { dest: 7, rule_index: p },
-        Instruction::CallRule { dest: 8, rule_index: q },
-        Instruction::CallRule { dest: 9, rule_index: q },
-        Instruction::IndexLiteral { dest: 4, container: 6, literal_idx: zero },
-        Instruction::IndexLiteral { dest: 5, container: 8, literal_idx: zero },
-    ]);
-    for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
-        for choose in [false, true] {
-            for recording in [false, true] {
+    let scalar = g2_rule(&program, "data.t.scalar")?;
+    let program = g2_driver(
+        program,
+        vec![
+            Instruction::LoadInput { dest: 0 },
+            Instruction::IndexLiteral {
+                dest: 1,
+                container: 0,
+                literal_idx: flag,
+            },
+            id,
+            computed,
+            Instruction::CallRule {
+                dest: 6,
+                rule_index: p,
+            },
+            Instruction::CallRule {
+                dest: 7,
+                rule_index: p,
+            },
+            Instruction::CallRule {
+                dest: 8,
+                rule_index: q,
+            },
+            Instruction::CallRule {
+                dest: 9,
+                rule_index: q,
+            },
+            Instruction::CallRule {
+                dest: 10,
+                rule_index: scalar,
+            },
+            Instruction::CallRule {
+                dest: 11,
+                rule_index: scalar,
+            },
+            Instruction::IndexLiteral {
+                dest: 4,
+                container: 6,
+                literal_idx: zero,
+            },
+            Instruction::IndexLiteral {
+                dest: 5,
+                container: 8,
+                literal_idx: zero,
+            },
+        ],
+    );
+    for recording in [false, true] {
+        for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
+            for choose in [false, true] {
                 let input = v(if choose {
                     r#"{"flag":false,"a":[false],"choose":true}"#
                 } else {
@@ -972,7 +1040,7 @@ fn g2_boolean_identity_and_cached_default_boundaries() -> Result<()> {
                 })?;
                 let mut vm = g2_vm(program.clone(), input, mode, recording);
                 g2_execute(&mut vm)?;
-                for reg in [2, 3, 4, 5] {
+                for reg in [2, 3, 4, 5, 10, 11] {
                     assert_eq!(vm.get_register(reg)?, &Value::Bool(false));
                 }
                 for reg in [6, 7, 8, 9] {
@@ -980,19 +1048,39 @@ fn g2_boolean_identity_and_cached_default_boundaries() -> Result<()> {
                 }
                 if recording {
                     let epoch = vm.explain.origins.epoch;
-                    assert_eq!(vm.explain.origins.get(2), source(epoch, vec![PathSegment::Key("flag".into())]));
+                    assert_eq!(
+                        vm.explain.origins.get(2),
+                        source(epoch, vec![PathSegment::Key("flag".into())])
+                    );
                     assert_eq!(vm.explain.origins.get(3), RuntimeOrigin::Unknown);
                     if choose {
-                        assert_eq!(vm.explain.origins.get(6), source(epoch, vec![PathSegment::Key("a".into())]));
-                        assert_eq!(vm.explain.origins.get(4), source(epoch, vec![PathSegment::Key("a".into()), PathSegment::Index(0)]));
+                        assert_eq!(
+                            vm.explain.origins.get(6),
+                            source(epoch, vec![PathSegment::Key("a".into())])
+                        );
+                        assert_eq!(
+                            vm.explain.origins.get(4),
+                            source(
+                                epoch,
+                                vec![PathSegment::Key("a".into()), PathSegment::Index(0)]
+                            )
+                        );
                     } else {
-                        assert!(matches!(vm.explain.origins.get(6), RuntimeOrigin::Computed { .. }));
+                        assert!(matches!(
+                            vm.explain.origins.get(6),
+                            RuntimeOrigin::Computed { .. }
+                        ));
                         assert_eq!(vm.explain.origins.get(4), RuntimeOrigin::Unknown);
                     }
                     assert_eq!(vm.explain.origins.get(6), vm.explain.origins.get(7));
-                    assert!(matches!(vm.explain.origins.get(8), RuntimeOrigin::Computed { .. }));
+                    assert!(matches!(
+                        vm.explain.origins.get(8),
+                        RuntimeOrigin::Computed { .. }
+                    ));
                     assert_eq!(vm.explain.origins.get(8), vm.explain.origins.get(9));
                     assert_eq!(vm.explain.origins.get(5), RuntimeOrigin::Unknown);
+                    assert_eq!(vm.explain.origins.get(10), RuntimeOrigin::Unknown);
+                    assert_eq!(vm.explain.origins.get(11), RuntimeOrigin::Unknown);
                 }
             }
         }
@@ -1003,21 +1091,68 @@ fn g2_boolean_identity_and_cached_default_boundaries() -> Result<()> {
 #[test]
 #[allow(clippy::panic_in_result_fn)]
 fn g2_cache_keeps_first_selected_value_not_last_equal_definition() -> Result<()> {
-    let mut program = (*compile(
-        "package t\np := input.a\np := input.b\nr := [p,p]\n",
-    )?).clone();
+    let program = (*compile("package t\np := input.a\np := input.b\nr := [p,p]\n")?).clone();
     let p = g2_rule(&program, "data.t.p")?;
     assert_eq!(program.rule_infos[usize::from(p)].definitions.len(), 2);
     assert!(!program.rule_infos[usize::from(p)].early_exit_on_first_success);
-    let program = g2_driver(program, vec![
-        Instruction::LoadInput { dest: 0 },
-        Instruction::Move { dest: 1, src: 0 },
-        Instruction::CallRule { dest: 1, rule_index: p },
-        Instruction::CallRule { dest: 2, rule_index: p },
-    ]);
-    for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
-        for conflict in [false, true] {
-            for recording in [false, true] {
+    let program = g2_driver(
+        program,
+        vec![
+            Instruction::LoadInput { dest: 0 },
+            Instruction::Move { dest: 1, src: 0 },
+            Instruction::CallRule {
+                dest: 1,
+                rule_index: p,
+            },
+            Instruction::CallRule {
+                dest: 2,
+                rule_index: p,
+            },
+        ],
+    );
+    let mut partial =
+        (*compile("package t\ns contains input.a\ns contains input.b\nr := [s,s]\n")?).clone();
+    let s = g2_rule(&partial, "data.t.s")?;
+    assert_eq!(partial.rule_infos[usize::from(s)].definitions.len(), 2);
+    let a = g2_literal(&mut partial, "[1]")?;
+    let b = g2_literal(&mut partial, "[2]")?;
+    let partial = g2_driver(
+        partial,
+        vec![
+            Instruction::LoadInput { dest: 0 },
+            Instruction::CallRule {
+                dest: 3,
+                rule_index: s,
+            },
+            Instruction::CallRule {
+                dest: 4,
+                rule_index: s,
+            },
+            Instruction::IndexLiteral {
+                dest: 5,
+                container: 3,
+                literal_idx: a,
+            },
+            Instruction::IndexLiteral {
+                dest: 6,
+                container: 3,
+                literal_idx: b,
+            },
+            Instruction::IndexLiteral {
+                dest: 7,
+                container: 4,
+                literal_idx: a,
+            },
+            Instruction::IndexLiteral {
+                dest: 8,
+                container: 4,
+                literal_idx: b,
+            },
+        ],
+    );
+    for recording in [false, true] {
+        for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
+            for conflict in [false, true] {
                 let input = v(if conflict {
                     r#"{"a":[1],"b":[2]}"#
                 } else {
@@ -1025,7 +1160,11 @@ fn g2_cache_keeps_first_selected_value_not_last_equal_definition() -> Result<()>
                 })?;
                 let mut vm = g2_vm(program.clone(), input, mode, recording);
                 g2_execute(&mut vm)?;
-                let expected = if conflict { Value::Undefined } else { v("[1]")? };
+                let expected = if conflict {
+                    Value::Undefined
+                } else {
+                    v("[1]")?
+                };
                 assert_eq!(vm.get_register(1)?, &expected);
                 assert_eq!(vm.get_register(2)?, &expected);
                 assert!(vm.rule_cache[usize::from(p)].0);
@@ -1040,6 +1179,29 @@ fn g2_cache_keeps_first_selected_value_not_last_equal_definition() -> Result<()>
                     assert_eq!(vm.explain.origins.get(2), expected_origin);
                 }
             }
+            let mut vm = g2_vm(partial.clone(), v(r#"{"a":[1],"b":[2]}"#)?, mode, recording);
+            g2_execute(&mut vm)?;
+            let expected = Value::from(alloc::collections::BTreeSet::from([v("[1]")?, v("[2]")?]));
+            assert_eq!(vm.get_register(3)?, &expected);
+            assert_eq!(vm.get_register(4)?, &expected);
+            for (registers, value, key) in [([5, 7], v("[1]")?, "a"), ([6, 8], v("[2]")?, "b")] {
+                for register in registers {
+                    assert_eq!(vm.get_register(register)?, &value);
+                    if recording {
+                        assert_eq!(
+                            vm.explain.origins.get(register),
+                            source(vm.explain.origins.epoch, vec![PathSegment::Key(key.into())])
+                        );
+                    }
+                }
+            }
+            if recording {
+                assert!(matches!(
+                    vm.explain.origins.get(3),
+                    RuntimeOrigin::Collection { .. }
+                ));
+                assert_eq!(vm.explain.origins.get(3), vm.explain.origins.get(4));
+            }
         }
     }
     Ok(())
@@ -1052,28 +1214,40 @@ fn g2_missing_rejected_and_else_returns_replace_destination_origins() -> Result<
         "package t\nproject(x) := x.missing\nmatched({\"k\": x}) := x\n\
          choose(x) := input.b if { false } else := x\n\
          r := [project(input.a),matched(input.a),choose(input.a)]\n",
-    )?).clone();
+    )?)
+    .clone();
     let a = g2_literal(&mut program, r#""a""#)?;
     let absent = g2_literal(&mut program, r#""absent""#)?;
     let project = g2_call(&mut program, "data.t.project", 2, 1)?;
     let matched = g2_call(&mut program, "data.t.matched", 3, 1)?;
     let undefined_arg = g2_call(&mut program, "data.t.project", 5, 4)?;
     let choose = g2_call(&mut program, "data.t.choose", 1, 1)?;
-    let program = g2_driver(program, vec![
-        Instruction::LoadInput { dest: 0 },
-        Instruction::IndexLiteral { dest: 1, container: 0, literal_idx: a },
-        Instruction::Move { dest: 2, src: 0 },
-        Instruction::Move { dest: 3, src: 0 },
-        project,
-        matched,
-        Instruction::IndexLiteral { dest: 4, container: 0, literal_idx: absent },
-        Instruction::Move { dest: 5, src: 0 },
-        undefined_arg,
-        choose,
-    ]);
-    for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
-        for matching in [false, true] {
-            for recording in [false, true] {
+    let program = g2_driver(
+        program,
+        vec![
+            Instruction::LoadInput { dest: 0 },
+            Instruction::IndexLiteral {
+                dest: 1,
+                container: 0,
+                literal_idx: a,
+            },
+            Instruction::Move { dest: 2, src: 0 },
+            Instruction::Move { dest: 3, src: 0 },
+            project,
+            matched,
+            Instruction::IndexLiteral {
+                dest: 4,
+                container: 0,
+                literal_idx: absent,
+            },
+            Instruction::Move { dest: 5, src: 0 },
+            undefined_arg,
+            choose,
+        ],
+    );
+    for recording in [false, true] {
+        for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
+            for matching in [false, true] {
                 let input = v(if matching {
                     r#"{"a":{"k":[1]},"b":{"k":[1]}}"#
                 } else {
@@ -1084,17 +1258,33 @@ fn g2_missing_rejected_and_else_returns_replace_destination_origins() -> Result<
                 assert_eq!(vm.get_register(1)?, &input[&v(r#""a""#)?]);
                 assert_eq!(vm.get_register(2)?, &Value::Undefined);
                 assert_eq!(vm.get_register(5)?, &Value::Undefined);
-                assert_eq!(vm.get_register(3)?, &if matching { v("[1]")? } else { Value::Undefined });
+                assert_eq!(
+                    vm.get_register(3)?,
+                    &if matching {
+                        v("[1]")?
+                    } else {
+                        Value::Undefined
+                    }
+                );
                 if recording {
                     let epoch = vm.explain.origins.epoch;
                     assert_eq!(vm.explain.origins.get(2), RuntimeOrigin::Unknown);
                     assert_eq!(vm.explain.origins.get(5), RuntimeOrigin::Unknown);
-                    assert_eq!(vm.explain.origins.get(1), source(epoch, vec![PathSegment::Key("a".into())]));
-                    assert_eq!(vm.explain.origins.get(3), if matching {
-                        source(epoch, vec![PathSegment::Key("a".into()), PathSegment::Key("k".into())])
-                    } else {
-                        RuntimeOrigin::Unknown
-                    });
+                    assert_eq!(
+                        vm.explain.origins.get(1),
+                        source(epoch, vec![PathSegment::Key("a".into())])
+                    );
+                    assert_eq!(
+                        vm.explain.origins.get(3),
+                        if matching {
+                            source(
+                                epoch,
+                                vec![PathSegment::Key("a".into()), PathSegment::Key("k".into())],
+                            )
+                        } else {
+                            RuntimeOrigin::Unknown
+                        }
+                    );
                 }
             }
         }
@@ -1105,40 +1295,60 @@ fn g2_missing_rejected_and_else_returns_replace_destination_origins() -> Result<
 #[test]
 #[allow(clippy::panic_in_result_fn)]
 fn g2_explicit_return_tracks_each_modes_actual_value_selection() -> Result<()> {
-    for undefined_return in [false, true] {
-        let mut program = (*compile("package t\np := input.a\nr := p\n")?).clone();
-        let p = g2_rule(&program, "data.t.p")?;
-        let a = g2_literal(&mut program, r#""a""#)?;
-        let b = g2_literal(&mut program, r#""b""#)?;
-        let entry = u32::try_from(program.instructions.len())?;
-        program.instructions.extend([
-            Instruction::RuleInit { result_reg: 0, rule_index: p },
-            Instruction::LoadInput { dest: 1 },
-            Instruction::IndexLiteral { dest: 0, container: 1, literal_idx: a },
-            Instruction::IndexLiteral { dest: 2, container: 1, literal_idx: b },
-        ]);
-        if undefined_return {
+    for recording in [false, true] {
+        for undefined_return in [false, true] {
+            let mut program = (*compile("package t\np := input.a\nr := p\n")?).clone();
+            let p = g2_rule(&program, "data.t.p")?;
+            let a = g2_literal(&mut program, r#""a""#)?;
+            let b = g2_literal(&mut program, r#""b""#)?;
+            let entry = u32::try_from(program.instructions.len())?;
             program.instructions.extend([
-                Instruction::LoadFalse { dest: 2 },
-                Instruction::ReturnUndefinedIfNotTrue { condition: 2 },
+                Instruction::RuleInit {
+                    result_reg: 0,
+                    rule_index: p,
+                },
+                Instruction::LoadInput { dest: 1 },
+                Instruction::IndexLiteral {
+                    dest: 0,
+                    container: 1,
+                    literal_idx: a,
+                },
+                Instruction::IndexLiteral {
+                    dest: 2,
+                    container: 1,
+                    literal_idx: b,
+                },
             ]);
-        } else {
-            program.instructions.push(Instruction::Return { value: 2 });
-        }
-        let info = &mut program.rule_infos[usize::from(p)];
-        info.result_reg = 0;
-        info.num_registers = 3;
-        info.definitions = Rc::new(vec![vec![entry]]);
-        info.destructuring_blocks = vec![None];
-        info.else_bodies = vec![vec![false]];
-        program.max_rule_window_size = program.max_rule_window_size.max(3);
-        let program = g2_driver(program, vec![
-            Instruction::LoadInput { dest: 0 },
-            Instruction::CallRule { dest: 1, rule_index: p },
-            Instruction::CallRule { dest: 2, rule_index: p },
-        ]);
-        for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
-            for recording in [false, true] {
+            if undefined_return {
+                program.instructions.extend([
+                    Instruction::LoadFalse { dest: 2 },
+                    Instruction::ReturnUndefinedIfNotTrue { condition: 2 },
+                ]);
+            } else {
+                program.instructions.push(Instruction::Return { value: 2 });
+            }
+            let info = &mut program.rule_infos[usize::from(p)];
+            info.result_reg = 0;
+            info.num_registers = 3;
+            info.definitions = Rc::new(vec![vec![entry]]);
+            info.destructuring_blocks = vec![None];
+            info.else_bodies = vec![vec![false]];
+            program.max_rule_window_size = program.max_rule_window_size.max(3);
+            let program = g2_driver(
+                program,
+                vec![
+                    Instruction::LoadInput { dest: 0 },
+                    Instruction::CallRule {
+                        dest: 1,
+                        rule_index: p,
+                    },
+                    Instruction::CallRule {
+                        dest: 2,
+                        rule_index: p,
+                    },
+                ],
+            );
+            for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
                 let mut vm = g2_vm(program.clone(), v(r#"{"a":[1],"b":[2]}"#)?, mode, recording);
                 g2_execute(&mut vm)?;
                 // Native selects result_reg even for an explicit return; do not repair parity here.
@@ -1166,24 +1376,60 @@ fn g2_explicit_return_tracks_each_modes_actual_value_selection() -> Result<()> {
 #[allow(clippy::panic_in_result_fn)]
 fn g2_accumulated_returns_and_cache_do_not_cross_capture_epochs() -> Result<()> {
     use super::super::execution_model::FrameKind;
-    let mut program = (*compile(
+    let program = (*compile(
         "package t\np := input.a\n\
          p := input.b if { __builtin_host_await(true,\"pause\") }\nr := [p,p]\n",
-    )?).clone();
+    )?)
+    .clone();
     let p = g2_rule(&program, "data.t.p")?;
     assert!(!program.rule_infos[usize::from(p)].early_exit_on_first_success);
-    let program = g2_driver(program, vec![
-        Instruction::LoadInput { dest: 0 },
-        Instruction::CallRule { dest: 1, rule_index: p },
-        Instruction::CallRule { dest: 2, rule_index: p },
-    ]);
+    let mut cached = program.clone();
+    let after = g2_literal(&mut cached, r#""after-cache""#)?;
+    let cached = g2_driver(
+        cached,
+        vec![
+            Instruction::LoadInput { dest: 0 },
+            Instruction::CallRule {
+                dest: 1,
+                rule_index: p,
+            },
+            Instruction::LoadTrue { dest: 13 },
+            Instruction::Load {
+                dest: 14,
+                literal_idx: after,
+            },
+            Instruction::HostAwait {
+                dest: 12,
+                arg: 13,
+                id: 14,
+            },
+            Instruction::CallRule {
+                dest: 2,
+                rule_index: p,
+            },
+        ],
+    );
+    let program = g2_driver(
+        program,
+        vec![
+            Instruction::LoadInput { dest: 0 },
+            Instruction::CallRule {
+                dest: 1,
+                rule_index: p,
+            },
+            Instruction::CallRule {
+                dest: 2,
+                rule_index: p,
+            },
+        ],
+    );
     let input = v(r#"{"a":[1],"b":[1]}"#)?;
-    for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
-        for scenario in ["keep", "replace", "input", "data", "late", "abort"] {
-            if mode == ExecutionMode::RunToCompletion && scenario != "keep" {
-                continue;
-            }
-            for recording in [false, true] {
+    for recording in [false, true] {
+        for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
+            for scenario in ["keep", "replace", "input", "data", "late", "abort"] {
+                if mode == ExecutionMode::RunToCompletion && scenario != "keep" {
+                    continue;
+                }
                 let mut vm = g2_vm(program.clone(), input.clone(), mode, recording);
                 if mode == ExecutionMode::RunToCompletion {
                     vm.set_host_await_responses([(v(r#""pause""#)?, vec![Value::Bool(true)])]);
@@ -1193,7 +1439,9 @@ fn g2_accumulated_returns_and_cache_do_not_cross_capture_epochs() -> Result<()> 
                     assert_eq!(vm.get_host_await_identifier(), Some(&v(r#""pause""#)?));
                     let accumulated = (0..vm.execution_stack.len()).find_map(|index| {
                         match &vm.execution_stack.get(index)?.kind {
-                            FrameKind::Rule(data) if data.rule_index == p => data.accumulated_result.as_ref(),
+                            FrameKind::Rule(data) if data.rule_index == p => {
+                                data.accumulated_result.as_ref()
+                            }
                             _ => None,
                         }
                     });
@@ -1211,13 +1459,18 @@ fn g2_accumulated_returns_and_cache_do_not_cross_capture_epochs() -> Result<()> 
                     }
                     let resumed = vm.resume(Some(Value::Bool(true)));
                     if scenario == "abort" {
-                        assert!(matches!(resumed, Err(super::super::errors::VmError::InstructionLimitExceeded { .. })));
+                        assert!(matches!(
+                            resumed,
+                            Err(super::super::errors::VmError::InstructionLimitExceeded { .. })
+                        ));
                         assert!(vm.explain.origins.registers.is_empty());
                         assert!(vm.explain.origins.windows.is_empty());
                         continue;
                     }
                     resumed?;
-                    assert!(matches!(vm.execution_state(), ExecutionState::Completed { result } if result == &Value::Bool(true)));
+                    assert!(
+                        matches!(vm.execution_state(), ExecutionState::Completed { result } if result == &Value::Bool(true))
+                    );
                     assert!(vm.explain.origins.windows.is_empty());
                 }
                 assert_eq!(vm.get_register(0)?, &input);
@@ -1247,11 +1500,41 @@ fn g2_accumulated_returns_and_cache_do_not_cross_capture_epochs() -> Result<()> 
                 for dest in [1, 2] {
                     assert_eq!(vm.get_register(dest)?, &v("[2]")?);
                     if vm.explain_enabled() {
-                        assert_eq!(vm.explain.origins.get(dest), source(vm.explain.origins.epoch, vec![PathSegment::Key("a".into())]));
+                        assert_eq!(
+                            vm.explain.origins.get(dest),
+                            source(vm.explain.origins.epoch, vec![PathSegment::Key("a".into())])
+                        );
                     }
                 }
             }
         }
+    }
+    for install in [false, true] {
+        let mut vm = g2_vm(
+            cached.clone(),
+            input.clone(),
+            ExecutionMode::Suspendable,
+            false,
+        );
+        vm.execute_entry_point_by_index(0)?;
+        assert_eq!(vm.get_host_await_identifier(), Some(&v(r#""pause""#)?));
+        vm.resume(Some(Value::Bool(true)))?;
+        assert_eq!(
+            vm.get_host_await_identifier(),
+            Some(&v(r#""after-cache""#)?)
+        );
+        assert!(vm.rule_cache[usize::from(p)].0);
+        assert_eq!(vm.rule_cache[usize::from(p)].1, v("[1]")?);
+        if install {
+            vm.set_explanation_recorder(Box::new(Recorder));
+        }
+        vm.resume(Some(Value::Bool(true)))?;
+        assert!(
+            matches!(vm.execution_state(), ExecutionState::Completed { result } if result == &Value::Bool(true))
+        );
+        assert_eq!(vm.get_register(2)?, &v("[1]")?);
+        assert_eq!(vm.explain.origins.get(2), RuntimeOrigin::Unknown);
+        assert!(vm.explain.origins.windows.is_empty());
     }
     Ok(())
 }

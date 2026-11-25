@@ -4,14 +4,17 @@
 //! Evaluation-local identities, not a recorder payload or a report producer.
 //! Computed identities say nothing about causal inputs. Constructed members
 //! retain only independently captured correspondence, with immutable aliases.
-//! Missing helper, cache and virtual-data propagation
-//! remains unknown; equal values and allocation addresses never supply identity.
+//! Helpers carry actual argument and selected-result origins; rule-cache entries
+//! retain the origin paired with their stored value. Virtual-data projections
+//! remain unknown; equal values and allocation addresses never supply identity.
 //!
 //! Direct input/data paths share identity only within a capture epoch.
 //! Evaluation initialization, abort, program/source replacement and recorder
 //! replacement invalidate the sidecar. Suspension alone does not. Register
-//! windows save and restore origins alongside values, while callee arguments
-//! and returned values remain unknown pending helper propagation. Body resets
+//! windows save and restore origins alongside values, including arguments and
+//! successful returns. Suspended selected results cannot cross capture epochs.
+//! Literal scalar defaults stay unknown; collection defaults are computed.
+//! Body resets
 //! retain exactly the slots the VM retains. Unknown members stay unknown;
 //! duplicate set contributions with different origins cannot select a source.
 //! Final snapshot owners drain iteratively, including register destruction and
@@ -169,12 +172,14 @@ pub(super) struct RuntimeOrigins {
     next_instance: u64,
     registers: Vec<RuntimeOrigin>,
     windows: Vec<Vec<RuntimeOrigin>>,
+    cached_rules: Vec<RuntimeOrigin>,
 }
 
 impl RuntimeOrigins {
     pub(super) fn reset(&mut self) {
         self.registers.clear();
         self.windows.clear();
+        self.cached_rules.clear();
         self.next_instance = 0;
         match self.epoch.checked_add(1) {
             Some(epoch) => self.epoch = epoch,
@@ -190,6 +195,7 @@ impl RuntimeOrigins {
     }
 
     pub(super) fn set(&mut self, register: u8, origin: RuntimeOrigin) {
+        let origin = self.current(origin);
         let index = usize::from(register);
         self.registers
             .resize(self.registers.len().max(index + 1), RuntimeOrigin::Unknown);
@@ -209,14 +215,56 @@ impl RuntimeOrigins {
         self.registers.resize(size, RuntimeOrigin::Unknown);
     }
 
-    pub(super) fn enter_window(&mut self) {
-        // Arguments deliberately start unknown until helper propagation.
+    pub(super) fn enter_window(&mut self, arguments: &[u8]) {
+        let mut registers = Vec::new();
+        if !arguments.is_empty() {
+            registers.push(RuntimeOrigin::Unknown);
+        }
+        registers.extend(arguments.iter().map(|&register| self.get(register)));
         self.windows.push(core::mem::take(&mut self.registers));
+        self.registers = registers;
     }
 
     pub(super) fn leave_window(&mut self) {
         // A recorder installed during suspension has no saved caller origins.
         self.registers = self.windows.pop().unwrap_or_default();
+    }
+
+    fn current(&self, origin: RuntimeOrigin) -> RuntimeOrigin {
+        let epoch = match &origin {
+            RuntimeOrigin::Unknown => return origin,
+            RuntimeOrigin::Source { epoch, .. }
+            | RuntimeOrigin::Computed { epoch, .. }
+            | RuntimeOrigin::Collection { epoch, .. } => *epoch,
+        };
+        if self.exhausted || epoch != self.epoch {
+            RuntimeOrigin::Unknown
+        } else {
+            origin
+        }
+    }
+
+    pub(super) fn cached_rule(&self, rule: usize) -> RuntimeOrigin {
+        self.cached_rules.get(rule).cloned().unwrap_or_default()
+    }
+
+    pub(super) fn cache_rule(&mut self, rule: usize, origin: RuntimeOrigin) {
+        let origin = self.current(origin);
+        self.cached_rules.resize(
+            self.cached_rules.len().max(rule + 1),
+            RuntimeOrigin::Unknown,
+        );
+        if let Some(slot) = self.cached_rules.get_mut(rule) {
+            *slot = origin;
+        }
+    }
+
+    pub(super) const fn computed_value(&mut self, value: &Value) -> RuntimeOrigin {
+        if matches!(value, Value::Array(_) | Value::Object(_) | Value::Set(_)) {
+            self.computed()
+        } else {
+            RuntimeOrigin::Unknown
+        }
     }
 
     const fn source(&self, root: PathRoot) -> RuntimeOrigin {
@@ -249,6 +297,15 @@ impl RuntimeOrigins {
 }
 
 impl RegoVM {
+    pub(super) fn explain_return_origin(&self) -> RuntimeOrigin {
+        use crate::rvm::instructions::Instruction;
+        match self.program.instructions.get(self.pc) {
+            Some(&Instruction::Return { value }) => self.explain.origins.get(value),
+            Some(&Instruction::Halt {}) => self.explain.origins.get(0),
+            _ => RuntimeOrigin::Unknown,
+        }
+    }
+
     #[cold]
     fn explain_member_origin(
         &mut self,

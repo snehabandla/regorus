@@ -72,6 +72,8 @@ pub(super) struct RuleFrameData {
     pub(super) total_definitions: usize,
     pub(super) phase: RuleFramePhase,
     pub(super) accumulated_result: Option<Value>,
+    #[cfg(feature = "explanations")]
+    pub(super) accumulated_origin: super::runtime_origins::RuntimeOrigin,
     pub(super) any_body_succeeded: bool,
     pub(super) rule_failed_due_to_inconsistency: bool,
     pub(super) rule_type: RuleType,

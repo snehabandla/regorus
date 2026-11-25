@@ -657,6 +657,12 @@ impl RegoVM {
     }
 
     fn handle_instruction_return(&mut self, value: Value, last_result: &mut Value) -> Result<()> {
+        #[cfg(feature = "explanations")]
+        let origin = if self.explain_enabled() && !matches!(value, Value::Undefined) {
+            self.explain_return_origin()
+        } else {
+            super::runtime_origins::RuntimeOrigin::Unknown
+        };
         loop {
             let frame = match self.execution_stack.pop() {
                 Some(frame) => frame,
@@ -681,6 +687,10 @@ impl RegoVM {
                         self.explain.origins.clear_register(data.result_reg);
                     }
                     data.accumulated_result = Some(value.clone());
+                    #[cfg(feature = "explanations")]
+                    if self.explain_enabled() {
+                        data.accumulated_origin = origin.clone();
+                    }
                     data.any_body_succeeded = true;
 
                     let result = self.finalize_rule_frame_data(data)?;

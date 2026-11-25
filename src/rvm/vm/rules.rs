@@ -15,6 +15,8 @@ use super::execution_model::{
     ExecutionFrame, ExecutionMode, FrameKind, RuleFrameData, RuleFramePhase,
 };
 use super::machine::RegoVM;
+#[cfg(feature = "explanations")]
+use super::runtime_origins::RuntimeOrigin;
 
 impl RegoVM {
     /// Returns true if the error represents a resource-limit violation that
@@ -61,8 +63,11 @@ impl RegoVM {
         rule_definitions: &[Vec<u32>],
         rule_info: &RuleInfo,
         function_call_params: Option<&FunctionCallParams>,
+        #[cfg(feature = "explanations")] result_origin: &mut RuntimeOrigin,
     ) -> Result<(Value, bool)> {
         let mut first_successful_result: Option<Value> = None;
+        #[cfg(feature = "explanations")]
+        let mut first_successful_origin = RuntimeOrigin::Unknown;
         let mut rule_failed_due_to_inconsistency = false;
         let is_function_call = rule_info.function_info.is_some();
         let result_reg = rule_info.result_reg;
@@ -87,6 +92,12 @@ impl RegoVM {
             },
         };
 
+        #[cfg(feature = "explanations")]
+        if self.explain_enabled() {
+            self.explain
+                .origins
+                .enter_window(function_call_params.map_or(&[], FunctionCallParams::arg_registers));
+        }
         let mut previous_registers = Vec::default();
         mem::swap(&mut previous_registers, &mut self.registers);
 
@@ -101,10 +112,6 @@ impl RegoVM {
 
         self.register_stack.push(previous_registers);
         self.registers = register_window;
-        #[cfg(feature = "explanations")]
-        if self.explain_enabled() {
-            self.explain.origins.enter_window();
-        }
 
         'outer: for (def_idx, definition_bodies) in rule_definitions.iter().enumerate() {
             for (body_entry_point_idx, body_entry_point) in definition_bodies.iter().enumerate() {
@@ -186,6 +193,11 @@ impl RegoVM {
                                     }
                                 } else {
                                     first_successful_result = Some(current_result.clone());
+                                    #[cfg(feature = "explanations")]
+                                    if self.explain_enabled() {
+                                        first_successful_origin =
+                                            self.explain.origins.get(result_reg);
+                                    }
                                     // All definitions produce the same static value;
                                     // no need to verify consistency with the rest.
                                     if rule_info.early_exit_on_first_success {
@@ -232,6 +244,21 @@ impl RegoVM {
             }
         }
 
+        #[cfg(feature = "explanations")]
+        if self.explain_enabled() {
+            *result_origin = if rule_failed_due_to_inconsistency {
+                RuntimeOrigin::Unknown
+            } else if first_successful_result.is_some() {
+                first_successful_origin
+            } else if matches!(
+                rule_info.rule_type,
+                RuleType::PartialSet | RuleType::PartialObject
+            ) {
+                self.explain.origins.get(result_reg)
+            } else {
+                RuntimeOrigin::Unknown
+            };
+        }
         let final_result = if rule_failed_due_to_inconsistency {
             Value::Undefined
         } else if let Some(successful_result) = first_successful_result {
@@ -333,6 +360,11 @@ impl RegoVM {
                     })?;
             if *computed {
                 self.set_register(dest, cached_result.clone())?;
+                #[cfg(feature = "explanations")]
+                if self.explain_enabled() {
+                    let origin = self.explain.origins.cached_rule(rule_idx);
+                    self.explain.origins.set(dest, origin);
+                }
                 return Ok(());
             }
         }
@@ -370,6 +402,14 @@ impl RegoVM {
                 *entry = (true, result.clone());
             }
             self.set_register(dest, result)?;
+            #[cfg(feature = "explanations")]
+            if self.explain_enabled() {
+                self.explain_computed_origin(dest);
+                if !is_function_rule {
+                    let origin = self.explain.origins.get(dest);
+                    self.explain.origins.cache_rule(rule_idx, origin);
+                }
+            }
             return Ok(());
         }
 
@@ -401,10 +441,14 @@ impl RegoVM {
             current_body_index: 0,
         });
 
+        #[cfg(feature = "explanations")]
+        let mut result_origin = RuntimeOrigin::Unknown;
         let execution_result = self.execute_rule_definitions_common(
             &rule_definitions,
             &rule_info,
             function_call_params,
+            #[cfg(feature = "explanations")]
+            &mut result_origin,
         );
 
         let call_context = self.call_rule_stack.pop();
@@ -434,6 +478,10 @@ impl RegoVM {
         };
 
         self.set_register(dest, result_from_rule.clone())?;
+        #[cfg(feature = "explanations")]
+        if self.explain_enabled() {
+            self.explain.origins.set(dest, result_origin);
+        }
 
         if self.get_register(dest)? == &Value::Undefined && !rule_failed_due_to_inconsistency {
             match call_context.rule_type {
@@ -466,6 +514,10 @@ impl RegoVM {
                     }
                 }
             }
+            #[cfg(feature = "explanations")]
+            if self.explain_enabled() {
+                self.explain_computed_origin(dest);
+            }
         }
 
         let final_value = self.get_register(dest)?.clone();
@@ -480,6 +532,11 @@ impl RegoVM {
                     available,
                 })?;
             *entry = (true, final_value.clone());
+            #[cfg(feature = "explanations")]
+            if self.explain_enabled() {
+                let origin = self.explain.origins.get(dest);
+                self.explain.origins.cache_rule(rule_idx, origin);
+            }
         }
         Ok(())
     }
@@ -540,6 +597,11 @@ impl RegoVM {
                     })?;
             if *computed {
                 self.set_register(dest, cached_result.clone())?;
+                #[cfg(feature = "explanations")]
+                if self.explain_enabled() {
+                    let origin = self.explain.origins.cached_rule(rule_idx);
+                    self.explain.origins.set(dest, origin);
+                }
                 return Ok(());
             }
         }
@@ -581,6 +643,14 @@ impl RegoVM {
             let captured_result = call.map(|id| (id, result.clone()));
             self.set_register(dest, result)?;
             #[cfg(feature = "explanations")]
+            if self.explain_enabled() {
+                self.explain_computed_origin(dest);
+                if !is_function_rule {
+                    let origin = self.explain.origins.get(dest);
+                    self.explain.origins.cache_rule(rule_idx, origin);
+                }
+            }
+            #[cfg(feature = "explanations")]
             if let Some((id, value)) = captured_result {
                 self.explain_end_call(id, Some(&value));
             }
@@ -610,13 +680,15 @@ impl RegoVM {
             }
         }
 
+        #[cfg(feature = "explanations")]
+        if self.explain_enabled() {
+            self.explain
+                .origins
+                .enter_window(function_call_params.map_or(&[], FunctionCallParams::arg_registers));
+        }
         let mut saved_registers = Vec::default();
         mem::swap(&mut saved_registers, &mut self.registers);
         self.registers = register_window;
-        #[cfg(feature = "explanations")]
-        if self.explain_enabled() {
-            self.explain.origins.enter_window();
-        }
 
         let mut saved_loop_stack = Vec::default();
         mem::swap(&mut saved_loop_stack, &mut self.loop_stack);
@@ -651,6 +723,8 @@ impl RegoVM {
             total_definitions: rule_info.definitions.len(),
             phase: RuleFramePhase::Initializing,
             accumulated_result: None,
+            #[cfg(feature = "explanations")]
+            accumulated_origin: RuntimeOrigin::Unknown,
             any_body_succeeded: false,
             rule_failed_due_to_inconsistency: false,
             rule_type: rule_info.rule_type.clone(),
@@ -687,12 +761,20 @@ impl RegoVM {
                 if current_ctx.current_definition_index == 0 && current_ctx.current_body_index == 0
                 {
                     self.set_register(result_reg, Value::new_set())?;
+                    #[cfg(feature = "explanations")]
+                    if self.explain_enabled() {
+                        self.explain_computed_origin(result_reg);
+                    }
                 }
             }
             RuleType::PartialObject => {
                 if current_ctx.current_definition_index == 0 && current_ctx.current_body_index == 0
                 {
                     self.set_register(result_reg, Value::new_object())?;
+                    #[cfg(feature = "explanations")]
+                    if self.explain_enabled() {
+                        self.explain_computed_origin(result_reg);
+                    }
                 }
             }
         }
@@ -856,6 +938,11 @@ impl RegoVM {
                     }
                 } else {
                     frame_data.accumulated_result = Some(current_result);
+                    #[cfg(feature = "explanations")]
+                    if self.explain_enabled() {
+                        frame_data.accumulated_origin =
+                            self.explain.origins.get(frame_data.result_reg);
+                    }
                     // All definitions produce the same static value;
                     // skip remaining definitions.
                     if rule_info.early_exit_on_first_success {
@@ -884,6 +971,8 @@ impl RegoVM {
             dest_reg,
             rule_index,
             accumulated_result,
+            #[cfg(feature = "explanations")]
+            accumulated_origin,
             rule_failed_due_to_inconsistency,
             rule_type,
             result_reg,
@@ -906,6 +995,16 @@ impl RegoVM {
             })?
             .clone();
 
+        #[cfg(feature = "explanations")]
+        let mut result_origin = if !self.explain_enabled() || rule_failed_due_to_inconsistency {
+            RuntimeOrigin::Unknown
+        } else if accumulated_result.is_some() {
+            accumulated_origin
+        } else if matches!(rule_type, RuleType::PartialSet | RuleType::PartialObject) {
+            self.explain.origins.get(result_reg)
+        } else {
+            RuntimeOrigin::Unknown
+        };
         let result_from_rule = if rule_failed_due_to_inconsistency {
             Value::Undefined
         } else if let Some(value) = accumulated_result {
@@ -1009,6 +1108,10 @@ impl RegoVM {
                     pc: self.pc,
                     register_count,
                 })?;
+        #[cfg(feature = "explanations")]
+        if self.explain_enabled() && needs_default && !rule_failed_due_to_inconsistency {
+            result_origin = self.explain.origins.computed_value(&final_value);
+        }
 
         if !is_function_rule {
             let available = self.rule_cache.len();
@@ -1027,7 +1130,11 @@ impl RegoVM {
         #[cfg(feature = "explanations")]
         if self.explain_enabled() {
             self.explain.origins.leave_window();
-            self.explain.origins.clear_register(dest_reg);
+            self.explain.origins.set(dest_reg, result_origin);
+            if !is_function_rule {
+                let origin = self.explain.origins.get(dest_reg);
+                self.explain.origins.cache_rule(rule_idx, origin);
+            }
         }
 
         // Underflow here means malformed/poisoned program state; surface as a
