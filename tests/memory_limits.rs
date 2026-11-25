@@ -2635,6 +2635,54 @@ fn partial_eval_validation_is_in_the_memory_budget() {
 
 #[cfg(feature = "explanations")]
 #[test]
+fn partial_eval_unknown_index_does_not_copy_all_declared_key_bytes() {
+    use regorus::explain::{ExplainError, PartialEvalSettings, ResidualStatus, UnknownPath};
+
+    let _guard = LimitGuard::lock();
+    let mut vm = partial_eval_vm("package test\nallow := true", "p.rego".into());
+    vm.set_input(Value::new_object());
+    let mut settings = PartialEvalSettings::default();
+    settings.unknowns = (0..32)
+        .map(|i| {
+            let key = format!("{}-{i}", "x".repeat(16 * 1024));
+            UnknownPath::input_keys([key.as_str()])
+        })
+        .collect();
+    vm.set_partial_eval_settings(settings);
+    // The caller's >512 KiB of key storage predates the evaluation baseline.
+    // A 64 KiB transient budget permits an index and one lookup key, but not
+    // another owned copy of the whole declaration list.
+    vm.set_memory_budget_config(Some(MemoryBudgetConfig {
+        limit: NonZeroU64::new(64 * 1024).unwrap(),
+    }));
+    let result = vm.partial_eval("data.test.allow").unwrap();
+    assert_eq!(result.status, ResidualStatus::Exact);
+    assert_eq!(result.result, Value::Bool(true));
+    assert!(result.warnings.is_empty());
+
+    vm.set_memory_budget_config(Some(MemoryBudgetConfig {
+        limit: NonZeroU64::MIN,
+    }));
+    assert!(matches!(
+        vm.partial_eval("data.test.allow"),
+        Err(ExplainError::Vm(VmError::MemoryBudgetExceeded { budget: 1, .. }))
+    ));
+    assert!(matches!(
+        vm.execution_state(),
+        ExecutionState::Error {
+            error: VmError::MemoryBudgetExceeded { budget: 1, .. }
+        }
+    ));
+    assert!(vm.get_registers().is_empty());
+    vm.set_memory_budget_config(None);
+    assert_eq!(
+        vm.partial_eval("data.test.allow").unwrap().result,
+        Value::Bool(true)
+    );
+}
+
+#[cfg(feature = "explanations")]
+#[test]
 fn partial_eval_warning_is_in_the_memory_budget() {
     use regorus::explain::{ExplainError, PartialEvalSettings, ResidualStatus, UnknownPath};
 
