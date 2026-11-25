@@ -1568,12 +1568,12 @@ fn g2_accumulated_returns_and_cache_do_not_cross_capture_epochs() -> Result<()> 
             vm.get_host_await_identifier(),
             Some(&v(r#""after-cache""#)?)
         );
-        let cached = vm
+        let cache_entry = vm
             .rule_cache
             .get(usize::from(p))
             .context("fixture cached rule")?;
-        assert!(cached.0);
-        assert_eq!(cached.1, v("[1]")?);
+        assert!(cache_entry.0);
+        assert_eq!(cache_entry.1, v("[1]")?);
         if install {
             vm.set_explanation_recorder(Box::new(Recorder));
         }
