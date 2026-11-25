@@ -527,8 +527,8 @@ fn negation_growing_source_prefix_measurements() -> Result<()> {
         let prefix_bytes = source.len();
         for rule in 0..rules {
             source.push_str(&alloc::format!("r{rule} if {{ "));
-            source.push_str(&"not input.blocked; ".repeat(16));
-            source.push_str("}\n");
+            source.push_str(&"not input.blocked; ".repeat(15));
+            source.push_str("not input.blocked }\n");
         }
         let source_bytes = source.len();
         engine.add_policy("checks.rego".to_string(), source)?;
