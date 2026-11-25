@@ -11,13 +11,11 @@ use crate::value::Object;
 use crate::Value;
 
 use super::super::obj_map::{
-    obj_key_ci, set_nested, take_dotted_path_obj, val_str, ObjMap, ROOT_FIELDS,
+    is_element_envelope_field, obj_key_ci, set_nested, take_dotted_path_obj, val_str, ObjMap,
+    ROOT_FIELDS,
 };
 use super::super::types::{ElementFields, ResolvedEntry};
 use super::casing::restore_casing;
-
-/// Sub-resource array element envelope fields that remain at the element root.
-const ELEMENT_ENVELOPE_FIELDS: &[&str] = &["name", "type", "id", "etag"];
 
 /// The denormalization state that re-wrapping reads.
 pub struct Context<'a> {
@@ -211,7 +209,7 @@ pub fn rewrap_sub_resource_arrays(
             &mut *properties
         };
         if let Some(value) = obj_key_ci(map, first).and_then(|key| map.get_mut(key.as_ref())) {
-            rewrap_at(value, rest, &fields);
+            rewrap_at(value, rest, &fields, cx.casing_map);
         }
     }
 }
@@ -333,14 +331,19 @@ pub fn redirect_chain(
 /// Like the normalizer's path tracking, arrays along the way are walked
 /// element by element and objects by key, so a name such as `a.b.c` matches
 /// `a.b[*].c[*]` and `a[*].b[*].c[*]` alike.
-fn rewrap_at(value: &mut Value, keys: &[&str], fields: &ElementFields) {
+fn rewrap_at(
+    value: &mut Value,
+    keys: &[&str],
+    fields: &ElementFields,
+    casing: &BTreeMap<String, String>,
+) {
     match value {
         Value::Array(arr) => {
             for elem in crate::Rc::make_mut(arr).iter_mut() {
                 if keys.is_empty() {
-                    *elem = rewrap_element(elem, fields);
+                    *elem = rewrap_element(elem, fields, casing);
                 } else {
-                    rewrap_at(elem, keys, fields);
+                    rewrap_at(elem, keys, fields, casing);
                 }
             }
         }
@@ -351,7 +354,7 @@ fn rewrap_at(value: &mut Value, keys: &[&str], fields: &ElementFields) {
             let obj = crate::Rc::make_mut(obj);
             if let Some(key) = find_key_ci_btree(obj, first) {
                 if let Some(child) = obj.get_mut(&key) {
-                    rewrap_at(child, rest, fields);
+                    rewrap_at(child, rest, fields, casing);
                 }
             }
         }
@@ -373,10 +376,14 @@ fn find_key_ci_btree(btree: &Object, key: &str) -> Option<Value> {
 
 /// Re-wrap a single sub-resource array element, the reverse of the
 /// normalizer's `flatten_element`: aliased fields go back to their ARM names
-/// inside or outside the `properties` wrapper, and other fields inside it
-/// unless an alias reads them at the root or they are standard envelope
-/// fields (`name`).
-fn rewrap_element(element: &Value, fields: &ElementFields) -> Value {
+/// inside or outside the `properties` wrapper, `_p_<name>` fields inside it,
+/// and other fields inside it unless an alias reads them at the root or they
+/// are standard envelope fields (`name`).
+fn rewrap_element(
+    element: &Value,
+    fields: &ElementFields,
+    casing: &BTreeMap<String, String>,
+) -> Value {
     let Ok(obj) = element.as_object() else {
         return element.clone();
     };
@@ -396,13 +403,16 @@ fn rewrap_element(element: &Value, fields: &ElementFields) -> Value {
         }
     }
 
-    for (key, val) in rest.iter() {
+    // Escaped wrapped fields first, so they win over an unescaped namesake.
+    let mut leftovers: Vec<(&Value, &Value)> = rest.iter().collect();
+    leftovers.sort_by_key(|(key, _)| !val_str(key).is_some_and(|k| k.starts_with("_p_")));
+    for (key, val) in leftovers {
         let Some(key_s) = val_str(key) else {
             continue;
         };
-        if ELEMENT_ENVELOPE_FIELDS
-            .iter()
-            .any(|field| field.eq_ignore_ascii_case(key_s))
+        if let Some(name) = key_s.strip_prefix("_p_") {
+            merge_absent(&mut props, restore_casing(name, casing), val.clone());
+        } else if is_element_envelope_field(key_s)
             || fields.root.contains(&key_s.to_ascii_lowercase())
         {
             merge_absent(&mut envelope, String::from(key_s), val.clone());

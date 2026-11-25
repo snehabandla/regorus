@@ -379,9 +379,9 @@ pub struct VersionedAggregates {
     pub array_renames_denormalize: Vec<(String, String)>,
     /// The aliased fields of each sub-resource array's elements, by the
     /// array's name in [`ResolvedAliases::sub_resource_arrays`]. These
-    /// fields are moved back while elements are re-wrapped, rather than by
-    /// `reverse_element_remaps`, so that each alias decides whether its value
-    /// goes inside or outside the `properties` wrapper.
+    /// fields are moved while elements are flattened or re-wrapped, rather
+    /// than by `element_remaps`, so that the `properties` wrapper decides
+    /// which alias a value belongs to.
     pub element_fields: BTreeMap<String, ElementFields>,
 }
 
@@ -394,7 +394,8 @@ pub struct ElementFields {
     /// Lowercase first short-name keys of aliases that read this array's
     /// elements outside their `properties` wrapper, and their first ARM keys
     /// unless a wrapped alias has that short name. Normalized keys with these
-    /// names stay at the element root when re-wrapped.
+    /// names stay at the element root when re-wrapped, so a wrapped value with
+    /// one of these names is normalized as `_p_<name>`.
     pub root: BTreeSet<String>,
 }
 

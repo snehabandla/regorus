@@ -653,14 +653,14 @@ fn compute_aggregates_for_version(
                     let arm_leaf = path::render(arm_leaf);
                     let source_lc = arm_leaf.to_ascii_lowercase();
                     let target_lc = path::render(short_leaf).to_ascii_lowercase();
-                    element_remaps.push(PrecomputedRemap {
-                        array_chain: array_chain.clone(),
-                        source_field: source_lc.clone(),
-                        target_field: target_lc.clone(),
-                    });
-
-                    // Re-wrapping moves the fields of flattened elements back.
+                    // Flattening and re-wrapping move the fields of flattened
+                    // elements.
                     if !flattened {
+                        element_remaps.push(PrecomputedRemap {
+                            array_chain: array_chain.clone(),
+                            source_field: source_lc.clone(),
+                            target_field: target_lc.clone(),
+                        });
                         reverse_element_remaps.push(PrecomputedReverseRemap {
                             array_chain,
                             source_field: target_lc.clone(),

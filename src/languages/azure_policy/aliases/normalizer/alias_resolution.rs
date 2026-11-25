@@ -13,7 +13,7 @@ use super::super::obj_map::{
 };
 use super::super::types::ResolvedAliases;
 use super::element_remap::apply_element_remap_precomputed;
-use super::flatten::normalize_value;
+use super::flatten::{normalize_value, Flatten};
 
 /// Apply per-alias path resolution to the normalized result.
 ///
@@ -28,6 +28,11 @@ pub fn apply_alias_entries(
 ) {
     let entries = &aliases.entries;
     let sub_resource_set = &aliases.sub_resource_arrays;
+    let agg = aliases.aggregates(api_version);
+    let flatten = Flatten {
+        sub_arrays: sub_resource_set,
+        fields: &agg.element_fields,
+    };
 
     for (lc_key, entry) in entries {
         if entry.is_wildcard {
@@ -46,7 +51,7 @@ pub fn apply_alias_entries(
         if let Some(value) = value {
             // Flatten nested sub-resource arrays too (e.g. `x.y` under plain `x`);
             // otherwise this overwrites what `merge_properties` flattened.
-            let value = normalize_value(&value, &entry.short_name, Some(sub_resource_set));
+            let value = normalize_value(&value, &entry.short_name, Some(&flatten));
 
             if is_root_field_collision(&entry.short_name, &entry.default_path) {
                 let target = collision_safe_key(&entry.short_name);
@@ -58,15 +63,6 @@ pub fn apply_alias_entries(
             }
         }
     }
-
-    // Look up precomputed aggregates: default or per-version.
-    let agg = api_version.map_or(&aliases.default_aggregates, |ver| {
-        let ver_lc = ver.to_ascii_lowercase();
-        aliases
-            .versioned_aggregates
-            .get(&ver_lc)
-            .unwrap_or(&aliases.default_aggregates)
-    });
 
     for remap in &agg.element_remaps {
         // Moves the value, so the stale ARM source key does not survive to
@@ -92,11 +88,7 @@ pub fn apply_alias_entries(
                     .and_then(|entry| {
                         let segments = entry.select_path_segments(api_version);
                         let value = navigate_arm_path_segments_ci(raw, segments)?;
-                        Some(normalize_value(
-                            &value,
-                            &entry.short_name,
-                            Some(sub_resource_set),
-                        ))
+                        Some(normalize_value(&value, &entry.short_name, Some(&flatten)))
                     });
                 let Some(resolved) = resolved else {
                     obj_insert(result, target_lc, val);

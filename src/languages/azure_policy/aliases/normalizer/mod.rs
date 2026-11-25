@@ -22,7 +22,7 @@ use super::obj_map::{
 use super::types::ResolvedAliases;
 use super::AliasRegistry;
 
-use flatten::{lowercase_object_keys, normalize_value};
+use flatten::{lowercase_object_keys, normalize_value, Flatten};
 
 /// Normalize a raw ARM resource JSON value into the `input.resource` structure.
 ///
@@ -51,7 +51,11 @@ pub fn normalize_with_aliases(
         Err(_) => return arm_resource.clone(),
     };
 
-    let sub_arrays_ref = aliases.map(|a| &a.sub_resource_arrays);
+    let flatten = aliases.map(|a| Flatten {
+        sub_arrays: &a.sub_resource_arrays,
+        fields: &a.aggregates(api_version).element_fields,
+    });
+    let cx = flatten.as_ref();
     let mut result = new_map();
 
     let is_data_plane =
@@ -71,11 +75,11 @@ pub fn normalize_with_aliases(
                 if key_s.eq_ignore_ascii_case("tags") || key_s.eq_ignore_ascii_case("identity") {
                     lowercase_object_keys(val)
                 } else {
-                    normalize_value(val, key_s, sub_arrays_ref)
+                    normalize_value(val, key_s, cx)
                 };
             obj_insert(&mut result, &lc_key, val);
         }
-        merge_properties(obj, &mut result, sub_arrays_ref);
+        merge_properties(obj, &mut result, cx);
     } else {
         // Copy root-level fields (keys lowercased).
         for &field in ROOT_FIELDS {
@@ -91,12 +95,12 @@ pub fn normalize_with_aliases(
                     // keys such as userAssignedIdentities member names.
                     lowercase_object_keys(val)
                 } else {
-                    normalize_value(val, field, sub_arrays_ref)
+                    normalize_value(val, field, cx)
                 };
                 obj_insert(&mut result, &field.to_ascii_lowercase(), val);
             }
         }
-        merge_properties(obj, &mut result, sub_arrays_ref);
+        merge_properties(obj, &mut result, cx);
     }
 
     // Per-alias path resolution.
@@ -109,11 +113,7 @@ pub fn normalize_with_aliases(
 
 /// Merge `properties` fields into the result map, skipping keys that already
 /// exist.
-fn merge_properties(
-    obj: &Object,
-    result: &mut ObjMap,
-    sub_arrays: Option<&alloc::collections::BTreeSet<alloc::string::String>>,
-) {
+fn merge_properties(obj: &Object, result: &mut ObjMap, cx: Option<&Flatten<'_>>) {
     let props_val = obj
         .iter()
         .find(|(k, _)| val_str(k).is_some_and(|s| s.eq_ignore_ascii_case("properties")))
@@ -128,7 +128,7 @@ fn merge_properties(
             if obj_contains(result, &lc_key) {
                 continue;
             }
-            let normalized = normalize_value(val, key_s, sub_arrays);
+            let normalized = normalize_value(val, key_s, cx);
             obj_insert(result, &lc_key, normalized);
         }
     }
