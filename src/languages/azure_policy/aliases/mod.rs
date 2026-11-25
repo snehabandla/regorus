@@ -49,8 +49,8 @@ use alloc::vec::Vec;
 use anyhow::Result;
 
 use types::{
-    AliasEntry, AliasPath, DataPolicyManifest, PrecomputedRemap, PrecomputedReverseRemap,
-    ProviderAliases, ResolvedAliases, ResolvedEntry, VersionedAggregates,
+    AliasEntry, AliasPath, DataPolicyManifest, ElementField, ElementFields, PrecomputedRemap,
+    PrecomputedReverseRemap, ProviderAliases, ResolvedAliases, ResolvedEntry, VersionedAggregates,
 };
 
 use obj_map::{collision_safe_key, is_root_field_collision};
@@ -492,6 +492,10 @@ fn compute_aggregates_for_version(
     let mut reverse_element_remaps = Vec::new();
     let mut renames_norm: Vec<(String, String)> = Vec::new();
     let mut renames_denorm: Vec<(String, String)> = Vec::new();
+    let mut element_fields: BTreeMap<String, ElementFields> = BTreeMap::new();
+    // First keys read outside and inside each flattened array's wrapper.
+    let mut arm_firsts: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    let mut wrapped_firsts: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
 
     // Use BTreeSet for O(log N) dedup instead of Vec::contains.
     let mut seen_norm = alloc::collections::BTreeSet::new();
@@ -522,6 +526,53 @@ fn compute_aggregates_for_version(
             .map(|part| part.segments)
             .collect();
         let arm_parts = arm_path.parts();
+
+        // The keys this alias reads outside the wrapper of each flattened
+        // array's elements stay at the element root.
+        let mut element_array = String::new();
+        for (level, part) in short_parts.iter().enumerate() {
+            let keys: Option<Vec<String>> = part
+                .iter()
+                .map(|segment| match segment {
+                    path::Segment::Key(key) => Some(key.to_ascii_lowercase()),
+                    _ => None,
+                })
+                .collect();
+            let Some(keys) = keys.filter(|keys| !keys.is_empty()) else {
+                break;
+            };
+            if !element_array.is_empty() {
+                element_array.push('.');
+            }
+            element_array.push_str(&keys.join("."));
+            let level = level.saturating_add(1);
+            let Some(path::Segment::Key(first)) = short_parts.get(level).and_then(|p| p.first())
+            else {
+                break;
+            };
+            if !sub_resource_arrays.contains(&element_array) {
+                continue;
+            }
+            let arm = arm_parts.get(level);
+            if arm.is_some_and(|arm| arm.has_flattened_wrapper()) {
+                wrapped_firsts
+                    .entry(element_array.clone())
+                    .or_default()
+                    .insert(first.to_ascii_lowercase());
+                continue;
+            }
+            element_fields
+                .entry(element_array.clone())
+                .or_default()
+                .root
+                .insert(first.to_ascii_lowercase());
+            if let Some(path::Segment::Key(arm_first)) = arm.and_then(|arm| arm.segments.first()) {
+                arm_firsts
+                    .entry(element_array.clone())
+                    .or_default()
+                    .insert(arm_first.to_ascii_lowercase());
+            }
+        }
 
         if short_parts.len() >= 2 && arm_parts.len() >= 2 {
             let array_chain: Option<Vec<Vec<String>>> = short_parts
@@ -565,6 +616,19 @@ fn compute_aggregates_for_version(
                     && path::renders_dotted(arm_leaf)
                     && !path::equivalent(short_leaf, arm_leaf)
                 {
+                    if flattened {
+                        // Renamed while flattening, from inside or outside
+                        // the wrapper. A field with its own name stays.
+                        element_fields
+                            .entry(array_name)
+                            .or_default()
+                            .fields
+                            .push(ElementField {
+                                wrapped: arm_leaf_raw.has_flattened_wrapper(),
+                                short: path::render(short_leaf).to_ascii_lowercase(),
+                                arm: path::render(arm_leaf),
+                            });
+                    }
                     // The forward remap runs before base renames, so it
                     // reaches root-level ARM arrays only along a chain with
                     // the same names once sub-resource elements are flattened.
@@ -595,13 +659,16 @@ fn compute_aggregates_for_version(
                         target_field: target_lc.clone(),
                     });
 
-                    reverse_element_remaps.push(PrecomputedReverseRemap {
-                        array_chain,
-                        source_field: target_lc.clone(),
-                        target_field: arm_leaf,
-                        cleanup_field: target_lc,
-                        at_root,
-                    });
+                    // Re-wrapping moves the fields of flattened elements back.
+                    if !flattened {
+                        reverse_element_remaps.push(PrecomputedReverseRemap {
+                            array_chain,
+                            source_field: target_lc.clone(),
+                            target_field: arm_leaf,
+                            cleanup_field: target_lc,
+                            at_root,
+                        });
+                    }
                 }
             }
         }
@@ -633,11 +700,23 @@ fn compute_aggregates_for_version(
         }
     }
 
+    // An unwrapped field also stays at the root under its ARM name, unless
+    // that is a wrapped alias's name.
+    for (array, keys) in arm_firsts {
+        let wrapped = wrapped_firsts.get(&array);
+        let root = &mut element_fields.entry(array.clone()).or_default().root;
+        root.extend(
+            keys.into_iter()
+                .filter(|key| !wrapped.is_some_and(|w| w.contains(key))),
+        );
+    }
+
     VersionedAggregates {
         element_remaps,
         reverse_element_remaps,
         array_renames_normalize: renames_norm,
         array_renames_denormalize: renames_denorm,
+        element_fields,
     }
 }
 

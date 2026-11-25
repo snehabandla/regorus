@@ -165,13 +165,7 @@ pub fn denormalize_with_aliases(
         // Look up versioned aggregates when api_version is provided,
         // falling back to default aggregates.
         if let Some(aliases) = aliases {
-            let agg = api_version.map_or(&aliases.default_aggregates, |ver| {
-                let ver_lc = ver.to_ascii_lowercase();
-                aliases
-                    .versioned_aggregates
-                    .get(&ver_lc)
-                    .unwrap_or(&aliases.default_aggregates)
-            });
+            let agg = aliases.aggregates(api_version);
 
             // Phase 2c: Precomputed array base renames.
             for (alias_base_lc, arm_base) in &agg.array_renames_denormalize {
@@ -248,7 +242,7 @@ pub fn denormalize_with_aliases(
                 writes: &writes,
                 is_data_plane,
                 casing_map: &casing_map,
-                normalized: obj,
+                fields: &aliases.aggregates(api_version).element_fields,
             };
             sub_resource::rewrap_sub_resource_arrays(
                 &mut result,

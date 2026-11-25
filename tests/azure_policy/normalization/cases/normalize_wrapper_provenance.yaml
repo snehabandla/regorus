@@ -1,0 +1,227 @@
+# Wrapper provenance of sub-resource array elements: denormalization puts
+# each aliased field back inside or outside the `properties` wrapper.
+cases:
+  - note: an unwrapped field takes its alias name
+    aliases_json: &k1 |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                { "name": "Test/widgets/rules[*].rawstatus", "defaultPath": "properties.rules[*].properties.rawstatus", "paths": [] },
+                { "name": "Test/widgets/rules[*].state", "defaultPath": "properties.rules[*].rawstatus", "paths": [] }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "properties": {"rules": [{"rawstatus": 1}]}}
+    expected_normalized: {"type": "Test/widgets", "rules": [{"state": 1}]}
+    round_trip: true
+
+  - note: a wrapped and an unwrapped alias go back inside and outside the wrapper
+    aliases_json: *k1
+    input: {"type": "Test/widgets", "rules": [{"rawstatus": 1, "state": 2}]}
+    expected_denormalized: {"type": "Test/widgets", "properties": {"rules": [{"rawstatus": 2, "properties": {"rawstatus": 1}}]}}
+
+  - note: a wrapped alias goes back inside the wrapper alone
+    aliases_json: *k1
+    input: {"type": "Test/widgets", "rules": [{"rawstatus": 1}]}
+    expected_denormalized: {"type": "Test/widgets", "properties": {"rules": [{"properties": {"rawstatus": 1}}]}}
+
+  - note: an unwrapped field takes the name of the unwrapped alias
+    aliases_json: &k2 |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                { "name": "Test/widgets/rules[*].rawstatus", "defaultPath": "properties.rules[*].properties.rawstatus", "paths": [] },
+                { "name": "Test/widgets/rules[*].other", "defaultPath": "properties.rules[*].rawstatus", "paths": [] }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "properties": {"rules": [{"rawstatus": 1}]}}
+    expected_normalized: {"type": "Test/widgets", "rules": [{"other": 1}]}
+    round_trip: true
+
+  - note: an unwrapped alias goes back outside the wrapper
+    aliases_json: *k2
+    input: {"type": "Test/widgets", "rules": [{"other": 1}]}
+    expected_denormalized: {"type": "Test/widgets", "properties": {"rules": [{"rawstatus": 1}]}}
+    reverse_round_trip: true
+
+  - note: a wrapped field of an array under a root field takes its alias name
+    aliases_json: &k3 |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                { "name": "Test/widgets/sku.rules[*].rawstatus", "defaultPath": "sku.rules[*].rawstatus", "paths": [] },
+                { "name": "Test/widgets/sku.rules[*].other", "defaultPath": "sku.rules[*].properties.rawstatus", "paths": [] }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "sku": {"rules": [{"properties": {"rawstatus": 1}}]}}
+    expected_normalized: {"type": "Test/widgets", "sku": {"rules": [{"other": 1}]}}
+    round_trip: true
+
+  - note: an unwrapped alias of an array under a root field stays outside the wrapper
+    aliases_json: *k3
+    input: {"type": "Test/widgets", "sku": {"rules": [{"rawstatus": 1}]}}
+    expected_denormalized: {"type": "Test/widgets", "sku": {"rules": [{"rawstatus": 1}]}}
+
+  - note: a data-plane wrapped field of an array under a root field goes back inside the wrapper
+    aliases_json: *k3
+    resource_type: "Test/widgets"
+    input: {"type": "Test.Data/widgets", "sku": {"rules": [{"other": 1}]}}
+    expected_denormalized: {"type": "Test.Data/widgets", "sku": {"rules": [{"properties": {"rawstatus": 1}}]}}
+    reverse_round_trip: true
+
+  - note: an unwrapped alias stays outside the wrapper when an array alias reads its ARM name inside
+    aliases_json: &k4 |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                { "name": "Test/widgets/rules[*].rawstatus", "defaultPath": "properties.rules[*].rawstatus", "paths": [] },
+                { "name": "Test/widgets/rules[*].other[*].code", "defaultPath": "properties.rules[*].properties.rawstatus[*].code", "paths": [] }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "rules": [{"rawstatus": 1, "other": [{"label": "ready"}]}]}
+    expected_denormalized: {"type": "Test/widgets", "properties": {"rules": [{"rawstatus": 1, "properties": {"other": [{"label": "ready"}]}}]}}
+    reverse_round_trip: true
+
+  - note: an unwrapped alias stays outside the wrapper when the only wrapped alias is indexed
+    aliases_json: &k5 |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                { "name": "Test/widgets/rules[*].rawstatus", "defaultPath": "properties.rules[*].rawstatus", "paths": [] },
+                { "name": "Test/widgets/rules[*].other[0].code", "defaultPath": "properties.rules[*].properties.rawstatus[0].code", "paths": [] }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "rules": [{"rawstatus": 1, "other": [{"code": "x"}]}]}
+    expected_denormalized: {"type": "Test/widgets", "properties": {"rules": [{"rawstatus": 1, "properties": {"other": [{"code": "x"}]}}]}}
+    reverse_round_trip: true
+
+  - note: an unwrapped array an alias reads outside the wrapper stays there
+    aliases_json: &k7 |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                { "name": "Test/widgets/rules[*].ips[*]", "defaultPath": "properties.rules[*].ips[*]", "paths": [] },
+                { "name": "Test/widgets/rules[*].x", "defaultPath": "properties.rules[*].properties.x", "paths": [] }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "rules": [{"ips": [1]}]}
+    expected_denormalized: {"type": "Test/widgets", "properties": {"rules": [{"ips": [1]}]}}
+    reverse_round_trip: true
+
+  - note: an element's own name wins over a wrapped alias of the same name
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                { "name": "Test/widgets/rules[*].name", "defaultPath": "properties.rules[*].properties.name", "paths": [] }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "properties": {"rules": [{"name": "n", "properties": {"name": "m"}}]}}
+    expected_normalized: {"type": "Test/widgets", "rules": [{"name": "n"}]}
+
+  - note: the rest of an unwrapped field's ARM parent stays outside the wrapper
+    aliases_json: &k8 |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                { "name": "Test/widgets/rules[*].x", "defaultPath": "properties.rules[*].properties.x", "paths": [] },
+                { "name": "Test/widgets/rules[*].state", "defaultPath": "properties.rules[*].status.code", "paths": [] },
+                { "name": "Test/widgets/rules[*].ips[*]", "defaultPath": "properties.rules[*].rawips[*]", "paths": [] },
+                { "name": "Test/widgets/rules[*].b", "defaultPath": "properties.rules[*].a.c", "paths": [] }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "properties": {"rules": [{"status": {"code": 1, "reason": "r"}}]}}
+    expected_normalized: {"type": "Test/widgets", "rules": [{"state": 1, "status": {"reason": "r"}}]}
+    round_trip: true
+
+  - note: an unwrapped array renamed from its ARM name stays outside the wrapper
+    aliases_json: *k8
+    input: {"type": "Test/widgets", "properties": {"rules": [{"rawips": ["a"]}]}}
+    expected_normalized: {"type": "Test/widgets", "rules": [{"rawips": ["a"]}]}
+    round_trip: true
+
+  - note: the emptied ARM parent of an unwrapped field stays outside the wrapper
+    aliases_json: *k8
+    input: {"type": "Test/widgets", "properties": {"rules": [{"a": {"c": 1}}]}}
+    expected_normalized: {"type": "Test/widgets", "rules": [{"a": {}, "b": 1}]}
+    round_trip: true
+
+  - note: arrays under identity are not re-wrapped, as they are not flattened
+    aliases_json: |
+      [
+        {
+          "namespace": "Test",
+          "resourceTypes": [
+            {
+              "resourceType": "widgets",
+              "aliases": [
+                { "name": "Test/widgets/identity.items[*].x", "defaultPath": "identity.items[*].properties.x", "paths": [] }
+              ]
+            }
+          ]
+        }
+      ]
+    input: {"type": "Test/widgets", "identity": {"items": [{"properties": {"x": 1}}]}}
+    expected_normalized: {"type": "Test/widgets", "identity": {"items": [{"properties": {"x": 1}}]}}
+    round_trip: true
+
+  - note: a data-plane unwrapped field of an array under a root field stays outside the wrapper
+    aliases_json: *k3
+    resource_type: "Test/widgets"
+    input: {"type": "Test.Data/widgets", "sku": {"rules": [{"rawstatus": 1}]}}
+    expected_denormalized: {"type": "Test.Data/widgets", "sku": {"rules": [{"rawstatus": 1}]}}
