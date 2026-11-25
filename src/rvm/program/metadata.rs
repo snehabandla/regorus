@@ -11,6 +11,7 @@
 //! values are converted through [`MetadataValue`] — a postcard/bincode-safe
 //! enum that avoids `deserialize_any`.
 
+use crate::number::Number;
 use crate::value::Object;
 use crate::Rc;
 use alloc::collections::{BTreeMap, BTreeSet};
@@ -87,6 +88,28 @@ impl ProgramMetadata {
 
         Value::Object(Rc::new(obj))
     }
+}
+
+pub(super) fn annotation_for_serialization(key: &str, value: &crate::Value) -> crate::Value {
+    use crate::Value;
+    if key != "regorus.explain.negation" {
+        return value.clone();
+    }
+    // Preserve invalid reserved metadata as an error, rather than allowing the
+    // general annotation bridge to normalize a float into a valid integer.
+    let mut pending = alloc::vec![value];
+    while let Some(item) = pending.pop() {
+        match *item {
+            Value::Array(ref array) => pending.extend(array.iter()),
+            Value::Number(ref number)
+                if !matches!(*number, Number::Float(_))
+                    && number.as_i64().is_some_and(|integer| integer >= 0) => {}
+            _ => {
+                return Value::String("regorus.explain.negation:invalid_representation".into());
+            }
+        }
+    }
+    value.clone()
 }
 
 // ── MetadataValue: postcard-safe serialization bridge ────────────────────────
@@ -405,7 +428,10 @@ mod metadata_serde {
         }
         let bridge: BTreeMap<String, MetadataValue> = annotations
             .iter()
-            .map(|(k, v)| (k.clone(), MetadataValue::from_value(v)))
+            .map(|(k, v)| {
+                let value = annotation_for_serialization(k, v);
+                (k.clone(), MetadataValue::from_value(&value))
+            })
             .collect();
         bridge.serialize(serializer)
     }

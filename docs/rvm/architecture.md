@@ -313,6 +313,15 @@ metadata errors. Missing metadata requires recompiling retained source before
 logical-scope capture is available. Ordinary execution does not consult this
 annotation, even when it is malformed.
 
+The decoder indexes `not` tokens once using the Rego lexer, preserving its
+Unicode, tab and multiline source coordinates. Numeric slots require integer
+representations; integral floating-point values are not accepted. Serialization
+in either feature build replaces invalid representations in this reserved
+annotation with the string `regorus.explain.negation:invalid_representation`,
+which the decoder rejects explicitly. This prevents the existing lossy metadata
+bridge from converting malformed floats into valid scope metadata. Other
+annotations retain their existing serialization behavior.
+
 Feature-off compilation emits no annotation. JSON and binary version 6 preserve
 the existing annotation carrier across feature builds without changing the
 serialized Program or Instruction layout. An annotated program still incurs

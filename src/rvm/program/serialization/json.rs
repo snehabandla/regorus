@@ -5,7 +5,7 @@ use alloc::format;
 use alloc::string::{String, ToString as _};
 use alloc::vec::Vec;
 
-use super::super::metadata::ProgramMetadata;
+use super::super::metadata::{annotation_for_serialization, ProgramMetadata};
 use super::super::types::{BuiltinInfo, RuleInfo, SourceFile, SpanInfo};
 use super::Program;
 use crate::rvm::instructions::InstructionData;
@@ -19,7 +19,13 @@ impl Program {
         self.validate_limits()?;
         self.validate_serialization_depth()?;
         // json! unwraps serialization errors, so convert fallible Value fields first.
-        let annotations = serde_json::to_value(&self.metadata.annotations)
+        let serializable_annotations: alloc::collections::BTreeMap<_, _> = self
+            .metadata
+            .annotations
+            .iter()
+            .map(|(key, value)| (key.clone(), annotation_for_serialization(key, value)))
+            .collect();
+        let annotations = serde_json::to_value(serializable_annotations)
             .map_err(|e| format!("JSON serialization failed: {e}"))?;
         let literals = serde_json::to_value(&self.literals)
             .map_err(|e| format!("JSON serialization failed: {e}"))?;

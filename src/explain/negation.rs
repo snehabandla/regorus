@@ -6,12 +6,16 @@
 //! operands remain explicitly unavailable until their re-entry ownership is
 //! defined. Neither condition prevents ordinary bytecode execution.
 
+use crate::lexer::{Lexer, Source, Token, TokenKind};
+use crate::number::Number;
 use crate::rvm::instructions::{GuardMode, Instruction};
 use crate::rvm::program::Program;
 use crate::Value;
+use alloc::collections::BTreeSet;
 use alloc::string::ToString as _;
 use alloc::vec;
 use alloc::vec::Vec;
+use core::num::{NonZeroU32, NonZeroUsize};
 use thiserror::Error;
 
 pub const ANNOTATION: &str = "regorus.explain.negation";
@@ -115,17 +119,54 @@ pub fn encode(
     ]))
 }
 
-fn integer(value: Option<&Value>) -> Result<usize, MetadataError> {
-    usize::try_from(
-        value
-            .ok_or(MetadataError::Shape)?
-            .as_u64()
-            .map_err(|_| MetadataError::Shape)?,
-    )
-    .map_err(|_| MetadataError::Shape)
+fn unsigned(value: Option<&Value>) -> Result<u64, MetadataError> {
+    match *value.ok_or(MetadataError::Shape)? {
+        Value::Number(ref number) if !matches!(*number, Number::Float(_)) => {
+            number.as_u64().ok_or(MetadataError::Shape)
+        }
+        _ => Err(MetadataError::Shape),
+    }
 }
 
-fn validate_site(program: &Program, not_pc: usize, check_pc: usize) -> Result<(), MetadataError> {
+fn integer(value: Option<&Value>) -> Result<usize, MetadataError> {
+    usize::try_from(unsigned(value)?).map_err(|_| MetadataError::Shape)
+}
+
+fn not_tokens(program: &Program) -> Result<BTreeSet<(usize, usize, usize)>, MetadataError> {
+    let mut tokens = BTreeSet::new();
+    for (index, file) in program.sources.iter().enumerate() {
+        let source = Source::from_contents_with_limits(
+            file.name.clone(),
+            file.content.clone(),
+            NonZeroUsize::MAX,
+            NonZeroUsize::MAX,
+        )
+        .map_err(|_| MetadataError::Span)?;
+        let mut lexer = Lexer::new(&source);
+        lexer.set_max_col(NonZeroU32::MAX);
+        loop {
+            let Token(kind, span) = lexer.next_token().map_err(|_| MetadataError::Span)?;
+            if kind == TokenKind::Eof {
+                break;
+            }
+            if kind == TokenKind::Ident && span.text() == "not" {
+                tokens.insert((
+                    index,
+                    usize::try_from(span.line).map_err(|_| MetadataError::Span)?,
+                    usize::try_from(span.col).map_err(|_| MetadataError::Span)?,
+                ));
+            }
+        }
+    }
+    Ok(tokens)
+}
+
+fn validate_site(
+    program: &Program,
+    not_pc: usize,
+    check_pc: usize,
+    tokens: &BTreeSet<(usize, usize, usize)>,
+) -> Result<(), MetadataError> {
     if check_pc >= program.instructions.len() || not_pc >= program.instructions.len() {
         return Err(MetadataError::Bounds);
     }
@@ -165,35 +206,7 @@ fn validate_site(program: &Program, not_pc: usize, check_pc: usize) -> Result<()
     {
         return Err(MetadataError::Span);
     }
-    let source = program
-        .sources
-        .get(span.source_index)
-        .ok_or(MetadataError::Span)?;
-    let line = span
-        .line
-        .checked_sub(1)
-        .and_then(|line| source.content.lines().nth(line))
-        .ok_or(MetadataError::Span)?;
-    let column = span.column.checked_sub(1).ok_or(MetadataError::Span)?;
-    let mut visual = 0_usize;
-    let mut offset = None;
-    for (index, byte) in line.bytes().enumerate() {
-        if visual == column {
-            offset = Some(index);
-            break;
-        }
-        visual = visual
-            .checked_add(if byte == b'\t' { 4 } else { 1 })
-            .ok_or(MetadataError::Span)?;
-    }
-    let text = offset
-        .and_then(|offset| line.get(offset..))
-        .ok_or(MetadataError::Span)?;
-    if !text.strip_prefix("not").is_some_and(|rest| {
-        rest.chars()
-            .next()
-            .is_some_and(|ch| !ch.is_alphanumeric() && ch != '_')
-    }) {
+    if !tokens.contains(&(span.source_index, span.line, span.column)) {
         return Err(MetadataError::Span);
     }
     Ok(())
@@ -210,11 +223,7 @@ pub fn decode(program: &Program) -> Result<NegationMetadata, MetadataError> {
     if integer(header.get(0))? != usize::try_from(VERSION).map_err(|_| MetadataError::Version)? {
         return Err(MetadataError::Version);
     }
-    let saved_identity = header
-        .get(1)
-        .ok_or(MetadataError::Shape)?
-        .as_u64()
-        .map_err(|_| MetadataError::Shape)?;
+    let saved_identity = unsigned(header.get(1))?;
     if saved_identity != identity(program)? {
         return Err(MetadataError::Stale);
     }
@@ -226,6 +235,11 @@ pub fn decode(program: &Program) -> Result<NegationMetadata, MetadataError> {
     if rows.len() > program.instructions.len() {
         return Err(MetadataError::Bounds);
     }
+    let tokens = if rows.is_empty() {
+        BTreeSet::new()
+    } else {
+        not_tokens(program)?
+    };
     let mut boundaries = Vec::new();
     let mut previous = None;
     for row in rows.iter() {
@@ -262,7 +276,7 @@ pub fn decode(program: &Program) -> Result<NegationMetadata, MetadataError> {
         if previous.is_some_and(|previous| previous >= not_pc) {
             return Err(MetadataError::Ordering);
         }
-        validate_site(program, not_pc, check_pc)?;
+        validate_site(program, not_pc, check_pc, &tokens)?;
         previous = Some(not_pc);
         boundaries.push(boundary);
     }
@@ -281,7 +295,6 @@ pub fn decode(program: &Program) -> Result<NegationMetadata, MetadataError> {
                 mode: GuardMode::Condition,
             }) if register == dest
         ) {
-            validate_site(program, pc, check_pc)?;
             if boundaries
                 .binary_search_by_key(&pc, NegationBoundary::not_pc)
                 .is_err()

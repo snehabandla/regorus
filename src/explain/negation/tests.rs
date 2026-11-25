@@ -17,6 +17,7 @@ use alloc::string::ToString as _;
 use alloc::vec;
 use alloc::vec::Vec;
 use anyhow::{bail, Context as _, Result};
+use std::io::Write as _;
 
 fn compile(policy: &str, host: &[(&str, usize)]) -> Result<Program> {
     let mut engine = Engine::new();
@@ -446,9 +447,6 @@ fn fractional_metadata_version_is_not_laundered_by_binary_serialization() -> Res
         ("json", decode(&json)),
         ("binary", decode(&binary)),
     ];
-    for (format, disposition) in &dispositions {
-        std::println!("fractional_version format={format} disposition={disposition:?}");
-    }
     for candidate in [&altered, &json, &binary] {
         for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
             assert_eq!(execute(candidate, "{}", mode)?, Value::Bool(true));
@@ -497,11 +495,8 @@ fn integral_float_annotation_slots_require_integer_representation() -> Result<()
         let altered = replace_annotation_number(&program, &path, number)?;
         let [json, binary] = roundtrips(&altered)?;
         let disposition = decode(&altered);
-        std::println!(
-            "integral_float slot={name} direct={disposition:?} json={:?} binary={:?}",
-            decode(&json),
-            decode(&binary),
-        );
+        assert_eq!(decode(&json), Err(MetadataError::Shape), "json {name}");
+        assert_eq!(decode(&binary), Err(MetadataError::Shape), "binary {name}");
         for candidate in [&altered, &json, &binary] {
             for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
                 assert_eq!(execute(candidate, "{}", mode)?, Value::Bool(true));
@@ -509,8 +504,6 @@ fn integral_float_annotation_slots_require_integer_representation() -> Result<()
         }
         direct_dispositions.push((name, disposition));
     }
-    // JSON/metadata serialization may canonicalize integral floats to integer
-    // representations. The logs expose that separately from direct decoding.
     for (name, disposition) in direct_dispositions {
         assert_eq!(disposition, Err(MetadataError::Shape), "{name}");
     }
@@ -550,21 +543,21 @@ fn negation_growing_source_prefix_measurements() -> Result<()> {
             .checked_mul(expected_sites)
             .and_then(|bytes| bytes.checked_mul(2))
             .context("scan count overflow")?;
-        std::println!(
+        writeln!(
+            std::io::stdout(),
             "negation_prefix sites={} source_bytes={source_bytes} prefix_bytes={prefix_bytes} \
-             two_pass_prefix_scan_lower_bound={prefix_scan_lower_bound} \
+             prior_decoder_prefix_scan_lower_bound={prefix_scan_lower_bound} \
              compile={compile_elapsed:?} decode={decode_elapsed:?}",
             sites.len(),
-        );
+        )?;
     }
     Ok(())
 }
 
 #[test]
+#[ignore = "requires an artifact produced/re-emitted by separate feature-build processes"]
 fn negation_external_artifact_capture_disposition() -> Result<()> {
-    let Some(prefix) = std::env::var_os("B29C_DECODE_PREFIX") else {
-        return Ok(());
-    };
+    let prefix = std::env::var_os("B29C_DECODE_PREFIX").context("B29C_DECODE_PREFIX is required")?;
     let prefix = std::path::PathBuf::from(prefix);
     anyhow::ensure!(
         !prefix.as_os_str().is_empty()
@@ -581,12 +574,13 @@ fn negation_external_artifact_capture_disposition() -> Result<()> {
         DeserializationResult::Complete(restored) => restored,
         DeserializationResult::Partial(_) => bail!("external version-6 artifact is partial"),
     };
-    let json_metadata = decode(&json)?;
-    let binary_metadata = decode(&binary)?;
+    let json_metadata = decode(&json);
+    let binary_metadata = decode(&binary);
     assert_eq!(json_metadata, binary_metadata);
     match (expected.as_str(), json_metadata) {
-        ("absent", NegationMetadata::Absent) => {}
-        ("present", NegationMetadata::Present(sites)) => assert_eq!(sites.len(), 1),
+        ("absent", Ok(NegationMetadata::Absent)) => {}
+        ("present", Ok(NegationMetadata::Present(sites))) => assert_eq!(sites.len(), 1),
+        ("malformed", Err(MetadataError::Shape)) => {}
         (requested, actual) => bail!("expected {requested}, decoded {actual:?}"),
     }
     for candidate in [&json, &binary] {
