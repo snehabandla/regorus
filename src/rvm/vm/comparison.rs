@@ -176,6 +176,44 @@ mod tests {
     }
 
     #[test]
+    fn object_comprehension_duplicate_comparison_checks_deadline_before_write() -> anyhow::Result<()>
+    {
+        use crate::rvm::instructions::{ComprehensionBeginParams, ComprehensionMode};
+
+        let _guard = acquire_limits_test_lock();
+        let mut vm = RegoVM::new();
+        vm.registers = vec![Value::Undefined; 8];
+        vm.registers[1] = Value::from("k");
+        vm.registers[2] = Value::from(vec![Value::Null; 128]);
+        vm.execute_comprehension_begin(&ComprehensionBeginParams {
+            mode: ComprehensionMode::Object,
+            collection_reg: 0,
+            result_reg: 0,
+            key_reg: 1,
+            value_reg: 2,
+            body_start: 1,
+            comprehension_end: 4,
+        })?;
+        vm.execute_comprehension_yield(2, Some(1))?;
+        let previous = vm.get_register(0)?.clone();
+        let mut next = vec![Value::Null; 128];
+        next[127] = Value::Bool(true);
+        vm.registers[2] = Value::from(next);
+        vm.set_execution_timer_config(Some(timer(Duration::ZERO)));
+        let result = vm.execute_comprehension_yield(2, Some(1));
+        assert!(
+            matches!(result, Err(VmError::TimeLimitExceeded { .. })),
+            "{result:?}"
+        );
+        assert_eq!(vm.get_register(0)?, &previous);
+        assert_eq!(vm.comprehension_stack.len(), 1);
+        vm.set_execution_timer_config(None);
+        assert!(vm.execute_comprehension_yield(2, Some(1)).is_err());
+        assert_eq!(vm.get_register(0)?, &previous);
+        Ok(())
+    }
+
+    #[test]
     fn checked_comparison_matches_native_semantics() -> anyhow::Result<()> {
         let mut values = vec![
             Value::Null,
