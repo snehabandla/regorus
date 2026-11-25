@@ -669,6 +669,43 @@ fn unknown_validation_keeps_full_width_indices_and_keys_distinct() -> anyhow::Re
 
 #[cfg(feature = "std")]
 #[test]
+fn unknown_validation_and_dispatch_share_one_execution_timer() -> anyhow::Result<()> {
+    use crate::utils::limits::{acquire_limits_test_lock, ExecutionTimerConfig};
+    use core::num::NonZeroU32;
+    use core::time::Duration;
+
+    let _guard = acquire_limits_test_lock();
+    let mut program = Program::new();
+    for _ in 0..60 {
+        program.add_instruction(Instruction::LoadTrue { dest: 0 }, None);
+    }
+    program.add_instruction(Instruction::Return { value: 0 }, None);
+    program.add_entry_point("entry".into(), 0);
+    let mut vm = RegoVM::new();
+    vm.load_program(alloc::sync::Arc::new(program));
+    vm.set_max_instructions(61);
+    vm.set_execution_timer_config(Some(ExecutionTimerConfig {
+        limit: Duration::ZERO,
+        check_interval: NonZeroU32::new(64).unwrap_or(NonZeroU32::MIN),
+    }));
+    let mut settings = PartialEvalSettings::default();
+    settings.unknowns = keys(&["short-a", "short-b"]);
+    vm.set_partial_eval_settings(settings);
+    let result = vm.partial_eval("entry");
+    assert!(
+        matches!(
+            result,
+            Err(ExplainError::Vm(VmError::TimeLimitExceeded { pc, .. })) if pc < 60
+        ),
+        "{result:?}"
+    );
+    vm.set_partial_eval_settings(PartialEvalSettings::default());
+    assert_eq!(vm.partial_eval("entry")?.result, Value::Bool(true));
+    Ok(())
+}
+
+#[cfg(feature = "std")]
+#[test]
 fn unknown_validation_checks_the_execution_deadline_before_dispatch() -> anyhow::Result<()> {
     use crate::utils::limits::{acquire_limits_test_lock, ExecutionTimerConfig};
     use core::num::NonZeroU32;
