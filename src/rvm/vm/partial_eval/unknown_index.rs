@@ -181,30 +181,32 @@ fn compare<E>(
     }
     for (left_segment, right_segment) in left.segments.iter().zip(&right.segments) {
         checkpoint()?;
-        let order = match (left_segment, right_segment) {
-            (&PathSegment::Index(left_index), &PathSegment::Index(right_index)) => {
-                left_index.cmp(&right_index)
-            }
-            (&PathSegment::Key(ref left_key), &PathSegment::Key(ref right_key)) => {
-                if checked_bytes {
-                    for (left_chunk, right_chunk) in left_key
-                        .as_bytes()
-                        .chunks(256)
-                        .zip(right_key.as_bytes().chunks(256))
-                    {
-                        checkpoint()?;
-                        let order = left_chunk.cmp(right_chunk);
-                        if !order.is_eq() {
-                            return Ok((order, false));
+        let order = match *left_segment {
+            PathSegment::Index(left_index) => match *right_segment {
+                PathSegment::Index(right_index) => left_index.cmp(&right_index),
+                PathSegment::Key(_) => Ordering::Greater,
+            },
+            PathSegment::Key(ref left_key) => match *right_segment {
+                PathSegment::Index(_) => Ordering::Less,
+                PathSegment::Key(ref right_key) => {
+                    if checked_bytes {
+                        for (left_chunk, right_chunk) in left_key
+                            .as_bytes()
+                            .chunks(256)
+                            .zip(right_key.as_bytes().chunks(256))
+                        {
+                            checkpoint()?;
+                            let order = left_chunk.cmp(right_chunk);
+                            if !order.is_eq() {
+                                return Ok((order, false));
+                            }
                         }
+                        left_key.len().cmp(&right_key.len())
+                    } else {
+                        left_key.cmp(right_key)
                     }
-                    left_key.len().cmp(&right_key.len())
-                } else {
-                    left_key.cmp(right_key)
                 }
-            }
-            (&PathSegment::Key(_), &PathSegment::Index(_)) => Ordering::Less,
-            (&PathSegment::Index(_), &PathSegment::Key(_)) => Ordering::Greater,
+            },
         };
         if !order.is_eq() {
             return Ok((order, false));
