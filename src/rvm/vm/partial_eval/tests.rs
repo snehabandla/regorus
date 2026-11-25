@@ -587,10 +587,7 @@ fn unknown_validation_preserves_first_error_and_overlap_owner() -> anyhow::Resul
         } else {
             r#"input["a"]["b"]"#
         };
-        assert_eq!(
-            run(keys(&paths), "{}")?,
-            overlap(r#"input["a"]"#, other)
-        );
+        assert_eq!(run(keys(&paths), "{}")?, overlap(r#"input["a"]"#, other));
     }
     assert_eq!(
         run(keys(&["z", "z", "a", "a"]), "{}")?,
@@ -608,7 +605,10 @@ fn unknown_validation_preserves_first_error_and_overlap_owner() -> anyhow::Resul
             path: r#"input["z"]"#.into(),
         })
     );
-    assert_eq!(run(keys(&["a.missing", "a.other"]), r#"{"a": {}}"#)?, Ok(()));
+    assert_eq!(
+        run(keys(&["a.missing", "a.other"]), r#"{"a": {}}"#)?,
+        Ok(())
+    );
     Ok(())
 }
 
@@ -660,7 +660,10 @@ fn unknown_validation_keeps_full_width_indices_and_keys_distinct() -> anyhow::Re
         UnknownPath::input_keys(["18446744073709551615"]),
     ];
     vm.set_partial_eval_settings(settings);
-    assert_eq!(vm.partial_eval("data.test.allow")?.result, Value::Bool(true));
+    assert_eq!(
+        vm.partial_eval("data.test.allow")?.result,
+        Value::Bool(true)
+    );
     Ok(())
 }
 

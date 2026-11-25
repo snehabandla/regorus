@@ -2665,7 +2665,10 @@ fn partial_eval_unknown_index_does_not_copy_all_declared_key_bytes() {
     }));
     assert!(matches!(
         vm.partial_eval("data.test.allow"),
-        Err(ExplainError::Vm(VmError::MemoryBudgetExceeded { budget: 1, .. }))
+        Err(ExplainError::Vm(VmError::MemoryBudgetExceeded {
+            budget: 1,
+            ..
+        }))
     ));
     assert!(matches!(
         vm.execution_state(),
