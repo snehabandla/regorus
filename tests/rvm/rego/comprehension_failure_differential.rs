@@ -77,6 +77,78 @@ fn describe(result: &Result<Value>) -> String {
 }
 
 #[test]
+fn object_comprehension_conflicts_match_interpreter() -> Result<()> {
+    let inputs = [
+        (r#"{"key":"k","xs":[2,2,3]}"#, true),
+        (r#"{"key":"k","xs":[2,2]}"#, false),
+        (r#"{"key":1,"xs":[3,2]}"#, true),
+        (r#"{"key":1,"xs":[1,1.0]}"#, false),
+        (r#"{"key":null,"xs":[false,true]}"#, true),
+        (r#"{"key":null,"xs":[false,false]}"#, false),
+        (r#"{"key":[1,2],"xs":[null,false]}"#, true),
+        (r#"{"key":[1,2],"xs":[null,null]}"#, false),
+        (r#"{"key":"k","xs":[{"a":[1,2]},{"a":[1,3]}]}"#, true),
+        (r#"{"key":"k","xs":[{"a":[1,2]},{"a":[1,2]}]}"#, false),
+        (r#"{"key":"k","xs":[]}"#, false),
+        (r#"{"xs":[2,3]}"#, false),
+    ];
+    let mut divergences = Vec::new();
+    for iteration in ["some x in input.xs", "x := input.xs[_]"] {
+        let comprehension = format!("{{input.key: x | {iteration}}}");
+        for wrapper in [
+            "p := COMP",
+            "default p := false\np if { count(COMP) > 0 }",
+            "p := [count(COMP) | some marker in [true]]",
+            "helper := COMP\np := helper",
+            "p if { not COMP == {} }",
+        ] {
+            let policy = format!("package t\n{}\n", wrapper.replace("COMP", &comprehension));
+            let mut engine = Engine::new();
+            engine.add_policy("t.rego".into(), policy.clone())?;
+            let compiled = engine.compile_with_entrypoint(&ENTRYPOINT.into())?;
+            let program = Compiler::compile_from_policy(&compiled, &[ENTRYPOINT])?;
+            for mode in [ExecutionMode::RunToCompletion, ExecutionMode::Suspendable] {
+                let mut vm = RegoVM::new();
+                vm.load_program(program.clone());
+                vm.set_execution_mode(mode);
+                for (input_json, conflict) in inputs {
+                    let input = Value::from_json_str(input_json)?;
+                    engine.set_input(input.clone());
+                    let expected = engine.eval_rule(ENTRYPOINT.into());
+                    assert_eq!(
+                        expected.is_err(),
+                        conflict,
+                        "interpreter control: {policy}, input {input_json}: {expected:?}"
+                    );
+                    if let Err(ref error) = expected {
+                        assert!(
+                            error.to_string().contains("generated multiple times"),
+                            "unexpected interpreter error: {error}"
+                        );
+                    }
+                    vm.set_input(input);
+                    let got = vm.execute_entry_point_by_name(ENTRYPOINT);
+                    let same = match (&expected, &got) {
+                        (Ok(expected), Ok(got)) => expected == got,
+                        (Err(_), Err(error)) => {
+                            format!("{error:?}").starts_with("ObjectComprehensionConflict")
+                        }
+                        _ => false,
+                    };
+                    if !same {
+                        divergences.push(format!(
+                            "{policy} [{mode:?}] input {input_json}: interpreter {expected:?}, RVM {got:?}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(divergences.is_empty(), "{}", divergences.join("\n"));
+    Ok(())
+}
+
+#[test]
 fn comprehension_condition_failures_match_interpreter() -> Result<()> {
     let inputs = INPUTS
         .iter()
