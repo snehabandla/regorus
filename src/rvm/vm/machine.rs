@@ -956,6 +956,11 @@ impl RegoVM {
     }
 
     pub(super) fn reset_execution_timer_state(&mut self) {
+        #[cfg(feature = "explanations")]
+        if self.pe.is_some() {
+            // Partial evaluation starts its timer before validating unknowns.
+            return;
+        }
         let config = self.effective_execution_timer_config();
         self.execution_timer = ExecutionTimer::new(config);
         self.execution_timer_elapsed_at_suspend = None;
