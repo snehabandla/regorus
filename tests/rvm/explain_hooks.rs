@@ -974,7 +974,7 @@ fn object_comprehension_conflict_stops_before_failed_emission() {
                 literal_idx: 1,
             },
             Instruction::ComprehensionBegin { params_index },
-            yield_instruction.clone(),
+            yield_instruction,
             Instruction::Load {
                 dest: 2,
                 literal_idx: 2,
