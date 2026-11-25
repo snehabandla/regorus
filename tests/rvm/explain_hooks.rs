@@ -683,9 +683,12 @@ fn comprehension_yields_report_typed_payloads_and_static_begin_sites() {
             Value::from(std::collections::BTreeSet::from([v("2"), v("3")])),
         ),
         (
-            r#"{"k": y | some y in input.xs; y > 1}"#,
+            "{y: (y + 10) | some y in input.xs; y > 1}",
             "object",
-            v(r#"{"k":3}"#),
+            Value::from(std::collections::BTreeMap::from([
+                (v("2"), v("12")),
+                (v("3"), v("13")),
+            ])),
         ),
     ];
     for (expression, kind, expected) in cases {
@@ -722,8 +725,11 @@ fn comprehension_yields_report_typed_payloads_and_static_begin_sites() {
         {
             assert_eq!(site, begin_pc);
             assert_eq!(observed_kind, kind);
-            assert_eq!(key, (kind == "object").then(|| v(r#""k""#)));
-            assert_eq!(value, Value::from(expected_value));
+            assert_eq!(key, (kind == "object").then(|| Value::from(expected_value)));
+            assert_eq!(
+                value,
+                Value::from(expected_value + if kind == "object" { 10 } else { 0 })
+            );
             assert!(context.in_comprehension);
             assert!(matches!(
                 r.program.instructions[context.pc],
@@ -938,6 +944,86 @@ fn comprehension_yields_handle_raw_undefined_keys_values_and_result_aliases() {
 }
 
 #[test]
+fn object_comprehension_conflict_stops_before_failed_emission() {
+    use regorus::rvm::instructions::{ComprehensionBeginParams, ComprehensionMode};
+
+    let mut outcomes = Vec::new();
+    for alias_value in [false, true] {
+        let mut program = Program::new();
+        program.literals = vec![v(r#""k""#), v("2"), v("3")];
+        let params_index = program.add_comprehension_begin_params(ComprehensionBeginParams {
+            mode: ComprehensionMode::Object,
+            collection_reg: 0,
+            result_reg: 0,
+            key_reg: 1,
+            value_reg: 2,
+            body_start: 3,
+            comprehension_end: 7,
+        });
+        let yield_instruction = Instruction::ComprehensionYield {
+            value_reg: if alias_value { 0 } else { 2 },
+            key_reg: Some(1),
+        };
+        program.instructions = vec![
+            Instruction::Load {
+                dest: 1,
+                literal_idx: 0,
+            },
+            Instruction::Load {
+                dest: 2,
+                literal_idx: 1,
+            },
+            Instruction::ComprehensionBegin { params_index },
+            yield_instruction,
+            Instruction::Load {
+                dest: 2,
+                literal_idx: 2,
+            },
+            yield_instruction,
+            Instruction::ComprehensionEnd {},
+            Instruction::Return { value: 0 },
+        ];
+        program.max_rule_window_size = 8;
+        program.dispatch_window_size = 8;
+        let program = Arc::new(program);
+        for mode in MODES {
+            let run = run_program(&program, "{}", mode, false);
+            let emissions: Vec<_> = run
+                .events
+                .iter()
+                .filter_map(|recorded| match &recorded.event {
+                    Event::ComprehensionEmission { key, value, .. } => {
+                        Some((key.clone(), value.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let error = run
+                .result
+                .as_ref()
+                .err()
+                .and_then(|error| error.downcast_ref::<regorus::rvm::vm::VmError>())
+                .cloned();
+            outcomes.push((alias_value, mode, error, emissions));
+        }
+    }
+    assert!(
+        outcomes.iter().all(|(alias, _, error, emissions)| {
+            let previous = if *alias { v("{}") } else { v("2") };
+            error.as_ref()
+                == Some(&regorus::rvm::vm::VmError::ObjectComprehensionConflict {
+                    key: v(r#""k""#).into(),
+                    previous: previous.clone().into(),
+                    value: if *alias { v(r#"{"k":{}}"#) } else { v("3") }.into(),
+                    pc: 5,
+                })
+                && *emissions == vec![(Some(v(r#""k""#)), previous)]
+        }),
+        "{outcomes:?}"
+    );
+}
+
+#[test]
 fn comprehension_yields_follow_auto_iteration_and_skip_failed_writes() {
     use regorus::rvm::instructions::{ComprehensionBeginParams, ComprehensionMode};
     for mode in [
@@ -1040,6 +1126,64 @@ fn comprehension_yields_follow_auto_iteration_and_skip_failed_writes() {
             }
         }
     }
+}
+
+#[test]
+fn object_comprehension_conflict_after_resume_is_terminal_and_reusable() {
+    let mut engine = Engine::new();
+    engine
+        .add_policy(
+            "test.rego".into(),
+            "package t\nh(y) := lookup(y)\nc := {\"k\": h(y) | some y in input.xs}\n".into(),
+        )
+        .unwrap();
+    let compiled = engine
+        .compile_with_entrypoint(&Rc::from("data.t.c"))
+        .unwrap();
+    let program =
+        Compiler::compile_from_policy_with_host_await(&compiled, &["data.t.c"], &[("lookup", 1)])
+            .unwrap();
+    let fixture = Fixture::default();
+    let mut vm = RegoVM::new();
+    vm.load_program(program);
+    vm.set_execution_mode(ExecutionMode::Suspendable);
+    vm.set_explanation_recorder(Box::new(fixture.clone()));
+    vm.set_input(v(r#"{"xs":[1,2]}"#));
+    vm.execute().unwrap();
+    assert!(matches!(
+        vm.execution_state(),
+        ExecutionState::Suspended { .. }
+    ));
+    vm.resume(Some(v("10"))).unwrap();
+    assert!(matches!(
+        vm.execution_state(),
+        ExecutionState::Suspended { .. }
+    ));
+    let error = vm.resume(Some(v("20"))).unwrap_err();
+    assert!(matches!(
+        error,
+        regorus::rvm::vm::VmError::ObjectComprehensionConflict { .. }
+    ));
+    let events = fixture.take();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|recorded| matches!(recorded.event, Event::ComprehensionEmission { .. }))
+            .count(),
+        1,
+    );
+    assert!(
+        matches!(vm.execution_state(), ExecutionState::Error { error: state_error } if state_error == &error),
+        "{:?}",
+        vm.execution_state()
+    );
+    vm.set_input(v(r#"{"xs":[1,1]}"#));
+    vm.execute().unwrap();
+    vm.resume(Some(v("10"))).unwrap();
+    vm.resume(Some(v("10"))).unwrap();
+    assert!(
+        matches!(vm.execution_state(), ExecutionState::Completed { result } if result == &v(r#"{"k":10}"#))
+    );
 }
 
 #[test]
