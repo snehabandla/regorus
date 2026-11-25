@@ -294,13 +294,11 @@ pub fn decode(program: &Program) -> Result<NegationMetadata, MetadataError> {
                 register,
                 mode: GuardMode::Condition,
             }) if register == dest
-        ) {
-            if boundaries
-                .binary_search_by_key(&pc, NegationBoundary::not_pc)
-                .is_err()
-            {
-                return Err(MetadataError::Coverage);
-            }
+        ) && boundaries
+            .binary_search_by_key(&pc, NegationBoundary::not_pc)
+            .is_err()
+        {
+            return Err(MetadataError::Coverage);
         }
     }
     Ok(NegationMetadata::Present(boundaries))

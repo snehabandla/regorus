@@ -530,13 +530,13 @@ fn negation_growing_source_prefix_measurements() -> Result<()> {
             "package t\nallow := data.t.checks\n".to_string(),
         )?;
         let entry: Rc<str> = "data.t.allow".into();
-        let started = std::time::Instant::now();
+        let compile_started = std::time::Instant::now();
         let compiled_policy = engine.compile_with_entrypoint(&entry)?;
         let program = Compiler::compile_from_policy(&compiled_policy, &["data.t.allow"])?;
-        let compile_elapsed = started.elapsed();
-        let started = std::time::Instant::now();
+        let compile_ns = compile_started.elapsed().as_nanos();
+        let decode_started = std::time::Instant::now();
         let sites = boundaries(&program)?;
-        let decode_elapsed = started.elapsed();
+        let decode_ns = decode_started.elapsed().as_nanos();
         let expected_sites = rules.checked_mul(16).context("site count overflow")?;
         assert_eq!(sites.len(), expected_sites);
         let prefix_scan_lower_bound = prefix_bytes
@@ -547,7 +547,7 @@ fn negation_growing_source_prefix_measurements() -> Result<()> {
             std::io::stdout(),
             "negation_prefix sites={} source_bytes={source_bytes} prefix_bytes={prefix_bytes} \
              prior_decoder_prefix_scan_lower_bound={prefix_scan_lower_bound} \
-             compile={compile_elapsed:?} decode={decode_elapsed:?}",
+             compile_ns={compile_ns} decode_ns={decode_ns}",
             sites.len(),
         )?;
     }
