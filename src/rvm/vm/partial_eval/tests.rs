@@ -700,6 +700,7 @@ fn unknown_validation_checks_the_execution_deadline_before_dispatch() -> anyhow:
     for unknowns in [siblings, vec![deep], long_siblings, overlapping] {
         let mut vm = RegoVM::new();
         vm.load_program(program.clone());
+        vm.set_max_instructions(2);
         let mut settings = PartialEvalSettings::default();
         settings.unknowns = unknowns;
         vm.set_partial_eval_settings(settings);
@@ -716,6 +717,13 @@ fn unknown_validation_checks_the_execution_deadline_before_dispatch() -> anyhow:
             ),
             "{result:?}"
         );
+        assert!(matches!(
+            vm.execution_state(),
+            super::super::execution_model::ExecutionState::Error {
+                error: VmError::TimeLimitExceeded { .. }
+            }
+        ));
+        assert!(vm.get_registers().is_empty());
         vm.set_partial_eval_settings(PartialEvalSettings::default());
         assert_eq!(vm.partial_eval("entry")?.result, Value::Bool(true));
         let mut settings = PartialEvalSettings::default();
@@ -725,6 +733,7 @@ fn unknown_validation_checks_the_execution_deadline_before_dispatch() -> anyhow:
     }
     let mut vm = RegoVM::new();
     vm.load_program(program);
+    vm.set_max_instructions(2);
     let mut settings = PartialEvalSettings::default();
     settings.unknowns = (0..64)
         .map(|i| UnknownPath::input_keys([format!("sibling-{i}").as_str()]))
@@ -736,4 +745,175 @@ fn unknown_validation_checks_the_execution_deadline_before_dispatch() -> anyhow:
     assert_eq!(result.result, Value::Bool(true));
     assert!(result.warnings.is_empty());
     Ok(())
+}
+
+#[cfg(feature = "std")]
+#[test]
+fn unknown_validation_and_dispatch_share_one_execution_timer() -> anyhow::Result<()> {
+    use crate::utils::limits::{acquire_limits_test_lock, ExecutionTimerConfig};
+    use core::num::NonZeroU32;
+    use core::time::Duration;
+
+    let _guard = acquire_limits_test_lock();
+    let mut program = Program::new();
+    for _ in 0..60 {
+        program.add_instruction(Instruction::LoadTrue { dest: 0 }, None);
+    }
+    program.add_instruction(Instruction::Return { value: 0 }, None);
+    program.add_entry_point("entry".into(), 0);
+    let mut vm = RegoVM::new();
+    vm.load_program(alloc::sync::Arc::new(program));
+    vm.set_max_instructions(61);
+    vm.set_execution_timer_config(Some(ExecutionTimerConfig {
+        limit: Duration::ZERO,
+        check_interval: NonZeroU32::new(64).unwrap_or(NonZeroU32::MIN),
+    }));
+    let mut settings = PartialEvalSettings::default();
+    settings.unknowns = keys(&["short-a", "short-b"]);
+    vm.set_partial_eval_settings(settings);
+    let result = vm.partial_eval("entry");
+    assert!(
+        matches!(
+            result,
+            Err(ExplainError::Vm(VmError::TimeLimitExceeded { pc, .. })) if pc < 60
+        ),
+        "{result:?}"
+    );
+    // Neither validation nor the 61 dispatched opcodes reaches the interval
+    // alone. Removing unknowns must recover with a fresh per-call timer.
+    vm.set_partial_eval_settings(PartialEvalSettings::default());
+    assert_eq!(vm.partial_eval("entry")?.result, Value::Bool(true));
+    Ok(())
+}
+
+fn index_unknowns_checked<E>(
+    paths: &[UnknownPath],
+    checkpoint: &mut impl FnMut() -> core::result::Result<(), E>,
+) -> core::result::Result<(), E> {
+    let mut index = UnknownIndex::new(true);
+    for path in 0..paths.len() {
+        assert_eq!(index.overlap(paths, path, checkpoint)?, None);
+        index.insert(paths, path, checkpoint)?;
+    }
+    for path in 0..paths.len() {
+        assert_eq!(index.overlap(paths, path, checkpoint)?, Some(path));
+    }
+    Ok(())
+}
+
+#[test]
+fn unknown_index_checkpoint_work_scales_with_balanced_lookup_and_key_bytes() {
+    use core::convert::Infallible;
+
+    for width in [1usize, 64, 1024] {
+        let mut paths: Vec<_> = (0..width)
+            .map(|i| UnknownPath::input_keys([format!("sibling-{i:04}").as_str()]))
+            .collect();
+        for _ in 0..2 {
+            let mut checkpoints = 0;
+            assert_eq!(
+                index_unknowns_checked(&paths, &mut || {
+                    checkpoints += 1;
+                    Ok::<(), Infallible>(())
+                }),
+                Ok(())
+            );
+            // Three AVL traversals per declaration, with height < 2*log2(n+1).
+            // These depth-one keys fit in one checked byte chunk.
+            let levels = (usize::BITS - width.leading_zeros()) as usize;
+            assert!(
+                checkpoints <= 32 * width * levels,
+                "width={width}, checkpoints={checkpoints}"
+            );
+            paths.reverse();
+        }
+    }
+    for common_bytes in [0, 256, 4096] {
+        let common = "x".repeat(common_bytes);
+        let paths = vec![
+            UnknownPath::input_keys([format!("{common}a").as_str()]),
+            UnknownPath::input_keys([format!("{common}b").as_str()]),
+        ];
+        let mut checkpoints = 0;
+        assert_eq!(
+            index_unknowns_checked(&paths, &mut || {
+                checkpoints += 1;
+                Ok::<(), Infallible>(())
+            }),
+            Ok(())
+        );
+        assert!(
+            checkpoints <= 128 + 4 * (common_bytes / 256 + 1),
+            "common_bytes={common_bytes}, checkpoints={checkpoints}"
+        );
+        assert!(checkpoints >= 2 * (common_bytes / 256 + 1));
+    }
+}
+
+#[test]
+fn unknown_index_interrupts_lookup_growth_and_long_key_comparison() {
+    let paths: Vec<_> = (0..64)
+        .map(|i| {
+            UnknownPath::input_keys([format!("{}-{i:04}", "x".repeat(4096)).as_str()])
+        })
+        .collect();
+    for stop_at in [1, 2, 17, 64, 512] {
+        let mut checkpoints = 0;
+        assert_eq!(
+            index_unknowns_checked(&paths, &mut || {
+                checkpoints += 1;
+                if checkpoints == stop_at {
+                    Err(stop_at)
+                } else {
+                    Ok(())
+                }
+            }),
+            Err(stop_at)
+        );
+        assert_eq!(checkpoints, stop_at);
+    }
+    assert_eq!(
+        index_unknowns_checked(&paths, &mut || Ok::<(), usize>(())),
+        Ok(())
+    );
+}
+
+#[test]
+fn unknown_index_ancestor_overlap_retains_first_declared_descendant_after_rotations() {
+    use core::convert::Infallible;
+
+    for descending in [false, true] {
+        let mut paths: Vec<_> = (0..64)
+            .map(|i| UnknownPath::input_keys(["prefix", format!("{i:04}").as_str()]))
+            .collect();
+        if descending {
+            paths.reverse();
+        }
+        let mut index = UnknownIndex::new(true);
+        for path in 0..paths.len() {
+            index.insert(&paths, path, &mut || Ok::<(), Infallible>(())).unwrap();
+        }
+        paths.push(UnknownPath::input_keys(["prefix"]));
+        paths.push(UnknownPath::new(UnknownRoot::Input, []));
+        paths.push(UnknownPath::new(UnknownRoot::Context, []));
+        for path in [64, 65] {
+            assert_eq!(
+                index.overlap(&paths, path, &mut || Ok::<(), Infallible>(())),
+                Ok(Some(0))
+            );
+        }
+        assert_eq!(
+            index.overlap(&paths, 66, &mut || Ok::<(), Infallible>(())),
+            Ok(None)
+        );
+        let mut checkpoints = 0;
+        assert_eq!(
+            index.overlap(&paths, 64, &mut || {
+                checkpoints += 1;
+                if checkpoints == 5 { Err(5) } else { Ok(()) }
+            }),
+            Err(5)
+        );
+        assert_eq!(checkpoints, 5);
+    }
 }
