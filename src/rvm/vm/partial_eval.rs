@@ -288,9 +288,7 @@ impl RegoVM {
             }
             // The VM's input is null until it is set; its context is undefined.
             let absent = matches!(value, Value::Undefined)
-                || (root == UnknownRoot::Input
-                    && depth == 0
-                    && matches!(value, Value::Null));
+                || (root == UnknownRoot::Input && depth == 0 && matches!(value, Value::Null));
             if !absent {
                 return Err(ExplainError::UnknownValueSupplied {
                     path: self.render_unknown(i)?,

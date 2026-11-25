@@ -40,8 +40,12 @@ impl UnknownIndex {
         while let Some(index) = cursor {
             checkpoint()?;
             let node = &self.nodes[index];
-            let (order, overlap) =
-                compare(&paths[path], &paths[node.path], self.checked_bytes, checkpoint)?;
+            let (order, overlap) = compare(
+                &paths[path],
+                &paths[node.path],
+                self.checked_bytes,
+                checkpoint,
+            )?;
             if overlap {
                 if paths[path].segments.len() >= paths[node.path].segments.len() {
                     return Ok(Some(node.path));
@@ -50,7 +54,14 @@ impl UnknownIndex {
                 // on this terminating error, to retain declaration-order diagnostics.
                 for node in &self.nodes {
                     checkpoint()?;
-                    if compare(&paths[path], &paths[node.path], self.checked_bytes, checkpoint)?.1 {
+                    if compare(
+                        &paths[path],
+                        &paths[node.path],
+                        self.checked_bytes,
+                        checkpoint,
+                    )?
+                    .1
+                    {
                         return Ok(Some(node.path));
                     }
                 }
@@ -128,12 +139,15 @@ impl UnknownIndex {
     }
 
     fn update_height(&mut self, index: usize) {
-        self.nodes[index].height =
-            1 + self.height(self.nodes[index].left).max(self.height(self.nodes[index].right));
+        self.nodes[index].height = 1 + self
+            .height(self.nodes[index].left)
+            .max(self.height(self.nodes[index].right));
     }
 
     fn rotate_left(&mut self, root: usize) -> usize {
-        let Some(right) = self.nodes[root].right else { return root };
+        let Some(right) = self.nodes[root].right else {
+            return root;
+        };
         self.nodes[root].right = self.nodes[right].left;
         self.nodes[right].left = Some(root);
         self.update_height(root);
@@ -142,7 +156,9 @@ impl UnknownIndex {
     }
 
     fn rotate_right(&mut self, root: usize) -> usize {
-        let Some(left) = self.nodes[root].left else { return root };
+        let Some(left) = self.nodes[root].left else {
+            return root;
+        };
         self.nodes[root].left = self.nodes[left].right;
         self.nodes[left].right = Some(root);
         self.update_height(root);
@@ -168,7 +184,11 @@ fn compare<E>(
             (PathSegment::Index(left), PathSegment::Index(right)) => left.cmp(right),
             (PathSegment::Key(left), PathSegment::Key(right)) => {
                 if checked_bytes {
-                    for (left, right) in left.as_bytes().chunks(256).zip(right.as_bytes().chunks(256)) {
+                    for (left, right) in left
+                        .as_bytes()
+                        .chunks(256)
+                        .zip(right.as_bytes().chunks(256))
+                    {
                         checkpoint()?;
                         let order = left.cmp(right);
                         if !order.is_eq() {

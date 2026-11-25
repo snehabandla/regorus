@@ -853,9 +853,7 @@ fn unknown_index_checkpoint_work_scales_with_balanced_lookup_and_key_bytes() {
 #[test]
 fn unknown_index_interrupts_lookup_growth_and_long_key_comparison() {
     let paths: Vec<_> = (0..64)
-        .map(|i| {
-            UnknownPath::input_keys([format!("{}-{i:04}", "x".repeat(4096)).as_str()])
-        })
+        .map(|i| UnknownPath::input_keys([format!("{}-{i:04}", "x".repeat(4096)).as_str()]))
         .collect();
     for stop_at in [1, 2, 17, 64, 512] {
         let mut checkpoints = 0;
@@ -891,7 +889,9 @@ fn unknown_index_ancestor_overlap_retains_first_declared_descendant_after_rotati
         }
         let mut index = UnknownIndex::new(true);
         for path in 0..paths.len() {
-            index.insert(&paths, path, &mut || Ok::<(), Infallible>(())).unwrap();
+            index
+                .insert(&paths, path, &mut || Ok::<(), Infallible>(()))
+                .unwrap();
         }
         paths.push(UnknownPath::input_keys(["prefix"]));
         paths.push(UnknownPath::new(UnknownRoot::Input, []));
@@ -910,7 +910,11 @@ fn unknown_index_ancestor_overlap_retains_first_declared_descendant_after_rotati
         assert_eq!(
             index.overlap(&paths, 64, &mut || {
                 checkpoints += 1;
-                if checkpoints == 5 { Err(5) } else { Ok(()) }
+                if checkpoints == 5 {
+                    Err(5)
+                } else {
+                    Ok(())
+                }
             }),
             Err(5)
         );
